@@ -2,6 +2,7 @@ use crate::model::{
     ChatMessage, ContextItemTrace, ContextPlan, EventRole, Session, SourceSpan, content_sha256,
     context_sha256, event_id,
 };
+use crate::retrieval::RecallResult;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ContextAssembler;
@@ -16,6 +17,23 @@ impl ContextAssembler {
         current_user: &str,
         history_indices: Option<&[usize]>,
         current_turn_index: Option<usize>,
+    ) -> ContextPlan {
+        self.assemble_with_recall(
+            session,
+            current_user,
+            history_indices,
+            current_turn_index,
+            None,
+        )
+    }
+
+    pub fn assemble_with_recall(
+        &self,
+        session: &Session,
+        current_user: &str,
+        history_indices: Option<&[usize]>,
+        current_turn_index: Option<usize>,
+        recall: Option<&RecallResult>,
     ) -> ContextPlan {
         let selected_indices = history_indices.map_or_else(
             || {
@@ -39,6 +57,21 @@ impl ContextAssembler {
                 EventRole::System,
                 &session.system_prompt,
             );
+        }
+        if let Some(recall) = recall {
+            for item in &recall.evidence {
+                // Evidence messages are deliberately original-role spans, not
+                // a generated wrapper.  This keeps exact provenance intact.
+                context_items.push(ContextItemTrace {
+                    role: item.selected.role,
+                    span: item.selected.span.clone(),
+                    content_sha256: item.selected.content_sha256.clone(),
+                });
+                messages.push(ChatMessage {
+                    role: item.selected.role.as_str().into(),
+                    content: item.content.clone(),
+                });
+            }
         }
         for index in &selected_indices {
             let turn = &session.turns[*index];
@@ -94,6 +127,10 @@ impl ContextAssembler {
             estimated_upper_tokens,
             exact_input_tokens: None,
             input_budget: session.budget.input_budget(),
+            retrieval_trace: recall.map(|value| value.trace.clone()).unwrap_or_default(),
+            evidence: recall
+                .map(|value| value.trace.selected_evidence.clone())
+                .unwrap_or_default(),
         }
     }
 

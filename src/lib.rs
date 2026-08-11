@@ -10,11 +10,12 @@ pub mod web;
 pub use context::ContextAssembler;
 pub use engine::{ChatEngine, LimitAction, PreparedTurn};
 pub use model::{
-    BudgetConfig, EventRole, ProvenanceQuality, Session, SourceSpan, TokenUsage, Turn,
+    BudgetConfig, EventRole, EvidenceKind, ProvenanceQuality, RetrievalConfig, RetrievalTrace,
+    Session, SourceSpan, TokenUsage, Turn,
 };
 pub use ollama::{ModelInfo, OllamaClient};
 pub use retrieval::{
-    AnswerContext, AnswerContextItem, IndexedSession, ResolvedSpan, RetrievalError, RetrievalStore,
-    StoredEvent, SyncReport,
+    AnswerContext, AnswerContextItem, IndexedSession, RecallResult, RecalledEvidence, ResolvedSpan,
+    RetrievalError, RetrievalStore, StoredEvent, SyncReport,
 };
 pub use store::{IndexSyncAfterSourceCommit, SessionStore};

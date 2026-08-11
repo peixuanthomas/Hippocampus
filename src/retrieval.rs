@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -10,12 +11,14 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::model::{
-    ChatMessage, ContextItemTrace, EventRole, ModelRequestTrace, ProvenanceQuality, SCHEMA_VERSION,
-    Session, SourceSpan, Turn, TurnStatus, content_sha256, context_sha256, event_id,
+    ChatMessage, ContextItemTrace, EventRole, EvidenceKind, ModelRequestTrace, ProvenanceQuality,
+    RankedCandidate, RetrievalConfig, RetrievalDocumentGranularity, RetrievalTrace, SCHEMA_VERSION,
+    SelectedEvidence, Session, SourceSpan, Turn, TurnStatus, content_sha256, context_sha256,
+    event_id,
 };
 
 pub const INDEX_FILENAME: &str = ".hippocampus-index.sqlite3";
-const INDEX_SCHEMA_VERSION: i64 = 1;
+const INDEX_SCHEMA_VERSION: i64 = 2;
 
 #[derive(Debug, Error)]
 pub enum RetrievalError {
@@ -100,7 +103,7 @@ pub struct AnswerContextItem {
     pub resolved: ResolvedSpan,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AnswerContext {
     pub answer_event_id: String,
     pub turn_id: String,
@@ -112,6 +115,7 @@ pub struct AnswerContext {
     pub provenance_quality: ProvenanceQuality,
     pub request: Option<ModelRequestTrace>,
     pub items: Vec<AnswerContextItem>,
+    pub retrieval_trace: RetrievalTrace,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -120,6 +124,19 @@ pub struct SyncReport {
     pub events: usize,
     pub spans: usize,
     pub answer_contexts: usize,
+    pub documents: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecalledEvidence {
+    pub selected: SelectedEvidence,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RecallResult {
+    pub trace: RetrievalTrace,
+    pub evidence: Vec<RecalledEvidence>,
 }
 
 #[derive(Debug, Clone)]
@@ -196,7 +213,10 @@ impl RetrievalStore {
             .map_err(|source| self.database_error(source))?;
         transaction
             .execute_batch(
-                "DELETE FROM answer_context_items;
+                "DELETE FROM retrieval_documents_fts;
+                 DELETE FROM retrieval_documents;
+                 DELETE FROM retrieval_runs;
+                 DELETE FROM answer_context_items;
                  DELETE FROM answer_contexts;
                  DELETE FROM source_spans;
                  DELETE FROM events;
@@ -294,6 +314,237 @@ impl RetrievalStore {
         })
     }
 
+    /// Deterministic FTS5 recall.  The FTS expression is assembled solely
+    /// from quoted tokenizer output; user punctuation never becomes syntax.
+    pub fn keyword_recall(
+        &self,
+        raw_query: &str,
+        current_user_event_id: &str,
+        recent_event_ids: &[String],
+        config: RetrievalConfig,
+    ) -> RetrievalResult<RecallResult> {
+        config
+            .validate()
+            .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+        let terms = query_terms(raw_query);
+        let mut trace = RetrievalTrace {
+            status: "ok".into(),
+            current_query_event_id: current_user_event_id.into(),
+            query_terms: terms.clone(),
+            config,
+            ..Default::default()
+        };
+        if terms.is_empty() {
+            trace.status = "empty_query".into();
+            return Ok(RecallResult {
+                trace,
+                evidence: Vec::new(),
+            });
+        }
+        let expression = terms
+            .iter()
+            .map(|term| format!("\"{}\"", term.replace('"', "")))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let connection = self.open_connection()?;
+        let mut statement = connection.prepare(
+            "SELECT d.document_id, d.granularity, d.event_id, d.start_char, d.end_char, d.content_sha256,
+                    e.role, e.session_id, e.created_at, bm25(retrieval_documents_fts) AS score
+             FROM retrieval_documents_fts JOIN retrieval_documents d ON d.rowid = retrieval_documents_fts.rowid
+             JOIN events e ON e.event_id = d.event_id
+             WHERE retrieval_documents_fts MATCH ?1
+             ORDER BY score ASC, d.document_id ASC LIMIT ?2"
+        ).map_err(|e| self.database_error(e))?;
+        let rows = statement
+            .query_map(
+                params![expression, (trace.config.candidate_limit * 4) as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        i64_to_usize(row.get(3)?)?,
+                        i64_to_usize(row.get(4)?)?,
+                        row.get::<_, String>(5)?,
+                        parse_role(&row.get::<_, String>(6)?)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, f64>(9)?,
+                    ))
+                },
+            )
+            .map_err(|e| self.database_error(e))?;
+        let fetched = rows
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| self.database_error(e))?;
+        drop(statement);
+        let recent: HashSet<&str> = recent_event_ids.iter().map(String::as_str).collect();
+        let mut used_events = HashSet::new();
+        let mut used_hashes = HashSet::new();
+        let mut core_chars = 0usize;
+        for (idx, row) in fetched.into_iter().enumerate() {
+            if trace.candidates.len() >= trace.config.candidate_limit {
+                break;
+            }
+            let (
+                document_id,
+                granularity,
+                event_id_value,
+                start,
+                end,
+                hash,
+                role,
+                session_id,
+                created_at,
+                score,
+            ) = row;
+            let span = SourceSpan {
+                event_id: event_id_value.clone(),
+                start_char: start,
+                end_char: end,
+            };
+            let mut candidate = RankedCandidate {
+                raw_rank: idx + 1,
+                document_id,
+                granularity: if granularity == "fragment" {
+                    RetrievalDocumentGranularity::Fragment
+                } else {
+                    RetrievalDocumentGranularity::Message
+                },
+                span: span.clone(),
+                role,
+                session_id,
+                created_at,
+                content_sha256: hash.clone(),
+                bm25_score: score,
+                selected: false,
+                reason: String::new(),
+            };
+            if event_id_value == current_user_event_id {
+                candidate.reason = "current_message".into();
+            } else if recent.contains(event_id_value.as_str()) {
+                candidate.reason = "recent_context".into();
+            } else if used_events.contains(&event_id_value) {
+                candidate.reason = "duplicate_event".into();
+            } else if used_hashes.contains(&hash) {
+                candidate.reason = "duplicate_content".into();
+            } else {
+                let source_event = self.get_event_from_connection(&connection, &span.event_id)?;
+                let source_session =
+                    self.get_session_from_connection(&connection, &source_event.session_id)?;
+                self.verify_fresh(&source_session)?;
+                verify_event_hash(&source_event)?;
+                let span_content = slice_chars(&source_event.content, &span)?;
+                if span_content.chars().count() + core_chars > trace.config.evidence_char_budget {
+                    candidate.reason = "evidence_budget".into();
+                } else if trace
+                    .selected_evidence
+                    .iter()
+                    .filter(|e| e.kind == EvidenceKind::Core)
+                    .count()
+                    >= trace.config.max_selected
+                {
+                    candidate.reason = "selection_limit".into();
+                } else {
+                    candidate.selected = true;
+                    candidate.reason = "selected_core".into();
+                    core_chars += span_content.chars().count();
+                    used_events.insert(event_id_value);
+                    used_hashes.insert(hash.clone());
+                    trace.selected_evidence.push(SelectedEvidence {
+                        span,
+                        content_sha256: hash,
+                        role,
+                        kind: EvidenceKind::Core,
+                        originating_candidate_rank: Some(candidate.raw_rank),
+                        reason: "bm25_core".into(),
+                    });
+                }
+            }
+            trace.candidates.push(candidate);
+        }
+        let mut evidence = Vec::new();
+        for selected in trace.selected_evidence.clone() {
+            let event = self.get_event_from_connection(&connection, &selected.span.event_id)?;
+            verify_event_hash(&event)?;
+            let content = slice_chars(&event.content, &selected.span)?;
+            evidence.push(RecalledEvidence { selected, content });
+        }
+        self.expand_context(
+            &connection,
+            &mut trace,
+            &mut evidence,
+            current_user_event_id,
+            &recent,
+            &used_events,
+            &used_hashes,
+        )?;
+        Ok(RecallResult { trace, evidence })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn expand_context(
+        &self,
+        connection: &Connection,
+        trace: &mut RetrievalTrace,
+        evidence: &mut Vec<RecalledEvidence>,
+        current: &str,
+        recent: &HashSet<&str>,
+        used_events: &HashSet<String>,
+        used_hashes: &HashSet<String>,
+    ) -> RetrievalResult<()> {
+        let mut budget = 0usize;
+        let cores = evidence.clone();
+        for core in cores {
+            let event = self.get_event_from_connection(connection, &core.selected.span.event_id)?;
+            let candidates = [
+                (event.reply_to_event_id.clone(), "reply_parent"),
+                (connection.query_row("SELECT event_id FROM events WHERE reply_to_event_id=?1 ORDER BY sequence LIMIT 1", [&event.id], |r| r.get(0)).optional().map_err(|e| self.database_error(e))?, "reply_child"),
+                (connection.query_row("SELECT event_id FROM events WHERE session_id=?1 AND sequence<?2 ORDER BY sequence DESC LIMIT 1", params![event.session_id, event.sequence as i64], |r| r.get(0)).optional().map_err(|e| self.database_error(e))?, "adjacent_before"),
+                (connection.query_row("SELECT event_id FROM events WHERE session_id=?1 AND sequence>?2 ORDER BY sequence LIMIT 1", params![event.session_id, event.sequence as i64], |r| r.get(0)).optional().map_err(|e| self.database_error(e))?, "adjacent_after"),
+            ];
+            for (id, reason) in candidates {
+                let Some(id) = id else { continue };
+                if id == current
+                    || recent.contains(id.as_str())
+                    || used_events.contains(&id)
+                    || evidence.iter().any(|e| e.selected.span.event_id == id)
+                {
+                    continue;
+                }
+                let adjacent = self.get_event_from_connection(connection, &id)?;
+                if adjacent.role == EventRole::System
+                    || used_hashes.contains(&adjacent.content_sha256)
+                {
+                    continue;
+                }
+                let chars = adjacent.content.chars().count();
+                if budget + chars > trace.config.expansion_char_budget {
+                    continue;
+                }
+                budget += chars;
+                let selected = SelectedEvidence {
+                    span: SourceSpan {
+                        event_id: id,
+                        start_char: 0,
+                        end_char: chars,
+                    },
+                    content_sha256: adjacent.content_sha256.clone(),
+                    role: adjacent.role,
+                    kind: EvidenceKind::Context,
+                    originating_candidate_rank: core.selected.originating_candidate_rank,
+                    reason: reason.into(),
+                };
+                trace.selected_evidence.push(selected.clone());
+                evidence.push(RecalledEvidence {
+                    selected,
+                    content: adjacent.content,
+                });
+            }
+        }
+        Ok(())
+    }
+
     pub fn answer_context(&self, answer_event_id: &str) -> RetrievalResult<AnswerContext> {
         let connection = self.open_connection()?;
         let event = self.get_event_from_connection(&connection, answer_event_id)?;
@@ -314,6 +565,19 @@ impl RetrievalStore {
             .ok_or_else(|| {
                 RetrievalError::AnswerContextNotFound(answer_event_id.to_owned())
             })?;
+        answer.retrieval_trace = connection
+            .query_row(
+                "SELECT trace_json FROM retrieval_runs WHERE answer_event_id=?1",
+                [answer_event_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| self.database_error(e))?
+            .map(|json| {
+                serde_json::from_str(&json).map_err(|e| RetrievalError::CorruptIndex(e.to_string()))
+            })
+            .transpose()?
+            .unwrap_or_default();
         let mut statement = connection
             .prepare(
                 "SELECT i.ordinal, i.role, i.event_id, i.start_char, i.end_char,
@@ -377,6 +641,7 @@ impl RetrievalStore {
         source: &SessionSource,
     ) -> RetrievalResult<SyncReport> {
         let source_file = source_file_name(&self.root, &source.path)?;
+        transaction.execute("DELETE FROM retrieval_documents_fts WHERE rowid IN (SELECT rowid FROM retrieval_documents WHERE event_id IN (SELECT event_id FROM events WHERE session_id=?1))", [source.session.id.as_str()]).map_err(|e| self.database_error(e))?;
         transaction
             .execute(
                 "DELETE FROM indexed_sessions WHERE session_id = ?1 OR source_file = ?2",
@@ -408,6 +673,7 @@ impl RetrievalStore {
             .map(|event| (event.id.clone(), event))
             .collect::<HashMap<_, _>>();
         let mut spans = HashSet::new();
+        let mut document_count = 0;
         for event in &events {
             insert_event(transaction, event).map_err(|error| self.database_error(error))?;
             let full_span = SourceSpan {
@@ -418,6 +684,14 @@ impl RetrievalStore {
             insert_span(transaction, &full_span, &event.content)
                 .map_err(|error| self.database_error(error))?;
             spans.insert((full_span.event_id, full_span.start_char, full_span.end_char));
+            if event.role != EventRole::System && !event.content.trim().is_empty() {
+                for (granularity, span) in document_spans(event) {
+                    let text = slice_chars(&event.content, &span)?;
+                    insert_document(transaction, event, &span, granularity, &text)
+                        .map_err(|error| self.database_error(error))?;
+                    document_count += 1;
+                }
+            }
         }
 
         let mut answer_context_count = 0;
@@ -435,6 +709,18 @@ impl RetrievalStore {
             )?;
             insert_answer_context(transaction, &answer_id, turn, &derived)
                 .map_err(|error| self.database_error(error))?;
+            transaction
+                .execute(
+                    "INSERT INTO retrieval_runs(answer_event_id, trace_json) VALUES(?1,?2)",
+                    params![
+                        answer_id,
+                        serde_json::to_string(&turn.context_trace.retrieval)
+                            .map_err(|e| self.database_error(
+                                rusqlite::Error::ToSqlConversionFailure(Box::new(e))
+                            ))?
+                    ],
+                )
+                .map_err(|e| self.database_error(e))?;
             let mut context_messages = Vec::with_capacity(derived.items.len());
             for (ordinal, item) in derived.items.iter().enumerate() {
                 let event = event_by_id.get(&item.span.event_id).ok_or_else(|| {
@@ -512,6 +798,7 @@ impl RetrievalStore {
             events: events.len(),
             spans: spans.len(),
             answer_contexts: answer_context_count,
+            documents: document_count,
         })
     }
 
@@ -580,7 +867,7 @@ impl RetrievalStore {
             path: self.root.clone(),
             source,
         })?;
-        let connection =
+        let mut connection =
             Connection::open(&self.index_path).map_err(|source| self.database_error(source))?;
         connection
             .busy_timeout(Duration::from_secs(5))
@@ -588,20 +875,51 @@ impl RetrievalStore {
         connection
             .execute_batch(
                 "PRAGMA foreign_keys = ON;
-                 PRAGMA journal_mode = WAL;
                  PRAGMA synchronous = FULL;",
             )
             .map_err(|source| self.database_error(source))?;
         let version = connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .map_err(|source| self.database_error(source))?;
-        if !matches!(version, 0 | INDEX_SCHEMA_VERSION) {
+        if !matches!(version, 0 | 1 | INDEX_SCHEMA_VERSION) {
             return Err(RetrievalError::UnsupportedIndexVersion(version));
         }
         connection
             .execute_batch(SCHEMA_SQL)
             .map_err(|source| self.database_error(source))?;
-        if version == 0 {
+        if version == 1 {
+            // v1 contains all immutable events, so a transactional rebuild of
+            // only derived tables is deterministic and loses no source data.
+            let transaction = connection
+                .transaction()
+                .map_err(|e| self.database_error(e))?;
+            transaction
+                .execute_batch(
+                    "DELETE FROM retrieval_documents_fts; DELETE FROM retrieval_documents;",
+                )
+                .map_err(|e| self.database_error(e))?;
+            let mut statement = transaction.prepare("SELECT event_id, session_id, turn_id, sequence, role, created_at, content, content_sha256, reply_to_event_id, token_count, turn_status, done_reason, error FROM events").map_err(|e| self.database_error(e))?;
+            let rows = statement
+                .query_map([], map_event)
+                .map_err(|e| self.database_error(e))?;
+            let events: Vec<_> = rows
+                .collect::<Result<_, _>>()
+                .map_err(|e| self.database_error(e))?;
+            drop(statement);
+            for event in &events {
+                if event.role != EventRole::System && !event.content.trim().is_empty() {
+                    for (granularity, span) in document_spans(event) {
+                        let text = slice_chars(&event.content, &span)?;
+                        insert_document(&transaction, event, &span, granularity, &text)
+                            .map_err(|e| self.database_error(e))?;
+                    }
+                }
+            }
+            transaction
+                .pragma_update(None, "user_version", INDEX_SCHEMA_VERSION)
+                .map_err(|e| self.database_error(e))?;
+            transaction.commit().map_err(|e| self.database_error(e))?;
+        } else if version == 0 {
             connection
                 .pragma_update(None, "user_version", INDEX_SCHEMA_VERSION)
                 .map_err(|source| self.database_error(source))?;
@@ -689,6 +1007,100 @@ impl RetrievalStore {
         }
         Ok(())
     }
+}
+
+fn document_spans(event: &StoredEvent) -> Vec<(RetrievalDocumentGranularity, SourceSpan)> {
+    let len = event.content.chars().count();
+    let mut spans = vec![(
+        RetrievalDocumentGranularity::Message,
+        SourceSpan {
+            event_id: event.id.clone(),
+            start_char: 0,
+            end_char: len,
+        },
+    )];
+    if len > 240 {
+        let mut start = 0;
+        while start < len {
+            let end = (start + 240).min(len);
+            spans.push((
+                RetrievalDocumentGranularity::Fragment,
+                SourceSpan {
+                    event_id: event.id.clone(),
+                    start_char: start,
+                    end_char: end,
+                },
+            ));
+            if end == len {
+                break;
+            }
+            start += 200;
+        }
+    }
+    spans
+}
+
+fn insert_document(
+    transaction: &Transaction<'_>,
+    event: &StoredEvent,
+    span: &SourceSpan,
+    granularity: RetrievalDocumentGranularity,
+    content: &str,
+) -> rusqlite::Result<()> {
+    let id = format!("{}:{}:{}", event.id, span.start_char, span.end_char);
+    transaction.execute("INSERT INTO retrieval_documents (document_id,event_id,start_char,end_char,granularity,content_sha256,exact_content,lexical_content,ngram_content) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)", params![id, event.id, span.start_char as i64, span.end_char as i64, match granularity { RetrievalDocumentGranularity::Message => "message", RetrievalDocumentGranularity::Fragment => "fragment" }, content_sha256(content), content, lexical_field(content), ngram_field(content)])?;
+    let rowid = transaction.last_insert_rowid();
+    transaction.execute("INSERT INTO retrieval_documents_fts(rowid, lexical_content, ngram_content) VALUES(?1,?2,?3)", params![rowid, lexical_field(content), ngram_field(content)])?;
+    Ok(())
+}
+
+fn jieba() -> &'static jieba_rs::Jieba {
+    static JIEBA: OnceLock<jieba_rs::Jieba> = OnceLock::new();
+    JIEBA.get_or_init(jieba_rs::Jieba::new)
+}
+fn lexical_field(content: &str) -> String {
+    jieba()
+        .cut(content, false)
+        .iter()
+        .map(|token| token.word)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+fn is_cjk(ch: char) -> bool {
+    matches!(ch as u32, 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF)
+}
+fn ngram_field(content: &str) -> String {
+    let chars: Vec<_> = content.chars().collect();
+    let mut output = Vec::new();
+    for n in [2, 3] {
+        for window in chars.windows(n) {
+            if window.iter().all(|c| is_cjk(*c)) {
+                output.push(window.iter().collect::<String>());
+            }
+        }
+    }
+    output.join(" ")
+}
+fn query_terms(raw: &str) -> Vec<String> {
+    let mut terms = jieba()
+        .cut(raw, false)
+        .into_iter()
+        .filter(|s| !s.word.trim().is_empty())
+        .map(|s| s.word.to_owned())
+        .collect::<Vec<_>>();
+    let chars: Vec<_> = raw.chars().collect();
+    for n in [2, 3] {
+        for w in chars.windows(n).take(128) {
+            if w.iter().all(|c| is_cjk(*c)) {
+                terms.push(w.iter().collect());
+            }
+        }
+    }
+    terms.retain(|term| term.chars().any(|c| c.is_alphanumeric() || is_cjk(c)));
+    terms.sort();
+    terms.dedup();
+    terms.truncate(128);
+    terms
 }
 
 #[derive(Debug)]
@@ -1036,6 +1448,7 @@ fn map_answer_context(row: &rusqlite::Row<'_>) -> rusqlite::Result<AnswerContext
         provenance_quality: quality,
         request,
         items: Vec::new(),
+        retrieval_trace: RetrievalTrace::default(),
     })
 }
 
@@ -1174,6 +1587,7 @@ fn add_report(total: &mut SyncReport, report: SyncReport) {
     total.events += report.events;
     total.spans += report.spans;
     total.answer_contexts += report.answer_contexts;
+    total.documents += report.documents;
 }
 
 const SCHEMA_SQL: &str = r#"
@@ -1244,6 +1658,26 @@ CREATE TABLE IF NOT EXISTS answer_context_items (
         REFERENCES source_spans(event_id, start_char, end_char)
 );
 
+CREATE TABLE IF NOT EXISTS retrieval_runs (
+    answer_event_id TEXT PRIMARY KEY REFERENCES events(event_id) ON DELETE CASCADE,
+    trace_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS retrieval_documents (
+    document_id TEXT PRIMARY KEY,
+    event_id TEXT NOT NULL REFERENCES events(event_id) ON DELETE CASCADE,
+    start_char INTEGER NOT NULL,
+    end_char INTEGER NOT NULL,
+    granularity TEXT NOT NULL CHECK(granularity IN ('message','fragment')),
+    content_sha256 TEXT NOT NULL,
+    exact_content TEXT NOT NULL,
+    lexical_content TEXT NOT NULL,
+    ngram_content TEXT NOT NULL
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS retrieval_documents_fts USING fts5(
+    lexical_content, ngram_content, tokenize='unicode61'
+);
+
 CREATE INDEX IF NOT EXISTS events_session_sequence
     ON events(session_id, sequence);
 CREATE INDEX IF NOT EXISTS events_reply_to
@@ -1286,6 +1720,7 @@ mod tests {
                 max_output_tokens: session.budget.max_output_tokens,
             }),
             provenance_quality: ProvenanceQuality::Exact,
+            retrieval: RetrievalTrace::default(),
         };
         turn.request_started_at = Some(started_at);
         turn.assistant_content = assistant.to_owned();
@@ -1320,6 +1755,7 @@ mod tests {
                 events: 5,
                 spans: 5,
                 answer_contexts: 2,
+                documents: 4,
             }
         );
 
@@ -1389,6 +1825,48 @@ mod tests {
                 .map(|item| item.resolved.content.as_str())
                 .collect::<Vec<_>>(),
             vec!["system 原文", "第一问", "第一答", "你a\u{301}🙂x"]
+        );
+    }
+
+    #[test]
+    fn keyword_recall_returns_exact_old_chinese_span_and_traces_exclusions() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let mut session = store
+            .create(
+                "model",
+                "http://localhost",
+                Some("system"),
+                Default::default(),
+                false,
+            )
+            .unwrap();
+        let old_user = "两年前唐波说他喜欢杭州，生日是2021年4月3日，偏好乌龙茶。";
+        append_complete_turn(&mut session, old_user, "收到", "secret");
+        for index in 0..20 {
+            append_complete_turn(&mut session, &format!("无关消息{index}"), "无关回答", "");
+        }
+        store.save(&mut session).unwrap();
+        let current = "请问唐波偏好什么？";
+        let current_event = event_id(&session.id, Some("pending"), EventRole::User);
+        let recall = store
+            .retrieval()
+            .keyword_recall(current, &current_event, &[], RetrievalConfig::default())
+            .unwrap();
+        assert!(recall.evidence.iter().any(|item| item.content == old_user));
+        assert!(
+            recall
+                .trace
+                .candidates
+                .iter()
+                .any(|candidate| candidate.bm25_score.is_finite())
+        );
+        assert!(
+            recall
+                .trace
+                .selected_evidence
+                .iter()
+                .any(|item| item.kind == EvidenceKind::Core)
         );
     }
 

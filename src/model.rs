@@ -25,6 +25,112 @@ pub struct BudgetConfig {
     pub trim_target_ratio: f64,
 }
 
+/// Independent limits for lexical long-term evidence.  Kept in the source
+/// session so a completed answer remains explainable after restart.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RetrievalConfig {
+    pub candidate_limit: usize,
+    pub max_selected: usize,
+    pub evidence_char_budget: usize,
+    pub expansion_char_budget: usize,
+}
+
+impl Default for RetrievalConfig {
+    fn default() -> Self {
+        Self {
+            candidate_limit: 64,
+            max_selected: 4,
+            evidence_char_budget: 1600,
+            expansion_char_budget: 800,
+        }
+    }
+}
+
+impl RetrievalConfig {
+    pub fn validate(&self) -> Result<()> {
+        if self.candidate_limit == 0
+            || self.candidate_limit > 512
+            || self.max_selected == 0
+            || self.max_selected > self.candidate_limit
+            || self.evidence_char_budget == 0
+            || self.evidence_char_budget > 32_768
+            || self.expansion_char_budget > 16_384
+        {
+            bail!("检索配置必须为合理的非零有界值");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RetrievalDocumentGranularity {
+    Message,
+    Fragment,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceKind {
+    Core,
+    Context,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RankedCandidate {
+    pub raw_rank: usize,
+    pub document_id: String,
+    pub granularity: RetrievalDocumentGranularity,
+    pub span: SourceSpan,
+    pub role: EventRole,
+    pub session_id: String,
+    pub created_at: String,
+    pub content_sha256: String,
+    pub bm25_score: f64,
+    pub selected: bool,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SelectedEvidence {
+    pub span: SourceSpan,
+    pub content_sha256: String,
+    pub role: EventRole,
+    pub kind: EvidenceKind,
+    pub originating_candidate_rank: Option<usize>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RetrievalTrace {
+    pub status: String,
+    pub current_query_event_id: String,
+    #[serde(default)]
+    pub query_terms: Vec<String>,
+    #[serde(default)]
+    pub config: RetrievalConfig,
+    #[serde(default)]
+    pub candidates: Vec<RankedCandidate>,
+    #[serde(default)]
+    pub selected_evidence: Vec<SelectedEvidence>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+impl Default for RetrievalTrace {
+    fn default() -> Self {
+        Self {
+            status: "not_run".into(),
+            current_query_event_id: String::new(),
+            query_terms: Vec::new(),
+            config: RetrievalConfig::default(),
+            candidates: Vec::new(),
+            selected_evidence: Vec::new(),
+            error: None,
+        }
+    }
+}
+
 impl Default for BudgetConfig {
     fn default() -> Self {
         Self {
@@ -190,7 +296,7 @@ pub struct ModelRequestTrace {
     pub max_output_tokens: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ContextTrace {
     #[serde(default)]
     pub included_turn_ids: Vec<String>,
@@ -214,6 +320,8 @@ pub struct ContextTrace {
     pub request: Option<ModelRequestTrace>,
     #[serde(default = "legacy_inferred")]
     pub provenance_quality: ProvenanceQuality,
+    #[serde(default)]
+    pub retrieval: RetrievalTrace,
 }
 
 fn default_decision() -> String {
@@ -235,11 +343,12 @@ impl Default for ContextTrace {
             context_sha256: None,
             request: None,
             provenance_quality: ProvenanceQuality::Exact,
+            retrieval: RetrievalTrace::default(),
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Turn {
     pub id: String,
     pub created_at: String,
@@ -327,6 +436,8 @@ pub struct Session {
     pub system_prompt: String,
     pub think: bool,
     pub budget: BudgetConfig,
+    #[serde(default)]
+    pub retrieval: RetrievalConfig,
     pub active_context_start_index: usize,
     pub turns: Vec<Turn>,
     #[serde(default)]
@@ -358,6 +469,7 @@ impl Session {
             system_prompt,
             think,
             budget,
+            retrieval: RetrievalConfig::default(),
             active_context_start_index: 0,
             turns: Vec::new(),
             cumulative_usage: TokenUsage::zero(),
@@ -392,7 +504,8 @@ impl Session {
                 bail!("轮次 {} 缺少精确回答上下文溯源", turn.id);
             }
         }
-        self.budget.validate()
+        self.budget.validate()?;
+        self.retrieval.validate()
     }
 
     pub fn touch(&mut self) {
@@ -451,7 +564,7 @@ pub struct ChatMessage {
     pub content: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ContextPlan {
     pub messages: Vec<ChatMessage>,
     pub context_items: Vec<ContextItemTrace>,
@@ -462,6 +575,8 @@ pub struct ContextPlan {
     pub estimated_upper_tokens: Option<u64>,
     pub exact_input_tokens: Option<u64>,
     pub input_budget: u64,
+    pub retrieval_trace: RetrievalTrace,
+    pub evidence: Vec<SelectedEvidence>,
 }
 
 pub fn content_sha256(content: &str) -> String {

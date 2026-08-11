@@ -9,6 +9,7 @@ use crate::model::{
     Session, SessionStatus, TokenUsage, Turn, TurnStatus, utc_now,
 };
 use crate::ollama::{ChatBackend, ChatRequest, OllamaError};
+use crate::retrieval::{RecallResult, RecalledEvidence};
 use crate::store::SessionStore;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,8 +131,49 @@ impl<B: ChatBackend> ChatEngine<B> {
             .into_iter()
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
+        let current_event_id = crate::model::event_id(
+            &session.id,
+            Some(&session.turns[turn_index].id),
+            crate::model::EventRole::User,
+        );
+        let recent_event_ids = history
+            .iter()
+            .flat_map(|index| {
+                let turn = &session.turns[*index];
+                [
+                    crate::model::event_id(
+                        &session.id,
+                        Some(&turn.id),
+                        crate::model::EventRole::User,
+                    ),
+                    crate::model::event_id(
+                        &session.id,
+                        Some(&turn.id),
+                        crate::model::EventRole::Assistant,
+                    ),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let recall = self
+            .store
+            .retrieval()
+            .keyword_recall(
+                &user_content,
+                &current_event_id,
+                &recent_event_ids,
+                session.retrieval.clone(),
+            )
+            .inspect_err(|error| {
+                session.turns[turn_index].context_trace.retrieval = crate::model::RetrievalTrace {
+                    status: "failed".into(),
+                    current_query_event_id: current_event_id.clone(),
+                    error: Some(error.to_string()),
+                    config: session.retrieval.clone(),
+                    ..Default::default()
+                };
+            })?;
         let (mut plan, render_supported) = self
-            .build_plan(session, turn_index, &history, &user_content)
+            .build_plan(session, turn_index, &history, &user_content, &recall)
             .await?;
         if !render_supported
             || plan
@@ -143,7 +185,7 @@ impl<B: ChatBackend> ChatEngine<B> {
 
         if plan_metric(&plan)? >= session.budget.warning_threshold() {
             let (mut mandatory, _) = self
-                .build_plan(session, turn_index, &[], &user_content)
+                .build_plan(session, turn_index, &[], &user_content, &recall)
                 .await?;
             self.probe_plan(session, turn_index, &mut mandatory).await?;
             if plan_metric(&mandatory)? > session.budget.input_budget() {
@@ -217,9 +259,13 @@ impl<B: ChatBackend> ChatEngine<B> {
             .collect::<Vec<_>>();
         let mut cache = HashMap::from([(history.len(), prepared.plan.clone())]);
         let user_content = session.turns[prepared.turn_index].user_content.clone();
-        let mut mandatory =
-            self.assembler
-                .assemble(session, &user_content, Some(&[]), Some(prepared.turn_index));
+        let mut mandatory = self.assembler.assemble_with_recall(
+            session,
+            &user_content,
+            Some(&[]),
+            Some(prepared.turn_index),
+            Some(&self.recall_from_plan(&prepared.plan)?),
+        );
         self.probe_plan(session, prepared.turn_index, &mut mandatory)
             .await?;
         cache.insert(0, mandatory.clone());
@@ -262,11 +308,12 @@ impl<B: ChatBackend> ChatEngine<B> {
                 plan_metric(candidate)?
             } else {
                 let start = history.len().saturating_sub(middle);
-                let mut candidate = self.assembler.assemble(
+                let mut candidate = self.assembler.assemble_with_recall(
                     session,
                     &user_content,
                     Some(&history[start..]),
                     Some(prepared.turn_index),
+                    Some(&self.recall_from_plan(&prepared.plan)?),
                 );
                 self.probe_plan(session, prepared.turn_index, &mut candidate)
                     .await?;
@@ -442,10 +489,15 @@ impl<B: ChatBackend> ChatEngine<B> {
         turn_index: usize,
         history: &[usize],
         user_content: &str,
+        recall: &RecallResult,
     ) -> Result<(ContextPlan, bool)> {
-        let mut plan =
-            self.assembler
-                .assemble(session, user_content, Some(history), Some(turn_index));
+        let mut plan = self.assembler.assemble_with_recall(
+            session,
+            user_content,
+            Some(history),
+            Some(turn_index),
+            Some(recall),
+        );
         match self
             .client
             .render_prompt(
@@ -619,6 +671,24 @@ impl<B: ChatBackend> ChatEngine<B> {
             message: message.to_owned(),
         }
     }
+
+    fn recall_from_plan(&self, plan: &ContextPlan) -> Result<RecallResult> {
+        let evidence = plan
+            .evidence
+            .iter()
+            .map(|selected| {
+                let content = self.store.retrieval().resolve_span(&selected.span)?.content;
+                Ok::<RecalledEvidence, anyhow::Error>(RecalledEvidence {
+                    selected: selected.clone(),
+                    content,
+                })
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(RecallResult {
+            trace: plan.retrieval_trace.clone(),
+            evidence,
+        })
+    }
 }
 
 fn plan_metric(plan: &ContextPlan) -> Result<u64> {
@@ -655,6 +725,7 @@ fn apply_trace(
         context_sha256: Some(plan.context_sha256.clone()),
         request: Some(request),
         provenance_quality: ProvenanceQuality::Exact,
+        retrieval: plan.retrieval_trace.clone(),
     };
 }
 

@@ -1,5 +1,24 @@
 # Hippocampus
 
+## Long-term lexical evidence (MVP)
+
+Hippocampus indexes immutable user/assistant originals in SQLite FTS5 after each source-session
+commit.  The derived index has a full message document and, above 240 Unicode characters,
+overlapping 240-character fragments (40-character overlap).  Jieba word fields and CJK 2/3
+character n-grams provide deterministic keyword recall; embeddings and generated summaries are
+not used.
+
+`Session::retrieval` controls candidate, core-evidence, and independent expansion budgets.  The
+public `RetrievalStore::keyword_recall` returns exact spans plus a `RetrievalTrace` recording
+quoted query terms, lower-is-better SQLite BM25 scores, raw ranks, every exclusion, and selected
+evidence.  Evidence is inserted as an independent contiguous original-role region between the
+original system message and normal recent history.  Completed answer context exposes the same
+trace via `answer_context`.
+
+Diagnosis is mechanical: a fact absent from bounded candidates is a retrieval failure; a
+candidate marked unselected with its reason is a selection failure; selected exact evidence in
+the persisted answer context followed by a wrong answer is a generation failure.
+
 Hippocampus 是一个完全使用 Rust 实现的本地 Ollama 会话客户端。无参数启动时进入 Ratatui TUI；`serve` 提供本地 Web UI；`ask` 子命令适合脚本和其他程序进行单次调用。
 
 项目保存每轮原始输入、模型正文、thinking、权威 token usage 和上下文裁剪轨迹。thinking 只用于当前轮展示和审计，绝不会重新注入后续模型上下文。当前会话格式为 `schema_version=2`；旧 Python 版本产生的 v1 JSON 可以直接读取，并在下一次保存时迁移，无法从旧格式证明的历史溯源会明确标记为 `legacy_inferred`。
