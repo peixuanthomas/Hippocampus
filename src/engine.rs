@@ -755,6 +755,8 @@ mod tests {
         events: Vec<ChatEvent>,
         stream_error: Option<OllamaError>,
         observe_source: Option<(PathBuf, Arc<Mutex<bool>>)>,
+        captured_requests: Arc<Mutex<Vec<ChatRequest>>>,
+        stream_calls: Arc<Mutex<usize>>,
     }
 
     impl FakeClient {
@@ -777,6 +779,8 @@ mod tests {
                 ],
                 stream_error: None,
                 observe_source: None,
+                captured_requests: Arc::new(Mutex::new(Vec::new())),
+                stream_calls: Arc::new(Mutex::new(0)),
             }
         }
 
@@ -828,10 +832,12 @@ mod tests {
 
         async fn stream_chat(
             &self,
-            _: ChatRequest,
+            request: ChatRequest,
             _: CancellationToken,
             emit: &mut (dyn FnMut(ChatEvent) + Send),
         ) -> Result<(), OllamaError> {
+            *self.stream_calls.lock().unwrap() += 1;
+            self.captured_requests.lock().unwrap().push(request);
             if let Some((path, observed)) = &self.observe_source {
                 let raw = std::fs::read(path).unwrap();
                 let persisted: Session = serde_json::from_slice(&raw).unwrap();
@@ -976,6 +982,144 @@ mod tests {
         assert_eq!(prepared.plan.exact_input_tokens, Some(100));
         assert_eq!(*probes.lock().unwrap(), 1);
         assert_eq!(session.turns[0].probe_usage.total_tokens, Some(101));
+    }
+
+    #[tokio::test]
+    async fn two_session_fragment_evidence_survives_source_resync() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let mut a = store
+            .create(
+                "model",
+                "http://localhost",
+                Some("a-system"),
+                budget(),
+                false,
+            )
+            .unwrap();
+        let client_a = FakeClient::new(100);
+        let engine_a = ChatEngine::new(store.clone(), client_a);
+        let long = format!(
+            "{} 海棠计划暗号是青瓷月亮。 {}",
+            "填充".repeat(110),
+            "尾部".repeat(30)
+        );
+        let prepared_a = engine_a.prepare_turn(&mut a, long.clone()).await.unwrap();
+        engine_a
+            .stream_turn(&mut a, &prepared_a, CancellationToken::new(), |_| {})
+            .await
+            .unwrap();
+        let mut b = store
+            .create(
+                "model",
+                "http://localhost",
+                Some("b-system"),
+                budget(),
+                false,
+            )
+            .unwrap();
+        let client_b = FakeClient::new(100);
+        let requests = client_b.captured_requests.clone();
+        let calls = client_b.stream_calls.clone();
+        let engine_b = ChatEngine::new(store.clone(), client_b);
+        let prepared_b = engine_b
+            .prepare_turn(&mut b, "海棠计划暗号是什么".into())
+            .await
+            .unwrap();
+        let core = prepared_b
+            .plan
+            .evidence
+            .iter()
+            .find(|item| item.kind == crate::model::EvidenceKind::Core)
+            .unwrap();
+        assert_eq!(
+            core.span.event_id,
+            crate::model::event_id(&a.id, Some(&a.turns[0].id), crate::model::EventRole::User)
+        );
+        let selected = prepared_b
+            .plan
+            .retrieval_trace
+            .candidates
+            .iter()
+            .find(|candidate| candidate.selected && candidate.span == core.span)
+            .unwrap();
+        assert_eq!(
+            selected.granularity,
+            crate::model::RetrievalDocumentGranularity::Fragment
+        );
+        let resolved = store.retrieval().resolve_span(&core.span).unwrap();
+        assert!(
+            prepared_b
+                .plan
+                .messages
+                .iter()
+                .any(|message| message.content == resolved.content)
+        );
+        assert_eq!(prepared_b.plan.messages[0].content, b.system_prompt);
+        engine_b
+            .stream_turn(&mut b, &prepared_b, CancellationToken::new(), |_| {})
+            .await
+            .unwrap();
+        assert_eq!(*calls.lock().unwrap(), 1);
+        assert_eq!(
+            requests.lock().unwrap()[0].messages,
+            prepared_b.plan.messages
+        );
+        let answer_id = crate::model::event_id(
+            &b.id,
+            Some(&b.turns[0].id),
+            crate::model::EventRole::Assistant,
+        );
+        let before = store.retrieval().answer_context(&answer_id).unwrap();
+        let messages = before
+            .items
+            .iter()
+            .map(|item| ChatMessage {
+                role: item.role.as_str().into(),
+                content: item.resolved.content.clone(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(messages, requests.lock().unwrap()[0].messages);
+        assert_eq!(before.context_sha256, prepared_b.plan.context_sha256);
+        assert_eq!(
+            before.retrieval_trace.selected_evidence,
+            prepared_b.plan.retrieval_trace.selected_evidence
+        );
+        assert_eq!(
+            before
+                .retrieval_trace
+                .candidates
+                .iter()
+                .map(|c| (c.raw_rank, &c.document_id, &c.reason, c.selected))
+                .collect::<Vec<_>>(),
+            prepared_b
+                .plan
+                .retrieval_trace
+                .candidates
+                .iter()
+                .map(|c| (c.raw_rank, &c.document_id, &c.reason, c.selected))
+                .collect::<Vec<_>>()
+        );
+        let prepared_a2 = engine_a
+            .prepare_turn(&mut a, "A的合法新增事件".into())
+            .await
+            .unwrap();
+        engine_a
+            .stream_turn(&mut a, &prepared_a2, CancellationToken::new(), |_| {})
+            .await
+            .unwrap();
+        let after = store.retrieval().answer_context(&answer_id).unwrap();
+        assert_eq!(after.context_sha256, before.context_sha256);
+        assert_eq!(
+            after.retrieval_trace.selected_evidence,
+            before.retrieval_trace.selected_evidence
+        );
+        let path = root.path().join(format!("{}.json", a.id));
+        let raw = std::fs::read(&path).unwrap();
+        std::fs::write(&path, [raw, b" ".to_vec()].concat()).unwrap();
+        assert!(
+            matches!(store.retrieval().answer_context(&answer_id), Err(crate::retrieval::RetrievalError::StaleIndex { session_id }) if session_id == a.id)
+        );
     }
 
     #[tokio::test]
