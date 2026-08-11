@@ -8,7 +8,7 @@ from rich.console import Console
 import hippocampus.cli as cli_module
 from hippocampus.cli import _plan_trace_line, main
 from hippocampus.engine import PreparedTurn
-from hippocampus.models import BudgetConfig, ChatEvent, ContextPlan, Session, TokenUsage
+from hippocampus.models import BudgetConfig, ChatEvent, ContextPlan, Session, TokenUsage, Turn
 from hippocampus.store import SessionStore
 
 
@@ -102,6 +102,64 @@ def test_list_show_are_read_only_and_sessions_do_not_cross(tmp_path) -> None:
     assert code == 0 and first.id in text and second.id in text and not FakeClient.made
     code, text = run(tmp_path, ["--sessions-dir", str(tmp_path), "show", first.id], [])
     assert code == 0 and "first" in text and "second" not in text and not FakeClient.made
+
+
+def test_show_renders_session_data_and_status_as_literal_text(tmp_path) -> None:
+    store = SessionStore(tmp_path)
+    session = store.create(
+        model="[blue]model[/blue]",
+        ollama_host="http://[red]host[/red]",
+        system_prompt="[green]system[/green]",
+    )
+    session.title = "[yellow]title[/yellow]"
+    session.turns.append(
+        Turn(
+            status="complete",
+            user_content="[red]user[/red]",
+            assistant_content="[blue]assistant[/blue]",
+            usage=TokenUsage(10, 2),
+        )
+    )
+    store.save(session)
+
+    code, text = run(tmp_path, ["--sessions-dir", str(tmp_path), "show", session.id], [])
+
+    assert code == 0
+    for literal in (
+        "[yellow]title[/yellow]",
+        "[blue]model[/blue]",
+        "[red]host[/red]",
+        "[green]system[/green]",
+        "[complete]",
+        "[red]user[/red]",
+        "[blue]assistant[/blue]",
+    ):
+        assert literal in text
+
+
+def test_non_tty_stream_renders_markup_like_chunks_literally(tmp_path) -> None:
+    class MarkupClient(FakeClient):
+        def stream_chat(self, **kwargs):
+            self.stream_calls += 1
+            yield ChatEvent(kind="thinking", text="[yellow]thought[/yellow]", live_output_tokens=1)
+            yield ChatEvent(kind="content", text="[red]literal[/red]", live_output_tokens=2)
+            yield ChatEvent(kind="completed", usage=TokenUsage(100, 3), live_output_tokens=2)
+
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, color_system=None)
+    answers = iter(["hello", "/exit"])
+    code = main(
+        ["--sessions-dir", str(tmp_path), "new"],
+        input_fn=lambda _: next(answers),
+        console=console,
+        client_factory=MarkupClient,
+    )
+
+    text = output.getvalue()
+    assert code == 0
+    assert "[yellow]thought[/yellow]" in text
+    assert "[red]literal[/red]" in text
+    assert "本轮最终（权威）： input=100, output=3, total=103" in text
 
 
 def test_budget_reports_answer_and_probe(tmp_path) -> None:

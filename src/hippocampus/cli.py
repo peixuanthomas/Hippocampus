@@ -31,6 +31,12 @@ def _usage_line(label: str, usage: TokenUsage) -> str:
     )
 
 
+def _print_literal(console: Console, value: object, **kwargs: object) -> None:
+    """Print dynamic terminal data without treating bracketed text as markup."""
+
+    console.print(Text(str(value)), highlight=False, **kwargs)
+
+
 def _plan_trace_line(session: Session, prepared: PreparedTurn) -> str:
     """Render the current prepared context plan, not a prior turn's trace."""
 
@@ -156,9 +162,9 @@ def _stream_prepared(
             for event in engine.stream_turn(session, prepared):
                 consume(event)
                 if event.kind == "thinking" and event.text:
-                    console.print(f"思考：{event.text}")
+                    _print_literal(console, f"思考：{event.text}")
                 elif event.kind == "content" and event.text:
-                    console.print(event.text, end="")
+                    _print_literal(console, event.text, end="")
             if content:
                 console.print()
     except KeyboardInterrupt:
@@ -181,16 +187,19 @@ def _stream_prepared(
 
 
 def _show_session(console: Console, session: Session) -> None:
-    console.print(f"会话 {session.id}｜{session.status}｜{session.title}")
-    console.print(f"模型：{session.model}｜Ollama：{session.ollama_host}｜thinking：{'on' if session.think else 'off'}")
-    console.print(f"系统提示：{session.system_prompt}")
+    _print_literal(console, f"会话 {session.id}｜{session.status}｜{session.title}")
+    _print_literal(
+        console,
+        f"模型：{session.model}｜Ollama：{session.ollama_host}｜thinking：{'on' if session.think else 'off'}",
+    )
+    _print_literal(console, f"系统提示：{session.system_prompt}")
     for line in _budget_lines(session):
         console.print(line)
     for index, turn in enumerate(session.turns, start=1):
         user = " ".join(turn.user_content.split())[:80]
         answer = " ".join(turn.assistant_content.split())[:80]
-        console.print(f"第 {index} 轮 [{turn.status}] 用户：{user}")
-        console.print(f"  正文：{answer or '（无）'}")
+        _print_literal(console, f"第 {index} 轮 [{turn.status}] 用户：{user}")
+        _print_literal(console, f"  正文：{answer or '（无）'}")
         console.print("  " + _usage_line("精确：", turn.usage))
         console.print("  " + _usage_line("probe：", turn.probe_usage))
 
@@ -201,7 +210,8 @@ def _list_sessions(console: Console, store: SessionStore) -> int:
         console.print("没有保存的会话。")
         return 0
     for session in sessions:
-        console.print(
+        _print_literal(
+            console,
             f"{session.id}｜{session.status}｜{session.updated_at}｜{session.model}｜"
             f"{len(session.turns)} 轮｜{session.title}"
         )
@@ -216,7 +226,8 @@ def _chat(
     model_info: Any,
     input_fn: Callable[[str], str],
 ) -> int:
-    console.print(
+    _print_literal(
+        console,
         f"Ollama {model_info.version}｜模型最大上下文 {model_info.context_length}｜会话 {session.id}"
     )
     for line in _budget_lines(session):
@@ -236,10 +247,10 @@ def _chat(
         command = value.strip()
         if command == "/exit":
             path = store.save(session)
-            console.print(f"已保存并退出：{path}")
+            _print_literal(console, f"已保存并退出：{path}")
             return 0
         if command == "/save":
-            console.print(f"已原子保存：{store.save(session)}")
+            _print_literal(console, f"已原子保存：{store.save(session)}")
             continue
         if command == "/help":
             console.print("/budget、/think on|off、/save、/help、/exit")
@@ -265,10 +276,10 @@ def _chat(
         try:
             prepared = engine.prepare_turn(session, value)
             if prepared.status == "blocked":
-                console.print(f"无法生成：{prepared.message}")
+                _print_literal(console, f"无法生成：{prepared.message}")
                 continue
             if prepared.needs_limit_decision:
-                console.print(prepared.message)
+                _print_literal(console, prepared.message)
                 while True:
                     try:
                         answer = input_fn("上下文临界。继续/结束：").strip()
@@ -282,7 +293,7 @@ def _chat(
                         return 130
                     if answer == "继续":
                         prepared = engine.resolve_limit(session, prepared, LimitAction.CONTINUE_WITH_TRIM)
-                        console.print(prepared.message)
+                        _print_literal(console, prepared.message)
                         break
                     if answer == "结束":
                         engine.resolve_limit(session, prepared, LimitAction.END_SESSION)
@@ -306,7 +317,7 @@ def _chat(
                     console.print(_usage_line("本轮非最终：", usage))
                 return 130
         except (ValueError, SessionStoreError, Exception) as exc:
-            console.print(f"错误：{exc}")
+            _print_literal(console, f"错误：{exc}")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -378,5 +389,5 @@ def main(
             info = client.check_model(session.model, session.budget.context_window)
         return _chat(console, store, session, client, info, input_fn or builtins.input)
     except (OSError, ValueError, SessionStoreError, Exception) as exc:
-        console.print(f"错误：{exc}")
+        _print_literal(console, f"错误：{exc}")
         return 1
