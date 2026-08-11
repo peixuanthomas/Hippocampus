@@ -1374,6 +1374,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn limit_resolution_reuses_prepared_retrieval_without_rank_drift() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let mut a = store
+            .create("model", "http://localhost", Some("a"), budget(), false)
+            .unwrap();
+        let ea = ChatEngine::new(store.clone(), FakeClient::new(100));
+        let pa = ea
+            .prepare_turn(&mut a, "外部唯一事实：朱砂钥匙".into())
+            .await
+            .unwrap();
+        ea.stream_turn(&mut a, &pa, CancellationToken::new(), |_| {})
+            .await
+            .unwrap();
+        let mut b = store
+            .create("model", "http://localhost", Some("b"), budget(), false)
+            .unwrap();
+        b.turns = (0..3).map(completed_turn).collect();
+        store.save(&mut b).unwrap();
+        let mut client = FakeClient::new(100);
+        client.history_cost = Some((300, 250));
+        let calls = client.stream_calls.clone();
+        let eb = ChatEngine::new(store.clone(), client);
+        let prepared = eb
+            .prepare_turn(&mut b, "朱砂钥匙是什么".into())
+            .await
+            .unwrap();
+        assert!(prepared.needs_limit_decision());
+        let trace = prepared.plan.retrieval_trace.clone();
+        let evidence = prepared.plan.evidence.clone();
+        let mut c = store
+            .create("model", "http://localhost", Some("c"), budget(), false)
+            .unwrap();
+        let ec = ChatEngine::new(store.clone(), FakeClient::new(100));
+        let pc = ec
+            .prepare_turn(&mut c, "朱砂钥匙朱砂钥匙朱砂钥匙".into())
+            .await
+            .unwrap();
+        ec.stream_turn(&mut c, &pc, CancellationToken::new(), |_| {})
+            .await
+            .unwrap();
+        let resumed = eb
+            .resolve_limit(&mut b, prepared, LimitAction::ContinueWithTrim)
+            .await
+            .unwrap();
+        assert!(resumed.ready());
+        assert_eq!(resumed.plan.retrieval_trace, trace);
+        assert_eq!(resumed.plan.evidence, evidence);
+        assert!(
+            !resumed
+                .plan
+                .retrieval_trace
+                .candidates
+                .iter()
+                .any(|candidate| candidate.session_id == c.id)
+        );
+        assert_eq!(*calls.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
     async fn interrupted_stream_never_promotes_probe_usage() {
         let root = tempfile::tempdir().unwrap();
         let store = SessionStore::new(root.path()).unwrap();
