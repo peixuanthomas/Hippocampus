@@ -1434,6 +1434,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn end_session_preserves_prepared_retrieval_trace() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let mut a = store
+            .create("model", "http://localhost", Some("a"), budget(), false)
+            .unwrap();
+        let ea = ChatEngine::new(store.clone(), FakeClient::new(100));
+        let pa = ea
+            .prepare_turn(&mut a, "外部事实：银杏信物".into())
+            .await
+            .unwrap();
+        ea.stream_turn(&mut a, &pa, CancellationToken::new(), |_| {})
+            .await
+            .unwrap();
+        let mut b = store
+            .create("model", "http://localhost", Some("b"), budget(), false)
+            .unwrap();
+        let client = FakeClient::new(850);
+        let calls = client.stream_calls.clone();
+        let eb = ChatEngine::new(store.clone(), client);
+        let prepared = eb
+            .prepare_turn(&mut b, "银杏信物是什么".into())
+            .await
+            .unwrap();
+        assert!(prepared.needs_limit_decision());
+        let trace = prepared.plan.retrieval_trace.clone();
+        let evidence = prepared.plan.evidence.clone();
+        let ended = eb
+            .resolve_limit(&mut b, prepared, LimitAction::EndSession)
+            .await
+            .unwrap();
+        assert_eq!(ended.status, PreparationStatus::Ended);
+        let turn = store.load(&b.id).unwrap().turns.pop().unwrap();
+        assert_eq!(turn.context_trace.retrieval, trace);
+        assert_eq!(turn.context_trace.retrieval.selected_evidence, evidence);
+        assert_eq!(turn.context_trace.decision, "paused_by_user");
+        assert_eq!(turn.status, TurnStatus::Blocked);
+        assert_eq!(*calls.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn mandatory_block_preserves_prepared_retrieval_trace() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let mut a = store
+            .create("model", "http://localhost", Some("a"), budget(), false)
+            .unwrap();
+        let ea = ChatEngine::new(store.clone(), FakeClient::new(100));
+        let pa = ea
+            .prepare_turn(&mut a, "外部事实：松烟墨盒".into())
+            .await
+            .unwrap();
+        ea.stream_turn(&mut a, &pa, CancellationToken::new(), |_| {})
+            .await
+            .unwrap();
+        let mut b = store
+            .create("model", "http://localhost", Some("b"), budget(), false)
+            .unwrap();
+        let client = FakeClient::new(850);
+        let calls = client.stream_calls.clone();
+        let eb = ChatEngine::new(store.clone(), client);
+        let prepared = eb
+            .prepare_turn(&mut b, "松烟墨盒是什么".into())
+            .await
+            .unwrap();
+        assert!(prepared.needs_limit_decision());
+        let trace = prepared.plan.retrieval_trace.clone();
+        let evidence = prepared.plan.evidence.clone();
+        let blocked = eb
+            .resolve_limit(&mut b, prepared, LimitAction::ContinueWithTrim)
+            .await
+            .unwrap();
+        assert_eq!(blocked.status, PreparationStatus::Blocked);
+        let turn = store.load(&b.id).unwrap().turns.pop().unwrap();
+        assert_eq!(turn.context_trace.retrieval, trace);
+        assert_eq!(turn.context_trace.retrieval.selected_evidence, evidence);
+        assert_eq!(turn.context_trace.decision, "mandatory_above_trim_target");
+        assert_eq!(turn.status, TurnStatus::Blocked);
+        assert_eq!(*calls.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
     async fn interrupted_stream_never_promotes_probe_usage() {
         let root = tempfile::tempdir().unwrap();
         let store = SessionStore::new(root.path()).unwrap();
