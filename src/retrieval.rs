@@ -1969,6 +1969,67 @@ mod tests {
     }
 
     #[test]
+    fn keyword_recall_large_irrelevant_corpus_recovers_exact_fact_types() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let mut session = store
+            .create(
+                "model",
+                "http://localhost",
+                Some("system"),
+                Default::default(),
+                false,
+            )
+            .unwrap();
+        let facts = [
+            ("唐波", "唐波是早期项目负责人。"),
+            ("杭州", "会议地点明确在杭州西湖区。"),
+            ("2021年4月3日", "签约日期是2021年4月3日。"),
+            ("乌龙茶", "我的明确偏好是乌龙茶。"),
+            ("蓝鲸", "明确事实：项目代号是蓝鲸。"),
+        ];
+        for (_, fact) in facts {
+            append_complete_turn(&mut session, fact, "已记录", "");
+        }
+        for index in 0..205 {
+            session.turns.push(Turn::pending(format!(
+                "无关历史消息{index}：讨论天气和书籍"
+            )));
+        }
+        store.save(&mut session).unwrap();
+        for (query, exact) in facts {
+            let recall = store
+                .retrieval()
+                .keyword_recall(
+                    query,
+                    "current",
+                    &[],
+                    RetrievalConfig {
+                        candidate_limit: 64,
+                        max_selected: 4,
+                        evidence_char_budget: 1600,
+                        expansion_char_budget: 0,
+                    },
+                )
+                .unwrap();
+            let hit = recall
+                .evidence
+                .iter()
+                .find(|item| item.content == exact)
+                .expect("old exact fact selected");
+            assert_eq!(hit.selected.content_sha256, content_sha256(exact));
+            let candidate = recall
+                .trace
+                .candidates
+                .iter()
+                .find(|candidate| candidate.selected && candidate.span == hit.selected.span)
+                .unwrap();
+            assert!(candidate.raw_rank <= 256 && candidate.bm25_score.is_finite());
+            assert_eq!(candidate.reason, "selected_core");
+        }
+    }
+
+    #[test]
     fn document_fragments_use_unicode_scalar_240_with_40_overlap() {
         let make = |len| StoredEvent {
             id: "evt".into(),
@@ -1988,12 +2049,25 @@ mod tests {
         assert_eq!(document_spans(&make(240)).len(), 1);
         let spans_241 = document_spans(&make(241));
         assert_eq!(spans_241.len(), 3);
+        assert_eq!(
+            (spans_241[1].1.start_char, spans_241[1].1.end_char),
+            (0, 240)
+        );
         assert_eq!(spans_241[1].1.end_char - spans_241[1].1.start_char, 240);
         assert_eq!(spans_241[2].1.start_char, 200);
+        assert_eq!(spans_241[1].1.end_char - spans_241[2].1.start_char, 40);
         let spans_440 = document_spans(&make(440));
         assert_eq!(spans_440.len(), 3);
         assert_eq!(spans_440[2].1.start_char, 200);
         assert_eq!(spans_440[2].1.end_char, 440);
+        for (_, span) in spans_241.iter().skip(1) {
+            assert!(span.end_char - span.start_char <= 240);
+        }
+        for (_, span) in spans_440.iter().skip(1) {
+            assert!(span.end_char - span.start_char <= 240);
+        }
+        assert_eq!(spans_241.last().unwrap().1.end_char, 241);
+        assert_eq!(spans_440.last().unwrap().1.end_char, 440);
     }
 
     #[test]
