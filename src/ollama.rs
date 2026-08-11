@@ -1,0 +1,575 @@
+use std::time::Duration;
+
+use async_trait::async_trait;
+use futures_util::StreamExt;
+use reqwest::{Client, StatusCode, Url};
+use serde_json::{Map, Value, json};
+use thiserror::Error;
+use tokio_util::sync::CancellationToken;
+
+use crate::model::{ChatEvent, ChatEventKind, ChatMessage, TokenUsage};
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum OllamaError {
+    #[error("无法连接 Ollama ({host}): {message}")]
+    Connection { host: String, message: String },
+    #[error("{0}")]
+    ModelNotFound(String),
+    #[error("{0}")]
+    Protocol(String),
+    #[error("{message}")]
+    Stream {
+        message: String,
+        live_output_tokens: u64,
+    },
+    #[error("{message}")]
+    ContextLength {
+        message: String,
+        prompt_tokens: Option<u64>,
+        context_tokens: Option<u64>,
+    },
+    #[error("用户中断生成，未收到最终权威 token 计数")]
+    Cancelled { live_output_tokens: u64 },
+    #[error("{0}")]
+    Other(String),
+}
+
+impl OllamaError {
+    pub fn live_output_tokens(&self) -> Option<u64> {
+        match self {
+            Self::Stream {
+                live_output_tokens, ..
+            }
+            | Self::Cancelled { live_output_tokens } => Some(*live_output_tokens),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelInfo {
+    pub version: String,
+    pub name: String,
+    pub context_length: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChatRequest {
+    pub model: String,
+    pub messages: Vec<ChatMessage>,
+    pub think: bool,
+    pub num_ctx: u64,
+    pub num_predict: u64,
+}
+
+#[async_trait]
+pub trait ChatBackend: Clone + Send + Sync + 'static {
+    async fn check_model(
+        &self,
+        model: &str,
+        requested_context: u64,
+    ) -> Result<ModelInfo, OllamaError>;
+
+    async fn render_prompt(
+        &self,
+        model: &str,
+        messages: &[ChatMessage],
+        think: bool,
+        num_ctx: u64,
+    ) -> Result<Option<String>, OllamaError>;
+
+    async fn probe(
+        &self,
+        model: &str,
+        messages: &[ChatMessage],
+        think: bool,
+        num_ctx: u64,
+    ) -> Result<TokenUsage, OllamaError>;
+
+    async fn stream_chat(
+        &self,
+        request: ChatRequest,
+        cancellation: CancellationToken,
+        emit: &mut (dyn FnMut(ChatEvent) + Send),
+    ) -> Result<(), OllamaError>;
+}
+
+#[derive(Debug, Clone)]
+pub struct OllamaClient {
+    host: String,
+    client: Client,
+}
+
+impl OllamaClient {
+    pub fn new(host: &str) -> Result<Self, OllamaError> {
+        Self::with_timeout(host, Duration::from_secs(600))
+    }
+
+    pub fn with_timeout(host: &str, timeout: Duration) -> Result<Self, OllamaError> {
+        let normalized = host.trim_end_matches('/');
+        let parsed = Url::parse(normalized)
+            .map_err(|_| OllamaError::Other(format!("无效 Ollama 地址: {host:?}")))?;
+        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+            return Err(OllamaError::Other(format!("无效 Ollama 地址: {host:?}")));
+        }
+        let client = Client::builder()
+            .timeout(timeout)
+            .build()
+            .map_err(|error| OllamaError::Other(error.to_string()))?;
+        Ok(Self {
+            host: normalized.to_owned(),
+            client,
+        })
+    }
+
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    async fn request_json(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        payload: Option<Value>,
+    ) -> Result<Value, OllamaError> {
+        let mut request = self
+            .client
+            .request(method, format!("{}{}", self.host, path))
+            .header("Accept", "application/json");
+        if let Some(payload) = payload {
+            request = request.json(&payload);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|error| self.connection(error))?;
+        let status = response.status();
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|error| self.connection(error))?;
+        let payload: Value = serde_json::from_slice(&bytes)
+            .map_err(|error| OllamaError::Protocol(format!("Ollama 返回了无效 JSON: {error}")))?;
+        if !status.is_success() || payload.get("error").is_some() {
+            return Err(api_error(&payload, Some(status)));
+        }
+        if !payload.is_object() {
+            return Err(OllamaError::Protocol("Ollama 响应不是 JSON 对象".into()));
+        }
+        Ok(payload)
+    }
+
+    fn connection(&self, error: reqwest::Error) -> OllamaError {
+        OllamaError::Connection {
+            host: self.host.clone(),
+            message: error.to_string(),
+        }
+    }
+
+    fn chat_payload(
+        model: &str,
+        messages: &[ChatMessage],
+        think: bool,
+        num_ctx: u64,
+        num_predict: u64,
+        stream: bool,
+    ) -> Value {
+        json!({
+            "model": model,
+            "messages": messages,
+            "stream": stream,
+            "think": think,
+            "truncate": false,
+            "shift": false,
+            "keep_alive": "5m",
+            "options": {
+                "num_ctx": num_ctx,
+                "num_predict": num_predict,
+            }
+        })
+    }
+}
+
+#[async_trait]
+impl ChatBackend for OllamaClient {
+    async fn check_model(
+        &self,
+        model: &str,
+        requested_context: u64,
+    ) -> Result<ModelInfo, OllamaError> {
+        let version_payload = self
+            .request_json(reqwest::Method::GET, "/api/version", None)
+            .await?;
+        let version = version_payload
+            .get("version")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_owned();
+        let tags = self
+            .request_json(reqwest::Method::GET, "/api/tags", None)
+            .await?;
+        let available = tags
+            .get("models")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|item| {
+                item.get("name")
+                    .or_else(|| item.get("model"))
+                    .and_then(Value::as_str)
+            })
+            .any(|name| name == model);
+        if !available {
+            return Err(OllamaError::ModelNotFound(format!(
+                "本地未安装模型 {model:?}；请先运行: ollama pull {model}"
+            )));
+        }
+        let details = self
+            .request_json(
+                reqwest::Method::POST,
+                "/api/show",
+                Some(json!({"model": model})),
+            )
+            .await?;
+        let context_length = extract_context_length(&details);
+        if context_length == 0 {
+            return Err(OllamaError::Protocol(format!(
+                "Ollama 未返回模型 {model:?} 的上下文长度"
+            )));
+        }
+        if requested_context > context_length {
+            return Err(OllamaError::Other(format!(
+                "配置的上下文 {requested_context} 超过模型上限 {context_length}"
+            )));
+        }
+        Ok(ModelInfo {
+            version,
+            name: model.to_owned(),
+            context_length,
+        })
+    }
+
+    async fn render_prompt(
+        &self,
+        model: &str,
+        messages: &[ChatMessage],
+        think: bool,
+        num_ctx: u64,
+    ) -> Result<Option<String>, OllamaError> {
+        let mut payload = Self::chat_payload(model, messages, think, num_ctx, 1, false);
+        payload
+            .as_object_mut()
+            .expect("chat payload is an object")
+            .insert("_debug_render_only".into(), Value::Bool(true));
+        let response = self
+            .request_json(reqwest::Method::POST, "/api/chat", Some(payload))
+            .await?;
+        Ok(response
+            .get("_debug_info")
+            .and_then(|value| value.get("rendered_template"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned))
+    }
+
+    async fn probe(
+        &self,
+        model: &str,
+        messages: &[ChatMessage],
+        think: bool,
+        num_ctx: u64,
+    ) -> Result<TokenUsage, OllamaError> {
+        let mut payload = Self::chat_payload(model, messages, think, num_ctx, 1, false);
+        let options = payload
+            .get_mut("options")
+            .and_then(Value::as_object_mut)
+            .expect("chat options are an object");
+        options.insert("temperature".into(), Value::from(0));
+        options.insert("seed".into(), Value::from(0));
+        let response = self
+            .request_json(reqwest::Method::POST, "/api/chat", Some(payload))
+            .await?;
+        let input = response.get("prompt_eval_count").and_then(Value::as_u64);
+        let output = response.get("eval_count").and_then(Value::as_u64);
+        match (input, output) {
+            (Some(input), Some(output)) => Ok(TokenUsage::new(Some(input), Some(output))),
+            _ => Err(OllamaError::Protocol(
+                "精确探测响应缺少 prompt_eval_count 或 eval_count".into(),
+            )),
+        }
+    }
+
+    async fn stream_chat(
+        &self,
+        request: ChatRequest,
+        cancellation: CancellationToken,
+        emit: &mut (dyn FnMut(ChatEvent) + Send),
+    ) -> Result<(), OllamaError> {
+        let mut payload = Self::chat_payload(
+            &request.model,
+            &request.messages,
+            request.think,
+            request.num_ctx,
+            request.num_predict,
+            true,
+        );
+        let object = payload.as_object_mut().expect("chat payload is an object");
+        object.insert("logprobs".into(), Value::Bool(true));
+        object.insert("top_logprobs".into(), Value::from(0));
+
+        let response = self
+            .client
+            .post(format!("{}/api/chat", self.host))
+            .header("Accept", "application/json")
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|error| self.connection(error))?;
+        let status = response.status();
+        if !status.is_success() {
+            let bytes = response
+                .bytes()
+                .await
+                .map_err(|error| self.connection(error))?;
+            let payload = serde_json::from_slice(&bytes)
+                .unwrap_or_else(|_| json!({"error": String::from_utf8_lossy(&bytes)}));
+            return Err(api_error(&payload, Some(status)));
+        }
+
+        let mut stream = response.bytes_stream();
+        let mut buffer = Vec::<u8>::new();
+        let mut live_output_tokens = 0_u64;
+        let mut saw_done = false;
+
+        loop {
+            let next = tokio::select! {
+                _ = cancellation.cancelled() => {
+                    return Err(OllamaError::Cancelled { live_output_tokens });
+                }
+                value = stream.next() => value,
+            };
+            let Some(chunk) = next else { break };
+            let chunk = chunk.map_err(|error| OllamaError::Stream {
+                message: format!("Ollama 流读取失败: {error}"),
+                live_output_tokens,
+            })?;
+            buffer.extend_from_slice(&chunk);
+
+            while let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
+                let line = buffer.drain(..=newline).collect::<Vec<_>>();
+                let line = &line[..line.len().saturating_sub(1)];
+                if line.iter().all(u8::is_ascii_whitespace) {
+                    continue;
+                }
+                let events = parse_stream_line(line, &mut live_output_tokens)?;
+                for event in events {
+                    if event.kind == ChatEventKind::Completed {
+                        saw_done = true;
+                    }
+                    emit(event);
+                }
+                if saw_done {
+                    return Ok(());
+                }
+            }
+        }
+
+        if !buffer.iter().all(u8::is_ascii_whitespace) {
+            let events = parse_stream_line(&buffer, &mut live_output_tokens)?;
+            for event in events {
+                if event.kind == ChatEventKind::Completed {
+                    saw_done = true;
+                }
+                emit(event);
+            }
+        }
+        if saw_done {
+            Ok(())
+        } else {
+            Err(OllamaError::Stream {
+                message: "Ollama 流在最终计数事件之前结束".into(),
+                live_output_tokens,
+            })
+        }
+    }
+}
+
+fn parse_stream_line(
+    line: &[u8],
+    live_output_tokens: &mut u64,
+) -> Result<Vec<ChatEvent>, OllamaError> {
+    let chunk: Value = serde_json::from_slice(line).map_err(|error| OllamaError::Stream {
+        message: format!("Ollama 流返回了无效 JSON: {error}"),
+        live_output_tokens: *live_output_tokens,
+    })?;
+    let object = chunk.as_object().ok_or_else(|| OllamaError::Stream {
+        message: "Ollama 流事件不是 JSON 对象".into(),
+        live_output_tokens: *live_output_tokens,
+    })?;
+    if object.contains_key("error") {
+        return Err(api_error(&chunk, None));
+    }
+    let increment = object
+        .get("logprobs")
+        .and_then(Value::as_array)
+        .map_or(0, |items| items.len() as u64);
+    *live_output_tokens += increment;
+    let mut events = Vec::new();
+    if let Some(message) = object.get("message").and_then(Value::as_object) {
+        if let Some(thinking) = nonempty_string(message, "thinking") {
+            events.push(ChatEvent::text(
+                ChatEventKind::Thinking,
+                thinking.to_owned(),
+                *live_output_tokens,
+            ));
+        }
+        if let Some(content) = nonempty_string(message, "content") {
+            events.push(ChatEvent::text(
+                ChatEventKind::Content,
+                content.to_owned(),
+                *live_output_tokens,
+            ));
+        }
+    }
+    if increment > 0 {
+        events.push(ChatEvent {
+            kind: ChatEventKind::Usage,
+            text: String::new(),
+            live_output_tokens: Some(*live_output_tokens),
+            usage: None,
+            done_reason: None,
+        });
+    }
+    if object.get("done").and_then(Value::as_bool) == Some(true) {
+        let input = object.get("prompt_eval_count").and_then(Value::as_u64);
+        let output = object.get("eval_count").and_then(Value::as_u64);
+        let (Some(input), Some(output)) = (input, output) else {
+            return Err(OllamaError::Stream {
+                message: "Ollama 最终事件缺少精确 token 计数".into(),
+                live_output_tokens: *live_output_tokens,
+            });
+        };
+        events.push(ChatEvent {
+            kind: ChatEventKind::Completed,
+            text: String::new(),
+            live_output_tokens: Some(*live_output_tokens),
+            usage: Some(TokenUsage::new(Some(input), Some(output))),
+            done_reason: object
+                .get("done_reason")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+        });
+    }
+    Ok(events)
+}
+
+fn nonempty_string<'a>(object: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
+    object
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+}
+
+fn extract_context_length(payload: &Value) -> u64 {
+    let direct = payload
+        .get("details")
+        .and_then(|value| value.get("context_length"))
+        .and_then(Value::as_u64);
+    if let Some(value) = direct {
+        return value;
+    }
+    payload
+        .get("model_info")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|object| object.iter())
+        .filter(|(key, _)| key.ends_with(".context_length"))
+        .filter_map(|(_, value)| value.as_u64())
+        .max()
+        .unwrap_or(0)
+}
+
+fn api_error(payload: &Value, status: Option<StatusCode>) -> OllamaError {
+    let raw_error = payload.get("error").unwrap_or(payload);
+    let mut message = match raw_error {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    };
+    let mut details = raw_error.as_object();
+    let parsed_nested;
+    if details.is_none() {
+        parsed_nested = raw_error
+            .as_str()
+            .and_then(|text| serde_json::from_str::<Value>(text).ok());
+        details = parsed_nested
+            .as_ref()
+            .and_then(|value| value.get("error").unwrap_or(value).as_object());
+    }
+    if let Some(details) = details
+        && let Some(value) = details.get("message").and_then(Value::as_str)
+    {
+        message = value.to_owned();
+    }
+    let prompt_tokens = details
+        .and_then(|value| value.get("n_prompt_tokens"))
+        .and_then(Value::as_u64);
+    let context_tokens = details
+        .and_then(|value| value.get("n_ctx"))
+        .and_then(Value::as_u64);
+    let lowered = message.to_lowercase();
+    if prompt_tokens.is_some()
+        || lowered.contains("exceeds the available context")
+        || lowered.contains("context length")
+        || lowered.contains("prompt is too long")
+    {
+        return OllamaError::ContextLength {
+            message,
+            prompt_tokens,
+            context_tokens,
+        };
+    }
+    if status == Some(StatusCode::NOT_FOUND) || lowered.contains("not found") {
+        return OllamaError::ModelNotFound(message);
+    }
+    let prefix = status.map_or_else(
+        || "Ollama: ".to_owned(),
+        |status| format!("Ollama HTTP {status}: "),
+    );
+    OllamaError::Other(prefix + &message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_channels_and_authoritative_usage_are_separate() {
+        let mut live = 0;
+        let first = br#"{"message":{"thinking":"think"},"done":false,"logprobs":[{}]}"#;
+        let events = parse_stream_line(first, &mut live).unwrap();
+        assert_eq!(events[0].kind, ChatEventKind::Thinking);
+        assert_eq!(live, 1);
+        let final_line = br#"{"message":{"content":"answer"},"done":true,"done_reason":"stop","prompt_eval_count":12,"eval_count":4}"#;
+        let events = parse_stream_line(final_line, &mut live).unwrap();
+        assert_eq!(events[0].kind, ChatEventKind::Content);
+        assert_eq!(events[1].usage.unwrap().total_tokens, Some(16));
+    }
+
+    #[test]
+    fn nested_context_error_exposes_counts() {
+        let nested = json!({
+            "error": serde_json::to_string(&json!({"error": {
+                "message": "request exceeds the available context size",
+                "n_prompt_tokens": 6012,
+                "n_ctx": 2048
+            }})).unwrap()
+        });
+        assert!(matches!(
+            api_error(&nested, Some(StatusCode::BAD_REQUEST)),
+            OllamaError::ContextLength {
+                prompt_tokens: Some(6012),
+                context_tokens: Some(2048),
+                ..
+            }
+        ));
+    }
+}

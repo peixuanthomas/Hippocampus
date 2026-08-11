@@ -9,4 +9,5 @@
 AGENTS.md
 /docs/
 /build/
+/target/
 .DS_Store

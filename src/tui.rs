@@ -1,0 +1,986 @@
+use std::io::{self, IsTerminal, Stdout};
+use std::time::Duration;
+
+use anyhow::{Result, bail};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers,
+};
+use crossterm::execute;
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
+use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+use unicode_width::UnicodeWidthChar;
+
+use crate::engine::{ChatEngine, LimitAction, PreparationStatus};
+use crate::model::{ChatEvent, ChatEventKind, Session};
+use crate::ollama::{ModelInfo, OllamaClient};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Role {
+    User,
+    Assistant,
+    System,
+    Error,
+}
+
+#[derive(Debug, Clone)]
+struct Message {
+    role: Role,
+    content: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Activity {
+    Idle,
+    Preparing,
+    Generating,
+    AwaitingLimit,
+    Cancelling,
+}
+
+enum BackgroundEvent {
+    Status(String),
+    LimitWarning(String),
+    Stream(ChatEvent),
+    Finished {
+        session: Box<Session>,
+        result: std::result::Result<(), String>,
+    },
+}
+
+struct App {
+    engine: ChatEngine<OllamaClient>,
+    session: Session,
+    model_info: ModelInfo,
+    messages: Vec<Message>,
+    editor: InputEditor,
+    status: String,
+    activity: Activity,
+    live_thinking: String,
+    live_answer: String,
+    live_tokens: u64,
+    scroll: usize,
+    follow_output: bool,
+    tx: mpsc::UnboundedSender<BackgroundEvent>,
+    rx: mpsc::UnboundedReceiver<BackgroundEvent>,
+    decision_tx: Option<mpsc::UnboundedSender<LimitAction>>,
+    cancellation: Option<CancellationToken>,
+}
+
+impl App {
+    fn new(engine: ChatEngine<OllamaClient>, session: Session, model_info: ModelInfo) -> Self {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut messages = vec![Message {
+            role: Role::System,
+            content: "输入 /help 查看命令；Enter 发送，Ctrl+J 换行。".into(),
+        }];
+        for turn in &session.turns {
+            messages.push(Message {
+                role: Role::User,
+                content: turn.user_content.clone(),
+            });
+            if !turn.assistant_content.is_empty() {
+                messages.push(Message {
+                    role: Role::Assistant,
+                    content: turn.assistant_content.clone(),
+                });
+            } else if let Some(error) = &turn.error {
+                messages.push(Message {
+                    role: Role::Error,
+                    content: format!("[{}] {error}", turn.status.as_str()),
+                });
+            }
+        }
+        Self {
+            engine,
+            session,
+            model_info,
+            messages,
+            editor: InputEditor::default(),
+            status: "就绪".into(),
+            activity: Activity::Idle,
+            live_thinking: String::new(),
+            live_answer: String::new(),
+            live_tokens: 0,
+            scroll: 0,
+            follow_output: true,
+            tx,
+            rx,
+            decision_tx: None,
+            cancellation: None,
+        }
+    }
+
+    fn start_turn(&mut self, input: String) {
+        self.messages.push(Message {
+            role: Role::User,
+            content: input.clone(),
+        });
+        self.editor.remember(input.clone());
+        self.live_thinking.clear();
+        self.live_answer.clear();
+        self.live_tokens = 0;
+        self.activity = Activity::Preparing;
+        self.status = "正在组装上下文…".into();
+        self.follow_output = true;
+
+        let mut session = self.session.clone();
+        let engine = self.engine.clone();
+        let ui_tx = self.tx.clone();
+        let (decision_tx, mut decision_rx) = mpsc::unbounded_channel();
+        let cancellation = CancellationToken::new();
+        self.decision_tx = Some(decision_tx);
+        self.cancellation = Some(cancellation.clone());
+
+        tokio::spawn(async move {
+            let result: Result<()> = async {
+                let mut prepared = engine.prepare_turn(&mut session, input).await?;
+                if prepared.needs_limit_decision() {
+                    let _ = ui_tx.send(BackgroundEvent::LimitWarning(prepared.message.clone()));
+                    let action = decision_rx.recv().await.unwrap_or(LimitAction::EndSession);
+                    prepared = engine.resolve_limit(&mut session, prepared, action).await?;
+                    if !prepared.message.is_empty() {
+                        let _ = ui_tx.send(BackgroundEvent::Status(prepared.message.clone()));
+                    }
+                }
+                if prepared.status == PreparationStatus::Blocked
+                    || prepared.status == PreparationStatus::Ended
+                {
+                    bail!(prepared.message);
+                }
+                let source = if prepared.plan.exact_input_tokens.is_some() {
+                    "精确"
+                } else {
+                    "估计上界"
+                };
+                let input_tokens = prepared
+                    .plan
+                    .exact_input_tokens
+                    .or(prepared.plan.estimated_upper_tokens)
+                    .map_or_else(|| "未知".into(), |value| value.to_string());
+                let _ = ui_tx.send(BackgroundEvent::Status(format!(
+                    "生成中 · {source} input={input_tokens}/{} · included={} omitted={}",
+                    prepared.plan.input_budget,
+                    prepared.plan.included_turn_ids.len(),
+                    prepared.plan.omitted_turn_ids.len()
+                )));
+                let stream_tx = ui_tx.clone();
+                engine
+                    .stream_turn(&mut session, &prepared, cancellation, move |event| {
+                        let _ = stream_tx.send(BackgroundEvent::Stream(event));
+                    })
+                    .await
+            }
+            .await;
+            let _ = ui_tx.send(BackgroundEvent::Finished {
+                session: Box::new(session),
+                result: result.map_err(|error| error.to_string()),
+            });
+        });
+    }
+
+    fn drain_background(&mut self) {
+        while let Ok(event) = self.rx.try_recv() {
+            match event {
+                BackgroundEvent::Status(status) => {
+                    self.status = status;
+                    if self.activity == Activity::Preparing {
+                        self.activity = Activity::Generating;
+                    }
+                }
+                BackgroundEvent::LimitWarning(message) => {
+                    self.activity = Activity::AwaitingLimit;
+                    self.status = message;
+                }
+                BackgroundEvent::Stream(event) => {
+                    self.activity = Activity::Generating;
+                    if let Some(tokens) = event.live_output_tokens {
+                        self.live_tokens = tokens;
+                    }
+                    match event.kind {
+                        ChatEventKind::Thinking => self.live_thinking.push_str(&event.text),
+                        ChatEventKind::Content => self.live_answer.push_str(&event.text),
+                        ChatEventKind::Usage | ChatEventKind::Completed => {}
+                    }
+                }
+                BackgroundEvent::Finished { session, result } => {
+                    self.session = *session;
+                    if !self.live_answer.is_empty() {
+                        self.messages.push(Message {
+                            role: Role::Assistant,
+                            content: std::mem::take(&mut self.live_answer),
+                        });
+                    }
+                    self.live_thinking.clear();
+                    self.live_tokens = 0;
+                    self.activity = Activity::Idle;
+                    self.decision_tx = None;
+                    self.cancellation = None;
+                    match result {
+                        Ok(()) => {
+                            let turn = self.session.turns.last();
+                            if let Some(error) = turn.and_then(|turn| turn.error.as_deref()) {
+                                self.status = error.to_owned();
+                            } else if let Some(turn) = turn {
+                                self.status = format!(
+                                    "完成 · input={} output={}",
+                                    display_optional(turn.usage.input_tokens),
+                                    display_optional(turn.usage.output_tokens)
+                                );
+                            } else {
+                                self.status = "完成".into();
+                            }
+                        }
+                        Err(error) => {
+                            self.status = error.clone();
+                            self.messages.push(Message {
+                                role: Role::Error,
+                                content: error,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn cancel_generation(&mut self) {
+        if let Some(cancellation) = &self.cancellation {
+            cancellation.cancel();
+            self.activity = Activity::Cancelling;
+            self.status = "正在中断并保存已收到的内容…".into();
+        }
+    }
+
+    fn resolve_limit(&mut self, action: LimitAction) {
+        if let Some(sender) = self.decision_tx.take() {
+            let _ = sender.send(action);
+            self.activity = Activity::Preparing;
+            self.status = if action == LimitAction::ContinueWithTrim {
+                "正在计算可保留的最大最近轮次…".into()
+            } else {
+                "正在暂停并保存会话…".into()
+            };
+        }
+    }
+
+    fn handle_idle_submit(&mut self) -> Result<bool> {
+        let input = self.editor.take().trim_end().to_owned();
+        if input.trim().is_empty() {
+            return Ok(true);
+        }
+        if input.starts_with('/') {
+            return self.handle_command(&input);
+        }
+        self.start_turn(input);
+        Ok(true)
+    }
+
+    fn handle_command(&mut self, command: &str) -> Result<bool> {
+        let parts = command.split_whitespace().collect::<Vec<_>>();
+        match parts.as_slice() {
+            ["/exit"] => return Ok(false),
+            ["/save"] => {
+                let path = self.engine.store().save(&mut self.session)?;
+                self.push_system(format!("已原子保存：{}", path.display()));
+            }
+            ["/help"] => self.push_system(
+                "/budget · /think on|off · /save · /help · /exit\nPageUp/PageDown 滚动，Ctrl+C 中断生成或退出。",
+            ),
+            ["/budget"] => {
+                let budget = &self.session.budget;
+                self.push_system(format!(
+                    "context={} · input={} · output reserve={} · safety={}\n80%={} · 90%={} · active start={}\n回答累计 input={} output={} · probe 累计 input={} output={}",
+                    budget.context_window,
+                    budget.input_budget(),
+                    budget.max_output_tokens,
+                    budget.safety_margin_tokens,
+                    budget.probe_threshold(),
+                    budget.warning_threshold(),
+                    self.session.active_context_start_index,
+                    display_optional(self.session.cumulative_usage.input_tokens),
+                    display_optional(self.session.cumulative_usage.output_tokens),
+                    display_optional(self.session.cumulative_probe_usage.input_tokens),
+                    display_optional(self.session.cumulative_probe_usage.output_tokens),
+                ));
+            }
+            ["/think"] => self.push_system(format!(
+                "thinking：{}",
+                if self.session.think { "on" } else { "off" }
+            )),
+            ["/think", value @ ("on" | "off")] => {
+                self.session.think = *value == "on";
+                self.engine.store().save(&mut self.session)?;
+                self.push_system(format!("thinking 已设为：{value}"));
+            }
+            ["/think", ..] => self.push_error("用法：/think on|off"),
+            _ => self.push_error("未知命令；输入 /help 查看命令。"),
+        }
+        Ok(true)
+    }
+
+    fn push_system(&mut self, content: impl Into<String>) {
+        self.messages.push(Message {
+            role: Role::System,
+            content: content.into(),
+        });
+        self.follow_output = true;
+    }
+
+    fn push_error(&mut self, content: impl Into<String>) {
+        self.messages.push(Message {
+            role: Role::Error,
+            content: content.into(),
+        });
+        self.follow_output = true;
+    }
+}
+
+pub async fn run(
+    engine: ChatEngine<OllamaClient>,
+    session: Session,
+    model_info: ModelInfo,
+) -> Result<Session> {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        bail!("TUI 需要交互终端；脚本调用请使用 `hippocampus ask \"问题\"`");
+    }
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+    terminal.clear()?;
+
+    let result = run_loop(&mut terminal, App::new(engine, session, model_info)).await;
+
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    )?;
+    terminal.show_cursor()?;
+    result
+}
+
+async fn run_loop(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    mut app: App,
+) -> Result<Session> {
+    loop {
+        app.drain_background();
+        terminal.draw(|frame| draw(frame, &mut app))?;
+        if !event::poll(Duration::from_millis(40))? {
+            continue;
+        }
+        match event::read()? {
+            Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+                if !handle_key(&mut app, key)? {
+                    if app.activity == Activity::Idle {
+                        return Ok(app.session);
+                    }
+                    app.cancel_generation();
+                }
+            }
+            Event::Paste(text) if app.activity == Activity::Idle => app.editor.insert_str(&text),
+            Event::Resize(_, _) => {}
+            _ => {}
+        }
+    }
+}
+
+fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
+    if app.activity == Activity::AwaitingLimit {
+        match key.code {
+            KeyCode::Enter | KeyCode::Char('c' | 'C' | 'y' | 'Y') => {
+                app.resolve_limit(LimitAction::ContinueWithTrim)
+            }
+            KeyCode::Esc | KeyCode::Char('e' | 'E' | 'n' | 'N') => {
+                app.resolve_limit(LimitAction::EndSession)
+            }
+            _ => {}
+        }
+        return Ok(true);
+    }
+
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        if app.activity == Activity::Idle {
+            return Ok(false);
+        }
+        app.cancel_generation();
+        return Ok(true);
+    }
+    match key.code {
+        KeyCode::PageUp => {
+            app.follow_output = false;
+            app.scroll = app.scroll.saturating_sub(8);
+        }
+        KeyCode::PageDown => {
+            app.scroll = app.scroll.saturating_add(8);
+            app.follow_output = true;
+        }
+        _ if app.activity != Activity::Idle => return Ok(true),
+        KeyCode::Enter
+            if key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT) =>
+        {
+            app.editor.insert_char('\n');
+        }
+        KeyCode::Enter => return app.handle_idle_submit(),
+        KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.editor.insert_char('\n')
+        }
+        KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.editor.move_line_start()
+        }
+        KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.editor.move_line_end()
+        }
+        KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.editor.delete_previous_word()
+        }
+        KeyCode::Backspace => app.editor.backspace(),
+        KeyCode::Delete => app.editor.delete(),
+        KeyCode::Left => app.editor.move_left(),
+        KeyCode::Right => app.editor.move_right(),
+        KeyCode::Home => app.editor.move_line_start(),
+        KeyCode::End => app.editor.move_line_end(),
+        KeyCode::Up => app.editor.move_up_or_history(),
+        KeyCode::Down => app.editor.move_down_or_history(),
+        KeyCode::Esc => app.editor.clear(),
+        KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.editor.insert_char(ch)
+        }
+        _ => {}
+    }
+    Ok(true)
+}
+
+fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
+    let area = frame.area();
+    let input_height = input_height(&app.editor.text, area.width.saturating_sub(4));
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(5),
+            Constraint::Length(1),
+            Constraint::Length(input_height),
+            Constraint::Length(1),
+        ])
+        .split(area);
+    draw_header(frame, app, chunks[0]);
+    draw_messages(frame, app, chunks[1]);
+    draw_status(frame, app, chunks[2]);
+    draw_input(frame, app, chunks[3]);
+    draw_help(frame, app, chunks[4]);
+    if app.activity == Activity::AwaitingLimit {
+        draw_limit_dialog(frame, area);
+    }
+}
+
+fn draw_header(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
+    let state = app.session.status.as_str();
+    let title = Line::from(vec![
+        Span::styled(
+            " HIPPOCAMPUS ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            " local memory · raw truth ",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+    let right = format!(
+        "{}  ·  think:{}  ·  ctx:{}  ·  {}  ",
+        app.session.model,
+        if app.session.think { "on" } else { "off" },
+        app.session.budget.context_window,
+        state
+    );
+    let header = Paragraph::new(title)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        )
+        .alignment(Alignment::Left);
+    frame.render_widget(header, area);
+    let right_width = right
+        .chars()
+        .count()
+        .min(area.width.saturating_sub(2) as usize) as u16;
+    if right_width > 0 {
+        let right_area = Rect::new(
+            area.right().saturating_sub(right_width + 1),
+            area.y + 1,
+            right_width,
+            1,
+        );
+        frame.render_widget(
+            Paragraph::new(right).style(Style::default().fg(Color::Gray)),
+            right_area,
+        );
+    }
+}
+
+fn draw_messages(frame: &mut ratatui::Frame<'_>, app: &mut App, area: Rect) {
+    let width = area.width.saturating_sub(3).max(1) as usize;
+    let mut lines = Vec::new();
+    for message in &app.messages {
+        append_message_lines(&mut lines, message.role, &message.content, width);
+    }
+    if !app.live_thinking.is_empty() {
+        append_message_lines(
+            &mut lines,
+            Role::System,
+            &format!("Thinking\n{}", app.live_thinking),
+            width,
+        );
+    }
+    if !app.live_answer.is_empty() || app.activity == Activity::Generating {
+        append_message_lines(
+            &mut lines,
+            Role::Assistant,
+            if app.live_answer.is_empty() {
+                "…"
+            } else {
+                &app.live_answer
+            },
+            width,
+        );
+    }
+    let viewport = area.height.saturating_sub(2) as usize;
+    let max_scroll = lines.len().saturating_sub(viewport);
+    if app.follow_output {
+        app.scroll = max_scroll;
+    } else {
+        app.scroll = app.scroll.min(max_scroll);
+    }
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(
+            Block::default()
+                .borders(Borders::LEFT | Borders::RIGHT)
+                .border_style(Style::default().fg(Color::Rgb(45, 50, 60))),
+        )
+        .scroll((app.scroll.min(u16::MAX as usize) as u16, 0));
+    frame.render_widget(paragraph, area);
+}
+
+fn append_message_lines<'a>(lines: &mut Vec<Line<'a>>, role: Role, content: &str, width: usize) {
+    let (label, color) = match role {
+        Role::User => ("› You", Color::Cyan),
+        Role::Assistant => ("◆ Hippocampus", Color::Green),
+        Role::System => ("· System", Color::Yellow),
+        Role::Error => ("! Error", Color::Red),
+    };
+    lines.push(Line::from(Span::styled(
+        label.to_owned(),
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    )));
+    let content_style = match role {
+        Role::System => Style::default().fg(Color::DarkGray),
+        Role::Error => Style::default().fg(Color::LightRed),
+        _ => Style::default().fg(Color::White),
+    };
+    for line in wrap_plain(content, width.saturating_sub(2).max(1)) {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(line, content_style),
+        ]));
+    }
+    lines.push(Line::raw(""));
+}
+
+fn draw_status(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
+    let color = match app.activity {
+        Activity::Idle => Color::DarkGray,
+        Activity::AwaitingLimit => Color::Yellow,
+        Activity::Cancelling => Color::Red,
+        Activity::Preparing | Activity::Generating => Color::Cyan,
+    };
+    let spinner = match app.activity {
+        Activity::Idle => "",
+        Activity::AwaitingLimit => "⚠ ",
+        Activity::Cancelling => "■ ",
+        Activity::Preparing | Activity::Generating => "● ",
+    };
+    frame.render_widget(
+        Paragraph::new(format!(" {spinner}{}", app.status)).style(Style::default().fg(color)),
+        area,
+    );
+}
+
+fn draw_input(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
+    let border = match app.activity {
+        Activity::Idle => Color::Cyan,
+        Activity::AwaitingLimit => Color::Yellow,
+        Activity::Cancelling => Color::Red,
+        Activity::Preparing | Activity::Generating => Color::DarkGray,
+    };
+    let title = if app.activity == Activity::Idle {
+        " Message · Enter send · Ctrl+J newline "
+    } else {
+        " Working · Ctrl+C interrupt "
+    };
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border));
+    let inner = block.inner(area);
+    let text = if app.editor.text.is_empty() && app.activity == Activity::Idle {
+        Text::from(Span::styled(
+            "Ask anything, or type /help…",
+            Style::default().fg(Color::DarkGray),
+        ))
+    } else {
+        Text::from(app.editor.text.clone())
+    };
+    let (cursor_row, cursor_col) = app.editor.cursor_position(inner.width.max(1));
+    let scroll = cursor_row.saturating_sub(inner.height.saturating_sub(1));
+    frame.render_widget(
+        Paragraph::new(text)
+            .block(block)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
+        area,
+    );
+    if app.activity == Activity::Idle {
+        frame.set_cursor_position((
+            inner.x + cursor_col.min(inner.width.saturating_sub(1)),
+            inner.y
+                + cursor_row
+                    .saturating_sub(scroll)
+                    .min(inner.height.saturating_sub(1)),
+        ));
+    }
+}
+
+fn draw_help(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
+    let text = format!(
+        "  session {}  ·  Ollama {}  ·  model max {}  ·  PgUp/PgDn scroll",
+        app.session.id, app.model_info.version, app.model_info.context_length
+    );
+    frame.render_widget(
+        Paragraph::new(text).style(Style::default().fg(Color::Rgb(75, 80, 90))),
+        area,
+    );
+}
+
+fn draw_limit_dialog(frame: &mut ratatui::Frame<'_>, area: Rect) {
+    let width = area.width.min(62);
+    let height = 7.min(area.height);
+    let dialog = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, dialog);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                "上下文接近上限",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::raw(""),
+            Line::raw("继续会丢弃最旧的完整轮次；原始会话记录仍会保留。"),
+            Line::raw("Enter / C：裁剪后继续    Esc / E：暂停会话"),
+        ])
+        .alignment(Alignment::Center)
+        .block(
+            Block::default()
+                .title(" Context budget ")
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::Yellow)),
+        ),
+        dialog,
+    );
+}
+
+fn input_height(text: &str, width: u16) -> u16 {
+    let width = width.max(1) as usize;
+    let rows = text
+        .split('\n')
+        .map(|line| display_width(line).div_ceil(width).max(1))
+        .sum::<usize>();
+    (rows as u16 + 2).clamp(4, 10)
+}
+
+fn wrap_plain(text: &str, width: usize) -> Vec<String> {
+    let mut output = Vec::new();
+    for source_line in text.split('\n') {
+        if source_line.is_empty() {
+            output.push(String::new());
+            continue;
+        }
+        let mut current = String::new();
+        let mut current_width = 0;
+        for ch in source_line.chars() {
+            let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if current_width > 0 && current_width + ch_width > width {
+                output.push(std::mem::take(&mut current));
+                current_width = 0;
+            }
+            current.push(ch);
+            current_width += ch_width;
+        }
+        output.push(current);
+    }
+    output
+}
+
+fn display_width(text: &str) -> usize {
+    text.chars()
+        .map(|ch| UnicodeWidthChar::width(ch).unwrap_or(0))
+        .sum()
+}
+
+fn display_optional(value: Option<u64>) -> String {
+    value.map_or_else(|| "未知".into(), |value| value.to_string())
+}
+
+#[derive(Default)]
+struct InputEditor {
+    text: String,
+    cursor: usize,
+    history: Vec<String>,
+    history_index: Option<usize>,
+    draft: String,
+}
+
+impl InputEditor {
+    fn insert_char(&mut self, ch: char) {
+        self.text.insert(self.cursor, ch);
+        self.cursor += ch.len_utf8();
+        self.history_index = None;
+    }
+
+    fn insert_str(&mut self, text: &str) {
+        self.text.insert_str(self.cursor, text);
+        self.cursor += text.len();
+        self.history_index = None;
+    }
+
+    fn take(&mut self) -> String {
+        self.cursor = 0;
+        self.history_index = None;
+        self.draft.clear();
+        std::mem::take(&mut self.text)
+    }
+
+    fn remember(&mut self, text: String) {
+        if self.history.last() != Some(&text) {
+            self.history.push(text);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.text.clear();
+        self.cursor = 0;
+        self.history_index = None;
+    }
+
+    fn backspace(&mut self) {
+        if let Some(previous) = previous_boundary(&self.text, self.cursor) {
+            self.text.drain(previous..self.cursor);
+            self.cursor = previous;
+        }
+    }
+
+    fn delete(&mut self) {
+        if let Some(next) = next_boundary(&self.text, self.cursor) {
+            self.text.drain(self.cursor..next);
+        }
+    }
+
+    fn move_left(&mut self) {
+        if let Some(previous) = previous_boundary(&self.text, self.cursor) {
+            self.cursor = previous;
+        }
+    }
+
+    fn move_right(&mut self) {
+        if let Some(next) = next_boundary(&self.text, self.cursor) {
+            self.cursor = next;
+        }
+    }
+
+    fn move_line_start(&mut self) {
+        self.cursor = self.text[..self.cursor]
+            .rfind('\n')
+            .map_or(0, |index| index + 1);
+    }
+
+    fn move_line_end(&mut self) {
+        self.cursor = self.text[self.cursor..]
+            .find('\n')
+            .map_or(self.text.len(), |offset| self.cursor + offset);
+    }
+
+    fn delete_previous_word(&mut self) {
+        let prefix = &self.text[..self.cursor];
+        let trimmed = prefix.trim_end_matches(char::is_whitespace);
+        let start = trimmed.rfind(char::is_whitespace).map_or(0, |index| {
+            index + trimmed[index..].chars().next().unwrap().len_utf8()
+        });
+        self.text.drain(start..self.cursor);
+        self.cursor = start;
+    }
+
+    fn history_previous(&mut self) {
+        if self.history.is_empty() || self.text.contains('\n') {
+            return;
+        }
+        let index = match self.history_index {
+            None => {
+                self.draft = self.text.clone();
+                self.history.len() - 1
+            }
+            Some(0) => 0,
+            Some(index) => index - 1,
+        };
+        self.history_index = Some(index);
+        self.text.clone_from(&self.history[index]);
+        self.cursor = self.text.len();
+    }
+
+    fn move_up_or_history(&mut self) {
+        let current_start = self.text[..self.cursor]
+            .rfind('\n')
+            .map_or(0, |index| index + 1);
+        if current_start == 0 {
+            self.history_previous();
+            return;
+        }
+        let column = self.text[current_start..self.cursor].chars().count();
+        let previous_end = current_start - 1;
+        let previous_start = self.text[..previous_end]
+            .rfind('\n')
+            .map_or(0, |index| index + 1);
+        self.cursor = byte_at_character_column(&self.text, previous_start, previous_end, column);
+    }
+
+    fn history_next(&mut self) {
+        let Some(index) = self.history_index else {
+            return;
+        };
+        if index + 1 < self.history.len() {
+            self.history_index = Some(index + 1);
+            self.text.clone_from(&self.history[index + 1]);
+        } else {
+            self.history_index = None;
+            self.text.clone_from(&self.draft);
+        }
+        self.cursor = self.text.len();
+    }
+
+    fn move_down_or_history(&mut self) {
+        let current_start = self.text[..self.cursor]
+            .rfind('\n')
+            .map_or(0, |index| index + 1);
+        let current_end = self.text[self.cursor..]
+            .find('\n')
+            .map_or(self.text.len(), |offset| self.cursor + offset);
+        if current_end == self.text.len() {
+            self.history_next();
+            return;
+        }
+        let column = self.text[current_start..self.cursor].chars().count();
+        let next_start = current_end + 1;
+        let next_end = self.text[next_start..]
+            .find('\n')
+            .map_or(self.text.len(), |offset| next_start + offset);
+        self.cursor = byte_at_character_column(&self.text, next_start, next_end, column);
+    }
+
+    fn cursor_position(&self, width: u16) -> (u16, u16) {
+        let width = width.max(1) as usize;
+        let mut row = 0_usize;
+        let mut column = 0_usize;
+        for ch in self.text[..self.cursor].chars() {
+            if ch == '\n' {
+                row += 1;
+                column = 0;
+                continue;
+            }
+            let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if column > 0 && column + char_width > width {
+                row += 1;
+                column = 0;
+            }
+            column += char_width;
+            if column >= width {
+                row += 1;
+                column = 0;
+            }
+        }
+        (
+            row.min(u16::MAX as usize) as u16,
+            column.min(u16::MAX as usize) as u16,
+        )
+    }
+}
+
+fn previous_boundary(text: &str, cursor: usize) -> Option<usize> {
+    (cursor > 0).then(|| text[..cursor].char_indices().next_back().unwrap().0)
+}
+
+fn next_boundary(text: &str, cursor: usize) -> Option<usize> {
+    (cursor < text.len()).then(|| cursor + text[cursor..].chars().next().unwrap().len_utf8())
+}
+
+fn byte_at_character_column(text: &str, start: usize, end: usize, column: usize) -> usize {
+    text[start..end]
+        .char_indices()
+        .nth(column)
+        .map_or(end, |(offset, _)| start + offset)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn editor_handles_utf8_boundaries() {
+        let mut editor = InputEditor::default();
+        editor.insert_str("你a");
+        editor.move_left();
+        editor.backspace();
+        assert_eq!(editor.text, "a");
+        assert_eq!(editor.cursor, 0);
+    }
+
+    #[test]
+    fn wrapping_respects_wide_characters() {
+        assert_eq!(wrap_plain("你好abc", 4), vec!["你好", "abc"]);
+    }
+
+    #[test]
+    fn multiline_arrows_preserve_character_column() {
+        let mut editor = InputEditor::default();
+        editor.insert_str("abcd\n你好吗\nxy");
+        editor.cursor = "abcd\n你".len();
+        editor.move_up_or_history();
+        assert_eq!(editor.cursor, 1);
+        editor.move_down_or_history();
+        assert_eq!(editor.cursor, "abcd\n你".len());
+    }
+}

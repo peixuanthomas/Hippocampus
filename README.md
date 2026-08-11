@@ -1,44 +1,76 @@
 # Hippocampus
 
-Hippocampus 是一个面向本地 Ollama 的单会话终端聊天工具。它只保存一个会话的原始 JSON 记录与可审计的上下文预算轨迹；没有长期记忆、检索、向量库、摘要或跨会话拼接。
+Hippocampus 是一个完全使用 Rust 实现的本地 Ollama 会话客户端。无参数启动时进入 Ratatui TUI；`ask` 子命令适合脚本和其他程序进行单次调用。
 
-要求 Python >= 3.11。安装后先自行启动并准备模型（工具不会自动下载）：
+项目保存每轮原始输入、模型正文、thinking、权威 token usage 和上下文裁剪轨迹。thinking 只用于当前轮展示和审计，绝不会重新注入后续模型上下文。旧 Python 版本产生的 `schema_version=1` 会话 JSON 可以直接继续使用。
+
+## 构建
+
+需要 Rust 2024 edition 工具链和已经运行的 Ollama：
 
 ```bash
-python -m venv .venv
-.venv/bin/pip install -e '.[test]'
 ollama serve
 ollama pull qwen3.5:9b
+cargo build --release
 ```
 
-使用：
+本仓库交付的可执行文件位于 `build/hippocampus`。
+
+## TUI
+
+直接运行会创建一个默认会话并进入 TUI：
 
 ```bash
-hippocampus new
-hippocampus --sessions-dir ./sessions new --model qwen3.5:9b --no-think
-hippocampus new --context-window 32768 --max-output-tokens 4096 --safety-margin-tokens 512
-hippocampus new --system-prompt '请简洁回答'
-hippocampus new --system-prompt-file prompt.txt
-hippocampus list
-hippocampus show 20260811-abcdef12
-hippocampus resume 20260811-abcdef12
-python -m hippocampus --help
+./build/hippocampus
+./build/hippocampus new --model qwen3.5:9b --no-think
+./build/hippocampus resume 20260811-abcdef12
+./build/hippocampus --sessions-dir ./sessions resume 20260811-abcdef12
 ```
 
-默认上下文窗口为 32768，输出预留 4096，安全余量 512，因此输入预算为 28160。达到输入预算的 80% 时会进行精确 probe；达到 90% 时会要求选择“继续”或“结束”。继续时只丢弃最旧的完整轮次，并展示保留/舍弃数量。`/budget` 可查看当前与最近 trace。
+界面顶部显示模型、thinking、上下文与会话状态；中间是对话；底部是可编辑的多行输入框。
 
-聊天内命令：`/budget`、`/think on|off`、`/save`、`/help`、`/exit`。thinking 和正文分通道实时显示；thinking 会保存在 JSON 中，但不会被再次注入模型上下文。每个会话独立保存为 `sessions/<id>.json`，可用唯一前缀恢复。
+- `Enter`：发送
+- `Ctrl+J`、`Shift+Enter` 或 `Alt+Enter`：换行
+- `↑` / `↓`：浏览输入历史
+- `PageUp` / `PageDown`：滚动对话
+- `Ctrl+C`：中断生成并保存已收到内容；空闲时退出
+- `/budget`、`/think on|off`、`/save`、`/help`、`/exit`
 
-Token 语义：流中的 live 输出仅是暂时计数，最终事件的 `input/output/total` 才是权威值。probe 的开销与回答开销分开累计。中断前没有最终事件时，未知项明确显示“未知”，不会虚构计数。
+上下文达到 90% 警戒线时，TUI 会要求明确选择：裁剪最旧的完整轮次后继续，或暂停会话。裁剪只改变后续请求的活动起点，不删除原始记录。
 
-默认测试不会访问 Ollama：
+## `ask` 单次调用
+
+不传 `--session` 时是无状态调用：不会读取历史、不会创建会话文件，只向 Ollama 发送 `system prompt + 当前问题`。
 
 ```bash
-pytest -q
+./build/hippocampus ask "只回答一个词：天空是什么颜色？"
+./build/hippocampus ask --no-think --system-prompt "简洁回答" "你好"
+./build/hippocampus ask --json "你好"
 ```
 
-真实集成测试需要服务和模型：
+传入 `--session` 时才会加载该会话上下文，并把新一轮原子保存回同一个会话：
 
 ```bash
-HIPPOCAMPUS_RUN_OLLAMA_INTEGRATION=1 pytest -q tests/test_integration_ollama.py
+./build/hippocampus ask --session 20260811-abcdef12 "继续刚才的话题"
+./build/hippocampus ask --session 20260811-abcdef12 --trim "继续"
+```
+
+当有会话的上下文达到警戒线时，非交互调用默认暂停并报错；`--trim` 表示授权自动丢弃最旧完整轮次后继续。
+
+## 会话管理
+
+```bash
+./build/hippocampus list
+./build/hippocampus show 20260811-abcdef12
+./build/hippocampus show 20260811-abcdef12 --json
+```
+
+默认上下文窗口为 32768，输出预留 4096，安全余量 512，输入预算因此为 28160。80% 起执行精确 probe，90% 起要求裁剪决策。流中的 logprob 数只用于实时显示；最终 `prompt_eval_count` 和 `eval_count` 才是权威值。没有收到最终事件时，未知计数保持为 `null`，不会用 probe 或估算值冒充。
+
+## 验证
+
+```bash
+cargo fmt --check
+cargo test
+cargo clippy --all-targets -- -D warnings
 ```
