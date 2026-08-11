@@ -2229,6 +2229,206 @@ mod tests {
     }
 
     #[test]
+    fn resync_rejects_nonempty_event_content_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let mut session = store
+            .create("model", "http://localhost", None, Default::default(), false)
+            .unwrap();
+        let answer = append_complete_turn(&mut session, "原文甲", "回复", "");
+        let path = store.save(&mut session).unwrap();
+        let before = store.retrieval().get_event(&answer).unwrap();
+        session.turns[0].assistant_content = "篡改甲".into();
+        fs::write(&path, serde_json::to_vec(&session).unwrap()).unwrap();
+        assert!(matches!(
+            store.retrieval().sync_session(&session, &path),
+            Err(RetrievalError::InvalidSource { .. })
+        ));
+        let connection = Connection::open(store.retrieval().index_path()).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT content FROM events WHERE event_id=?1",
+                    [&answer],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            before.content
+        );
+    }
+
+    #[test]
+    fn resync_rejects_obsolete_missing_event() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let mut session = store
+            .create("model", "http://localhost", None, Default::default(), false)
+            .unwrap();
+        append_complete_turn(&mut session, "一", "甲", "");
+        let second = append_complete_turn(&mut session, "二", "乙", "");
+        let path = store.save(&mut session).unwrap();
+        session.turns.pop();
+        fs::write(&path, serde_json::to_vec(&session).unwrap()).unwrap();
+        assert!(matches!(
+            store.retrieval().sync_session(&session, &path),
+            Err(RetrievalError::InvalidSource { .. })
+        ));
+        let connection = Connection::open(store.retrieval().index_path()).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT content FROM events WHERE event_id=?1",
+                    [&second],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            "乙"
+        );
+    }
+
+    #[test]
+    fn resync_allows_empty_assistant_to_first_terminal_content() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let mut session = store
+            .create("model", "http://localhost", None, Default::default(), false)
+            .unwrap();
+        let mut turn = Turn::pending("问题".into());
+        turn.request_started_at = Some(utc_now());
+        turn.context_trace.provenance_quality = ProvenanceQuality::LegacyInferred;
+        session.turns.push(turn);
+        let path = store.save(&mut session).unwrap();
+        let answer = event_id(
+            &session.id,
+            Some(&session.turns[0].id),
+            EventRole::Assistant,
+        );
+        session.turns[0].assistant_content = "首次完成".into();
+        session.turns[0].status = TurnStatus::Complete;
+        session.turns[0].context_trace.provenance_quality = ProvenanceQuality::LegacyInferred;
+        fs::write(&path, serde_json::to_vec(&session).unwrap()).unwrap();
+        store.retrieval().sync_session(&session, &path).unwrap();
+        assert_eq!(
+            store.retrieval().get_event(&answer).unwrap().content,
+            "首次完成"
+        );
+        assert_eq!(
+            store
+                .retrieval()
+                .resolve_span(&SourceSpan {
+                    event_id: answer.clone(),
+                    start_char: 0,
+                    end_char: "首次完成".chars().count()
+                })
+                .unwrap()
+                .content,
+            "首次完成"
+        );
+        session.turns[0].assistant_content = "二次篡改".into();
+        fs::write(&path, serde_json::to_vec(&session).unwrap()).unwrap();
+        assert!(matches!(
+            store.retrieval().sync_session(&session, &path),
+            Err(RetrievalError::InvalidSource { .. })
+        ));
+    }
+
+    #[test]
+    fn external_answer_context_survives_source_append_resync() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let mut a = store
+            .create(
+                "model",
+                "http://localhost",
+                Some("a-system"),
+                Default::default(),
+                false,
+            )
+            .unwrap();
+        let external_answer = append_complete_turn(&mut a, "A问题", "A原始证据", "");
+        store.save(&mut a).unwrap();
+        let mut b = store
+            .create(
+                "model",
+                "http://localhost",
+                Some("b-system"),
+                Default::default(),
+                false,
+            )
+            .unwrap();
+        let mut turn = Turn::pending("B问题".into());
+        turn.request_started_at = Some(utc_now());
+        turn.assistant_content = "B回答".into();
+        turn.status = TurnStatus::Complete;
+        let messages = vec![
+            ChatMessage {
+                role: "system".into(),
+                content: b.system_prompt.clone(),
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: "A原始证据".into(),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: "B问题".into(),
+            },
+        ];
+        turn.context_trace = ContextTrace {
+            context_items: vec![
+                ContextItemTrace {
+                    role: EventRole::System,
+                    span: SourceSpan {
+                        event_id: event_id(&b.id, None, EventRole::System),
+                        start_char: 0,
+                        end_char: b.system_prompt.chars().count(),
+                    },
+                    content_sha256: content_sha256(&b.system_prompt),
+                },
+                ContextItemTrace {
+                    role: EventRole::Assistant,
+                    span: SourceSpan {
+                        event_id: external_answer.clone(),
+                        start_char: 0,
+                        end_char: "A原始证据".chars().count(),
+                    },
+                    content_sha256: content_sha256("A原始证据"),
+                },
+                ContextItemTrace {
+                    role: EventRole::User,
+                    span: SourceSpan {
+                        event_id: event_id(&b.id, Some(&turn.id), EventRole::User),
+                        start_char: 0,
+                        end_char: "B问题".chars().count(),
+                    },
+                    content_sha256: content_sha256("B问题"),
+                },
+            ],
+            context_sha256: Some(context_sha256(&messages)),
+            request: Some(ModelRequestTrace {
+                model: b.model.clone(),
+                think: false,
+                context_window: b.budget.context_window,
+                max_output_tokens: b.budget.max_output_tokens,
+            }),
+            provenance_quality: ProvenanceQuality::Exact,
+            ..Default::default()
+        };
+        b.turns.push(turn);
+        store.save(&mut b).unwrap();
+        let b_answer = event_id(&b.id, Some(&b.turns[0].id), EventRole::Assistant);
+        let before = store.retrieval().answer_context(&b_answer).unwrap();
+        append_complete_turn(&mut a, "新增", "A新增", "");
+        store.save(&mut a).unwrap();
+        let after = store.retrieval().answer_context(&b_answer).unwrap();
+        assert_eq!(before.context_sha256, after.context_sha256);
+        assert_eq!(
+            before.items[1].resolved.content,
+            after.items[1].resolved.content
+        );
+    }
+
+    #[test]
     fn only_real_or_legacy_model_requests_create_assistant_events() {
         let mut session = Session::new(
             "session".into(),
