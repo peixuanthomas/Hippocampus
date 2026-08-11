@@ -1,11 +1,5 @@
 /references/
 /sessions/
-/.venv/
-/.pytest_cache/
-/.ruff_cache/
-**/__pycache__/
-*.py[cod]
-*.egg-info/
 AGENTS.md
 /docs/
 /build/
