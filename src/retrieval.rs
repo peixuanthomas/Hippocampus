@@ -348,7 +348,7 @@ impl RetrievalStore {
             .join(" OR ");
         let connection = self.open_connection()?;
         let mut statement = connection.prepare(
-            "SELECT d.document_id, d.granularity, d.event_id, d.start_char, d.end_char, d.content_sha256,
+            "SELECT d.document_id, d.granularity, d.event_id, d.start_char, d.end_char, d.content_sha256, d.exact_content,
                     e.role, e.session_id, e.created_at, bm25(retrieval_documents_fts) AS score
              FROM retrieval_documents_fts JOIN retrieval_documents d ON d.rowid = retrieval_documents_fts.rowid
              JOIN events e ON e.event_id = d.event_id
@@ -366,10 +366,11 @@ impl RetrievalStore {
                         i64_to_usize(row.get(3)?)?,
                         i64_to_usize(row.get(4)?)?,
                         row.get::<_, String>(5)?,
-                        parse_role(&row.get::<_, String>(6)?)?,
-                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(6)?,
+                        parse_role(&row.get::<_, String>(7)?)?,
                         row.get::<_, String>(8)?,
-                        row.get::<_, f64>(9)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, f64>(10)?,
                     ))
                 },
             )
@@ -382,10 +383,9 @@ impl RetrievalStore {
         let mut used_events = HashSet::new();
         let mut used_hashes = HashSet::new();
         let mut core_chars = 0usize;
+        // Keep the entire deterministic overfetch in the trace. Exclusions
+        // must not consume the usable candidate pool.
         for (idx, row) in fetched.into_iter().enumerate() {
-            if trace.candidates.len() >= trace.config.candidate_limit {
-                break;
-            }
             let (
                 document_id,
                 granularity,
@@ -393,6 +393,7 @@ impl RetrievalStore {
                 start,
                 end,
                 hash,
+                stored_content,
                 role,
                 session_id,
                 created_at,
@@ -435,6 +436,16 @@ impl RetrievalStore {
                 self.verify_fresh(&source_session)?;
                 verify_event_hash(&source_event)?;
                 let span_content = slice_chars(&source_event.content, &span)?;
+                let span_hash = connection.query_row("SELECT content_sha256 FROM source_spans WHERE event_id=?1 AND start_char=?2 AND end_char=?3", params![span.event_id, span.start_char as i64, span.end_char as i64], |row| row.get::<_, String>(0)).optional().map_err(|e| self.database_error(e))?;
+                if stored_content != span_content
+                    || hash != content_sha256(&span_content)
+                    || span_hash.as_deref() != Some(hash.as_str())
+                {
+                    return Err(RetrievalError::CorruptIndex(format!(
+                        "检索文档 {} 与原始片段不一致",
+                        candidate.document_id
+                    )));
+                }
                 if span_content.chars().count() + core_chars > trace.config.evidence_char_budget {
                     candidate.reason = "evidence_budget".into();
                 } else if trace
@@ -476,8 +487,8 @@ impl RetrievalStore {
             &mut evidence,
             current_user_event_id,
             &recent,
-            &used_events,
-            &used_hashes,
+            &mut used_events,
+            &mut used_hashes,
         )?;
         Ok(RecallResult { trace, evidence })
     }
@@ -490,8 +501,8 @@ impl RetrievalStore {
         evidence: &mut Vec<RecalledEvidence>,
         current: &str,
         recent: &HashSet<&str>,
-        used_events: &HashSet<String>,
-        used_hashes: &HashSet<String>,
+        used_events: &mut HashSet<String>,
+        used_hashes: &mut HashSet<String>,
     ) -> RetrievalResult<()> {
         let mut budget = 0usize;
         let cores = evidence.clone();
@@ -513,12 +524,21 @@ impl RetrievalStore {
                     continue;
                 }
                 let adjacent = self.get_event_from_connection(connection, &id)?;
+                let session = self.get_session_from_connection(connection, &adjacent.session_id)?;
+                self.verify_fresh(&session)?;
+                verify_event_hash(&adjacent)?;
                 if adjacent.role == EventRole::System
                     || used_hashes.contains(&adjacent.content_sha256)
                 {
                     continue;
                 }
                 let chars = adjacent.content.chars().count();
+                let stored_span_hash = connection.query_row("SELECT content_sha256 FROM source_spans WHERE event_id=?1 AND start_char=0 AND end_char=?2", params![adjacent.id, chars as i64], |row| row.get::<_, String>(0)).optional().map_err(|e| self.database_error(e))?;
+                if stored_span_hash.as_deref() != Some(adjacent.content_sha256.as_str()) {
+                    return Err(RetrievalError::CorruptIndex(
+                        "扩展上下文片段与原文不一致".into(),
+                    ));
+                }
                 if budget + chars > trace.config.expansion_char_budget {
                     continue;
                 }
@@ -536,6 +556,8 @@ impl RetrievalStore {
                     reason: reason.into(),
                 };
                 trace.selected_evidence.push(selected.clone());
+                used_events.insert(selected.span.event_id.clone());
+                used_hashes.insert(selected.content_sha256.clone());
                 evidence.push(RecalledEvidence {
                     selected,
                     content: adjacent.content,
@@ -606,8 +628,19 @@ impl RetrievalStore {
         for row in rows {
             let (ordinal, role, span, expected_hash, content) =
                 row.map_err(|source| self.database_error(source))?;
+            let source_event = self.get_event_from_connection(&connection, &span.event_id)?;
+            let source_session =
+                self.get_session_from_connection(&connection, &source_event.session_id)?;
+            self.verify_fresh(&source_session)?;
+            verify_event_hash(&source_event)?;
+            if source_event.role != role {
+                return Err(RetrievalError::CorruptIndex(
+                    "回答上下文角色与原始事件不匹配".into(),
+                ));
+            }
+            let span_hash = connection.query_row("SELECT content_sha256 FROM source_spans WHERE event_id=?1 AND start_char=?2 AND end_char=?3", params![span.event_id, span.start_char as i64, span.end_char as i64], |row| row.get::<_, String>(0)).optional().map_err(|e| self.database_error(e))?.ok_or_else(|| RetrievalError::CorruptIndex("回答上下文缺少原始片段".into()))?;
             let actual_hash = content_sha256(&content);
-            if actual_hash != expected_hash {
+            if actual_hash != expected_hash || actual_hash != span_hash {
                 return Err(RetrievalError::CorruptIndex(format!(
                     "回答上下文片段 {} 的哈希不匹配",
                     span.event_id
@@ -642,18 +675,18 @@ impl RetrievalStore {
     ) -> RetrievalResult<SyncReport> {
         let source_file = source_file_name(&self.root, &source.path)?;
         transaction.execute("DELETE FROM retrieval_documents_fts WHERE rowid IN (SELECT rowid FROM retrieval_documents WHERE event_id IN (SELECT event_id FROM events WHERE session_id=?1))", [source.session.id.as_str()]).map_err(|e| self.database_error(e))?;
-        transaction
-            .execute(
-                "DELETE FROM indexed_sessions WHERE session_id = ?1 OR source_file = ?2",
-                params![source.session.id, source_file],
-            )
-            .map_err(|error| self.database_error(error))?;
+        transaction.execute("DELETE FROM retrieval_documents WHERE event_id IN (SELECT event_id FROM events WHERE session_id=?1)", [source.session.id.as_str()]).map_err(|e| self.database_error(e))?;
+        transaction.execute("DELETE FROM retrieval_runs WHERE answer_event_id IN (SELECT event_id FROM events WHERE session_id=?1)", [source.session.id.as_str()]).map_err(|e| self.database_error(e))?;
+        transaction.execute("DELETE FROM answer_contexts WHERE answer_event_id IN (SELECT event_id FROM events WHERE session_id=?1)", [source.session.id.as_str()]).map_err(|e| self.database_error(e))?;
         transaction
             .execute(
                 "INSERT INTO indexed_sessions
                  (session_id, title, created_at, updated_at, source_file, source_sha256,
                   source_schema_version, indexed_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(session_id) DO UPDATE SET title=excluded.title, updated_at=excluded.updated_at,
+                 source_file=excluded.source_file, source_sha256=excluded.source_sha256,
+                 source_schema_version=excluded.source_schema_version, indexed_at=excluded.indexed_at",
                 params![
                     source.session.id,
                     source.session.title,
@@ -687,6 +720,8 @@ impl RetrievalStore {
             if event.role != EventRole::System && !event.content.trim().is_empty() {
                 for (granularity, span) in document_spans(event) {
                     let text = slice_chars(&event.content, &span)?;
+                    insert_span(transaction, &span, &text)
+                        .map_err(|error| self.database_error(error))?;
                     insert_document(transaction, event, &span, granularity, &text)
                         .map_err(|error| self.database_error(error))?;
                     document_count += 1;
@@ -723,15 +758,25 @@ impl RetrievalStore {
                 .map_err(|e| self.database_error(e))?;
             let mut context_messages = Vec::with_capacity(derived.items.len());
             for (ordinal, item) in derived.items.iter().enumerate() {
-                let event = event_by_id.get(&item.span.event_id).ok_or_else(|| {
-                    RetrievalError::InvalidSource {
-                        path: source.path.clone(),
-                        message: format!(
-                            "回答 {} 引用了不存在的事件 {}",
-                            turn.id, item.span.event_id
-                        ),
-                    }
-                })?;
+                let local = event_by_id.get(&item.span.event_id).copied();
+                let external = if local.is_none() {
+                    transaction.query_row("SELECT event_id, session_id, turn_id, sequence, role, created_at, content, content_sha256, reply_to_event_id, token_count, turn_status, done_reason, error FROM events WHERE event_id=?1", [&item.span.event_id], map_event).optional().map_err(|e| self.database_error(e))?
+                } else {
+                    None
+                };
+                let event =
+                    local
+                        .or(external.as_ref())
+                        .ok_or_else(|| RetrievalError::InvalidSource {
+                            path: source.path.clone(),
+                            message: format!(
+                                "回答 {} 引用了不存在的事件 {}",
+                                turn.id, item.span.event_id
+                            ),
+                        })?;
+                let indexed = transaction.query_row("SELECT session_id, title, created_at, updated_at, source_file, source_sha256, source_schema_version FROM indexed_sessions WHERE session_id=?1", [&event.session_id], map_session).map_err(|e| self.database_error(e))?;
+                self.verify_fresh(&indexed)?;
+                verify_event_hash(event)?;
                 if item.role != event.role {
                     return Err(RetrievalError::InvalidSource {
                         path: source.path.clone(),
@@ -910,6 +955,8 @@ impl RetrievalStore {
                 if event.role != EventRole::System && !event.content.trim().is_empty() {
                     for (granularity, span) in document_spans(event) {
                         let text = slice_chars(&event.content, &span)?;
+                        insert_span(&transaction, &span, &text)
+                            .map_err(|e| self.database_error(e))?;
                         insert_document(&transaction, event, &span, granularity, &text)
                             .map_err(|e| self.database_error(e))?;
                     }
@@ -1290,7 +1337,11 @@ fn insert_event(transaction: &Transaction<'_>, event: &StoredEvent) -> rusqlite:
         "INSERT INTO events
          (event_id, session_id, turn_id, sequence, role, created_at, content, content_sha256,
           reply_to_event_id, token_count, turn_status, done_reason, error)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+         ON CONFLICT(event_id) DO UPDATE SET sequence=excluded.sequence, content=excluded.content,
+         content_sha256=excluded.content_sha256, reply_to_event_id=excluded.reply_to_event_id,
+         token_count=excluded.token_count, turn_status=excluded.turn_status,
+         done_reason=excluded.done_reason, error=excluded.error",
         params![
             event.id,
             event.session_id,
@@ -1868,6 +1919,34 @@ mod tests {
                 .iter()
                 .any(|item| item.kind == EvidenceKind::Core)
         );
+    }
+
+    #[test]
+    fn document_fragments_use_unicode_scalar_240_with_40_overlap() {
+        let make = |len| StoredEvent {
+            id: "evt".into(),
+            session_id: "s".into(),
+            turn_id: Some("t".into()),
+            sequence: 1,
+            role: EventRole::User,
+            created_at: "now".into(),
+            content: "🙂".repeat(len),
+            content_sha256: String::new(),
+            reply_to_event_id: None,
+            token_count: None,
+            turn_status: None,
+            done_reason: None,
+            error: None,
+        };
+        assert_eq!(document_spans(&make(240)).len(), 1);
+        let spans_241 = document_spans(&make(241));
+        assert_eq!(spans_241.len(), 3);
+        assert_eq!(spans_241[1].1.end_char - spans_241[1].1.start_char, 240);
+        assert_eq!(spans_241[2].1.start_char, 200);
+        let spans_440 = document_spans(&make(440));
+        assert_eq!(spans_440.len(), 3);
+        assert_eq!(spans_440[2].1.start_char, 200);
+        assert_eq!(spans_440[2].1.end_char, 440);
     }
 
     #[test]
