@@ -2129,6 +2129,106 @@ mod tests {
     }
 
     #[test]
+    fn migrates_real_v1_index_transactionally_with_wal() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let mut session = store
+            .create(
+                "model",
+                "http://localhost",
+                Some("system"),
+                Default::default(),
+                false,
+            )
+            .unwrap();
+        let answer_id = append_complete_turn(
+            &mut session,
+            &format!("{}杭州唐波", "甲".repeat(241)),
+            "原始回复",
+            "",
+        );
+        store.save(&mut session).unwrap();
+        let expected = store.retrieval().answer_context(&answer_id).unwrap();
+        {
+            let connection = Connection::open(store.retrieval().index_path()).unwrap();
+            connection.execute_batch("DROP TABLE retrieval_documents_fts; DROP TABLE retrieval_documents; DROP TABLE retrieval_runs; PRAGMA user_version=1;").unwrap();
+        }
+        let migrated = RetrievalStore::new(root.path()).unwrap();
+        let replay = migrated.replay_session(&session.id).unwrap();
+        assert!(!replay.is_empty());
+        let connection = Connection::open(migrated.index_path()).unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "wal"
+        );
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert!(
+            connection
+                .query_row("SELECT count(*) FROM retrieval_documents", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap()
+                >= 3
+        );
+        let recall = migrated
+            .keyword_recall("唐波", "current", &[], RetrievalConfig::default())
+            .unwrap();
+        assert!(
+            recall
+                .evidence
+                .iter()
+                .any(|item| item.content.contains("杭州唐波"))
+        );
+        let restored = migrated.answer_context(&answer_id).unwrap();
+        assert_eq!(restored.context_sha256, expected.context_sha256);
+        assert_eq!(
+            restored
+                .items
+                .iter()
+                .map(|item| &item.resolved.content)
+                .collect::<Vec<_>>(),
+            expected
+                .items
+                .iter()
+                .map(|item| &item.resolved.content)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn unknown_index_version_errors_before_v2_ddl() {
+        let root = tempfile::tempdir().unwrap();
+        let index = root.path().join(INDEX_FILENAME);
+        let connection = Connection::open(&index).unwrap();
+        connection
+            .pragma_update(None, "user_version", 99_i64)
+            .unwrap();
+        drop(connection);
+        let store = RetrievalStore::new(root.path()).unwrap();
+        assert!(matches!(
+            store.replay_session("none"),
+            Err(RetrievalError::UnsupportedIndexVersion(99))
+        ));
+        let connection = Connection::open(index).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE name='retrieval_documents'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
     fn only_real_or_legacy_model_requests_create_assistant_events() {
         let mut session = Session::new(
             "session".into(),
