@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import io
+import sys
 from io import StringIO
 from types import SimpleNamespace
 
@@ -167,6 +169,54 @@ def test_budget_reports_answer_and_probe(tmp_path) -> None:
     assert code == 0 and "回答累计： input=100, output=3, total=103" in text
     assert "probe 累计： input=0, output=0, total=0" in text
     assert "最近本轮 probe： input=0, output=0, total=0" in text
+
+
+def test_default_input_replaces_malformed_terminal_bytes(tmp_path, monkeypatch) -> None:
+    raw_input = io.TextIOWrapper(
+        io.BytesIO(b"hello \xff\n/exit\n"), encoding="utf-8", errors="strict"
+    )
+    monkeypatch.setattr(sys, "stdin", raw_input)
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, color_system=None)
+
+    code = main(
+        ["--sessions-dir", str(tmp_path), "new"],
+        console=console,
+        client_factory=FakeClient,
+    )
+
+    session = SessionStore(tmp_path).list_sessions()[0]
+    assert code == 0
+    assert session.turns[0].user_content == "hello �"
+    assert "输入中的无效字节已替换" in output.getvalue()
+
+
+def test_unrecoverable_input_decode_error_reprompts(tmp_path) -> None:
+    answers = iter(
+        [
+            UnicodeDecodeError("utf-8", b"bad \xff", 4, 5, "invalid start byte"),
+            "/exit",
+        ]
+    )
+
+    def input_fn(_):
+        answer = next(answers)
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
+
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, color_system=None)
+    code = main(
+        ["--sessions-dir", str(tmp_path), "new"],
+        input_fn=input_fn,
+        console=console,
+        client_factory=FakeClient,
+    )
+
+    assert code == 0
+    assert SessionStore(tmp_path).list_sessions()[0].turns == []
+    assert "本行未发送，请重新输入" in output.getvalue()
 
 
 def test_limit_end_does_not_stream(tmp_path) -> None:

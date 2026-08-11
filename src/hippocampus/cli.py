@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import builtins
+import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
@@ -35,6 +36,20 @@ def _print_literal(console: Console, value: object, **kwargs: object) -> None:
     """Print dynamic terminal data without treating bracketed text as markup."""
 
     console.print(Text(str(value)), highlight=False, **kwargs)
+
+
+def _configure_standard_input() -> None:
+    """Keep malformed terminal bytes from terminating an interactive session."""
+
+    reconfigure = getattr(sys.stdin, "reconfigure", None)
+    if not callable(reconfigure):
+        return
+    try:
+        reconfigure(errors="replace")
+    except (OSError, ValueError):
+        # Some embedded or already-consumed text streams cannot be reconfigured.
+        # The interactive loop still catches UnicodeDecodeError and can reprompt.
+        pass
 
 
 def _plan_trace_line(session: Session, prepared: PreparedTurn) -> str:
@@ -237,6 +252,9 @@ def _chat(
     while True:
         try:
             value = input_fn("你> ")
+        except UnicodeDecodeError:
+            console.print("输入包含无法按终端编码解析的字节；本行未发送，请重新输入。")
+            continue
         except EOFError:
             store.save(session)
             console.print("收到 EOF，已保存并退出。")
@@ -244,6 +262,8 @@ def _chat(
         except KeyboardInterrupt:
             console.print("已中断；未伪造 token 计数。")
             return 130
+        if "\ufffd" in value:
+            console.print("警告：输入中的无效字节已替换为 �；请检查终端是否使用 UTF-8。")
         command = value.strip()
         if command == "/exit":
             path = store.save(session)
@@ -283,6 +303,9 @@ def _chat(
                 while True:
                     try:
                         answer = input_fn("上下文临界。继续/结束：").strip()
+                    except UnicodeDecodeError:
+                        console.print("输入包含无法按终端编码解析的字节，请重新选择。")
+                        continue
                     except EOFError:
                         engine.resolve_limit(session, prepared, LimitAction.END_SESSION)
                         console.print("收到 EOF，已暂停并保存；消息未发送给模型。")
@@ -358,6 +381,8 @@ def main(
         args = parser.parse_args(argv)
     except SystemExit as exc:
         return int(exc.code)
+    if input_fn is None:
+        _configure_standard_input()
     console = console or Console()
     store = SessionStore(args.sessions_dir)
     try:
