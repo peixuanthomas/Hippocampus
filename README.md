@@ -2,7 +2,7 @@
 
 Hippocampus 是一个完全使用 Rust 实现的本地 Ollama 会话客户端。无参数启动时进入 Ratatui TUI；`serve` 提供本地 Web UI；`ask` 子命令适合脚本和其他程序进行单次调用。
 
-项目保存每轮原始输入、模型正文、thinking、权威 token usage 和上下文裁剪轨迹。thinking 只用于当前轮展示和审计，绝不会重新注入后续模型上下文。旧 Python 版本产生的 `schema_version=1` 会话 JSON 可以直接继续使用。
+项目保存每轮原始输入、模型正文、thinking、权威 token usage 和上下文裁剪轨迹。thinking 只用于当前轮展示和审计，绝不会重新注入后续模型上下文。当前会话格式为 `schema_version=2`；旧 Python 版本产生的 v1 JSON 可以直接读取，并在下一次保存时迁移，无法从旧格式证明的历史溯源会明确标记为 `legacy_inferred`。
 
 ## 构建
 
@@ -86,6 +86,34 @@ cargo build --release
 ./build/hippocampus show 20260811-abcdef12
 ./build/hippocampus show 20260811-abcdef12 --json
 ```
+
+## 事件检索与溯源 API
+
+会话 JSON 始终是唯一事实来源。每次 JSON 原子保存成功后，`SessionStore` 会同步更新同目录下的 `.hippocampus-index.sqlite3`；该 SQLite 文件只是一层可删除、可重建的派生索引。
+
+Rust 调用方可以通过 `SessionStore::retrieval()` 获取 `RetrievalStore`：
+
+```rust,no_run
+let store = hippocampus::SessionStore::new("sessions")?;
+let retrieval = store.retrieval();
+
+let events = retrieval.replay_session("20260811-abcdef12")?;
+let event = retrieval.get_event(&events[1].id)?;
+let fragment = retrieval.resolve_span(&hippocampus::SourceSpan {
+    event_id: event.id.clone(),
+    start_char: 0,
+    end_char: event.content.chars().count(),
+})?;
+let trace = retrieval.answer_context(&events.last().unwrap().id)?;
+
+// SQLite 被删除、清空或修改后，从全部会话 JSON 重建。
+retrieval.rebuild()?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+事件 ID 与内容无关并可确定性重建；原文片段使用从 0 开始、右开区间的 Unicode 字符偏移。thinking 不进入检索事件。assistant 的 `token_count` 只在最终模型 usage 可证明时记录权威生成数，user 与 system 保持未知。所有读取都会核对原始 JSON 的 SHA-256，源文件变化时拒绝返回过期结果。
+
+如果 JSON 已经安全落盘、但 SQLite 同步失败，保存会返回 `IndexSyncAfterSourceCommit`。此时原始会话没有丢失，可重试保存或调用 `RetrievalStore::rebuild()` 恢复派生层。
 
 默认上下文窗口为 32768，输出预留 4096，安全余量 512，输入预算因此为 28160。80% 起执行精确 probe，90% 起要求裁剪决策。流中的 logprob 数只用于实时显示；最终 `prompt_eval_count` 和 `eval_count` 才是权威值。没有收到最终事件时，未知计数保持为 `null`，不会用 probe 或估算值冒充。
 

@@ -1,4 +1,7 @@
-use crate::model::{ChatMessage, ContextPlan, Session};
+use crate::model::{
+    ChatMessage, ContextItemTrace, ContextPlan, EventRole, Session, SourceSpan, content_sha256,
+    context_sha256, event_id,
+};
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ContextAssembler;
@@ -26,27 +29,47 @@ impl ContextAssembler {
         );
 
         let mut messages = Vec::new();
+        let mut context_items = Vec::new();
         if !session.system_prompt.is_empty() {
-            messages.push(ChatMessage {
-                role: "system".to_owned(),
-                content: session.system_prompt.clone(),
-            });
+            push_message(
+                &mut messages,
+                &mut context_items,
+                &session.id,
+                None,
+                EventRole::System,
+                &session.system_prompt,
+            );
         }
         for index in &selected_indices {
             let turn = &session.turns[*index];
-            messages.push(ChatMessage {
-                role: "user".to_owned(),
-                content: turn.user_content.clone(),
-            });
-            messages.push(ChatMessage {
-                role: "assistant".to_owned(),
-                content: turn.assistant_content.clone(),
-            });
+            push_message(
+                &mut messages,
+                &mut context_items,
+                &session.id,
+                Some(&turn.id),
+                EventRole::User,
+                &turn.user_content,
+            );
+            push_message(
+                &mut messages,
+                &mut context_items,
+                &session.id,
+                Some(&turn.id),
+                EventRole::Assistant,
+                &turn.assistant_content,
+            );
         }
-        messages.push(ChatMessage {
-            role: "user".to_owned(),
-            content: current_user.to_owned(),
-        });
+        let current_turn_id = current_turn_index
+            .and_then(|index| session.turns.get(index))
+            .map_or("__transient_current__", |turn| turn.id.as_str());
+        push_message(
+            &mut messages,
+            &mut context_items,
+            &session.id,
+            Some(current_turn_id),
+            EventRole::User,
+            current_user,
+        );
 
         let included_turn_ids = selected_indices
             .iter()
@@ -60,8 +83,11 @@ impl ContextAssembler {
             .collect::<Vec<_>>();
         let estimated_upper_tokens = Some(Self::estimate_upper_bound(&messages));
 
+        let context_sha256 = context_sha256(&messages);
         ContextPlan {
             messages,
+            context_items,
+            context_sha256,
             included_turn_ids,
             omitted_turn_ids,
             selected_history_indices: selected_indices,
@@ -88,6 +114,30 @@ impl ContextAssembler {
     }
 }
 
+fn push_message(
+    messages: &mut Vec<ChatMessage>,
+    context_items: &mut Vec<ContextItemTrace>,
+    session_id: &str,
+    turn_id: Option<&str>,
+    role: EventRole,
+    content: &str,
+) {
+    let event_id = event_id(session_id, turn_id, role);
+    context_items.push(ContextItemTrace {
+        role,
+        span: SourceSpan {
+            event_id,
+            start_char: 0,
+            end_char: content.chars().count(),
+        },
+        content_sha256: content_sha256(content),
+    });
+    messages.push(ChatMessage {
+        role: role.as_str().to_owned(),
+        content: content.to_owned(),
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -106,6 +156,7 @@ mod tests {
             usage: TokenUsage::zero(),
             probe_usage: TokenUsage::zero(),
             context_trace: Default::default(),
+            request_started_at: Some(utc_now()),
             done_reason: None,
             error: None,
         }
@@ -132,5 +183,19 @@ mod tests {
         assert_eq!(plan.included_turn_ids, vec![session.turns[1].id.clone()]);
         assert!(!format!("{:?}", plan.messages).contains("secret"));
         assert_eq!(plan.messages.last().unwrap().content, "current");
+        assert_eq!(plan.context_items.len(), plan.messages.len());
+        assert!(
+            plan.context_items
+                .iter()
+                .all(|item| item.role != EventRole::Assistant
+                    || item.content_sha256 != content_sha256("new-secret"))
+        );
+        for (message, item) in plan.messages.iter().zip(&plan.context_items) {
+            assert_eq!(item.role.as_str(), message.role);
+            assert_eq!(item.span.start_char, 0);
+            assert_eq!(item.span.end_char, message.content.chars().count());
+            assert_eq!(item.content_sha256, content_sha256(&message.content));
+        }
+        assert_eq!(plan.context_sha256, context_sha256(&plan.messages));
     }
 }

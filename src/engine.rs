@@ -5,8 +5,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::context::ContextAssembler;
 use crate::model::{
-    ChatEvent, ChatEventKind, ContextPlan, ContextTrace, Session, SessionStatus, TokenUsage, Turn,
-    TurnStatus,
+    ChatEvent, ChatEventKind, ContextPlan, ContextTrace, ModelRequestTrace, ProvenanceQuality,
+    Session, SessionStatus, TokenUsage, Turn, TurnStatus, utc_now,
 };
 use crate::ollama::{ChatBackend, ChatRequest, OllamaError};
 use crate::store::SessionStore;
@@ -150,7 +150,8 @@ impl<B: ChatBackend> ChatEngine<B> {
                 return self.block_mandatory(session, turn_index, mandatory, start_before);
             }
             apply_trace(
-                &mut session.turns[turn_index],
+                session,
+                turn_index,
                 &plan,
                 "limit_warning",
                 start_before,
@@ -168,7 +169,8 @@ impl<B: ChatBackend> ChatEngine<B> {
         }
 
         apply_trace(
-            &mut session.turns[turn_index],
+            session,
+            turn_index,
             &plan,
             "ready",
             start_before,
@@ -226,17 +228,18 @@ impl<B: ChatBackend> ChatEngine<B> {
             return self.block_mandatory(session, prepared.turn_index, mandatory, start_before);
         }
         if mandatory_tokens > session.budget.trim_target() {
-            let turn = &mut session.turns[prepared.turn_index];
-            turn.status = TurnStatus::Blocked;
-            turn.error =
-                Some("系统提示与当前输入超过 80% 安全裁剪目标，请缩短系统提示或当前输入".into());
             apply_trace(
-                turn,
+                session,
+                prepared.turn_index,
                 &mandatory,
                 "mandatory_above_trim_target",
                 start_before,
                 start_before,
             );
+            let turn = &mut session.turns[prepared.turn_index];
+            turn.status = TurnStatus::Blocked;
+            turn.error =
+                Some("系统提示与当前输入超过 80% 安全裁剪目标，请缩短系统提示或当前输入".into());
             turn.touch();
             session.status = SessionStatus::Paused;
             self.store.save(session)?;
@@ -294,7 +297,8 @@ impl<B: ChatBackend> ChatEngine<B> {
         session.active_context_start_index = new_start;
         session.status = SessionStatus::Active;
         apply_trace(
-            &mut session.turns[prepared.turn_index],
+            session,
+            prepared.turn_index,
             &selected_plan,
             "trimmed_and_continued",
             start_before,
@@ -337,6 +341,10 @@ impl<B: ChatBackend> ChatEngine<B> {
             num_ctx: session.budget.context_window,
             num_predict: session.budget.max_output_tokens,
         };
+        let turn = &mut session.turns[prepared.turn_index];
+        turn.request_started_at = Some(utc_now());
+        turn.touch();
+        self.store.save(session)?;
         let result = self
             .client
             .stream_chat(request, cancellation, &mut |event| {
@@ -502,16 +510,17 @@ impl<B: ChatBackend> ChatEngine<B> {
         start_before: usize,
     ) -> Result<PreparedTurn> {
         let message = "系统提示与当前输入本身已超过输入预算；请缩短输入或提高上下文配置";
-        let turn = &mut session.turns[turn_index];
-        turn.status = TurnStatus::Blocked;
-        turn.error = Some(message.into());
         apply_trace(
-            turn,
+            session,
+            turn_index,
             &plan,
             "mandatory_input_exceeded",
             start_before,
             start_before,
         );
+        let turn = &mut session.turns[turn_index];
+        turn.status = TurnStatus::Blocked;
+        turn.error = Some(message.into());
         turn.touch();
         session.status = SessionStatus::Paused;
         self.store.save(session)?;
@@ -619,12 +628,20 @@ fn plan_metric(plan: &ContextPlan) -> Result<u64> {
 }
 
 fn apply_trace(
-    turn: &mut Turn,
+    session: &mut Session,
+    turn_index: usize,
     plan: &ContextPlan,
     decision: &str,
     start_before: usize,
     start_after: usize,
 ) {
+    let request = ModelRequestTrace {
+        model: session.model.clone(),
+        think: session.think,
+        context_window: session.budget.context_window,
+        max_output_tokens: session.budget.max_output_tokens,
+    };
+    let turn = &mut session.turns[turn_index];
     turn.context_trace = ContextTrace {
         included_turn_ids: plan.included_turn_ids.clone(),
         omitted_turn_ids: plan.omitted_turn_ids.clone(),
@@ -634,11 +651,16 @@ fn apply_trace(
         decision: decision.to_owned(),
         active_context_start_before: start_before,
         active_context_start_after: start_after,
+        context_items: plan.context_items.clone(),
+        context_sha256: Some(plan.context_sha256.clone()),
+        request: Some(request),
+        provenance_quality: ProvenanceQuality::Exact,
     };
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
@@ -655,6 +677,7 @@ mod tests {
         probes: Arc<Mutex<usize>>,
         events: Vec<ChatEvent>,
         stream_error: Option<OllamaError>,
+        observe_source: Option<(PathBuf, Arc<Mutex<bool>>)>,
     }
 
     impl FakeClient {
@@ -676,6 +699,7 @@ mod tests {
                     },
                 ],
                 stream_error: None,
+                observe_source: None,
             }
         }
 
@@ -731,6 +755,14 @@ mod tests {
             _: CancellationToken,
             emit: &mut (dyn FnMut(ChatEvent) + Send),
         ) -> Result<(), OllamaError> {
+            if let Some((path, observed)) = &self.observe_source {
+                let raw = std::fs::read(path).unwrap();
+                let persisted: Session = serde_json::from_slice(&raw).unwrap();
+                *observed.lock().unwrap() = persisted
+                    .turns
+                    .last()
+                    .is_some_and(|turn| turn.request_started_at.is_some());
+            }
             for event in &self.events {
                 emit(event.clone());
             }
@@ -771,8 +803,52 @@ mod tests {
         assert_eq!(session.turns[0].status, TurnStatus::Complete);
         assert_eq!(session.turns[0].thinking, "reason");
         assert_eq!(session.turns[0].usage.total_tokens, Some(103));
+        let answer_id = crate::model::event_id(
+            &session.id,
+            Some(&session.turns[0].id),
+            crate::model::EventRole::Assistant,
+        );
+        let trace = engine
+            .store()
+            .retrieval()
+            .answer_context(&answer_id)
+            .unwrap();
+        assert_eq!(trace.provenance_quality, ProvenanceQuality::Exact);
+        assert_eq!(
+            trace
+                .items
+                .iter()
+                .map(|item| item.resolved.content.as_str())
+                .collect::<Vec<_>>(),
+            vec![session.system_prompt.as_str(), "hello"]
+        );
         let next = ContextAssembler.assemble(&session, "next", None, None);
         assert!(!format!("{:?}", next.messages).contains("reason"));
+    }
+
+    #[tokio::test]
+    async fn request_start_is_durable_before_backend_stream_begins() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let mut session = store
+            .create("model", "http://localhost", None, budget(), true)
+            .unwrap();
+        let observed = Arc::new(Mutex::new(false));
+        let mut client = FakeClient::new(100);
+        client.observe_source = Some((
+            root.path().join(format!("{}.json", session.id)),
+            observed.clone(),
+        ));
+        let engine = ChatEngine::new(store, client);
+        let prepared = engine
+            .prepare_turn(&mut session, "hello".into())
+            .await
+            .unwrap();
+        engine
+            .stream_turn(&mut session, &prepared, CancellationToken::new(), |_| {})
+            .await
+            .unwrap();
+        assert!(*observed.lock().unwrap());
     }
 
     #[tokio::test]
@@ -795,6 +871,15 @@ mod tests {
         assert_eq!(ended.status, PreparationStatus::Ended);
         assert_eq!(session.status, SessionStatus::Paused);
         assert_eq!(session.turns[0].status, TurnStatus::Blocked);
+        let answer_id = crate::model::event_id(
+            &session.id,
+            Some(&session.turns[0].id),
+            crate::model::EventRole::Assistant,
+        );
+        assert!(matches!(
+            engine.store().retrieval().get_event(&answer_id),
+            Err(crate::retrieval::RetrievalError::EventNotFound(_))
+        ));
     }
 
     #[tokio::test]

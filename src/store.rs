@@ -4,13 +4,28 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
+use thiserror::Error;
 use uuid::Uuid;
 
-use crate::model::{BudgetConfig, DEFAULT_SYSTEM_PROMPT, Session, SessionStatus};
+use crate::model::{
+    BudgetConfig, DEFAULT_SYSTEM_PROMPT, SCHEMA_VERSION, Session, SessionStatus, TurnStatus,
+};
+use crate::retrieval::{RetrievalError, RetrievalStore};
+
+#[derive(Debug, Error)]
+#[error(
+    "原始会话已安全保存到 {source_path}，但派生索引同步失败；请重试保存或调用 RetrievalStore::rebuild: {source}"
+)]
+pub struct IndexSyncAfterSourceCommit {
+    pub source_path: PathBuf,
+    #[source]
+    pub source: RetrievalError,
+}
 
 #[derive(Debug, Clone)]
 pub struct SessionStore {
     root: PathBuf,
+    retrieval: RetrievalStore,
 }
 
 impl SessionStore {
@@ -22,11 +37,16 @@ impl SessionStore {
         } else {
             std::env::current_dir()?.join(path)
         };
-        Ok(Self { root })
+        let retrieval = RetrievalStore::new(&root)?;
+        Ok(Self { root, retrieval })
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub fn retrieval(&self) -> &RetrievalStore {
+        &self.retrieval
     }
 
     pub fn create(
@@ -56,12 +76,18 @@ impl SessionStore {
 
     pub fn save(&self, session: &mut Session) -> Result<PathBuf> {
         validate_identifier(&session.id)?;
+        session.normalize_legacy_provenance();
         session.validate()?;
-        session.touch();
-        session.refresh_cumulative_usage();
         fs::create_dir_all(&self.root)
             .with_context(|| format!("无法创建会话目录 {}", self.root.display()))?;
         let target = self.root.join(format!("{}.json", session.id));
+        if target.is_file() {
+            let previous = load_session_snapshot(&target)?;
+            validate_append_only(&previous, session)?;
+        }
+        session.schema_version = SCHEMA_VERSION;
+        session.touch();
+        session.refresh_cumulative_usage();
         let temporary = self
             .root
             .join(format!(".{}.{}.tmp", session.id, Uuid::new_v4().simple()));
@@ -82,6 +108,12 @@ impl SessionStore {
             let _ = fs::remove_file(&temporary);
         }
         result.with_context(|| format!("无法原子保存会话 {}", target.display()))?;
+        self.retrieval
+            .sync_session(session, &target)
+            .map_err(|source| IndexSyncAfterSourceCommit {
+                source_path: target.clone(),
+                source,
+            })?;
         Ok(target)
     }
 
@@ -91,6 +123,7 @@ impl SessionStore {
             fs::read(&path).with_context(|| format!("无法读取会话文件 {}", path.display()))?;
         let mut session: Session = serde_json::from_slice(&raw)
             .map_err(|error| anyhow!("会话文件损坏或格式不受支持: {}: {error}", path.display()))?;
+        session.normalize_legacy_provenance();
         session
             .validate()
             .map_err(|error| anyhow!("会话文件损坏或格式不受支持: {}: {error}", path.display()))?;
@@ -156,6 +189,60 @@ impl SessionStore {
     }
 }
 
+fn load_session_snapshot(path: &Path) -> Result<Session> {
+    let raw = fs::read(path).with_context(|| format!("无法读取已有会话文件 {}", path.display()))?;
+    let session: Session = serde_json::from_slice(&raw)
+        .map_err(|error| anyhow!("已有会话文件损坏，拒绝覆盖: {}: {error}", path.display()))?;
+    session
+        .validate()
+        .map_err(|error| anyhow!("已有会话文件无效，拒绝覆盖: {}: {error}", path.display()))?;
+    Ok(session)
+}
+
+fn validate_append_only(previous: &Session, next: &Session) -> Result<()> {
+    if previous.id != next.id || previous.created_at != next.created_at {
+        bail!("会话 ID 与创建时间不可修改");
+    }
+    if previous.system_prompt != next.system_prompt {
+        bail!("已保存的 system prompt 属于原始事件，不可修改");
+    }
+    if next.turns.len() < previous.turns.len() {
+        bail!("已保存的轮次不可删除");
+    }
+    for (index, (old, new)) in previous.turns.iter().zip(&next.turns).enumerate() {
+        if old.id != new.id {
+            bail!("第 {} 个已保存轮次的 ID 或顺序不可修改", index + 1);
+        }
+        if old.created_at != new.created_at {
+            bail!("轮次 {} 的创建时间不可修改", old.id);
+        }
+        if old.user_content != new.user_content {
+            bail!("轮次 {} 的用户原文不可修改", old.id);
+        }
+        if let Some(started_at) = &old.request_started_at
+            && new.request_started_at.as_ref() != Some(started_at)
+        {
+            bail!("轮次 {} 的模型请求开始时间不可修改", old.id);
+        }
+        if old.status != TurnStatus::Pending {
+            if old.status != new.status {
+                bail!("终态轮次 {} 的状态不可修改", old.id);
+            }
+            if old.assistant_content != new.assistant_content || old.thinking != new.thinking {
+                bail!("终态轮次 {} 的模型原文不可修改", old.id);
+            }
+            if old.request_started_at != new.request_started_at {
+                bail!("终态轮次 {} 的模型请求来源不可修改", old.id);
+            }
+        } else if (!new.assistant_content.is_empty() || !new.thinking.is_empty())
+            && new.request_started_at.is_none()
+        {
+            bail!("轮次 {} 尚未记录模型请求，不能写入模型原文", old.id);
+        }
+    }
+    Ok(())
+}
+
 fn expand_tilde(path: &Path) -> PathBuf {
     let Some(value) = path.to_str() else {
         return path.to_path_buf();
@@ -198,7 +285,7 @@ fn sync_directory(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ContextTrace, TokenUsage, Turn, TurnStatus, utc_now};
+    use crate::model::{ContextTrace, ProvenanceQuality, TokenUsage, Turn, TurnStatus, utc_now};
 
     #[test]
     fn round_trip_legacy_schema_and_atomic_file() {
@@ -217,14 +304,18 @@ mod tests {
         session.turns.push(Turn {
             id: "turn".into(),
             created_at: now.clone(),
-            updated_at: now,
+            updated_at: now.clone(),
             status: TurnStatus::Complete,
             user_content: "hello".into(),
             assistant_content: "world".into(),
             thinking: "private".into(),
             usage: TokenUsage::new(Some(12), Some(4)),
             probe_usage: TokenUsage::new(Some(12), Some(1)),
-            context_trace: ContextTrace::default(),
+            context_trace: ContextTrace {
+                provenance_quality: ProvenanceQuality::LegacyInferred,
+                ..ContextTrace::default()
+            },
+            request_started_at: Some(now.clone()),
             done_reason: Some("stop".into()),
             error: None,
         });
@@ -304,7 +395,15 @@ mod tests {
         assert_eq!(session.turns[0].thinking, "不会回注");
         assert_eq!(session.cumulative_usage.total_tokens, Some(16));
         store.save(&mut session).unwrap();
-        assert!(store.load(&session.id).is_ok());
+        let migrated = store.load(&session.id).unwrap();
+        assert_eq!(migrated.schema_version, SCHEMA_VERSION);
+        let answer_id = crate::model::event_id(
+            &session.id,
+            Some("turn-1"),
+            crate::model::EventRole::Assistant,
+        );
+        let trace = store.retrieval().answer_context(&answer_id).unwrap();
+        assert_eq!(trace.provenance_quality, ProvenanceQuality::LegacyInferred);
     }
 
     #[test]
@@ -313,5 +412,82 @@ mod tests {
         let store = SessionStore::new(root.path()).unwrap();
         assert!(store.resolve("../secret").is_err());
         assert!(store.resolve("/absolute").is_err());
+    }
+
+    #[test]
+    fn persisted_events_are_logically_append_only() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let mut session = store
+            .create(
+                "model",
+                "http://localhost",
+                Some("system"),
+                BudgetConfig::default(),
+                true,
+            )
+            .unwrap();
+        session.turns.push(Turn::pending("原始用户文本".into()));
+        store.save(&mut session).unwrap();
+
+        session.system_prompt = "changed".into();
+        assert!(store.save(&mut session).is_err());
+        session = store.load(&session.id).unwrap();
+        session.turns[0].user_content = "changed".into();
+        assert!(store.save(&mut session).is_err());
+
+        session = store.load(&session.id).unwrap();
+        session.turns[0].context_trace.provenance_quality = ProvenanceQuality::LegacyInferred;
+        session.turns[0].request_started_at = Some(utc_now());
+        session.turns[0].assistant_content = "终态回复".into();
+        session.turns[0].thinking = "审计 thinking".into();
+        session.turns[0].usage = TokenUsage::new(Some(10), Some(4));
+        session.turns[0].status = TurnStatus::Complete;
+        store.save(&mut session).unwrap();
+
+        let mut modified = store.load(&session.id).unwrap();
+        modified.turns[0].assistant_content = "rewritten".into();
+        assert!(store.save(&mut modified).is_err());
+
+        let mut deleted = store.load(&session.id).unwrap();
+        deleted.turns.clear();
+        assert!(store.save(&mut deleted).is_err());
+
+        let mut reordered = store.load(&session.id).unwrap();
+        reordered.turns.push(Turn::pending("第二问".into()));
+        store.save(&mut reordered).unwrap();
+        reordered.turns.swap(0, 1);
+        assert!(store.save(&mut reordered).is_err());
+    }
+
+    #[test]
+    fn index_sync_failure_reports_that_source_was_committed() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let mut session = store
+            .create(
+                "model",
+                "http://localhost",
+                None,
+                BudgetConfig::default(),
+                false,
+            )
+            .unwrap();
+        let connection = rusqlite::Connection::open(store.retrieval().index_path()).unwrap();
+        connection
+            .pragma_update(None, "user_version", 99_i64)
+            .unwrap();
+        drop(connection);
+
+        session.title = "source committed".into();
+        let error = store.save(&mut session).unwrap_err();
+        assert!(error.downcast_ref::<IndexSyncAfterSourceCommit>().is_some());
+        assert!(error.to_string().contains("原始会话已安全保存"));
+        assert_eq!(store.load(&session.id).unwrap().title, "source committed");
+        store.retrieval().rebuild().unwrap();
+        assert_eq!(
+            store.retrieval().get_session(&session.id).unwrap().title,
+            "source committed"
+        );
     }
 }

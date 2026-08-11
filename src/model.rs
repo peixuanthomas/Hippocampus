@@ -1,10 +1,15 @@
+use std::collections::HashSet;
+
 use anyhow::{Result, bail};
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-pub const SCHEMA_VERSION: u32 = 1;
-pub const DEFAULT_SYSTEM_PROMPT: &str = "你是一个有帮助、诚实且简洁的 AI 助手。";
+pub const SCHEMA_VERSION: u32 = 2;
+pub const LEGACY_SCHEMA_VERSION: u32 = 1;
+pub const DEFAULT_SYSTEM_PROMPT: &str =
+    "你是一个乐于助人的AI助手，你的任务是解决用户的问题或者与用户对话。";
 
 pub fn utc_now() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::AutoSi, false)
@@ -134,6 +139,57 @@ impl TurnStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProvenanceQuality {
+    Exact,
+    LegacyInferred,
+}
+
+fn legacy_inferred() -> ProvenanceQuality {
+    ProvenanceQuality::LegacyInferred
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EventRole {
+    System,
+    User,
+    Assistant,
+}
+
+impl EventRole {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::User => "user",
+            Self::Assistant => "assistant",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SourceSpan {
+    pub event_id: String,
+    pub start_char: usize,
+    pub end_char: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContextItemTrace {
+    pub role: EventRole,
+    pub span: SourceSpan,
+    pub content_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelRequestTrace {
+    pub model: String,
+    pub think: bool,
+    pub context_window: u64,
+    pub max_output_tokens: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ContextTrace {
     #[serde(default)]
@@ -150,6 +206,14 @@ pub struct ContextTrace {
     pub active_context_start_before: usize,
     #[serde(default)]
     pub active_context_start_after: usize,
+    #[serde(default)]
+    pub context_items: Vec<ContextItemTrace>,
+    #[serde(default)]
+    pub context_sha256: Option<String>,
+    #[serde(default)]
+    pub request: Option<ModelRequestTrace>,
+    #[serde(default = "legacy_inferred")]
+    pub provenance_quality: ProvenanceQuality,
 }
 
 fn default_decision() -> String {
@@ -167,6 +231,10 @@ impl Default for ContextTrace {
             decision: default_decision(),
             active_context_start_before: 0,
             active_context_start_after: 0,
+            context_items: Vec::new(),
+            context_sha256: None,
+            request: None,
+            provenance_quality: ProvenanceQuality::Exact,
         }
     }
 }
@@ -189,6 +257,8 @@ pub struct Turn {
     pub probe_usage: TokenUsage,
     #[serde(default)]
     pub context_trace: ContextTrace,
+    #[serde(default)]
+    pub request_started_at: Option<String>,
     pub done_reason: Option<String>,
     pub error: Option<String>,
 }
@@ -207,6 +277,7 @@ impl Turn {
             usage: TokenUsage::default(),
             probe_usage: TokenUsage::zero(),
             context_trace: ContextTrace::default(),
+            request_started_at: None,
             done_reason: None,
             error: None,
         }
@@ -295,7 +366,7 @@ impl Session {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.schema_version != SCHEMA_VERSION {
+        if !matches!(self.schema_version, LEGACY_SCHEMA_VERSION | SCHEMA_VERSION) {
             bail!("不支持的会话 schema 版本：{}", self.schema_version);
         }
         if self.id.is_empty() {
@@ -307,11 +378,33 @@ impl Session {
         if self.active_context_start_index > self.turns.len() {
             bail!("active_context_start_index 超出轮次数量");
         }
+        let mut turn_ids = HashSet::new();
+        if self.turns.iter().any(|turn| !turn_ids.insert(&turn.id)) {
+            bail!("会话包含重复的轮次 ID");
+        }
+        for turn in &self.turns {
+            if turn.request_started_at.is_some()
+                && turn.context_trace.provenance_quality == ProvenanceQuality::Exact
+                && (turn.context_trace.context_items.is_empty()
+                    || turn.context_trace.context_sha256.is_none()
+                    || turn.context_trace.request.is_none())
+            {
+                bail!("轮次 {} 缺少精确回答上下文溯源", turn.id);
+            }
+        }
         self.budget.validate()
     }
 
     pub fn touch(&mut self) {
         self.updated_at = utc_now();
+    }
+
+    pub fn normalize_legacy_provenance(&mut self) {
+        if self.schema_version == LEGACY_SCHEMA_VERSION {
+            for turn in &mut self.turns {
+                turn.context_trace.provenance_quality = ProvenanceQuality::LegacyInferred;
+            }
+        }
     }
 
     pub fn eligible_turns(
@@ -361,12 +454,42 @@ pub struct ChatMessage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextPlan {
     pub messages: Vec<ChatMessage>,
+    pub context_items: Vec<ContextItemTrace>,
+    pub context_sha256: String,
     pub included_turn_ids: Vec<String>,
     pub omitted_turn_ids: Vec<String>,
     pub selected_history_indices: Vec<usize>,
     pub estimated_upper_tokens: Option<u64>,
     pub exact_input_tokens: Option<u64>,
     pub input_budget: u64,
+}
+
+pub fn content_sha256(content: &str) -> String {
+    format!("{:x}", Sha256::digest(content.as_bytes()))
+}
+
+pub fn event_id(session_id: &str, turn_id: Option<&str>, role: EventRole) -> String {
+    let mut hasher = Sha256::new();
+    hash_part(&mut hasher, b"hippocampus:event:v1");
+    hash_part(&mut hasher, session_id.as_bytes());
+    hash_part(&mut hasher, turn_id.unwrap_or("__system__").as_bytes());
+    hash_part(&mut hasher, role.as_str().as_bytes());
+    format!("evt_{:x}", hasher.finalize())
+}
+
+pub fn context_sha256(messages: &[ChatMessage]) -> String {
+    let mut hasher = Sha256::new();
+    hash_part(&mut hasher, b"hippocampus:context:v1");
+    for message in messages {
+        hash_part(&mut hasher, message.role.as_bytes());
+        hash_part(&mut hasher, message.content.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn hash_part(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value);
 }
 
 impl ContextPlan {
@@ -422,5 +545,18 @@ mod tests {
     fn unknown_usage_stays_unknown() {
         let usage = TokenUsage::new(None, Some(4));
         assert_eq!(usage.total_tokens, None);
+    }
+
+    #[test]
+    fn event_ids_are_stable_and_content_independent() {
+        let first = event_id("session", Some("turn"), EventRole::User);
+        let second = event_id("session", Some("turn"), EventRole::User);
+        assert_eq!(first, second);
+        assert_ne!(
+            first,
+            event_id("session", Some("turn"), EventRole::Assistant)
+        );
+        assert_ne!(first, event_id("other", Some("turn"), EventRole::User));
+        assert_eq!(first.len(), 68);
     }
 }

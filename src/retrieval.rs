@@ -1,0 +1,1494 @@
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
+
+use chrono::Utc;
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use thiserror::Error;
+
+use crate::model::{
+    ChatMessage, ContextItemTrace, EventRole, ModelRequestTrace, ProvenanceQuality, SCHEMA_VERSION,
+    Session, SourceSpan, Turn, TurnStatus, content_sha256, context_sha256, event_id,
+};
+
+pub const INDEX_FILENAME: &str = ".hippocampus-index.sqlite3";
+const INDEX_SCHEMA_VERSION: i64 = 1;
+
+#[derive(Debug, Error)]
+pub enum RetrievalError {
+    #[error("无法访问派生索引 {path}: {source}")]
+    Database {
+        path: PathBuf,
+        #[source]
+        source: rusqlite::Error,
+    },
+    #[error("无法访问原始会话文件 {path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("原始会话文件无效 {path}: {message}")]
+    InvalidSource { path: PathBuf, message: String },
+    #[error("派生索引版本不受支持：{0}")]
+    UnsupportedIndexVersion(i64),
+    #[error("索引中找不到会话 {0}")]
+    SessionNotFound(String),
+    #[error("索引中找不到事件 {0}")]
+    EventNotFound(String),
+    #[error("索引中找不到回答上下文 {0}")]
+    AnswerContextNotFound(String),
+    #[error("会话 {session_id} 的派生索引已过期或原文件缺失，请重新同步或重建")]
+    StaleIndex { session_id: String },
+    #[error(
+        "原文片段范围无效：事件 {event_id} 共有 {char_count} 个字符，请求 [{start_char}..{end_char}]"
+    )]
+    InvalidSpan {
+        event_id: String,
+        start_char: usize,
+        end_char: usize,
+        char_count: usize,
+    },
+    #[error("派生索引内容校验失败：{0}")]
+    CorruptIndex(String),
+}
+
+pub type RetrievalResult<T> = std::result::Result<T, RetrievalError>;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IndexedSession {
+    pub id: String,
+    pub title: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub source_file: String,
+    pub source_sha256: String,
+    pub source_schema_version: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StoredEvent {
+    pub id: String,
+    pub session_id: String,
+    pub turn_id: Option<String>,
+    pub sequence: usize,
+    pub role: EventRole,
+    pub created_at: String,
+    pub content: String,
+    pub content_sha256: String,
+    pub reply_to_event_id: Option<String>,
+    pub token_count: Option<u64>,
+    pub turn_status: Option<TurnStatus>,
+    pub done_reason: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResolvedSpan {
+    pub span: SourceSpan,
+    pub content: String,
+    pub content_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AnswerContextItem {
+    pub ordinal: usize,
+    pub role: EventRole,
+    pub resolved: ResolvedSpan,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AnswerContext {
+    pub answer_event_id: String,
+    pub turn_id: String,
+    pub context_sha256: String,
+    pub estimated_upper_tokens: Option<u64>,
+    pub exact_input_tokens: Option<u64>,
+    pub input_budget: u64,
+    pub decision: String,
+    pub provenance_quality: ProvenanceQuality,
+    pub request: Option<ModelRequestTrace>,
+    pub items: Vec<AnswerContextItem>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncReport {
+    pub sessions: usize,
+    pub events: usize,
+    pub spans: usize,
+    pub answer_contexts: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct RetrievalStore {
+    root: PathBuf,
+    index_path: PathBuf,
+}
+
+impl RetrievalStore {
+    pub fn new(root: impl AsRef<Path>) -> RetrievalResult<Self> {
+        let path = root.as_ref();
+        let root = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map_err(|source| RetrievalError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                })?
+                .join(path)
+        };
+        Ok(Self {
+            index_path: root.join(INDEX_FILENAME),
+            root,
+        })
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn index_path(&self) -> &Path {
+        &self.index_path
+    }
+
+    pub fn sync_session(
+        &self,
+        expected_session: &Session,
+        source_path: &Path,
+    ) -> RetrievalResult<SyncReport> {
+        let source = self.read_source(source_path)?;
+        if source.session.id != expected_session.id {
+            return Err(RetrievalError::InvalidSource {
+                path: source_path.to_path_buf(),
+                message: format!(
+                    "落盘会话 ID {} 与待同步会话 ID {} 不一致",
+                    source.session.id, expected_session.id
+                ),
+            });
+        }
+        let mut connection = self.open_connection()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|source| self.database_error(source))?;
+        let report = self.write_session(&transaction, &source)?;
+        transaction
+            .commit()
+            .map_err(|source| self.database_error(source))?;
+        Ok(report)
+    }
+
+    pub fn rebuild(&self) -> RetrievalResult<SyncReport> {
+        let sources = self.load_all_sources()?;
+        let mut connection = match self.open_connection() {
+            Ok(connection) => connection,
+            Err(RetrievalError::UnsupportedIndexVersion(_)) => {
+                self.remove_index_files()?;
+                self.open_connection()?
+            }
+            Err(error) => return Err(error),
+        };
+        let transaction = connection
+            .transaction()
+            .map_err(|source| self.database_error(source))?;
+        transaction
+            .execute_batch(
+                "DELETE FROM answer_context_items;
+                 DELETE FROM answer_contexts;
+                 DELETE FROM source_spans;
+                 DELETE FROM events;
+                 DELETE FROM indexed_sessions;",
+            )
+            .map_err(|source| self.database_error(source))?;
+        let mut total = SyncReport::default();
+        for source in &sources {
+            add_report(&mut total, self.write_session(&transaction, source)?);
+        }
+        transaction
+            .commit()
+            .map_err(|source| self.database_error(source))?;
+        Ok(total)
+    }
+
+    pub fn get_session(&self, session_id: &str) -> RetrievalResult<IndexedSession> {
+        let connection = self.open_connection()?;
+        let session = connection
+            .query_row(
+                "SELECT session_id, title, created_at, updated_at, source_file, source_sha256, source_schema_version
+                 FROM indexed_sessions WHERE session_id = ?1",
+                [session_id],
+                map_session,
+            )
+            .optional()
+            .map_err(|source| self.database_error(source))?
+            .ok_or_else(|| RetrievalError::SessionNotFound(session_id.to_owned()))?;
+        self.verify_fresh(&session)?;
+        Ok(session)
+    }
+
+    pub fn get_event(&self, event_id: &str) -> RetrievalResult<StoredEvent> {
+        let connection = self.open_connection()?;
+        let event = self.get_event_from_connection(&connection, event_id)?;
+        let session = self.get_session_from_connection(&connection, &event.session_id)?;
+        self.verify_fresh(&session)?;
+        verify_event_hash(&event)?;
+        Ok(event)
+    }
+
+    pub fn replay_session(&self, session_id: &str) -> RetrievalResult<Vec<StoredEvent>> {
+        let connection = self.open_connection()?;
+        let session = self.get_session_from_connection(&connection, session_id)?;
+        self.verify_fresh(&session)?;
+        let mut statement = connection
+            .prepare(
+                "SELECT event_id, session_id, turn_id, sequence, role, created_at, content,
+                        content_sha256, reply_to_event_id, token_count, turn_status, done_reason, error
+                 FROM events WHERE session_id = ?1 ORDER BY sequence",
+            )
+            .map_err(|source| self.database_error(source))?;
+        let rows = statement
+            .query_map([session_id], map_event)
+            .map_err(|source| self.database_error(source))?;
+        let mut events = Vec::new();
+        for row in rows {
+            let event = row.map_err(|source| self.database_error(source))?;
+            verify_event_hash(&event)?;
+            events.push(event);
+        }
+        Ok(events)
+    }
+
+    pub fn resolve_span(&self, span: &SourceSpan) -> RetrievalResult<ResolvedSpan> {
+        let connection = self.open_connection()?;
+        let event = self.get_event_from_connection(&connection, &span.event_id)?;
+        let session = self.get_session_from_connection(&connection, &event.session_id)?;
+        self.verify_fresh(&session)?;
+        verify_event_hash(&event)?;
+        let start_char =
+            usize_to_i64(span.start_char).map_err(|source| self.database_error(source))?;
+        let end_char = usize_to_i64(span.end_char).map_err(|source| self.database_error(source))?;
+        let saved_hash = connection
+            .query_row(
+                "SELECT content_sha256 FROM source_spans
+                 WHERE event_id = ?1 AND start_char = ?2 AND end_char = ?3",
+                params![span.event_id, start_char, end_char],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|source| self.database_error(source))?;
+        let content = slice_chars(&event.content, span)?;
+        let actual_hash = content_sha256(&content);
+        if saved_hash.is_some_and(|saved_hash| actual_hash != saved_hash) {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "片段 {}[{}..{}] 的哈希不匹配",
+                span.event_id, span.start_char, span.end_char
+            )));
+        }
+        Ok(ResolvedSpan {
+            span: span.clone(),
+            content,
+            content_sha256: actual_hash,
+        })
+    }
+
+    pub fn answer_context(&self, answer_event_id: &str) -> RetrievalResult<AnswerContext> {
+        let connection = self.open_connection()?;
+        let event = self.get_event_from_connection(&connection, answer_event_id)?;
+        let session = self.get_session_from_connection(&connection, &event.session_id)?;
+        self.verify_fresh(&session)?;
+        verify_event_hash(&event)?;
+        let mut answer = connection
+            .query_row(
+                "SELECT answer_event_id, turn_id, context_sha256, estimated_upper_tokens,
+                        exact_input_tokens, input_budget, decision, provenance_quality,
+                        request_model, request_think, request_context_window, request_max_output_tokens
+                 FROM answer_contexts WHERE answer_event_id = ?1",
+                [answer_event_id],
+                map_answer_context,
+            )
+            .optional()
+            .map_err(|source| self.database_error(source))?
+            .ok_or_else(|| {
+                RetrievalError::AnswerContextNotFound(answer_event_id.to_owned())
+            })?;
+        let mut statement = connection
+            .prepare(
+                "SELECT i.ordinal, i.role, i.event_id, i.start_char, i.end_char,
+                        i.content_sha256, e.content
+                 FROM answer_context_items i
+                 JOIN events e ON e.event_id = i.event_id
+                 WHERE i.answer_event_id = ?1 ORDER BY i.ordinal",
+            )
+            .map_err(|source| self.database_error(source))?;
+        let rows = statement
+            .query_map([answer_event_id], |row| {
+                let ordinal = i64_to_usize(row.get(0)?)?;
+                let role = parse_role(&row.get::<_, String>(1)?)?;
+                let span = SourceSpan {
+                    event_id: row.get(2)?,
+                    start_char: i64_to_usize(row.get(3)?)?,
+                    end_char: i64_to_usize(row.get(4)?)?,
+                };
+                let expected_hash: String = row.get(5)?;
+                let event_content: String = row.get(6)?;
+                let content = slice_chars_sql(&event_content, &span)?;
+                Ok((ordinal, role, span, expected_hash, content))
+            })
+            .map_err(|source| self.database_error(source))?;
+        let mut messages = Vec::new();
+        for row in rows {
+            let (ordinal, role, span, expected_hash, content) =
+                row.map_err(|source| self.database_error(source))?;
+            let actual_hash = content_sha256(&content);
+            if actual_hash != expected_hash {
+                return Err(RetrievalError::CorruptIndex(format!(
+                    "回答上下文片段 {} 的哈希不匹配",
+                    span.event_id
+                )));
+            }
+            messages.push(ChatMessage {
+                role: role.as_str().to_owned(),
+                content: content.clone(),
+            });
+            answer.items.push(AnswerContextItem {
+                ordinal,
+                role,
+                resolved: ResolvedSpan {
+                    span,
+                    content,
+                    content_sha256: actual_hash,
+                },
+            });
+        }
+        if context_sha256(&messages) != answer.context_sha256 {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "回答 {answer_event_id} 的整体上下文哈希不匹配"
+            )));
+        }
+        Ok(answer)
+    }
+
+    fn write_session(
+        &self,
+        transaction: &Transaction<'_>,
+        source: &SessionSource,
+    ) -> RetrievalResult<SyncReport> {
+        let source_file = source_file_name(&self.root, &source.path)?;
+        transaction
+            .execute(
+                "DELETE FROM indexed_sessions WHERE session_id = ?1 OR source_file = ?2",
+                params![source.session.id, source_file],
+            )
+            .map_err(|error| self.database_error(error))?;
+        transaction
+            .execute(
+                "INSERT INTO indexed_sessions
+                 (session_id, title, created_at, updated_at, source_file, source_sha256,
+                  source_schema_version, indexed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    source.session.id,
+                    source.session.title,
+                    source.session.created_at,
+                    source.session.updated_at,
+                    source_file,
+                    source.sha256,
+                    source.session.schema_version,
+                    Utc::now().to_rfc3339(),
+                ],
+            )
+            .map_err(|error| self.database_error(error))?;
+
+        let events = derive_events(&source.session);
+        let event_by_id = events
+            .iter()
+            .map(|event| (event.id.clone(), event))
+            .collect::<HashMap<_, _>>();
+        let mut spans = HashSet::new();
+        for event in &events {
+            insert_event(transaction, event).map_err(|error| self.database_error(error))?;
+            let full_span = SourceSpan {
+                event_id: event.id.clone(),
+                start_char: 0,
+                end_char: event.content.chars().count(),
+            };
+            insert_span(transaction, &full_span, &event.content)
+                .map_err(|error| self.database_error(error))?;
+            spans.insert((full_span.event_id, full_span.start_char, full_span.end_char));
+        }
+
+        let mut answer_context_count = 0;
+        for turn in &source.session.turns {
+            let answer_id = event_id(&source.session.id, Some(&turn.id), EventRole::Assistant);
+            if !event_by_id.contains_key(&answer_id) {
+                continue;
+            }
+            let derived = derive_context(
+                &source.session,
+                turn,
+                &event_by_id,
+                source.legacy,
+                &source.path,
+            )?;
+            insert_answer_context(transaction, &answer_id, turn, &derived)
+                .map_err(|error| self.database_error(error))?;
+            let mut context_messages = Vec::with_capacity(derived.items.len());
+            for (ordinal, item) in derived.items.iter().enumerate() {
+                let event = event_by_id.get(&item.span.event_id).ok_or_else(|| {
+                    RetrievalError::InvalidSource {
+                        path: source.path.clone(),
+                        message: format!(
+                            "回答 {} 引用了不存在的事件 {}",
+                            turn.id, item.span.event_id
+                        ),
+                    }
+                })?;
+                if item.role != event.role {
+                    return Err(RetrievalError::InvalidSource {
+                        path: source.path.clone(),
+                        message: format!(
+                            "回答 {} 的上下文角色与事件 {} 不一致",
+                            turn.id, item.span.event_id
+                        ),
+                    });
+                }
+                let selected = slice_chars(&event.content, &item.span)?;
+                let actual_hash = content_sha256(&selected);
+                if actual_hash != item.content_sha256 {
+                    return Err(RetrievalError::InvalidSource {
+                        path: source.path.clone(),
+                        message: format!(
+                            "回答 {} 的上下文片段 {} 哈希不匹配",
+                            turn.id, item.span.event_id
+                        ),
+                    });
+                }
+                context_messages.push(ChatMessage {
+                    role: item.role.as_str().to_owned(),
+                    content: selected.clone(),
+                });
+                insert_span(transaction, &item.span, &selected)
+                    .map_err(|error| self.database_error(error))?;
+                spans.insert((
+                    item.span.event_id.clone(),
+                    item.span.start_char,
+                    item.span.end_char,
+                ));
+                let ordinal = usize_to_i64(ordinal).map_err(|error| self.database_error(error))?;
+                let start_char = usize_to_i64(item.span.start_char)
+                    .map_err(|error| self.database_error(error))?;
+                let end_char =
+                    usize_to_i64(item.span.end_char).map_err(|error| self.database_error(error))?;
+                transaction
+                    .execute(
+                        "INSERT INTO answer_context_items
+                         (answer_event_id, ordinal, role, event_id, start_char, end_char, content_sha256)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        params![
+                            answer_id,
+                            ordinal,
+                            item.role.as_str(),
+                            item.span.event_id,
+                            start_char,
+                            end_char,
+                            item.content_sha256,
+                        ],
+                    )
+                    .map_err(|error| self.database_error(error))?;
+            }
+            if context_sha256(&context_messages) != derived.context_sha256 {
+                return Err(RetrievalError::InvalidSource {
+                    path: source.path.clone(),
+                    message: format!("回答 {} 的整体上下文哈希不匹配", turn.id),
+                });
+            }
+            answer_context_count += 1;
+        }
+        Ok(SyncReport {
+            sessions: 1,
+            events: events.len(),
+            spans: spans.len(),
+            answer_contexts: answer_context_count,
+        })
+    }
+
+    fn read_source(&self, path: &Path) -> RetrievalResult<SessionSource> {
+        let bytes = fs::read(path).map_err(|source| RetrievalError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let mut session: Session =
+            serde_json::from_slice(&bytes).map_err(|error| RetrievalError::InvalidSource {
+                path: path.to_path_buf(),
+                message: error.to_string(),
+            })?;
+        session.normalize_legacy_provenance();
+        session
+            .validate()
+            .map_err(|error| RetrievalError::InvalidSource {
+                path: path.to_path_buf(),
+                message: error.to_string(),
+            })?;
+        if path.file_stem().and_then(|value| value.to_str()) != Some(session.id.as_str()) {
+            return Err(RetrievalError::InvalidSource {
+                path: path.to_path_buf(),
+                message: "文件名必须与会话 ID 一致".into(),
+            });
+        }
+        session.refresh_cumulative_usage();
+        Ok(SessionSource {
+            legacy: session.schema_version < SCHEMA_VERSION,
+            session,
+            path: path.to_path_buf(),
+            sha256: bytes_sha256(&bytes),
+        })
+    }
+
+    fn load_all_sources(&self) -> RetrievalResult<Vec<SessionSource>> {
+        if !self.root.is_dir() {
+            return Ok(Vec::new());
+        }
+        let entries = fs::read_dir(&self.root).map_err(|source| RetrievalError::Io {
+            path: self.root.clone(),
+            source,
+        })?;
+        let mut paths = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|source| RetrievalError::Io {
+                path: self.root.clone(),
+                source,
+            })?;
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) == Some("json")
+                && path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|value| !value.starts_with('.'))
+            {
+                paths.push(path);
+            }
+        }
+        paths.sort();
+        paths.iter().map(|path| self.read_source(path)).collect()
+    }
+
+    fn open_connection(&self) -> RetrievalResult<Connection> {
+        fs::create_dir_all(&self.root).map_err(|source| RetrievalError::Io {
+            path: self.root.clone(),
+            source,
+        })?;
+        let connection =
+            Connection::open(&self.index_path).map_err(|source| self.database_error(source))?;
+        connection
+            .busy_timeout(Duration::from_secs(5))
+            .map_err(|source| self.database_error(source))?;
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys = ON;
+                 PRAGMA journal_mode = WAL;
+                 PRAGMA synchronous = FULL;",
+            )
+            .map_err(|source| self.database_error(source))?;
+        let version = connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .map_err(|source| self.database_error(source))?;
+        if !matches!(version, 0 | INDEX_SCHEMA_VERSION) {
+            return Err(RetrievalError::UnsupportedIndexVersion(version));
+        }
+        connection
+            .execute_batch(SCHEMA_SQL)
+            .map_err(|source| self.database_error(source))?;
+        if version == 0 {
+            connection
+                .pragma_update(None, "user_version", INDEX_SCHEMA_VERSION)
+                .map_err(|source| self.database_error(source))?;
+        }
+        Ok(connection)
+    }
+
+    fn get_session_from_connection(
+        &self,
+        connection: &Connection,
+        session_id: &str,
+    ) -> RetrievalResult<IndexedSession> {
+        connection
+            .query_row(
+                "SELECT session_id, title, created_at, updated_at, source_file, source_sha256, source_schema_version
+                 FROM indexed_sessions WHERE session_id = ?1",
+                [session_id],
+                map_session,
+            )
+            .optional()
+            .map_err(|source| self.database_error(source))?
+            .ok_or_else(|| RetrievalError::SessionNotFound(session_id.to_owned()))
+    }
+
+    fn get_event_from_connection(
+        &self,
+        connection: &Connection,
+        event_id: &str,
+    ) -> RetrievalResult<StoredEvent> {
+        connection
+            .query_row(
+                "SELECT event_id, session_id, turn_id, sequence, role, created_at, content,
+                        content_sha256, reply_to_event_id, token_count, turn_status, done_reason, error
+                 FROM events WHERE event_id = ?1",
+                [event_id],
+                map_event,
+            )
+            .optional()
+            .map_err(|source| self.database_error(source))?
+            .ok_or_else(|| RetrievalError::EventNotFound(event_id.to_owned()))
+    }
+
+    fn verify_fresh(&self, session: &IndexedSession) -> RetrievalResult<()> {
+        if !is_safe_source_file(&session.source_file) {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "会话 {} 的源文件名不安全",
+                session.id
+            )));
+        }
+        let path = self.root.join(&session.source_file);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return Err(RetrievalError::StaleIndex {
+                    session_id: session.id.clone(),
+                });
+            }
+        };
+        if bytes_sha256(&bytes) != session.source_sha256 {
+            return Err(RetrievalError::StaleIndex {
+                session_id: session.id.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    fn database_error(&self, source: rusqlite::Error) -> RetrievalError {
+        RetrievalError::Database {
+            path: self.index_path.clone(),
+            source,
+        }
+    }
+
+    fn remove_index_files(&self) -> RetrievalResult<()> {
+        for path in [
+            self.index_path.clone(),
+            index_sidecar(&self.index_path, "-wal"),
+            index_sidecar(&self.index_path, "-shm"),
+        ] {
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(source) => return Err(RetrievalError::Io { path, source }),
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct SessionSource {
+    session: Session,
+    path: PathBuf,
+    sha256: String,
+    legacy: bool,
+}
+
+#[derive(Debug)]
+struct DerivedContext {
+    items: Vec<ContextItemTrace>,
+    context_sha256: String,
+    provenance_quality: ProvenanceQuality,
+    request: Option<ModelRequestTrace>,
+}
+
+fn derive_events(session: &Session) -> Vec<StoredEvent> {
+    let mut events = Vec::new();
+    if !session.system_prompt.is_empty() {
+        events.push(StoredEvent {
+            id: event_id(&session.id, None, EventRole::System),
+            session_id: session.id.clone(),
+            turn_id: None,
+            sequence: 0,
+            role: EventRole::System,
+            created_at: session.created_at.clone(),
+            content: session.system_prompt.clone(),
+            content_sha256: content_sha256(&session.system_prompt),
+            reply_to_event_id: None,
+            token_count: None,
+            turn_status: None,
+            done_reason: None,
+            error: None,
+        });
+    }
+    let mut previous_assistant = None;
+    for (index, turn) in session.turns.iter().enumerate() {
+        let user_id = event_id(&session.id, Some(&turn.id), EventRole::User);
+        events.push(StoredEvent {
+            id: user_id.clone(),
+            session_id: session.id.clone(),
+            turn_id: Some(turn.id.clone()),
+            sequence: index * 2 + 1,
+            role: EventRole::User,
+            created_at: turn.created_at.clone(),
+            content: turn.user_content.clone(),
+            content_sha256: content_sha256(&turn.user_content),
+            reply_to_event_id: previous_assistant.clone(),
+            token_count: None,
+            turn_status: Some(turn.status),
+            done_reason: None,
+            error: turn.error.clone(),
+        });
+        if has_assistant_event(session, turn) {
+            let assistant_id = event_id(&session.id, Some(&turn.id), EventRole::Assistant);
+            let token_count = if turn.usage.input_tokens.is_some() {
+                turn.usage.output_tokens
+            } else {
+                None
+            };
+            events.push(StoredEvent {
+                id: assistant_id.clone(),
+                session_id: session.id.clone(),
+                turn_id: Some(turn.id.clone()),
+                sequence: index * 2 + 2,
+                role: EventRole::Assistant,
+                created_at: turn
+                    .request_started_at
+                    .clone()
+                    .unwrap_or_else(|| turn.updated_at.clone()),
+                content: turn.assistant_content.clone(),
+                content_sha256: content_sha256(&turn.assistant_content),
+                reply_to_event_id: Some(user_id),
+                token_count,
+                turn_status: Some(turn.status),
+                done_reason: turn.done_reason.clone(),
+                error: turn.error.clone(),
+            });
+            previous_assistant = Some(assistant_id);
+        }
+    }
+    events
+}
+
+fn has_assistant_event(session: &Session, turn: &Turn) -> bool {
+    turn.request_started_at.is_some()
+        || ((session.schema_version < SCHEMA_VERSION
+            || turn.context_trace.provenance_quality == ProvenanceQuality::LegacyInferred)
+            && (!turn.assistant_content.is_empty()
+                || !turn.thinking.is_empty()
+                || turn.usage.input_tokens.is_some()
+                || turn.usage.output_tokens.is_some()))
+}
+
+fn derive_context(
+    session: &Session,
+    turn: &Turn,
+    events: &HashMap<String, &StoredEvent>,
+    legacy: bool,
+    source_path: &Path,
+) -> RetrievalResult<DerivedContext> {
+    if !legacy && turn.context_trace.provenance_quality == ProvenanceQuality::Exact {
+        if turn.context_trace.context_items.is_empty() {
+            return Err(RetrievalError::InvalidSource {
+                path: source_path.to_path_buf(),
+                message: format!("回答 {} 缺少 v2 精确上下文溯源", turn.id),
+            });
+        }
+        let context_hash = turn.context_trace.context_sha256.clone().ok_or_else(|| {
+            RetrievalError::InvalidSource {
+                path: source_path.to_path_buf(),
+                message: format!("回答 {} 缺少 v2 上下文哈希", turn.id),
+            }
+        })?;
+        let request =
+            turn.context_trace
+                .request
+                .clone()
+                .ok_or_else(|| RetrievalError::InvalidSource {
+                    path: source_path.to_path_buf(),
+                    message: format!("回答 {} 缺少 v2 请求元数据", turn.id),
+                })?;
+        return Ok(DerivedContext {
+            items: turn.context_trace.context_items.clone(),
+            context_sha256: context_hash,
+            provenance_quality: ProvenanceQuality::Exact,
+            request: Some(request),
+        });
+    }
+
+    let mut items = Vec::new();
+    if let Some(system) = events.get(&event_id(&session.id, None, EventRole::System)) {
+        items.push(full_item(system));
+    }
+    for included_turn_id in &turn.context_trace.included_turn_ids {
+        for role in [EventRole::User, EventRole::Assistant] {
+            let id = event_id(&session.id, Some(included_turn_id), role);
+            if let Some(event) = events.get(&id) {
+                items.push(full_item(event));
+            }
+        }
+    }
+    let current_user_id = event_id(&session.id, Some(&turn.id), EventRole::User);
+    let current_user = events.get(&current_user_id).ok_or_else(|| {
+        RetrievalError::CorruptIndex(format!("回答 {} 缺少当前用户事件", turn.id))
+    })?;
+    items.push(full_item(current_user));
+    let mut messages = Vec::with_capacity(items.len());
+    for item in &items {
+        let event = events.get(&item.span.event_id).ok_or_else(|| {
+            RetrievalError::CorruptIndex(format!(
+                "推断上下文引用了不存在的事件 {}",
+                item.span.event_id
+            ))
+        })?;
+        messages.push(ChatMessage {
+            role: item.role.as_str().to_owned(),
+            content: event.content.clone(),
+        });
+    }
+    Ok(DerivedContext {
+        items,
+        context_sha256: context_sha256(&messages),
+        provenance_quality: ProvenanceQuality::LegacyInferred,
+        request: None,
+    })
+}
+
+fn full_item(event: &StoredEvent) -> ContextItemTrace {
+    ContextItemTrace {
+        role: event.role,
+        span: SourceSpan {
+            event_id: event.id.clone(),
+            start_char: 0,
+            end_char: event.content.chars().count(),
+        },
+        content_sha256: event.content_sha256.clone(),
+    }
+}
+
+fn insert_event(transaction: &Transaction<'_>, event: &StoredEvent) -> rusqlite::Result<()> {
+    let sequence = usize_to_i64(event.sequence)?;
+    let token_count = event.token_count.map(u64_to_i64).transpose()?;
+    transaction.execute(
+        "INSERT INTO events
+         (event_id, session_id, turn_id, sequence, role, created_at, content, content_sha256,
+          reply_to_event_id, token_count, turn_status, done_reason, error)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        params![
+            event.id,
+            event.session_id,
+            event.turn_id,
+            sequence,
+            event.role.as_str(),
+            event.created_at,
+            event.content,
+            event.content_sha256,
+            event.reply_to_event_id,
+            token_count,
+            event.turn_status.map(TurnStatus::as_str),
+            event.done_reason,
+            event.error,
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_span(
+    transaction: &Transaction<'_>,
+    span: &SourceSpan,
+    content: &str,
+) -> rusqlite::Result<()> {
+    let start_char = usize_to_i64(span.start_char)?;
+    let end_char = usize_to_i64(span.end_char)?;
+    transaction.execute(
+        "INSERT OR IGNORE INTO source_spans
+         (event_id, start_char, end_char, content_sha256) VALUES (?1, ?2, ?3, ?4)",
+        params![span.event_id, start_char, end_char, content_sha256(content),],
+    )?;
+    Ok(())
+}
+
+fn insert_answer_context(
+    transaction: &Transaction<'_>,
+    answer_event_id: &str,
+    turn: &Turn,
+    derived: &DerivedContext,
+) -> rusqlite::Result<()> {
+    let request = derived.request.as_ref();
+    let estimated_upper_tokens = turn
+        .context_trace
+        .estimated_upper_tokens
+        .map(u64_to_i64)
+        .transpose()?;
+    let exact_input_tokens = turn
+        .context_trace
+        .exact_input_tokens
+        .map(u64_to_i64)
+        .transpose()?;
+    let input_budget = u64_to_i64(turn.context_trace.input_budget)?;
+    let request_context_window = request
+        .map(|value| u64_to_i64(value.context_window))
+        .transpose()?;
+    let request_max_output_tokens = request
+        .map(|value| u64_to_i64(value.max_output_tokens))
+        .transpose()?;
+    transaction.execute(
+        "INSERT INTO answer_contexts
+         (answer_event_id, turn_id, context_sha256, estimated_upper_tokens, exact_input_tokens,
+          input_budget, decision, provenance_quality, request_model, request_think,
+          request_context_window, request_max_output_tokens)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            answer_event_id,
+            turn.id,
+            derived.context_sha256,
+            estimated_upper_tokens,
+            exact_input_tokens,
+            input_budget,
+            turn.context_trace.decision,
+            match derived.provenance_quality {
+                ProvenanceQuality::Exact => "exact",
+                ProvenanceQuality::LegacyInferred => "legacy_inferred",
+            },
+            request.map(|value| value.model.as_str()),
+            request.map(|value| value.think),
+            request_context_window,
+            request_max_output_tokens,
+        ],
+    )?;
+    Ok(())
+}
+
+fn map_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexedSession> {
+    Ok(IndexedSession {
+        id: row.get(0)?,
+        title: row.get(1)?,
+        created_at: row.get(2)?,
+        updated_at: row.get(3)?,
+        source_file: row.get(4)?,
+        source_sha256: row.get(5)?,
+        source_schema_version: i64_to_u32(row.get(6)?)?,
+    })
+}
+
+fn map_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredEvent> {
+    let role = parse_role(&row.get::<_, String>(4)?)?;
+    let status = row
+        .get::<_, Option<String>>(10)?
+        .map(|value| parse_status(&value))
+        .transpose()?;
+    Ok(StoredEvent {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        turn_id: row.get(2)?,
+        sequence: i64_to_usize(row.get(3)?)?,
+        role,
+        created_at: row.get(5)?,
+        content: row.get(6)?,
+        content_sha256: row.get(7)?,
+        reply_to_event_id: row.get(8)?,
+        token_count: row.get::<_, Option<i64>>(9)?.map(i64_to_u64).transpose()?,
+        turn_status: status,
+        done_reason: row.get(11)?,
+        error: row.get(12)?,
+    })
+}
+
+fn map_answer_context(row: &rusqlite::Row<'_>) -> rusqlite::Result<AnswerContext> {
+    let quality = match row.get::<_, String>(7)?.as_str() {
+        "exact" => ProvenanceQuality::Exact,
+        "legacy_inferred" => ProvenanceQuality::LegacyInferred,
+        value => {
+            return Err(conversion_error(format!(
+                "unknown provenance quality {value}"
+            )));
+        }
+    };
+    let model: Option<String> = row.get(8)?;
+    let think: Option<bool> = row.get(9)?;
+    let context_window: Option<i64> = row.get(10)?;
+    let max_output_tokens: Option<i64> = row.get(11)?;
+    let request = match (model, think, context_window, max_output_tokens) {
+        (Some(model), Some(think), Some(context_window), Some(max_output_tokens)) => {
+            Some(ModelRequestTrace {
+                model,
+                think,
+                context_window: i64_to_u64(context_window)?,
+                max_output_tokens: i64_to_u64(max_output_tokens)?,
+            })
+        }
+        (None, None, None, None) => None,
+        _ => return Err(conversion_error("partial request metadata")),
+    };
+    Ok(AnswerContext {
+        answer_event_id: row.get(0)?,
+        turn_id: row.get(1)?,
+        context_sha256: row.get(2)?,
+        estimated_upper_tokens: row.get::<_, Option<i64>>(3)?.map(i64_to_u64).transpose()?,
+        exact_input_tokens: row.get::<_, Option<i64>>(4)?.map(i64_to_u64).transpose()?,
+        input_budget: i64_to_u64(row.get(5)?)?,
+        decision: row.get(6)?,
+        provenance_quality: quality,
+        request,
+        items: Vec::new(),
+    })
+}
+
+fn parse_role(value: &str) -> rusqlite::Result<EventRole> {
+    match value {
+        "system" => Ok(EventRole::System),
+        "user" => Ok(EventRole::User),
+        "assistant" => Ok(EventRole::Assistant),
+        _ => Err(conversion_error(format!("unknown event role {value}"))),
+    }
+}
+
+fn parse_status(value: &str) -> rusqlite::Result<TurnStatus> {
+    match value {
+        "pending" => Ok(TurnStatus::Pending),
+        "complete" => Ok(TurnStatus::Complete),
+        "truncated" => Ok(TurnStatus::Truncated),
+        "blocked" => Ok(TurnStatus::Blocked),
+        "interrupted" => Ok(TurnStatus::Interrupted),
+        "failed" => Ok(TurnStatus::Failed),
+        "no_answer" => Ok(TurnStatus::NoAnswer),
+        _ => Err(conversion_error(format!("unknown turn status {value}"))),
+    }
+}
+
+fn conversion_error(message: impl Into<String>) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        0,
+        rusqlite::types::Type::Text,
+        Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            message.into(),
+        )),
+    )
+}
+
+fn i64_to_usize(value: i64) -> rusqlite::Result<usize> {
+    usize::try_from(value).map_err(|_| conversion_error(format!("invalid usize {value}")))
+}
+
+fn i64_to_u64(value: i64) -> rusqlite::Result<u64> {
+    u64::try_from(value).map_err(|_| conversion_error(format!("invalid u64 {value}")))
+}
+
+fn i64_to_u32(value: i64) -> rusqlite::Result<u32> {
+    u32::try_from(value).map_err(|_| conversion_error(format!("invalid u32 {value}")))
+}
+
+fn usize_to_i64(value: usize) -> rusqlite::Result<i64> {
+    i64::try_from(value)
+        .map_err(|_| conversion_error(format!("usize exceeds SQLite INTEGER: {value}")))
+}
+
+fn u64_to_i64(value: u64) -> rusqlite::Result<i64> {
+    i64::try_from(value)
+        .map_err(|_| conversion_error(format!("u64 exceeds SQLite INTEGER: {value}")))
+}
+
+fn slice_chars(content: &str, span: &SourceSpan) -> RetrievalResult<String> {
+    let char_count = content.chars().count();
+    if span.start_char > span.end_char || span.end_char > char_count {
+        return Err(RetrievalError::InvalidSpan {
+            event_id: span.event_id.clone(),
+            start_char: span.start_char,
+            end_char: span.end_char,
+            char_count,
+        });
+    }
+    Ok(content
+        .chars()
+        .skip(span.start_char)
+        .take(span.end_char - span.start_char)
+        .collect())
+}
+
+fn slice_chars_sql(content: &str, span: &SourceSpan) -> rusqlite::Result<String> {
+    let char_count = content.chars().count();
+    if span.start_char > span.end_char || span.end_char > char_count {
+        return Err(conversion_error(format!(
+            "invalid span {}..{} for {char_count} chars",
+            span.start_char, span.end_char
+        )));
+    }
+    Ok(content
+        .chars()
+        .skip(span.start_char)
+        .take(span.end_char - span.start_char)
+        .collect())
+}
+
+fn verify_event_hash(event: &StoredEvent) -> RetrievalResult<()> {
+    if content_sha256(&event.content) != event.content_sha256 {
+        return Err(RetrievalError::CorruptIndex(format!(
+            "事件 {} 的内容哈希不匹配",
+            event.id
+        )));
+    }
+    Ok(())
+}
+
+fn bytes_sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn index_sidecar(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
+fn source_file_name(root: &Path, path: &Path) -> RetrievalResult<String> {
+    if path.parent() != Some(root) {
+        return Err(RetrievalError::InvalidSource {
+            path: path.to_path_buf(),
+            message: "会话源文件必须直接位于 sessions 目录".into(),
+        });
+    }
+    let value = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| is_safe_source_file(value))
+        .ok_or_else(|| RetrievalError::InvalidSource {
+            path: path.to_path_buf(),
+            message: "会话源文件名不安全".into(),
+        })?;
+    Ok(value.to_owned())
+}
+
+fn is_safe_source_file(value: &str) -> bool {
+    let mut components = Path::new(value).components();
+    matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
+}
+
+fn add_report(total: &mut SyncReport, report: SyncReport) {
+    total.sessions += report.sessions;
+    total.events += report.events;
+    total.spans += report.spans;
+    total.answer_contexts += report.answer_contexts;
+}
+
+const SCHEMA_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS indexed_sessions (
+    session_id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    source_file TEXT NOT NULL UNIQUE,
+    source_sha256 TEXT NOT NULL,
+    source_schema_version INTEGER NOT NULL,
+    indexed_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS events (
+    event_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES indexed_sessions(session_id) ON DELETE CASCADE,
+    turn_id TEXT,
+    sequence INTEGER NOT NULL CHECK(sequence >= 0),
+    role TEXT NOT NULL CHECK(role IN ('system', 'user', 'assistant')),
+    created_at TEXT NOT NULL,
+    content TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    reply_to_event_id TEXT REFERENCES events(event_id),
+    token_count INTEGER CHECK(token_count IS NULL OR token_count >= 0),
+    turn_status TEXT,
+    done_reason TEXT,
+    error TEXT,
+    UNIQUE(session_id, sequence),
+    UNIQUE(session_id, turn_id, role),
+    CHECK((role = 'system' AND turn_id IS NULL AND sequence = 0)
+       OR (role != 'system' AND turn_id IS NOT NULL))
+);
+
+CREATE TABLE IF NOT EXISTS source_spans (
+    event_id TEXT NOT NULL REFERENCES events(event_id) ON DELETE CASCADE,
+    start_char INTEGER NOT NULL CHECK(start_char >= 0),
+    end_char INTEGER NOT NULL CHECK(end_char >= start_char),
+    content_sha256 TEXT NOT NULL,
+    PRIMARY KEY(event_id, start_char, end_char)
+);
+
+CREATE TABLE IF NOT EXISTS answer_contexts (
+    answer_event_id TEXT PRIMARY KEY REFERENCES events(event_id) ON DELETE CASCADE,
+    turn_id TEXT NOT NULL,
+    context_sha256 TEXT NOT NULL,
+    estimated_upper_tokens INTEGER,
+    exact_input_tokens INTEGER,
+    input_budget INTEGER NOT NULL,
+    decision TEXT NOT NULL,
+    provenance_quality TEXT NOT NULL CHECK(provenance_quality IN ('exact', 'legacy_inferred')),
+    request_model TEXT,
+    request_think INTEGER,
+    request_context_window INTEGER,
+    request_max_output_tokens INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS answer_context_items (
+    answer_event_id TEXT NOT NULL REFERENCES answer_contexts(answer_event_id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+    role TEXT NOT NULL CHECK(role IN ('system', 'user', 'assistant')),
+    event_id TEXT NOT NULL,
+    start_char INTEGER NOT NULL,
+    end_char INTEGER NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    PRIMARY KEY(answer_event_id, ordinal),
+    FOREIGN KEY(event_id, start_char, end_char)
+        REFERENCES source_spans(event_id, start_char, end_char)
+);
+
+CREATE INDEX IF NOT EXISTS events_session_sequence
+    ON events(session_id, sequence);
+CREATE INDEX IF NOT EXISTS events_reply_to
+    ON events(reply_to_event_id);
+"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::ContextAssembler;
+    use crate::model::{ContextTrace, ModelRequestTrace, TokenUsage, Turn, TurnStatus, utc_now};
+    use crate::store::SessionStore;
+
+    fn append_complete_turn(
+        session: &mut Session,
+        user: &str,
+        assistant: &str,
+        thinking: &str,
+    ) -> String {
+        session.turns.push(Turn::pending(user.to_owned()));
+        let index = session.turns.len() - 1;
+        let plan = ContextAssembler.assemble(session, user, None, Some(index));
+        let started_at = utc_now();
+        let turn = &mut session.turns[index];
+        turn.context_trace = ContextTrace {
+            included_turn_ids: plan.included_turn_ids,
+            omitted_turn_ids: plan.omitted_turn_ids,
+            estimated_upper_tokens: plan.estimated_upper_tokens,
+            exact_input_tokens: Some(42),
+            input_budget: plan.input_budget,
+            decision: "ready".into(),
+            active_context_start_before: session.active_context_start_index,
+            active_context_start_after: session.active_context_start_index,
+            context_items: plan.context_items,
+            context_sha256: Some(plan.context_sha256),
+            request: Some(ModelRequestTrace {
+                model: session.model.clone(),
+                think: session.think,
+                context_window: session.budget.context_window,
+                max_output_tokens: session.budget.max_output_tokens,
+            }),
+            provenance_quality: ProvenanceQuality::Exact,
+        };
+        turn.request_started_at = Some(started_at);
+        turn.assistant_content = assistant.to_owned();
+        turn.thinking = thinking.to_owned();
+        turn.usage = TokenUsage::new(Some(42), Some(3));
+        turn.status = TurnStatus::Complete;
+        turn.done_reason = Some("stop".into());
+        event_id(&session.id, Some(&turn.id), EventRole::Assistant)
+    }
+
+    #[test]
+    fn replays_events_resolves_unicode_and_reconstructs_answer_context() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let mut session = store
+            .create(
+                "model",
+                "http://localhost",
+                Some("system 原文"),
+                Default::default(),
+                true,
+            )
+            .unwrap();
+        append_complete_turn(&mut session, "第一问", "第一答", "不得索引的 thinking");
+        let second_answer =
+            append_complete_turn(&mut session, "你a\u{301}🙂x", "第二答", "private");
+        store.save(&mut session).unwrap();
+        assert_eq!(
+            store.retrieval().rebuild().unwrap(),
+            SyncReport {
+                sessions: 1,
+                events: 5,
+                spans: 5,
+                answer_contexts: 2,
+            }
+        );
+
+        let events = store.retrieval().replay_session(&session.id).unwrap();
+        assert_eq!(events.len(), 5);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 4]
+        );
+        assert_eq!(
+            events.iter().map(|event| event.role).collect::<Vec<_>>(),
+            vec![
+                EventRole::System,
+                EventRole::User,
+                EventRole::Assistant,
+                EventRole::User,
+                EventRole::Assistant,
+            ]
+        );
+        assert_eq!(
+            events[2].reply_to_event_id.as_deref(),
+            Some(events[1].id.as_str())
+        );
+        assert_eq!(
+            events[3].reply_to_event_id.as_deref(),
+            Some(events[2].id.as_str())
+        );
+        assert_eq!(
+            events[4].reply_to_event_id.as_deref(),
+            Some(events[3].id.as_str())
+        );
+        assert_eq!(events[2].token_count, Some(3));
+        assert_eq!(events[1].token_count, None);
+        assert!(
+            events
+                .iter()
+                .all(|event| !event.content.contains("thinking"))
+        );
+
+        let span = SourceSpan {
+            event_id: events[3].id.clone(),
+            start_char: 1,
+            end_char: 4,
+        };
+        let resolved = store.retrieval().resolve_span(&span).unwrap();
+        assert_eq!(resolved.content, "a\u{301}🙂");
+        assert_eq!(resolved.content_sha256, content_sha256("a\u{301}🙂"));
+        assert!(matches!(
+            store.retrieval().resolve_span(&SourceSpan {
+                event_id: events[3].id.clone(),
+                start_char: 0,
+                end_char: 99,
+            }),
+            Err(RetrievalError::InvalidSpan { .. })
+        ));
+
+        let answer = store.retrieval().answer_context(&second_answer).unwrap();
+        assert_eq!(answer.provenance_quality, ProvenanceQuality::Exact);
+        assert_eq!(answer.request.as_ref().unwrap().model, "model");
+        assert_eq!(
+            answer
+                .items
+                .iter()
+                .map(|item| item.resolved.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["system 原文", "第一问", "第一答", "你a\u{301}🙂x"]
+        );
+    }
+
+    #[test]
+    fn rebuild_repairs_modified_and_deleted_derived_rows_and_refreshes_source_hash() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let mut session = store
+            .create("model", "http://localhost", None, Default::default(), false)
+            .unwrap();
+        let answer_id = append_complete_turn(&mut session, "原文", "回复", "secret");
+        let source_path = store.save(&mut session).unwrap();
+
+        {
+            let connection = Connection::open(store.retrieval().index_path()).unwrap();
+            connection
+                .execute(
+                    "UPDATE events SET content = 'tampered' WHERE event_id = ?1",
+                    [&answer_id],
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            store.retrieval().get_event(&answer_id),
+            Err(RetrievalError::CorruptIndex(_))
+        ));
+        store.retrieval().rebuild().unwrap();
+        assert_eq!(
+            store.retrieval().get_event(&answer_id).unwrap().content,
+            "回复"
+        );
+
+        {
+            let connection = Connection::open(store.retrieval().index_path()).unwrap();
+            connection
+                .execute("DELETE FROM events WHERE event_id = ?1", [&answer_id])
+                .unwrap();
+        }
+        assert!(matches!(
+            store.retrieval().get_event(&answer_id),
+            Err(RetrievalError::EventNotFound(_))
+        ));
+        store.retrieval().rebuild().unwrap();
+        assert_eq!(
+            store.retrieval().get_event(&answer_id).unwrap().content,
+            "回复"
+        );
+
+        let raw = fs::read_to_string(&source_path).unwrap();
+        fs::write(&source_path, format!("{raw} ")).unwrap();
+        assert!(matches!(
+            store.retrieval().get_session(&session.id),
+            Err(RetrievalError::StaleIndex { .. })
+        ));
+        store.retrieval().rebuild().unwrap();
+        assert_eq!(
+            store.retrieval().get_session(&session.id).unwrap().id,
+            session.id
+        );
+    }
+
+    #[test]
+    fn only_real_or_legacy_model_requests_create_assistant_events() {
+        let mut session = Session::new(
+            "session".into(),
+            "model".into(),
+            "http://localhost".into(),
+            "system".into(),
+            Default::default(),
+            false,
+        )
+        .unwrap();
+        let mut blocked = Turn::pending("blocked".into());
+        blocked.status = TurnStatus::Blocked;
+        session.turns.push(blocked);
+        let mut preparation_failed = Turn::pending("preparation failed".into());
+        preparation_failed.status = TurnStatus::Failed;
+        session.turns.push(preparation_failed);
+        for status in [
+            TurnStatus::Complete,
+            TurnStatus::Truncated,
+            TurnStatus::Interrupted,
+            TurnStatus::NoAnswer,
+            TurnStatus::Failed,
+        ] {
+            let mut requested = Turn::pending(format!("requested {}", status.as_str()));
+            requested.request_started_at = Some(utc_now());
+            requested.context_trace.provenance_quality = ProvenanceQuality::LegacyInferred;
+            requested.status = status;
+            session.turns.push(requested);
+        }
+
+        let events = derive_events(&session);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.role == EventRole::Assistant)
+                .count(),
+            5
+        );
+        assert_eq!(events.last().unwrap().content, "");
+    }
+}
