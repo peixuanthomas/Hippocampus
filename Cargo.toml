@@ -7,11 +7,14 @@ publish = false
 
 [dependencies]
 anyhow = "1.0"
+ammonia = "4.1"
 async-trait = "0.1"
+axum = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
 crossterm = "0.28"
 futures-util = "0.3"
+pulldown-cmark = "0.13"
 ratatui = "0.29"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -23,7 +26,9 @@ unicode-width = "0.2"
 uuid = { version = "1.11", features = ["v4"] }
 
 [dev-dependencies]
+http-body-util = "0.1"
 tempfile = "3.15"
+tower = { version = "0.5", features = ["util"] }
 
 [profile.release]
 lto = "thin"

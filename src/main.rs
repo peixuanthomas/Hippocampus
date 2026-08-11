@@ -1,4 +1,5 @@
 use std::io::{self, Write};
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
@@ -43,6 +44,8 @@ enum Command {
     },
     /// 单次调用；带 --session 使用会话上下文，否则只发送 system prompt + 当前问题
     Ask(AskArgs),
+    /// 启动本地 Web UI 并保持服务运行
+    Serve(ServeArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -138,6 +141,21 @@ struct AskArgs {
     json: bool,
 }
 
+#[derive(Debug, Args)]
+struct ServeArgs {
+    /// 加载已有会话；不传则按下列参数创建新会话
+    #[arg(long)]
+    session: Option<String>,
+    /// HTTP 监听地址；默认仅本机可访问
+    #[arg(long, default_value = "127.0.0.1")]
+    bind: IpAddr,
+    /// HTTP 监听端口
+    #[arg(long, default_value_t = 31_415)]
+    port: u16,
+    #[command(flatten)]
+    new: NewArgs,
+}
+
 impl AskArgs {
     fn thinking_enabled(&self) -> bool {
         self.think || !self.no_think
@@ -162,7 +180,35 @@ async fn run() -> Result<()> {
         Some(Command::List) => list_sessions(&store),
         Some(Command::Show { identifier, json }) => show_session(&store, &identifier, json),
         Some(Command::Ask(args)) => run_ask(store, &cli.host, args).await,
+        Some(Command::Serve(args)) => run_serve(store, &cli.host, args).await,
     }
+}
+
+async fn run_serve(store: SessionStore, host: &str, args: ServeArgs) -> Result<()> {
+    let mut session = if let Some(identifier) = &args.session {
+        let mut session = store.load(identifier)?;
+        store.reopen(&mut session)?;
+        session
+    } else {
+        let prompt = args.new.read_prompt()?;
+        store.create(
+            &args.new.model,
+            host,
+            prompt.as_deref(),
+            args.new.budget(),
+            args.new.thinking_enabled(),
+        )?
+    };
+    let client = OllamaClient::new(&session.ollama_host)?;
+    let info = client
+        .check_model(&session.model, session.budget.context_window)
+        .await?;
+    let engine = ChatEngine::new(store.clone(), client);
+    let address = SocketAddr::new(args.bind, args.port);
+    hippocampus::web::serve(engine, session.clone(), info, address).await?;
+    session = store.load(&session.id)?;
+    store.save(&mut session)?;
+    Ok(())
 }
 
 async fn run_new_tui(store: SessionStore, host: &str, args: NewArgs) -> Result<()> {
@@ -518,5 +564,24 @@ mod tests {
         assert_eq!(args.context_window, 2048);
         assert!(!args.thinking_enabled());
         assert_eq!(args.system_prompt.as_deref(), Some("system"));
+    }
+
+    #[test]
+    fn serve_defaults_to_loopback_and_supports_session() {
+        let cli = Cli::try_parse_from([
+            "hippocampus",
+            "serve",
+            "--session",
+            "20260811-abc",
+            "--port",
+            "8080",
+        ])
+        .unwrap();
+        let Some(Command::Serve(args)) = cli.command else {
+            panic!("expected serve command");
+        };
+        assert_eq!(args.session.as_deref(), Some("20260811-abc"));
+        assert!(args.bind.is_loopback());
+        assert_eq!(args.port, 8080);
     }
 }

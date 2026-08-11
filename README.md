@@ -1,6 +1,6 @@
 # Hippocampus
 
-Hippocampus 是一个完全使用 Rust 实现的本地 Ollama 会话客户端。无参数启动时进入 Ratatui TUI；`ask` 子命令适合脚本和其他程序进行单次调用。
+Hippocampus 是一个完全使用 Rust 实现的本地 Ollama 会话客户端。无参数启动时进入 Ratatui TUI；`serve` 提供本地 Web UI；`ask` 子命令适合脚本和其他程序进行单次调用。
 
 项目保存每轮原始输入、模型正文、thinking、权威 token usage 和上下文裁剪轨迹。thinking 只用于当前轮展示和审计，绝不会重新注入后续模型上下文。旧 Python 版本产生的 `schema_version=1` 会话 JSON 可以直接继续使用。
 
@@ -37,6 +37,28 @@ cargo build --release
 - `/budget`、`/think on|off`、`/save`、`/help`、`/exit`
 
 上下文达到 90% 警戒线时，TUI 会要求明确选择：裁剪最旧的完整轮次后继续，或暂停会话。裁剪只改变后续请求的活动起点，不删除原始记录。
+
+## Web UI
+
+`serve` 会保持 HTTP 服务运行。默认只监听本机 `127.0.0.1:31415`，然后在浏览器打开显示的地址：
+
+```bash
+./build/hippocampus serve
+./build/hippocampus serve --session 20260811-abcdef12
+./build/hippocampus serve --port 8080 --no-think
+```
+
+不传 `--session` 时会创建新会话；传入后会继续指定会话。页面包含与 TUI 相近的顶部状态栏、对话区、多行输入框、thinking 开关、原子保存和停止生成按钮。流式正文实时出现，完成后 Markdown 会渲染成标题、列表、表格、引用、代码块和链接等富文本；原始 HTML 与危险内容会在 Rust 服务端清洗。
+
+网页端同样保留上下文临界决策：达到 90% 后会弹出“裁剪并继续”或“暂停会话”。所有静态资源都编译进可执行文件，不依赖 CDN 或外部前端服务。
+
+如需保持在 shell 后台运行，可以使用操作系统自己的进程管理方式，例如：
+
+```bash
+./build/hippocampus serve >hippocampus-web.log 2>&1 &
+```
+
+默认回环地址没有跨设备访问能力。`--bind 0.0.0.0` 可以开放局域网访问，但当前版本没有用户认证，不应暴露到不可信网络或公网。
 
 ## `ask` 单次调用
 

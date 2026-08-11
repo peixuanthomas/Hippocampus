@@ -4,6 +4,7 @@ pub mod model;
 pub mod ollama;
 pub mod store;
 pub mod tui;
+pub mod web;
 
 pub use context::ContextAssembler;
 pub use engine::{ChatEngine, LimitAction, PreparedTurn};
