@@ -741,6 +741,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
+    use rusqlite::Connection;
 
     use super::*;
     use crate::model::{BudgetConfig, ChatMessage};
@@ -1120,6 +1121,78 @@ mod tests {
         assert!(
             matches!(store.retrieval().answer_context(&answer_id), Err(crate::retrieval::RetrievalError::StaleIndex { session_id }) if session_id == a.id)
         );
+    }
+
+    #[tokio::test]
+    async fn tampered_external_retrieval_artifacts_fail_before_model_stream() {
+        for (column, value, table) in [
+            ("exact_content", "tampered", "retrieval_documents"),
+            ("content_sha256", "bad-hash", "retrieval_documents"),
+            ("content_sha256", "bad-hash", "source_spans"),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let store = SessionStore::new(root.path()).unwrap();
+            let mut a = store
+                .create("model", "http://localhost", Some("a"), budget(), false)
+                .unwrap();
+            let engine_a = ChatEngine::new(store.clone(), FakeClient::new(100));
+            let prepared_a = engine_a
+                .prepare_turn(&mut a, "唯一暗号是青瓷月亮".into())
+                .await
+                .unwrap();
+            engine_a
+                .stream_turn(&mut a, &prepared_a, CancellationToken::new(), |_| {})
+                .await
+                .unwrap();
+            let source_bytes = std::fs::read(root.path().join(format!("{}.json", a.id))).unwrap();
+            let event =
+                crate::model::event_id(&a.id, Some(&a.turns[0].id), crate::model::EventRole::User);
+            let connection = Connection::open(store.retrieval().index_path()).unwrap();
+            if table == "retrieval_documents" {
+                connection
+                    .execute(
+                        &format!("UPDATE retrieval_documents SET {column}=?1 WHERE event_id=?2"),
+                        rusqlite::params![value, event],
+                    )
+                    .unwrap();
+            } else {
+                connection
+                    .execute(
+                        &format!(
+                            "UPDATE source_spans SET {column}=?1 WHERE event_id=?2 AND start_char=0"
+                        ),
+                        rusqlite::params![value, event],
+                    )
+                    .unwrap();
+            }
+            drop(connection);
+            let mut b = store
+                .create("model", "http://localhost", Some("b"), budget(), false)
+                .unwrap();
+            let client = FakeClient::new(100);
+            let calls = client.stream_calls.clone();
+            let requests = client.captured_requests.clone();
+            let engine_b = ChatEngine::new(store.clone(), client);
+            assert!(
+                engine_b
+                    .prepare_turn(&mut b, "青瓷月亮暗号".into())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(*calls.lock().unwrap(), 0);
+            assert!(requests.lock().unwrap().is_empty());
+            assert!(
+                b.turns
+                    .last()
+                    .is_some_and(|turn| turn.status == TurnStatus::Failed
+                        && turn.request_started_at.is_none()
+                        && turn.context_trace.retrieval.status == "failed")
+            );
+            assert_eq!(
+                std::fs::read(root.path().join(format!("{}.json", a.id))).unwrap(),
+                source_bytes
+            );
+        }
     }
 
     #[tokio::test]
