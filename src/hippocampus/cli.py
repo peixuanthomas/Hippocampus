@@ -58,6 +58,8 @@ def _budget_lines(session: Session, prepared: PreparedTurn | None = None) -> lis
             f"估计={_unknown(trace.estimated_upper_tokens)}, 精确 input={_unknown(trace.exact_input_tokens)}；"
             f"included={len(trace.included_turn_ids)}, omitted={len(trace.omitted_turn_ids)}"
         )
+    if session.turns:
+        lines.append(_usage_line("最近本轮 probe：", session.turns[-1].probe_usage))
     lines.extend(
         [
             _usage_line("回答累计：", session.cumulative_usage()),
@@ -94,6 +96,8 @@ def _render_live(
         f"当前 input（{source}）: {_unknown(input_tokens)} / {budget.input_budget} ({ratio})；"
         f"included={len(plan.included_turn_ids)}, omitted={len(plan.omitted_turn_ids)}\n"
         f"实时输出（未最终确认）: {live_tokens}\n"
+        + _usage_line("本轮 probe：", session.turns[prepared.turn_index].probe_usage)
+        + "\n"
         + _usage_line("probe 累计：", session.cumulative_probe_usage()),
         style="dim",
     )
@@ -164,6 +168,7 @@ def _stream_prepared(
         console.print(f"实时输出校正：live {live_tokens} → final {final.output_tokens}")
     console.print(_usage_line("本轮最终（权威）：", final))
     console.print(_usage_line("回答累计：", session.cumulative_usage()))
+    console.print(_usage_line("本轮 probe：", session.turns[prepared.turn_index].probe_usage))
     console.print(_usage_line("probe 累计：", session.cumulative_probe_usage()))
 
 
@@ -279,9 +284,18 @@ def _chat(
             try:
                 _stream_prepared(console, engine, session, prepared)
             except KeyboardInterrupt:
-                usage = session.turns[-1].usage
-                console.print("生成已被用户中断；未收到最终权威 token 计数。")
-                console.print(_usage_line("本轮非最终：", usage))
+                turn = session.turns[prepared.turn_index]
+                usage = turn.usage
+                if (
+                    turn.status in {"complete", "truncated", "no_answer"}
+                    and usage.input_tokens is not None
+                    and usage.output_tokens is not None
+                ):
+                    console.print("最终结果与权威 token 计数已保存，仅终端显示被中断。")
+                    console.print(_usage_line("本轮最终（权威）：", usage))
+                else:
+                    console.print("生成已被用户中断；未收到最终权威 token 计数。")
+                    console.print(_usage_line("本轮非最终：", usage))
                 return 130
         except (ValueError, SessionStoreError, Exception) as exc:
             console.print(f"错误：{exc}")

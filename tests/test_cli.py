@@ -77,6 +77,7 @@ def test_budget_reports_answer_and_probe(tmp_path) -> None:
     code, text = run(tmp_path, ["--sessions-dir", str(tmp_path), "new"], ["hello", "/budget", "/exit"])
     assert code == 0 and "回答累计： input=100, output=3, total=103" in text
     assert "probe 累计： input=0, output=0, total=0" in text
+    assert "最近本轮 probe： input=0, output=0, total=0" in text
 
 
 def test_limit_end_does_not_stream(tmp_path) -> None:
@@ -174,6 +175,7 @@ def test_tty_live_displays_trace_probe_and_final_correction(tmp_path) -> None:
     assert code == 0
     assert "当前 input（精确）: 100 / 28160 (0.4%)" in text
     assert "included=0, omitted=0" in text
+    assert "本轮 probe： input=100, output=1, total=101" in text
     assert "probe 累计： input=100, output=1, total=101" in text
     assert "live 2 → final 3" in text
     assert "本轮最终（权威）： input=100, output=3, total=103" in text
@@ -209,6 +211,64 @@ def test_tty_live_update_interrupt_is_persisted(tmp_path, monkeypatch) -> None:
     assert session.turns[-1].status == "interrupted"
     assert session.turns[-1].assistant_content == ""
     assert session.turns[-1].usage == TokenUsage(None, 1)
+
+
+def test_tty_interrupt_after_completed_keeps_authoritative_usage(tmp_path, monkeypatch) -> None:
+    class RaisingAfterCompletedLive:
+        updates = 0
+
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args) -> None:
+            return None
+
+        def update(self, value) -> None:
+            type(self).updates += 1
+            if type(self).updates == 3:
+                raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli_module, "Live", RaisingAfterCompletedLive)
+    output = StringIO()
+    console = Console(file=output, force_terminal=True, color_system=None)
+    answers = iter(["hello"])
+    code = main(
+        ["--sessions-dir", str(tmp_path), "new"],
+        input_fn=lambda _: next(answers),
+        console=console,
+        client_factory=FakeClient,
+    )
+    session = SessionStore(tmp_path).list_sessions()[0]
+    turn = session.turns[-1]
+    text = output.getvalue()
+    assert code == 130 and turn.status == "complete"
+    assert turn.usage == TokenUsage(100, 3)
+    assert "权威 token 计数已保存" in text
+    assert "本轮最终（权威）： input=100, output=3, total=103" in text
+    assert "本轮非最终" not in text and "未收到最终" not in text
+
+
+def test_non_tty_prints_current_and_cumulative_probe(tmp_path) -> None:
+    class ProbingClient(FakeClient):
+        def render_prompt(self, **kwargs):
+            return None
+
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, color_system=None)
+    answers = iter(["hello", "/exit"])
+    code = main(
+        ["--sessions-dir", str(tmp_path), "new"],
+        input_fn=lambda _: next(answers),
+        console=console,
+        client_factory=ProbingClient,
+    )
+    text = output.getvalue()
+    assert code == 0
+    assert "本轮 probe： input=100, output=1, total=101" in text
+    assert "probe 累计： input=100, output=1, total=101" in text
 
 
 def test_corrupt_session_is_chinese_error(tmp_path) -> None:
