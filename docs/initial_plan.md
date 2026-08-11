@@ -18,7 +18,7 @@ Hippocampus 是一个面向日常长期对话的外部上下文管理系统。�
 ## 3. 初始技术方向
 
 - 主要语言：Python。
-- 模型服务：本地 Ollama，测试模型为 Qwen3.6 27B。
+- 模型服务：本地 Ollama，测试模型为 Qwen3.5 9B。
 - 原始数据与元数据：SQLite，启用 WAL。
 - 关键词检索：SQLite FTS5，补充中文字符 n-gram 索引。
 - 向量检索：在关键词基线稳定后接入 HNSW 或 FAISS。
