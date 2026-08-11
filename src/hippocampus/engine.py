@@ -324,6 +324,15 @@ class ChatEngine:
                     yield event
                     return
                 yield event
+        except KeyboardInterrupt:
+            self.interrupt_turn(
+                session,
+                prepared,
+                thinking="".join(thinking_parts),
+                content="".join(content_parts),
+                live_output_tokens=live_output_tokens,
+            )
+            raise
         except Exception as exc:
             turn.thinking = "".join(thinking_parts)
             turn.assistant_content = "".join(content_parts)
@@ -359,6 +368,30 @@ class ChatEngine:
         turn.touch()
         self.store.save(session)
         raise OllamaProtocolError(turn.error)
+
+    def interrupt_turn(
+        self,
+        session: Session,
+        prepared: PreparedTurn,
+        *,
+        thinking: str = "",
+        content: str = "",
+        live_output_tokens: int = 0,
+    ) -> None:
+        """Persist a user-interrupted pending turn without inventing final usage."""
+
+        try:
+            turn = self._pending_turn(session, prepared)
+        except ValueError:
+            return
+        turn.thinking = thinking
+        turn.assistant_content = content
+        turn.usage = TokenUsage(None, live_output_tokens if live_output_tokens else None)
+        turn.status = "interrupted"
+        turn.error = "用户中断生成，未收到最终权威 token 计数"
+        turn.touch()
+        session.status = "paused"
+        self.store.save(session)
 
     def _build_plan(
         self,

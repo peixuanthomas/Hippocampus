@@ -67,8 +67,21 @@ def _budget_lines(session: Session, prepared: PreparedTurn | None = None) -> lis
     return lines
 
 
-def _render_live(thinking: str, content: str, live_tokens: int, session: Session) -> Panel:
+def _render_live(
+    thinking: str,
+    content: str,
+    live_tokens: int,
+    session: Session,
+    prepared: PreparedTurn,
+    final_usage: TokenUsage | None = None,
+) -> Panel:
     budget = session.budget
+    plan = prepared.plan
+    input_tokens = plan.exact_input_tokens
+    source = "精确" if input_tokens is not None else "估计上界"
+    if input_tokens is None:
+        input_tokens = plan.estimated_upper_tokens
+    ratio = "未知" if input_tokens is None else f"{input_tokens / budget.input_budget:.1%}"
     body = Text()
     if thinking:
         body.append("Thinking（仅本轮展示，不会回注上下文）\n", style="yellow")
@@ -78,11 +91,19 @@ def _render_live(thinking: str, content: str, live_tokens: int, session: Session
     body.append(content or "…", style="white")
     body.append("\n\n")
     body.append(
-        f"实时输出（未最终确认）: {live_tokens}；最终权威计数将在完成事件校正\n"
-        f"输入预算: {budget.input_budget}；included/omitted 见本轮 trace；"
-        f"probe 累计: {_unknown(session.cumulative_probe_usage().total_tokens)}",
+        f"当前 input（{source}）: {_unknown(input_tokens)} / {budget.input_budget} ({ratio})；"
+        f"included={len(plan.included_turn_ids)}, omitted={len(plan.omitted_turn_ids)}\n"
+        f"实时输出（未最终确认）: {live_tokens}\n"
+        + _usage_line("probe 累计：", session.cumulative_probe_usage()),
         style="dim",
     )
+    if final_usage is not None:
+        body.append("\n" + _usage_line("本轮最终（权威）：", final_usage), style="bold cyan")
+        if final_usage.output_tokens is not None and final_usage.output_tokens != live_tokens:
+            body.append(
+                f"\n实时输出校正：live {live_tokens} → final {final_usage.output_tokens}",
+                style="bold cyan",
+            )
     return Panel(body, title="Hippocampus", border_style="cyan")
 
 
@@ -92,32 +113,55 @@ def _stream_prepared(
     thinking = ""
     content = ""
     live_tokens = 0
+    final_usage: TokenUsage | None = None
 
     def consume(event: ChatEvent) -> None:
-        nonlocal thinking, content, live_tokens
+        nonlocal thinking, content, live_tokens, final_usage
         if event.live_output_tokens is not None:
             live_tokens = event.live_output_tokens
         if event.kind == "thinking":
             thinking += event.text
         elif event.kind == "content":
             content += event.text
+        elif event.kind == "completed":
+            final_usage = event.usage
 
-    if console.is_terminal:
-        with Live(_render_live(thinking, content, live_tokens, session), console=console, refresh_per_second=12) as live:
+    try:
+        if console.is_terminal:
+            with Live(
+                _render_live(thinking, content, live_tokens, session, prepared),
+                console=console,
+                refresh_per_second=12,
+            ) as live:
+                for event in engine.stream_turn(session, prepared):
+                    consume(event)
+                    live.update(
+                        _render_live(
+                            thinking, content, live_tokens, session, prepared, final_usage
+                        )
+                    )
+        else:
             for event in engine.stream_turn(session, prepared):
                 consume(event)
-                live.update(_render_live(thinking, content, live_tokens, session))
-    else:
-        for event in engine.stream_turn(session, prepared):
-            consume(event)
-            if event.kind == "thinking" and event.text:
-                console.print(f"思考：{event.text}")
-            elif event.kind == "content" and event.text:
-                console.print(event.text, end="")
-        if content:
-            console.print()
+                if event.kind == "thinking" and event.text:
+                    console.print(f"思考：{event.text}")
+                elif event.kind == "content" and event.text:
+                    console.print(event.text, end="")
+            if content:
+                console.print()
+    except KeyboardInterrupt:
+        engine.interrupt_turn(
+            session,
+            prepared,
+            thinking=thinking,
+            content=content,
+            live_output_tokens=live_tokens,
+        )
+        raise
 
     final = session.turns[-1].usage
+    if final.output_tokens is not None and final.output_tokens != live_tokens:
+        console.print(f"实时输出校正：live {live_tokens} → final {final.output_tokens}")
     console.print(_usage_line("本轮最终（权威）：", final))
     console.print(_usage_line("回答累计：", session.cumulative_usage()))
     console.print(_usage_line("probe 累计：", session.cumulative_probe_usage()))
@@ -213,7 +257,16 @@ def _chat(
             if prepared.needs_limit_decision:
                 console.print(prepared.message)
                 while True:
-                    answer = input_fn("上下文临界。继续/结束：").strip()
+                    try:
+                        answer = input_fn("上下文临界。继续/结束：").strip()
+                    except EOFError:
+                        engine.resolve_limit(session, prepared, LimitAction.END_SESSION)
+                        console.print("收到 EOF，已暂停并保存；消息未发送给模型。")
+                        return 0
+                    except KeyboardInterrupt:
+                        engine.resolve_limit(session, prepared, LimitAction.END_SESSION)
+                        console.print("已中断并暂停保存；消息未发送给模型。")
+                        return 130
                     if answer == "继续":
                         prepared = engine.resolve_limit(session, prepared, LimitAction.CONTINUE_WITH_TRIM)
                         console.print(prepared.message)
@@ -223,7 +276,13 @@ def _chat(
                         console.print("已结束本会话；消息未发送给模型。")
                         return 0
                     console.print("请输入“继续”或“结束”。")
-            _stream_prepared(console, engine, session, prepared)
+            try:
+                _stream_prepared(console, engine, session, prepared)
+            except KeyboardInterrupt:
+                usage = session.turns[-1].usage
+                console.print("生成已被用户中断；未收到最终权威 token 计数。")
+                console.print(_usage_line("本轮非最终：", usage))
+                return 130
         except (ValueError, SessionStoreError, Exception) as exc:
             console.print(f"错误：{exc}")
 

@@ -330,6 +330,29 @@ def test_interrupted_probed_stream_does_not_promote_probe_input_to_answer(tmp_pa
     assert turn.context_trace.exact_input_tokens == 750
 
 
+def test_keyboard_interrupt_persists_nonfinal_partial_usage(tmp_path) -> None:
+    store = SessionStore(tmp_path / "sessions")
+
+    class InterruptingClient(FakeClient):
+        def stream_chat(self, **kwargs):
+            yield ChatEvent(kind="content", text="partial", live_output_tokens=2)
+            raise KeyboardInterrupt
+
+    session = make_session(store)
+    engine = ChatEngine(store, InterruptingClient(count=100))
+    prepared = engine.prepare_turn(session, "question")
+
+    with pytest.raises(KeyboardInterrupt):
+        list(engine.stream_turn(session, prepared))
+
+    turn = session.turns[-1]
+    assert turn.status == "interrupted"
+    assert session.status == "paused"
+    assert turn.assistant_content == "partial"
+    assert turn.usage == TokenUsage(None, 2)
+    assert "用户中断" in (turn.error or "")
+
+
 def test_prepared_turn_cannot_be_used_with_another_session(tmp_path) -> None:
     store = SessionStore(tmp_path / "sessions")
     client = FakeClient(count=100)
