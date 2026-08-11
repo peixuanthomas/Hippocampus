@@ -6,8 +6,9 @@ from types import SimpleNamespace
 from rich.console import Console
 
 import hippocampus.cli as cli_module
-from hippocampus.cli import main
-from hippocampus.models import ChatEvent, TokenUsage
+from hippocampus.cli import _plan_trace_line, main
+from hippocampus.engine import PreparedTurn
+from hippocampus.models import BudgetConfig, ChatEvent, ContextPlan, Session, TokenUsage
 from hippocampus.store import SessionStore
 
 
@@ -50,6 +51,7 @@ def test_new_health_stream_and_authoritative_final_usage(tmp_path) -> None:
     code, text = run(tmp_path, ["--sessions-dir", str(tmp_path), "new"], ["hello", "/exit"])
     assert code == 0 and len(FakeClient.made) == 1
     assert FakeClient.made[0].checked
+    assert "当前 trace：估计上界 input=100 / 28160 (0.4%)；included=0, omitted=0" in text
     assert "本轮最终（权威）： input=100, output=3, total=103" in text
     assert "实时输出校正：live 2 → final 3" in text
 
@@ -60,6 +62,35 @@ def test_resume_prefix_reopens_and_think_persists(tmp_path) -> None:
     code, text = run(tmp_path, ["--sessions-dir", str(tmp_path), "resume", session.id[:12]], ["/think off", "/exit"])
     assert code == 0 and "thinking 已设为：off" in text
     assert store.load(session.id).think is False
+
+
+def test_non_terminal_trace_uses_current_prepared_plan() -> None:
+    session = Session(
+        id="session",
+        budget=BudgetConfig(
+            context_window=1_000,
+            max_output_tokens=100,
+            safety_margin_tokens=0,
+        ),
+    )
+    prepared = PreparedTurn(
+        session_id=session.id,
+        turn_id="turn",
+        turn_index=0,
+        status="ready",
+        plan=ContextPlan(
+            messages=[],
+            included_turn_ids=["new-a", "new-b"],
+            omitted_turn_ids=["old"],
+            selected_history_indices=[4, 5],
+            estimated_upper_tokens=10,
+            exact_input_tokens=750,
+            input_budget=900,
+        ),
+    )
+    assert _plan_trace_line(session, prepared) == (
+        "当前 trace：精确 input=750 / 900 (83.3%)；included=2, omitted=1"
+    )
 
 
 def test_list_show_are_read_only_and_sessions_do_not_cross(tmp_path) -> None:

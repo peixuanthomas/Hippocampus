@@ -31,6 +31,22 @@ def _usage_line(label: str, usage: TokenUsage) -> str:
     )
 
 
+def _plan_trace_line(session: Session, prepared: PreparedTurn) -> str:
+    """Render the current prepared context plan, not a prior turn's trace."""
+
+    plan = prepared.plan
+    input_tokens = plan.exact_input_tokens
+    source = "精确" if input_tokens is not None else "估计上界"
+    if input_tokens is None:
+        input_tokens = plan.estimated_upper_tokens
+    ratio = "未知" if input_tokens is None else f"{input_tokens / session.budget.input_budget:.1%}"
+    return (
+        f"当前 trace：{source} input={_unknown(input_tokens)} / "
+        f"{session.budget.input_budget} ({ratio})；"
+        f"included={len(plan.included_turn_ids)}, omitted={len(plan.omitted_turn_ids)}"
+    )
+
+
 def _budget_lines(session: Session, prepared: PreparedTurn | None = None) -> list[str]:
     budget = session.budget
     lines = [
@@ -41,16 +57,7 @@ def _budget_lines(session: Session, prepared: PreparedTurn | None = None) -> lis
         f"活动起点={session.active_context_start_index}",
     ]
     if prepared is not None:
-        trace = prepared.plan
-        exact_or_estimate = trace.exact_input_tokens
-        source = "精确" if exact_or_estimate is not None else "估计上界"
-        if exact_or_estimate is None:
-            exact_or_estimate = trace.estimated_upper_tokens
-        ratio = "未知" if exact_or_estimate is None else f"{exact_or_estimate / budget.input_budget:.1%}"
-        lines.append(
-            f"当前 trace：{source} input={_unknown(exact_or_estimate)} ({ratio})；"
-            f"included={len(trace.included_turn_ids)}, omitted={len(trace.omitted_turn_ids)}"
-        )
+        lines.append(_plan_trace_line(session, prepared))
     elif session.turns:
         trace = session.turns[-1].context_trace
         lines.append(
@@ -145,6 +152,7 @@ def _stream_prepared(
                         )
                     )
         else:
+            console.print(_plan_trace_line(session, prepared))
             for event in engine.stream_turn(session, prepared):
                 consume(event)
                 if event.kind == "thinking" and event.text:
