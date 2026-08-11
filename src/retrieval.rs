@@ -191,7 +191,7 @@ impl RetrievalStore {
         let transaction = connection
             .transaction()
             .map_err(|source| self.database_error(source))?;
-        let report = self.write_session(&transaction, &source)?;
+        let report = self.write_session(&transaction, &source, true)?;
         transaction
             .commit()
             .map_err(|source| self.database_error(source))?;
@@ -225,7 +225,14 @@ impl RetrievalStore {
             .map_err(|source| self.database_error(source))?;
         let mut total = SyncReport::default();
         for source in &sources {
-            add_report(&mut total, self.write_session(&transaction, source)?);
+            add_report(&mut total, self.write_session(&transaction, source, false)?);
+        }
+        // Every immutable event/span now exists, independent of filename order.
+        // The second pass only needs materialize answer references; it may
+        // refresh that source's own derived documents without deleting events.
+        for source in &sources {
+            let report = self.write_session(&transaction, source, true)?;
+            total.answer_contexts += report.answer_contexts;
         }
         transaction
             .commit()
@@ -672,6 +679,7 @@ impl RetrievalStore {
         &self,
         transaction: &Transaction<'_>,
         source: &SessionSource,
+        materialize_answers: bool,
     ) -> RetrievalResult<SyncReport> {
         let source_file = source_file_name(&self.root, &source.path)?;
         transaction.execute("DELETE FROM retrieval_documents_fts WHERE rowid IN (SELECT rowid FROM retrieval_documents WHERE event_id IN (SELECT event_id FROM events WHERE session_id=?1))", [source.session.id.as_str()]).map_err(|e| self.database_error(e))?;
@@ -754,6 +762,15 @@ impl RetrievalStore {
             }
         }
 
+        if !materialize_answers {
+            return Ok(SyncReport {
+                sessions: 1,
+                events: events.len(),
+                spans: spans.len(),
+                answer_contexts: 0,
+                documents: document_count,
+            });
+        }
         let mut answer_context_count = 0;
         for turn in &source.session.turns {
             let answer_id = event_id(&source.session.id, Some(&turn.id), EventRole::Assistant);
@@ -2425,6 +2442,110 @@ mod tests {
         assert_eq!(
             before.items[1].resolved.content,
             after.items[1].resolved.content
+        );
+    }
+
+    #[test]
+    fn rebuild_materializes_cross_session_answers_after_all_events() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let mut a = Session::new(
+            "z-source".into(),
+            "model".into(),
+            "http://localhost".into(),
+            "a".into(),
+            Default::default(),
+            false,
+        )
+        .unwrap();
+        let external = append_complete_turn(&mut a, "A问", "A证据", "");
+        store.save(&mut a).unwrap();
+        let mut b = Session::new(
+            "a-dependent".into(),
+            "model".into(),
+            "http://localhost".into(),
+            "b".into(),
+            Default::default(),
+            false,
+        )
+        .unwrap();
+        let mut turn = Turn::pending("B问".into());
+        turn.request_started_at = Some(utc_now());
+        turn.assistant_content = "B答".into();
+        turn.status = TurnStatus::Complete;
+        let messages = vec![
+            ChatMessage {
+                role: "system".into(),
+                content: "b".into(),
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: "A证据".into(),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: "B问".into(),
+            },
+        ];
+        turn.context_trace = ContextTrace {
+            context_items: vec![
+                ContextItemTrace {
+                    role: EventRole::System,
+                    span: SourceSpan {
+                        event_id: event_id(&b.id, None, EventRole::System),
+                        start_char: 0,
+                        end_char: 1,
+                    },
+                    content_sha256: content_sha256("b"),
+                },
+                ContextItemTrace {
+                    role: EventRole::Assistant,
+                    span: SourceSpan {
+                        event_id: external,
+                        start_char: 0,
+                        end_char: 3,
+                    },
+                    content_sha256: content_sha256("A证据"),
+                },
+                ContextItemTrace {
+                    role: EventRole::User,
+                    span: SourceSpan {
+                        event_id: event_id(&b.id, Some(&turn.id), EventRole::User),
+                        start_char: 0,
+                        end_char: 2,
+                    },
+                    content_sha256: content_sha256("B问"),
+                },
+            ],
+            context_sha256: Some(context_sha256(&messages)),
+            request: Some(ModelRequestTrace {
+                model: "model".into(),
+                think: false,
+                context_window: b.budget.context_window,
+                max_output_tokens: b.budget.max_output_tokens,
+            }),
+            provenance_quality: ProvenanceQuality::Exact,
+            ..Default::default()
+        };
+        b.turns.push(turn);
+        store.save(&mut b).unwrap();
+        let answer = event_id(&b.id, Some(&b.turns[0].id), EventRole::Assistant);
+        let before = store.retrieval().answer_context(&answer).unwrap();
+        let report = store.retrieval().rebuild().unwrap();
+        assert_eq!(report.sessions, 2);
+        let after = store.retrieval().answer_context(&answer).unwrap();
+        assert_eq!(after.context_sha256, before.context_sha256);
+        assert_eq!(
+            after
+                .items
+                .iter()
+                .map(|i| &i.resolved.content)
+                .collect::<Vec<_>>(),
+            before
+                .items
+                .iter()
+                .map(|i| &i.resolved.content)
+                .collect::<Vec<_>>()
         );
     }
 
