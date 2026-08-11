@@ -172,6 +172,12 @@ impl<B: ChatBackend> ChatEngine<B> {
                     ..Default::default()
                 };
             })?;
+        // Retrieval has succeeded independently of rendering/probing. Persist
+        // it now so a later planning failure remains diagnosable.
+        session.turns[turn_index].context_trace.retrieval = recall.trace.clone();
+        session.turns[turn_index].context_trace.decision = "retrieval_completed".into();
+        session.turns[turn_index].touch();
+        self.store.save(session)?;
         let (mut plan, render_supported) = self
             .build_plan(session, turn_index, &history, &user_content, &recall)
             .await?;

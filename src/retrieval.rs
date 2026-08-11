@@ -705,9 +705,34 @@ impl RetrievalStore {
             .iter()
             .map(|event| (event.id.clone(), event))
             .collect::<HashMap<_, _>>();
+        let expected_ids: HashSet<_> = events.iter().map(|event| event.id.as_str()).collect();
+        let mut existing_statement = transaction
+            .prepare("SELECT event_id FROM events WHERE session_id=?1")
+            .map_err(|e| self.database_error(e))?;
+        let existing_ids = existing_statement
+            .query_map([source.session.id.as_str()], |row| row.get::<_, String>(0))
+            .map_err(|e| self.database_error(e))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| self.database_error(e))?;
+        drop(existing_statement);
+        if existing_ids
+            .iter()
+            .any(|id| !expected_ids.contains(id.as_str()))
+        {
+            return Err(RetrievalError::InvalidSource {
+                path: source.path.clone(),
+                message: "源会话删除了已索引的不可变事件".into(),
+            });
+        }
         let mut spans = HashSet::new();
         let mut document_count = 0;
         for event in &events {
+            if let Some(existing) = transaction.query_row("SELECT event_id, session_id, turn_id, sequence, role, created_at, content, content_sha256, reply_to_event_id, token_count, turn_status, done_reason, error FROM events WHERE event_id=?1", [&event.id], map_event).optional().map_err(|e| self.database_error(e))? {
+                let transition = existing.role == EventRole::Assistant && existing.content.is_empty() && !event.content.is_empty();
+                if existing.session_id != event.session_id || existing.turn_id != event.turn_id || existing.sequence != event.sequence || existing.role != event.role || existing.created_at != event.created_at || (!transition && existing.content != event.content) {
+                    return Err(RetrievalError::InvalidSource { path: source.path.clone(), message: format!("索引中的不可变事件 {} 与源文件不一致", event.id) });
+                }
+            }
             insert_event(transaction, event).map_err(|error| self.database_error(error))?;
             let full_span = SourceSpan {
                 event_id: event.id.clone(),
@@ -920,6 +945,7 @@ impl RetrievalStore {
         connection
             .execute_batch(
                 "PRAGMA foreign_keys = ON;
+                 PRAGMA journal_mode = WAL;
                  PRAGMA synchronous = FULL;",
             )
             .map_err(|source| self.database_error(source))?;
@@ -929,14 +955,14 @@ impl RetrievalStore {
         if !matches!(version, 0 | 1 | INDEX_SCHEMA_VERSION) {
             return Err(RetrievalError::UnsupportedIndexVersion(version));
         }
-        connection
-            .execute_batch(SCHEMA_SQL)
-            .map_err(|source| self.database_error(source))?;
         if version == 1 {
             // v1 contains all immutable events, so a transactional rebuild of
             // only derived tables is deterministic and loses no source data.
             let transaction = connection
                 .transaction()
+                .map_err(|e| self.database_error(e))?;
+            transaction
+                .execute_batch(SCHEMA_SQL)
                 .map_err(|e| self.database_error(e))?;
             transaction
                 .execute_batch(
@@ -967,8 +993,19 @@ impl RetrievalStore {
                 .map_err(|e| self.database_error(e))?;
             transaction.commit().map_err(|e| self.database_error(e))?;
         } else if version == 0 {
-            connection
+            let transaction = connection
+                .transaction()
+                .map_err(|e| self.database_error(e))?;
+            transaction
+                .execute_batch(SCHEMA_SQL)
+                .map_err(|e| self.database_error(e))?;
+            transaction
                 .pragma_update(None, "user_version", INDEX_SCHEMA_VERSION)
+                .map_err(|e| self.database_error(e))?;
+            transaction.commit().map_err(|e| self.database_error(e))?;
+        } else {
+            connection
+                .execute_batch(SCHEMA_SQL)
                 .map_err(|source| self.database_error(source))?;
         }
         Ok(connection)
@@ -1368,10 +1405,20 @@ fn insert_span(
 ) -> rusqlite::Result<()> {
     let start_char = usize_to_i64(span.start_char)?;
     let end_char = usize_to_i64(span.end_char)?;
+    let hash = content_sha256(content);
+    let existing = transaction.query_row("SELECT content_sha256 FROM source_spans WHERE event_id=?1 AND start_char=?2 AND end_char=?3", params![span.event_id, start_char, end_char], |row| row.get::<_, String>(0)).optional()?;
+    if let Some(existing) = existing {
+        if existing != hash {
+            return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                std::io::Error::other("source span hash mismatch"),
+            )));
+        }
+        return Ok(());
+    }
     transaction.execute(
-        "INSERT OR IGNORE INTO source_spans
+        "INSERT INTO source_spans
          (event_id, start_char, end_char, content_sha256) VALUES (?1, ?2, ?3, ?4)",
-        params![span.event_id, start_char, end_char, content_sha256(content),],
+        params![span.event_id, start_char, end_char, hash],
     )?;
     Ok(())
 }
