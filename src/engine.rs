@@ -119,6 +119,7 @@ impl<B: ChatBackend> ChatEngine<B> {
         prepared
     }
 
+    #[allow(clippy::collapsible_if)]
     async fn prepare_persisted_turn(
         &self,
         session: &mut Session,
@@ -178,15 +179,25 @@ impl<B: ChatBackend> ChatEngine<B> {
         session.turns[turn_index].context_trace.decision = "retrieval_completed".into();
         session.turns[turn_index].touch();
         self.store.save(session)?;
-        let (mut plan, render_supported) = self
+        let (mut plan, render_supported) = match self
             .build_plan(session, turn_index, &history, &user_content, &recall)
-            .await?;
+            .await
+        {
+            Ok(plan) => plan,
+            Err(error) => {
+                session.turns[turn_index].context_trace.decision = "render_failed".into();
+                return Err(error);
+            }
+        };
         if !render_supported
             || plan
                 .estimated_upper_tokens
                 .is_some_and(|tokens| tokens >= session.budget.probe_threshold())
         {
-            self.probe_plan(session, turn_index, &mut plan).await?;
+            if let Err(error) = self.probe_plan(session, turn_index, &mut plan).await {
+                session.turns[turn_index].context_trace.decision = "probe_failed".into();
+                return Err(error);
+            }
         }
 
         if plan_metric(&plan)? >= session.budget.warning_threshold() {
@@ -758,6 +769,8 @@ mod tests {
         observe_source: Option<(PathBuf, Arc<Mutex<bool>>)>,
         captured_requests: Arc<Mutex<Vec<ChatRequest>>>,
         stream_calls: Arc<Mutex<usize>>,
+        render_error: Option<OllamaError>,
+        probe_error: Option<OllamaError>,
     }
 
     impl FakeClient {
@@ -782,6 +795,8 @@ mod tests {
                 observe_source: None,
                 captured_requests: Arc::new(Mutex::new(Vec::new())),
                 stream_calls: Arc::new(Mutex::new(0)),
+                render_error: None,
+                probe_error: None,
             }
         }
 
@@ -815,6 +830,9 @@ mod tests {
             _: bool,
             _: u64,
         ) -> Result<Option<String>, OllamaError> {
+            if let Some(error) = &self.render_error {
+                return Err(error.clone());
+            }
             Ok(self
                 .render_supported
                 .then(|| "x".repeat(self.count_for(messages) as usize)))
@@ -828,6 +846,9 @@ mod tests {
             _: u64,
         ) -> Result<TokenUsage, OllamaError> {
             *self.probes.lock().unwrap() += 1;
+            if let Some(error) = &self.probe_error {
+                return Err(error.clone());
+            }
             Ok(TokenUsage::new(Some(self.count_for(messages)), Some(1)))
         }
 
@@ -1193,6 +1214,101 @@ mod tests {
                 source_bytes
             );
         }
+    }
+
+    #[tokio::test]
+    async fn successful_recall_survives_render_and_probe_failures() {
+        for probe_case in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let store = SessionStore::new(root.path()).unwrap();
+            let mut a = store
+                .create("model", "http://localhost", Some("a"), budget(), false)
+                .unwrap();
+            let ea = ChatEngine::new(store.clone(), FakeClient::new(100));
+            let pa = ea
+                .prepare_turn(&mut a, "外部事实：琥珀钥匙在杭州".into())
+                .await
+                .unwrap();
+            ea.stream_turn(&mut a, &pa, CancellationToken::new(), |_| {})
+                .await
+                .unwrap();
+            let mut b = store
+                .create("model", "http://localhost", Some("b"), budget(), false)
+                .unwrap();
+            let mut client = FakeClient::new(if probe_case { 800 } else { 100 });
+            client.render_supported = probe_case;
+            if probe_case {
+                client.probe_error = Some(OllamaError::Protocol("probe failure".into()));
+            } else {
+                client.render_error = Some(OllamaError::Protocol("render failure".into()));
+            }
+            let calls = client.stream_calls.clone();
+            let engine = ChatEngine::new(store.clone(), client);
+            assert!(
+                engine
+                    .prepare_turn(&mut b, "琥珀钥匙在哪里".into())
+                    .await
+                    .is_err()
+            );
+            let reloaded = store.load(&b.id).unwrap();
+            let turn = reloaded.turns.last().unwrap();
+            assert_eq!(turn.context_trace.retrieval.status, "ok");
+            assert!(!turn.context_trace.retrieval.candidates.is_empty());
+            assert!(!turn.context_trace.retrieval.selected_evidence.is_empty());
+            assert_eq!(
+                turn.context_trace.decision,
+                if probe_case {
+                    "probe_failed"
+                } else {
+                    "render_failed"
+                }
+            );
+            assert_eq!(turn.status, TurnStatus::Failed);
+            assert!(turn.request_started_at.is_none());
+            assert_eq!(*calls.lock().unwrap(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn render_fallback_preserves_external_retrieval_trace() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let mut a = store
+            .create("model", "http://localhost", Some("a"), budget(), false)
+            .unwrap();
+        let ea = ChatEngine::new(store.clone(), FakeClient::new(100));
+        let pa = ea
+            .prepare_turn(&mut a, "外部事实：翡翠罗盘".into())
+            .await
+            .unwrap();
+        ea.stream_turn(&mut a, &pa, CancellationToken::new(), |_| {})
+            .await
+            .unwrap();
+        let mut b = store
+            .create("model", "http://localhost", Some("b"), budget(), false)
+            .unwrap();
+        let mut client = FakeClient::new(100);
+        client.render_supported = false;
+        let probes = client.probes.clone();
+        let engine = ChatEngine::new(store.clone(), client);
+        let prepared = engine
+            .prepare_turn(&mut b, "翡翠罗盘是什么".into())
+            .await
+            .unwrap();
+        assert_eq!(*probes.lock().unwrap(), 1);
+        assert!(!prepared.plan.retrieval_trace.selected_evidence.is_empty());
+        assert_eq!(
+            store
+                .load(&b.id)
+                .unwrap()
+                .turns
+                .last()
+                .unwrap()
+                .context_trace
+                .retrieval
+                .selected_evidence,
+            prepared.plan.retrieval_trace.selected_evidence
+        );
     }
 
     #[tokio::test]
