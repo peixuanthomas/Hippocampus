@@ -173,6 +173,24 @@ def test_continue_keeps_maximum_suffix_at_trim_target(tmp_path) -> None:
     assert session.turns[-1].context_trace.decision == "trimmed_and_continued"
 
 
+def test_continue_blocks_when_mandatory_input_exceeds_trim_target(tmp_path) -> None:
+    store = SessionStore(tmp_path / "sessions")
+    client = FakeClient(count=850)
+    session = make_session(store)
+    engine = ChatEngine(store, client)
+
+    prepared = engine.prepare_turn(session, "near limit")
+    blocked = engine.resolve_limit(session, prepared, LimitAction.CONTINUE_WITH_TRIM)
+
+    assert prepared.needs_limit_decision
+    assert blocked.status == "blocked"
+    assert session.status == "paused"
+    assert session.turns[-1].status == "blocked"
+    assert session.turns[-1].context_trace.decision == "mandatory_above_trim_target"
+    assert "超过 80% 安全裁剪目标" in blocked.message
+    assert client.stream_calls == []
+
+
 def test_mandatory_input_over_budget_is_blocked(tmp_path) -> None:
     store = SessionStore(tmp_path / "sessions")
     client = FakeClient(count=950)
@@ -288,6 +306,28 @@ def test_interrupted_stream_saves_only_confirmed_partial_counts(tmp_path) -> Non
     assert turn.context_eligible is False
     assert turn.usage.input_tokens is None
     assert turn.usage.output_tokens == 2
+
+
+def test_interrupted_probed_stream_does_not_promote_probe_input_to_answer(tmp_path) -> None:
+    store = SessionStore(tmp_path / "sessions")
+    client = FakeClient(
+        count=750,
+        stream_events=[ChatEvent(kind="content", text="partial", live_output_tokens=2)],
+        stream_error=OllamaConnectionError("lost"),
+    )
+    session = make_session(store)
+    engine = ChatEngine(store, client)
+    prepared = engine.prepare_turn(session, "question")
+
+    with pytest.raises(OllamaConnectionError):
+        list(engine.stream_turn(session, prepared))
+
+    turn = session.turns[-1]
+    assert turn.status == "interrupted"
+    assert turn.context_eligible is False
+    assert turn.usage == TokenUsage(None, 2)
+    assert turn.probe_usage == TokenUsage(750, 1)
+    assert turn.context_trace.exact_input_tokens == 750
 
 
 def test_prepared_turn_cannot_be_used_with_another_session(tmp_path) -> None:

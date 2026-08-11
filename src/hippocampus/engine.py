@@ -187,7 +187,28 @@ class ChatEngine:
 
         target = session.budget.trim_target
         if mandatory_tokens > target:
-            best_count = 0
+            turn.status = "blocked"
+            turn.error = (
+                "系统提示与当前输入超过 80% 安全裁剪目标，请缩短系统提示或当前输入"
+            )
+            self._apply_trace(
+                turn,
+                mandatory,
+                decision="mandatory_above_trim_target",
+                start_before=start_before,
+                start_after=start_before,
+            )
+            turn.touch()
+            session.status = "paused"
+            self.store.save(session)
+            return PreparedTurn(
+                session_id=session.id,
+                turn_id=turn.id,
+                turn_index=prepared.turn_index,
+                plan=mandatory,
+                status="blocked",
+                message=turn.error,
+            )
         else:
             low, high = 0, len(history)
             best_count = 0
@@ -310,7 +331,7 @@ class ChatEngine:
                 turn.usage = final_usage
             else:
                 turn.usage = TokenUsage(
-                    prepared.plan.exact_input_tokens,
+                    None,
                     live_output_tokens if live_output_tokens else None,
                 )
             if isinstance(exc, OllamaContextLengthError):
@@ -331,7 +352,7 @@ class ChatEngine:
         turn.thinking = "".join(thinking_parts)
         turn.assistant_content = "".join(content_parts)
         turn.usage = TokenUsage(
-            prepared.plan.exact_input_tokens,
+            None,
             live_output_tokens if live_output_tokens else None,
         )
         turn.error = "模型流在完成事件之前结束"
