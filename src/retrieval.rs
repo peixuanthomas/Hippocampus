@@ -1927,6 +1927,122 @@ CREATE INDEX IF NOT EXISTS consolidation_batches_session_started
     ON consolidation_batches(session_id, started_at, attempt_id);
 CREATE INDEX IF NOT EXISTS consolidation_batches_batch_key
     ON consolidation_batches(batch_key);
+
+CREATE TABLE IF NOT EXISTS memory_entities (
+    entity_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL CHECK(kind IN ('person','organization','location','object','concept','unknown')),
+    canonical_name TEXT NOT NULL CHECK(length(canonical_name) > 0),
+    normalized_name TEXT NOT NULL CHECK(length(normalized_name) > 0),
+    disambiguation TEXT NOT NULL CHECK(disambiguation IN ('resolved','pending')),
+    created_session_id TEXT NOT NULL CHECK(length(created_session_id) > 0),
+    created_batch_key TEXT NOT NULL CHECK(length(created_batch_key) > 0),
+    created_event_id TEXT NOT NULL CHECK(length(created_event_id) > 0),
+    created_start INTEGER NOT NULL CHECK(created_start >= 0),
+    created_end INTEGER NOT NULL CHECK(created_end > created_start),
+    created_hash TEXT NOT NULL CHECK(length(created_hash) = 64),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS memory_entities_normalized
+    ON memory_entities(normalized_name, kind, entity_id);
+
+CREATE TABLE IF NOT EXISTS memory_entity_aliases (
+    alias_id TEXT PRIMARY KEY,
+    entity_id TEXT NOT NULL,
+    alias_text TEXT NOT NULL CHECK(length(alias_text) > 0),
+    normalized_alias TEXT NOT NULL CHECK(length(normalized_alias) > 0),
+    alias_kind TEXT NOT NULL CHECK(alias_kind IN ('explicit_alias','stable_identifier')),
+    stable_identifier_kind TEXT,
+    session_id TEXT NOT NULL CHECK(length(session_id) > 0),
+    batch_key TEXT NOT NULL CHECK(length(batch_key) > 0),
+    event_id TEXT NOT NULL CHECK(length(event_id) > 0),
+    start_char INTEGER NOT NULL CHECK(start_char >= 0),
+    end_char INTEGER NOT NULL CHECK(end_char > start_char),
+    content_sha256 TEXT NOT NULL CHECK(length(content_sha256) = 64),
+    created_at TEXT NOT NULL,
+    CHECK((alias_kind = 'explicit_alias' AND stable_identifier_kind IS NULL)
+       OR (alias_kind = 'stable_identifier' AND stable_identifier_kind IS NOT NULL
+           AND length(stable_identifier_kind) > 0))
+);
+CREATE INDEX IF NOT EXISTS memory_entity_aliases_entity
+    ON memory_entity_aliases(entity_id, alias_id);
+CREATE INDEX IF NOT EXISTS memory_entity_aliases_normalized
+    ON memory_entity_aliases(alias_kind, stable_identifier_kind, normalized_alias, entity_id);
+
+CREATE TABLE IF NOT EXISTS memory_claims (
+    claim_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL CHECK(length(session_id) > 0),
+    subject_entity_id TEXT NOT NULL CHECK(length(subject_entity_id) > 0),
+    predicate_key TEXT NOT NULL CHECK(length(predicate_key) > 0),
+    object_kind TEXT NOT NULL CHECK(object_kind IN ('text','entity')),
+    object_text TEXT,
+    object_entity_id TEXT,
+    normalized_object TEXT NOT NULL CHECK(length(normalized_object) > 0),
+    polarity TEXT NOT NULL CHECK(polarity IN ('assert','deny')),
+    cardinality TEXT NOT NULL CHECK(cardinality IN ('single','multi')),
+    certainty TEXT NOT NULL CHECK(certainty IN ('certain','uncertain')),
+    state TEXT NOT NULL CHECK(state IN ('active','superseded','conflicted','uncertain')),
+    asserted_at TEXT NOT NULL,
+    event_time TEXT,
+    valid_from TEXT NOT NULL,
+    valid_to TEXT,
+    reference_time TEXT NOT NULL,
+    created_batch_key TEXT NOT NULL CHECK(length(created_batch_key) > 0),
+    updated_batch_key TEXT NOT NULL CHECK(length(updated_batch_key) > 0),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK((object_kind = 'text' AND object_text IS NOT NULL AND object_entity_id IS NULL)
+       OR (object_kind = 'entity' AND object_text IS NULL AND object_entity_id IS NOT NULL))
+);
+CREATE INDEX IF NOT EXISTS memory_claims_subject_predicate
+    ON memory_claims(subject_entity_id, predicate_key, state, claim_id);
+CREATE INDEX IF NOT EXISTS memory_claims_updated
+    ON memory_claims(updated_at DESC, claim_id);
+
+CREATE TABLE IF NOT EXISTS memory_claim_evidence (
+    evidence_id TEXT PRIMARY KEY,
+    claim_id TEXT NOT NULL,
+    session_id TEXT NOT NULL CHECK(length(session_id) > 0),
+    batch_key TEXT NOT NULL CHECK(length(batch_key) > 0),
+    event_id TEXT NOT NULL CHECK(length(event_id) > 0),
+    sequence INTEGER NOT NULL CHECK(sequence >= 0),
+    role TEXT NOT NULL CHECK(role IN ('user','assistant')),
+    kind TEXT NOT NULL CHECK(kind IN ('assertion','user_confirmation','correction','temporal')),
+    start_char INTEGER NOT NULL CHECK(start_char >= 0),
+    end_char INTEGER NOT NULL CHECK(end_char > start_char),
+    content_sha256 TEXT NOT NULL CHECK(length(content_sha256) = 64),
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS memory_claim_evidence_claim
+    ON memory_claim_evidence(claim_id, event_id, start_char, end_char, evidence_id);
+CREATE INDEX IF NOT EXISTS memory_claim_evidence_event
+    ON memory_claim_evidence(event_id, claim_id);
+
+CREATE TABLE IF NOT EXISTS memory_claim_transitions (
+    transition_id TEXT PRIMARY KEY,
+    claim_id TEXT NOT NULL,
+    from_state TEXT CHECK(from_state IS NULL OR from_state IN ('active','superseded','conflicted','uncertain')),
+    to_state TEXT NOT NULL CHECK(to_state IN ('active','superseded','conflicted','uncertain')),
+    reason TEXT NOT NULL CHECK(reason IN ('created','confirmed','certainty_upgraded','conflicted','corrected','replaced')),
+    related_claim_id TEXT,
+    session_id TEXT NOT NULL CHECK(length(session_id) > 0),
+    batch_key TEXT NOT NULL CHECK(length(batch_key) > 0),
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS memory_claim_transitions_claim
+    ON memory_claim_transitions(claim_id, created_at, transition_id);
+
+CREATE TABLE IF NOT EXISTS memory_boundary_suggestions (
+    boundary_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL CHECK(length(session_id) > 0),
+    batch_key TEXT NOT NULL CHECK(length(batch_key) > 0),
+    before_event_id TEXT NOT NULL CHECK(length(before_event_id) > 0),
+    reason TEXT NOT NULL CHECK(reason IN ('explicit_topic_transition','model_topic_shift')),
+    evidence_json TEXT NOT NULL CHECK(length(evidence_json) > 0),
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS memory_boundary_suggestions_session_event
+    ON memory_boundary_suggestions(session_id, before_event_id, boundary_id);
 "#;
 
 #[cfg(test)]

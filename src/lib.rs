@@ -14,9 +14,17 @@ pub use config::{
     AppConfig, KnowledgeConfig, KnowledgeSourceConfig, KnowledgeSourceKind, WebSearchConfig,
 };
 pub use consolidation::{
-    CONSOLIDATION_MAX_CHARS, CONSOLIDATION_MAX_TURNS, ConsolidationAttemptRecord,
-    ConsolidationAttemptStatus, ConsolidationEvent, ConsolidationInputBatch,
-    ConsolidationWatermark,
+    BoundarySuggestionReason, CONSOLIDATION_MAX_CHARS, CONSOLIDATION_MAX_TURNS, ClaimCardinality,
+    ClaimCertainty, ClaimDisposition, ClaimPolarity, ConsolidatedClaimObject,
+    ConsolidatedClaimOutput, ConsolidatedEntityOutput, ConsolidationApplyError,
+    ConsolidationApplyReport, ConsolidationApplyResult, ConsolidationAttemptRecord,
+    ConsolidationAttemptStatus, ConsolidationBoundaryOutput, ConsolidationCandidateSnapshot,
+    ConsolidationClaimEvidence, ConsolidationClaimObjectKind, ConsolidationEvent,
+    ConsolidationEvidenceKind, ConsolidationInputBatch, ConsolidationQuote, ConsolidationWatermark,
+    EntityAliasOutput, EntityDisambiguation, EntityResolution, EntityResolutionBasis,
+    MemoryAliasCandidate, MemoryAliasKind, MemoryClaimCandidate, MemoryClaimEvidenceCandidate,
+    MemoryClaimState, MemoryEntityCandidate, MemoryEntityKind, StructuredConsolidationOutput,
+    structured_consolidation_schema,
 };
 pub use context::ContextAssembler;
 pub use engine::{ChatEngine, LimitAction, PreparedTurn};
