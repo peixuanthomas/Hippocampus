@@ -20,6 +20,7 @@ use ratatui::widgets::{
     Wrap,
 };
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use unicode_width::UnicodeWidthChar;
 
@@ -65,6 +66,7 @@ enum BackgroundEvent {
         result: std::result::Result<(), String>,
     },
     SessionSwitched {
+        generation: u64,
         result: Box<SwitchResult>,
     },
 }
@@ -88,6 +90,8 @@ struct App {
     rx: mpsc::UnboundedReceiver<BackgroundEvent>,
     decision_tx: Option<mpsc::UnboundedSender<LimitAction>>,
     cancellation: Option<CancellationToken>,
+    switch_task: Option<JoinHandle<()>>,
+    switch_generation: u64,
 }
 
 impl App {
@@ -113,6 +117,8 @@ impl App {
             rx,
             decision_tx: None,
             cancellation: None,
+            switch_task: None,
+            switch_generation: 0,
         }
     }
 
@@ -198,10 +204,12 @@ impl App {
         }
         self.activity = Activity::Switching;
         self.status = format!("正在切换到会话 {identifier}…");
+        self.switch_generation = self.switch_generation.wrapping_add(1);
+        let generation = self.switch_generation;
         let store = self.engine.store().clone();
         let config = self.engine.config().clone();
         let tx = self.tx.clone();
-        tokio::spawn(async move {
+        self.switch_task = Some(tokio::spawn(async move {
             let result: Result<_> = async {
                 let mut target = store.load(&identifier)?;
                 let client = OllamaClient::new(&target.ollama_host)?;
@@ -214,9 +222,10 @@ impl App {
             }
             .await;
             let _ = tx.send(BackgroundEvent::SessionSwitched {
+                generation,
                 result: Box::new(result.map_err(|error| error.to_string())),
             });
-        });
+        }));
     }
 
     fn drain_background(&mut self) {
@@ -295,7 +304,12 @@ impl App {
                         }
                     }
                 }
-                BackgroundEvent::SessionSwitched { result } => {
+                BackgroundEvent::SessionSwitched { generation, result } => {
+                    if generation != self.switch_generation || self.activity != Activity::Switching
+                    {
+                        continue;
+                    }
+                    self.switch_task = None;
                     self.activity = Activity::Idle;
                     match *result {
                         Ok((engine, session, model_info)) => {
@@ -324,7 +338,12 @@ impl App {
             self.status = "正在中断并保存已收到的内容…".into();
         }
         if self.activity == Activity::Switching {
-            self.status = "会话切换正在进行，完成后会恢复可操作状态。".into();
+            if let Some(task) = self.switch_task.take() {
+                task.abort();
+            }
+            self.switch_generation = self.switch_generation.wrapping_add(1);
+            self.activity = Activity::Idle;
+            self.status = "已取消会话切换。".into();
         }
     }
 
@@ -610,28 +629,67 @@ pub async fn run(
         bail!("TUI 需要交互终端；脚本调用请使用 `hippocampus ask \"问题\"`");
     }
     enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(
-        stdout,
-        EnterAlternateScreen,
-        EnableBracketedPaste,
-        EnableMouseCapture
-    )?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-    terminal.clear()?;
+    let backend = CrosstermBackend::new(io::stdout());
+    let mut terminal = match Terminal::new(backend) {
+        Ok(terminal) => terminal,
+        Err(error) => {
+            let _ = disable_raw_mode();
+            return Err(error.into());
+        }
+    };
+    let mut alternate_screen = false;
+    let mut bracketed_paste = false;
+    let mut mouse_capture = false;
+    let result: Result<Session> = async {
+        execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+        alternate_screen = true;
+        execute!(terminal.backend_mut(), EnableBracketedPaste)?;
+        bracketed_paste = true;
+        execute!(terminal.backend_mut(), EnableMouseCapture)?;
+        mouse_capture = true;
+        terminal.clear()?;
+        run_loop(&mut terminal, App::new(engine, session, model_info)).await
+    }
+    .await;
+    let cleanup = restore_terminal(
+        &mut terminal,
+        alternate_screen,
+        bracketed_paste,
+        mouse_capture,
+    );
+    match (result, cleanup) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(session), Ok(())) => Ok(session),
+    }
+}
 
-    let result = run_loop(&mut terminal, App::new(engine, session, model_info)).await;
-
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        DisableBracketedPaste,
-        DisableMouseCapture,
-        LeaveAlternateScreen
-    )?;
-    terminal.show_cursor()?;
-    result
+fn restore_terminal(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    alternate_screen: bool,
+    bracketed_paste: bool,
+    mouse_capture: bool,
+) -> Result<()> {
+    let mut first_error = None;
+    let mut record = |result: io::Result<()>| {
+        if let Err(error) = result
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+    };
+    if mouse_capture {
+        record(execute!(terminal.backend_mut(), DisableMouseCapture));
+    }
+    if bracketed_paste {
+        record(execute!(terminal.backend_mut(), DisableBracketedPaste));
+    }
+    if alternate_screen {
+        record(execute!(terminal.backend_mut(), LeaveAlternateScreen));
+    }
+    record(terminal.show_cursor());
+    record(disable_raw_mode());
+    first_error.map_or(Ok(()), |error| Err(error.into()))
 }
 
 async fn run_loop(
@@ -809,7 +867,11 @@ fn draw_header(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
 }
 
 fn draw_messages(frame: &mut ratatui::Frame<'_>, app: &mut App, area: Rect) {
-    let width = area.width.saturating_sub(3).max(1) as usize;
+    let block = Block::default()
+        .borders(Borders::LEFT | Borders::RIGHT)
+        .border_style(Style::default().fg(Color::Rgb(45, 50, 60)));
+    let inner = block.inner(area);
+    let width = inner.width.max(1) as usize;
     let mut lines = Vec::new();
     for message in visible_messages(&app.messages, app.debug) {
         append_message_lines(
@@ -842,7 +904,7 @@ fn draw_messages(frame: &mut ratatui::Frame<'_>, app: &mut App, area: Rect) {
             &app.session.ai_name,
         );
     }
-    let viewport = area.height.saturating_sub(2) as usize;
+    let viewport = inner.height as usize;
     let max_scroll = lines.len().saturating_sub(viewport);
     app.max_scroll = max_scroll;
     if app.follow_output {
@@ -851,13 +913,8 @@ fn draw_messages(frame: &mut ratatui::Frame<'_>, app: &mut App, area: Rect) {
         app.scroll = app.scroll.min(max_scroll);
     }
     let content_length = lines.len();
-    let paragraph = Paragraph::new(Text::from(lines))
-        .block(
-            Block::default()
-                .borders(Borders::LEFT | Borders::RIGHT)
-                .border_style(Style::default().fg(Color::Rgb(45, 50, 60))),
-        )
-        .scroll((app.scroll.min(u16::MAX as usize) as u16, 0));
+    let visible_lines = message_window(&lines, app.scroll, viewport);
+    let paragraph = Paragraph::new(Text::from(visible_lines)).block(block);
     frame.render_widget(paragraph, area);
     if max_scroll > 0 {
         let mut scrollbar = ScrollbarState::new(content_length)
@@ -871,6 +928,10 @@ fn draw_messages(frame: &mut ratatui::Frame<'_>, app: &mut App, area: Rect) {
             &mut scrollbar,
         );
     }
+}
+
+fn message_window<'a>(lines: &[Line<'a>], scroll: usize, viewport: usize) -> Vec<Line<'a>> {
+    lines.iter().skip(scroll).take(viewport).cloned().collect()
 }
 
 fn visible_messages(messages: &[Message], debug: bool) -> impl Iterator<Item = &Message> {
@@ -1356,5 +1417,16 @@ mod tests {
         assert!(output.contains("完整用户输入"));
         assert!(output.contains("context_sha256=abc123"));
         assert!(output.contains("included_turns=1 ids=[turn-a]"));
+    }
+
+    #[test]
+    fn message_window_reaches_rows_beyond_u16_scroll_limit() {
+        let lines = (0..65_540)
+            .map(|index| Line::raw(index.to_string()))
+            .collect::<Vec<_>>();
+        let window = message_window(&lines, 65_536, 3);
+        assert_eq!(window.len(), 3);
+        assert_eq!(window[0].to_string(), "65536");
+        assert_eq!(window[2].to_string(), "65538");
     }
 }
