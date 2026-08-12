@@ -38,6 +38,7 @@ pub struct ConsolidationInputBatch {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ConsolidationAttemptStatus {
+    Applied,
     Rejected,
     ModelError,
     Cancelled,
@@ -46,6 +47,7 @@ pub enum ConsolidationAttemptStatus {
 impl ConsolidationAttemptStatus {
     const fn as_str(self) -> &'static str {
         match self {
+            Self::Applied => "applied",
             Self::Rejected => "rejected",
             Self::ModelError => "model_error",
             Self::Cancelled => "cancelled",
@@ -255,6 +257,11 @@ impl RetrievalStore {
         &self,
         record: &ConsolidationAttemptRecord,
     ) -> RetrievalResult<()> {
+        if record.status == ConsolidationAttemptStatus::Applied {
+            return Err(invalid_attempt(
+                "record_consolidation_failure 不接受 applied 状态",
+            ));
+        }
         validate_attempt(record)?;
         let from_sequence = attempt_usize_to_sql(record.from_sequence, "from_sequence")?;
         let through_sequence = attempt_usize_to_sql(record.through_sequence, "through_sequence")?;
@@ -444,6 +451,7 @@ fn validate_attempt(record: &ConsolidationAttemptRecord) -> RetrievalResult<()> 
         &record.request_sha256,
         record.request_json.as_bytes(),
     )?;
+    validate_json("request_json", &record.request_json)?;
     if record.input_event_ids.len() != record.input_event_hashes.len() {
         return Err(invalid_attempt("输入事件 ID 与哈希数量不一致"));
     }
@@ -460,6 +468,7 @@ fn validate_attempt(record: &ConsolidationAttemptRecord) -> RetrievalResult<()> 
         (None, None) => {}
         (Some(response), Some(hash)) => {
             validate_exact_hash("response_sha256", hash, response.as_bytes())?;
+            validate_json("response_json", response)?;
         }
         _ => return Err(invalid_attempt("响应 JSON 与哈希必须同时存在或同时缺失")),
     }
@@ -468,8 +477,7 @@ fn validate_attempt(record: &ConsolidationAttemptRecord) -> RetrievalResult<()> 
         ("error_json", record.error_json.as_deref()),
     ] {
         if let Some(value) = value {
-            serde_json::from_str::<serde_json::Value>(value)
-                .map_err(|_| invalid_attempt(format!("{name} 不是有效 JSON")))?;
+            validate_json(name, value)?;
         }
     }
     attempt_usize_to_sql(record.from_sequence, "from_sequence")?;
@@ -482,6 +490,12 @@ fn validate_attempt(record: &ConsolidationAttemptRecord) -> RetrievalResult<()> 
         attempt_u64_to_sql(value, "output_tokens")?;
     }
     Ok(())
+}
+
+fn validate_json(name: &str, value: &str) -> RetrievalResult<()> {
+    serde_json::from_str::<serde_json::Value>(value)
+        .map(|_| ())
+        .map_err(|_| invalid_attempt(format!("{name} 不是有效 JSON")))
 }
 
 fn validate_exact_hash(name: &str, hash: &str, bytes: &[u8]) -> RetrievalResult<()> {
@@ -580,6 +594,7 @@ fn map_stored_attempt(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredAttempt
 
 fn decode_stored_attempt(stored: StoredAttempt) -> RetrievalResult<ConsolidationAttemptRecord> {
     let status = match stored.status.as_str() {
+        "applied" => ConsolidationAttemptStatus::Applied,
         "rejected" => ConsolidationAttemptStatus::Rejected,
         "model_error" => ConsolidationAttemptStatus::ModelError,
         "cancelled" => ConsolidationAttemptStatus::Cancelled,
@@ -718,6 +733,47 @@ mod tests {
             validation_json: Some("{\"path\":\"$.claims[0]\"}".into()),
             error_json: Some("{\"message\":\"invalid\"}".into()),
         }
+    }
+
+    fn seed_attempt_direct(store: &RetrievalStore, record: &ConsolidationAttemptRecord) {
+        store
+            .consolidation_attempts(&record.session_id)
+            .expect("initialize consolidation schema");
+        let connection = Connection::open(store.index_path()).unwrap();
+        connection
+            .execute(
+                "INSERT INTO consolidation_batches
+                 (attempt_id, batch_key, session_id, from_sequence, through_sequence, trigger,
+                  model, request_json, request_sha256, input_event_ids, input_event_hashes,
+                  response_json, response_sha256, status, input_tokens, output_tokens, latency_ms,
+                  started_at, completed_at, validation_json, error_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                         ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+                params![
+                    record.attempt_id,
+                    record.batch_key,
+                    record.session_id,
+                    record.from_sequence as i64,
+                    record.through_sequence as i64,
+                    record.trigger,
+                    record.model,
+                    record.request_json,
+                    record.request_sha256,
+                    serde_json::to_string(&record.input_event_ids).unwrap(),
+                    serde_json::to_string(&record.input_event_hashes).unwrap(),
+                    record.response_json,
+                    record.response_sha256,
+                    record.status.as_str(),
+                    record.input_tokens.map(|value| value as i64),
+                    record.output_tokens.map(|value| value as i64),
+                    record.latency_ms as i64,
+                    record.started_at,
+                    record.completed_at,
+                    record.validation_json,
+                    record.error_json,
+                ],
+            )
+            .unwrap();
     }
 
     #[test]
@@ -1021,6 +1077,54 @@ mod tests {
     }
 
     #[test]
+    fn applied_status_is_reserved_but_failure_api_cannot_write_it() {
+        assert_eq!(
+            serde_json::to_string(&ConsolidationAttemptStatus::Applied).unwrap(),
+            "\"applied\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ConsolidationAttemptStatus>("\"applied\"").unwrap(),
+            ConsolidationAttemptStatus::Applied
+        );
+
+        let root = tempfile::tempdir().unwrap();
+        let store = RetrievalStore::new(root.path()).unwrap();
+        assert!(store.consolidation_attempts("session").unwrap().is_empty());
+        let mut applied = failed_attempt("applied-attempt", "cb_applied", "session");
+        applied.status = ConsolidationAttemptStatus::Applied;
+
+        assert!(matches!(
+            store.record_consolidation_failure(&applied),
+            Err(RetrievalError::CorruptIndex(message))
+                if message == "巩固失败记录无效：record_consolidation_failure 不接受 applied 状态"
+        ));
+        assert!(store.consolidation_attempts("session").unwrap().is_empty());
+        assert_eq!(
+            store.consolidation_watermark("session").unwrap(),
+            ConsolidationWatermark {
+                session_id: "session".into(),
+                through_sequence: 0,
+                through_event_id: None,
+                through_event_sha256: None,
+                updated_at: None,
+            }
+        );
+
+        seed_attempt_direct(&store, &applied);
+        assert_eq!(
+            store.consolidation_attempts("session").unwrap(),
+            vec![applied]
+        );
+        assert_eq!(
+            store
+                .consolidation_watermark("session")
+                .unwrap()
+                .through_sequence,
+            0
+        );
+    }
+
+    #[test]
     fn invalid_attempts_are_rejected_before_insert() {
         let root = tempfile::tempdir().unwrap();
         let store = RetrievalStore::new(root.path()).unwrap();
@@ -1037,6 +1141,10 @@ mod tests {
         let mut request_hash = base.clone();
         request_hash.request_sha256 = content_sha256("wrong");
         invalid.push(request_hash);
+        let mut malformed_request = base.clone();
+        malformed_request.request_json = "{".into();
+        malformed_request.request_sha256 = sha256_bytes(malformed_request.request_json.as_bytes());
+        invalid.push(malformed_request);
         let mut arrays = base.clone();
         arrays.input_event_hashes.pop();
         invalid.push(arrays);
@@ -1049,6 +1157,13 @@ mod tests {
         let mut response_hash = base.clone();
         response_hash.response_sha256 = Some(content_sha256("wrong"));
         invalid.push(response_hash);
+        let mut malformed_response = base.clone();
+        malformed_response.response_json = Some("[".into());
+        malformed_response.response_sha256 = malformed_response
+            .response_json
+            .as_ref()
+            .map(|response| sha256_bytes(response.as_bytes()));
+        invalid.push(malformed_response);
         let mut validation_json = base.clone();
         validation_json.validation_json = Some("not json".into());
         invalid.push(validation_json);
@@ -1064,6 +1179,36 @@ mod tests {
             ));
         }
         assert!(store.consolidation_attempts("session").unwrap().is_empty());
+    }
+
+    #[test]
+    fn malformed_request_and_response_json_are_rejected_when_read() {
+        let request_root = tempfile::tempdir().unwrap();
+        let request_store = RetrievalStore::new(request_root.path()).unwrap();
+        let mut malformed_request = failed_attempt("request", "cb_request", "session");
+        malformed_request.request_json = "{".into();
+        malformed_request.request_sha256 = sha256_bytes(malformed_request.request_json.as_bytes());
+        seed_attempt_direct(&request_store, &malformed_request);
+        assert!(matches!(
+            request_store.consolidation_attempts("session"),
+            Err(RetrievalError::CorruptIndex(message))
+                if message == "巩固失败记录无效：request_json 不是有效 JSON"
+        ));
+
+        let response_root = tempfile::tempdir().unwrap();
+        let response_store = RetrievalStore::new(response_root.path()).unwrap();
+        let mut malformed_response = failed_attempt("response", "cb_response", "session");
+        malformed_response.response_json = Some("[".into());
+        malformed_response.response_sha256 = malformed_response
+            .response_json
+            .as_ref()
+            .map(|response| sha256_bytes(response.as_bytes()));
+        seed_attempt_direct(&response_store, &malformed_response);
+        assert!(matches!(
+            response_store.consolidation_attempts("session"),
+            Err(RetrievalError::CorruptIndex(message))
+                if message == "巩固失败记录无效：response_json 不是有效 JSON"
+        ));
     }
 
     #[test]

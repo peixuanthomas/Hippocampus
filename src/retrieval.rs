@@ -1939,7 +1939,7 @@ CREATE TABLE IF NOT EXISTS consolidation_batches (
     input_event_hashes TEXT NOT NULL,
     response_json TEXT,
     response_sha256 TEXT,
-    status TEXT NOT NULL CHECK(status IN ('rejected', 'model_error', 'cancelled')),
+    status TEXT NOT NULL CHECK(status IN ('applied', 'rejected', 'model_error', 'cancelled')),
     input_tokens INTEGER CHECK(input_tokens IS NULL OR input_tokens >= 0),
     output_tokens INTEGER CHECK(output_tokens IS NULL OR output_tokens >= 0),
     latency_ms INTEGER NOT NULL CHECK(latency_ms >= 0),
