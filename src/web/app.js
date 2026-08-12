@@ -10,6 +10,8 @@ const elements = {
   save: document.querySelector("#save-button"),
   think: document.querySelector("#think-button"),
   model: document.querySelector("#model-chip"),
+  brand: document.querySelector("#brand-name"),
+  emptyName: document.querySelector("#empty-name"),
   context: document.querySelector("#context-chip"),
   sessionStatus: document.querySelector("#session-status"),
   runtime: document.querySelector("#runtime-message"),
@@ -61,7 +63,7 @@ function createMessage(role, content, options = {}) {
     markdown.textContent = content;
   } else {
     icon.textContent = "◆";
-    label.textContent = "Hippocampus";
+    label.textContent = options.aiName ?? state.session?.ai_name ?? "LLM";
     if (options.html) markdown.innerHTML = options.html;
     else markdown.textContent = content;
   }
@@ -76,6 +78,9 @@ function createMessage(role, content, options = {}) {
 
 function renderSession(session) {
   state.session = session;
+  document.title = session.ai_name;
+  elements.brand.textContent = session.ai_name.toUpperCase();
+  elements.emptyName.textContent = session.ai_name;
   elements.model.textContent = session.model;
   elements.think.textContent = `think:${session.think ? "on" : "off"}`;
   elements.context.textContent = `ctx:${session.budget.context_window}`;
@@ -86,6 +91,7 @@ function renderSession(session) {
     createMessage("user", turn.user);
     if (turn.assistant_markdown) {
       createMessage("assistant", turn.assistant_markdown, {
+        aiName: session.ai_name,
         html: turn.assistant_html,
         thinking: turn.thinking,
         meta: `${turn.status} · ${formatUsage(turn.usage)}`,
@@ -132,7 +138,7 @@ async function sendMessage(message) {
   setRuntime("正在连接模型…", true);
   elements.token.textContent = "";
   createMessage("user", message);
-  const live = createMessage("assistant", "…");
+  const live = createMessage("assistant", "…", { aiName: state.session?.ai_name });
   live.markdown.textContent = "";
   state.live = { ...live, markdownText: "", thinkingText: "" };
   scrollToBottom();

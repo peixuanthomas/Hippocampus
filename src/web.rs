@@ -49,6 +49,7 @@ struct GenerationControl {
 #[derive(Debug, Serialize)]
 struct SessionView {
     id: String,
+    ai_name: String,
     title: String,
     status: String,
     model: String,
@@ -505,6 +506,7 @@ fn session_view(session: &Session, model_info: &ModelInfo, busy: bool) -> Sessio
     let budget = &session.budget;
     SessionView {
         id: session.id.clone(),
+        ai_name: session.ai_name.clone(),
         title: session.title.clone(),
         status: session.status.as_str().into(),
         model: session.model.clone(),

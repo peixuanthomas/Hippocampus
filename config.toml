@@ -1,0 +1,27 @@
+ai_name = "hippocampus"
+system_prompt = """
+你是一个乐于助人的AI助手，你的任务是解决用户的问题或者与用户对话。
+"""
+
+[web_search]
+enabled = true
+max_results = 5
+max_tool_rounds = 4
+max_tool_calls = 8
+max_injected_chars_per_fetch = 12000
+
+[knowledge]
+auto_sync = true
+candidate_limit = 64
+max_selected = 4
+evidence_char_budget = 3200
+
+# [[knowledge.sources]]
+# id = "local-notes"
+# kind = "path"
+# location = "./knowledge"
+
+# [[knowledge.sources]]
+# id = "project-docs"
+# kind = "url"
+# location = "https://example.com/docs.txt"

@@ -1,6 +1,6 @@
 use crate::model::{
     ChatMessage, ContextItemTrace, ContextPlan, EventRole, Session, SourceSpan, content_sha256,
-    context_sha256, event_id,
+    context_sha256, event_id, identity_instruction,
 };
 use crate::retrieval::RecallResult;
 
@@ -58,6 +58,11 @@ impl ContextAssembler {
                 &session.system_prompt,
             );
         }
+        let identity_instruction = identity_instruction(&session.ai_name);
+        messages.push(ChatMessage {
+            role: EventRole::System.as_str().to_owned(),
+            content: identity_instruction.clone(),
+        });
         if let Some(recall) = recall {
             for item in &recall.evidence {
                 // Evidence messages are deliberately original-role spans, not
@@ -127,6 +132,7 @@ impl ContextAssembler {
             estimated_upper_tokens,
             exact_input_tokens: None,
             input_budget: session.budget.input_budget(),
+            identity_instruction,
             retrieval_trace: recall.map(|value| value.trace.clone()).unwrap_or_default(),
             evidence: recall
                 .map(|value| value.trace.selected_evidence.clone())
@@ -220,14 +226,19 @@ mod tests {
         assert_eq!(plan.included_turn_ids, vec![session.turns[1].id.clone()]);
         assert!(!format!("{:?}", plan.messages).contains("secret"));
         assert_eq!(plan.messages.last().unwrap().content, "current");
-        assert_eq!(plan.context_items.len(), plan.messages.len());
+        assert_eq!(plan.context_items.len() + 1, plan.messages.len());
         assert!(
             plan.context_items
                 .iter()
                 .all(|item| item.role != EventRole::Assistant
                     || item.content_sha256 != content_sha256("new-secret"))
         );
-        for (message, item) in plan.messages.iter().zip(&plan.context_items) {
+        for (message, item) in plan
+            .messages
+            .iter()
+            .filter(|message| message.content != plan.identity_instruction)
+            .zip(&plan.context_items)
+        {
             assert_eq!(item.role.as_str(), message.role);
             assert_eq!(item.span.start_char, 0);
             assert_eq!(item.span.end_char, message.content.chars().count());

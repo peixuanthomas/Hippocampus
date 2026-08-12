@@ -6,13 +6,25 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 pub const LEGACY_SCHEMA_VERSION: u32 = 1;
+pub const PREVIOUS_SCHEMA_VERSION: u32 = 2;
 pub const DEFAULT_SYSTEM_PROMPT: &str =
     "你是一个乐于助人的AI助手，你的任务是解决用户的问题或者与用户对话。";
 
 pub fn utc_now() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::AutoSi, false)
+}
+
+pub fn default_ai_name() -> String {
+    "LLM".to_owned()
+}
+
+pub fn identity_instruction(ai_name: &str) -> String {
+    format!(
+        "你的 AI 名称是 {:?}。当用户询问你的身份时，请使用这个名称。",
+        ai_name
+    )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -318,6 +330,8 @@ pub struct ContextTrace {
     pub context_sha256: Option<String>,
     #[serde(default)]
     pub request: Option<ModelRequestTrace>,
+    #[serde(default)]
+    pub identity_instruction: Option<String>,
     #[serde(default = "legacy_inferred")]
     pub provenance_quality: ProvenanceQuality,
     #[serde(default)]
@@ -342,6 +356,7 @@ impl Default for ContextTrace {
             context_items: Vec::new(),
             context_sha256: None,
             request: None,
+            identity_instruction: None,
             provenance_quality: ProvenanceQuality::Exact,
             retrieval: RetrievalTrace::default(),
         }
@@ -433,6 +448,8 @@ pub struct Session {
     pub status: SessionStatus,
     pub model: String,
     pub ollama_host: String,
+    #[serde(default = "default_ai_name")]
+    pub ai_name: String,
     pub system_prompt: String,
     pub think: bool,
     pub budget: BudgetConfig,
@@ -455,7 +472,30 @@ impl Session {
         budget: BudgetConfig,
         think: bool,
     ) -> Result<Self> {
+        Self::new_named(
+            id,
+            model,
+            ollama_host,
+            default_ai_name(),
+            system_prompt,
+            budget,
+            think,
+        )
+    }
+
+    pub fn new_named(
+        id: String,
+        model: String,
+        ollama_host: String,
+        ai_name: String,
+        system_prompt: String,
+        budget: BudgetConfig,
+        think: bool,
+    ) -> Result<Self> {
         budget.validate()?;
+        if ai_name.trim().is_empty() {
+            bail!("AI 名称不能为空");
+        }
         let now = utc_now();
         Ok(Self {
             schema_version: SCHEMA_VERSION,
@@ -466,6 +506,7 @@ impl Session {
             status: SessionStatus::Active,
             model,
             ollama_host,
+            ai_name,
             system_prompt,
             think,
             budget,
@@ -478,7 +519,10 @@ impl Session {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if !matches!(self.schema_version, LEGACY_SCHEMA_VERSION | SCHEMA_VERSION) {
+        if !matches!(
+            self.schema_version,
+            LEGACY_SCHEMA_VERSION | PREVIOUS_SCHEMA_VERSION | SCHEMA_VERSION
+        ) {
             bail!("不支持的会话 schema 版本：{}", self.schema_version);
         }
         if self.id.is_empty() {
@@ -486,6 +530,9 @@ impl Session {
         }
         if self.model.is_empty() || self.ollama_host.is_empty() {
             bail!("模型与 Ollama 地址不能为空");
+        }
+        if self.ai_name.trim().is_empty() {
+            bail!("AI 名称不能为空");
         }
         if self.active_context_start_index > self.turns.len() {
             bail!("active_context_start_index 超出轮次数量");
@@ -575,6 +622,7 @@ pub struct ContextPlan {
     pub estimated_upper_tokens: Option<u64>,
     pub exact_input_tokens: Option<u64>,
     pub input_budget: u64,
+    pub identity_instruction: String,
     pub retrieval_trace: RetrievalTrace,
     pub evidence: Vec<SelectedEvidence>,
 }

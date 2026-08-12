@@ -741,6 +741,7 @@ fn apply_trace(
         context_items: plan.context_items.clone(),
         context_sha256: Some(plan.context_sha256.clone()),
         request: Some(request),
+        identity_instruction: Some(plan.identity_instruction.clone()),
         provenance_quality: ProvenanceQuality::Exact,
         retrieval: plan.retrieval_trace.clone(),
     };
@@ -1093,7 +1094,7 @@ mod tests {
             crate::model::EventRole::Assistant,
         );
         let before = store.retrieval().answer_context(&answer_id).unwrap();
-        let messages = before
+        let mut messages = before
             .items
             .iter()
             .map(|item| ChatMessage {
@@ -1101,6 +1102,19 @@ mod tests {
                 content: item.resolved.content.clone(),
             })
             .collect::<Vec<_>>();
+        if let Some(identity) = &before.identity_instruction {
+            let position = messages
+                .iter()
+                .position(|message| message.role == "system")
+                .map_or(0, |index| index + 1);
+            messages.insert(
+                position,
+                ChatMessage {
+                    role: "system".into(),
+                    content: identity.clone(),
+                },
+            );
+        }
         assert_eq!(messages, requests.lock().unwrap()[0].messages);
         assert_eq!(before.context_sha256, prepared_b.plan.context_sha256);
         assert_eq!(

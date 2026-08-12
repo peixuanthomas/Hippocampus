@@ -18,7 +18,7 @@ use crate::model::{
 };
 
 pub const INDEX_FILENAME: &str = ".hippocampus-index.sqlite3";
-const INDEX_SCHEMA_VERSION: i64 = 2;
+const INDEX_SCHEMA_VERSION: i64 = 3;
 
 #[derive(Debug, Error)]
 pub enum RetrievalError {
@@ -114,6 +114,7 @@ pub struct AnswerContext {
     pub decision: String,
     pub provenance_quality: ProvenanceQuality,
     pub request: Option<ModelRequestTrace>,
+    pub identity_instruction: Option<String>,
     pub items: Vec<AnswerContextItem>,
     pub retrieval_trace: RetrievalTrace,
 }
@@ -584,7 +585,8 @@ impl RetrievalStore {
             .query_row(
                 "SELECT answer_event_id, turn_id, context_sha256, estimated_upper_tokens,
                         exact_input_tokens, input_budget, decision, provenance_quality,
-                        request_model, request_think, request_context_window, request_max_output_tokens
+                        request_model, request_think, request_context_window, request_max_output_tokens,
+                        identity_instruction
                  FROM answer_contexts WHERE answer_event_id = ?1",
                 [answer_event_id],
                 map_answer_context,
@@ -632,6 +634,7 @@ impl RetrievalStore {
             })
             .map_err(|source| self.database_error(source))?;
         let mut messages = Vec::new();
+        let mut inserted_identity = false;
         for row in rows {
             let (ordinal, role, span, expected_hash, content) =
                 row.map_err(|source| self.database_error(source))?;
@@ -657,6 +660,16 @@ impl RetrievalStore {
                 role: role.as_str().to_owned(),
                 content: content.clone(),
             });
+            if !inserted_identity
+                && role == EventRole::System
+                && let Some(identity) = &answer.identity_instruction
+            {
+                messages.push(ChatMessage {
+                    role: EventRole::System.as_str().to_owned(),
+                    content: identity.clone(),
+                });
+                inserted_identity = true;
+            }
             answer.items.push(AnswerContextItem {
                 ordinal,
                 role,
@@ -798,7 +811,8 @@ impl RetrievalStore {
                     ],
                 )
                 .map_err(|e| self.database_error(e))?;
-            let mut context_messages = Vec::with_capacity(derived.items.len());
+            let mut context_messages = Vec::with_capacity(derived.items.len() + 1);
+            let mut inserted_identity = false;
             for (ordinal, item) in derived.items.iter().enumerate() {
                 let local = event_by_id.get(&item.span.event_id).copied();
                 let external = if local.is_none() {
@@ -843,6 +857,16 @@ impl RetrievalStore {
                     role: item.role.as_str().to_owned(),
                     content: selected.clone(),
                 });
+                if !inserted_identity
+                    && item.role == EventRole::System
+                    && let Some(identity) = &derived.identity_instruction
+                {
+                    context_messages.push(ChatMessage {
+                        role: EventRole::System.as_str().to_owned(),
+                        content: identity.clone(),
+                    });
+                    inserted_identity = true;
+                }
                 insert_span(transaction, &item.span, &selected)
                     .map_err(|error| self.database_error(error))?;
                 spans.insert((
@@ -914,7 +938,7 @@ impl RetrievalStore {
         }
         session.refresh_cumulative_usage();
         Ok(SessionSource {
-            legacy: session.schema_version < SCHEMA_VERSION,
+            legacy: session.schema_version == crate::model::LEGACY_SCHEMA_VERSION,
             session,
             path: path.to_path_buf(),
             sha256: bytes_sha256(&bytes),
@@ -969,10 +993,10 @@ impl RetrievalStore {
         let version = connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .map_err(|source| self.database_error(source))?;
-        if !matches!(version, 0 | 1 | INDEX_SCHEMA_VERSION) {
+        if !matches!(version, 0 | 1 | 2 | INDEX_SCHEMA_VERSION) {
             return Err(RetrievalError::UnsupportedIndexVersion(version));
         }
-        if version == 1 {
+        if matches!(version, 1 | 2) {
             // v1 contains all immutable events, so a transactional rebuild of
             // only derived tables is deterministic and loses no source data.
             let transaction = connection
@@ -981,27 +1005,38 @@ impl RetrievalStore {
             transaction
                 .execute_batch(SCHEMA_SQL)
                 .map_err(|e| self.database_error(e))?;
-            transaction
-                .execute_batch(
-                    "DELETE FROM retrieval_documents_fts; DELETE FROM retrieval_documents;",
-                )
-                .map_err(|e| self.database_error(e))?;
-            let mut statement = transaction.prepare("SELECT event_id, session_id, turn_id, sequence, role, created_at, content, content_sha256, reply_to_event_id, token_count, turn_status, done_reason, error FROM events").map_err(|e| self.database_error(e))?;
-            let rows = statement
-                .query_map([], map_event)
-                .map_err(|e| self.database_error(e))?;
-            let events: Vec<_> = rows
-                .collect::<Result<_, _>>()
-                .map_err(|e| self.database_error(e))?;
-            drop(statement);
-            for event in &events {
-                if event.role != EventRole::System && !event.content.trim().is_empty() {
-                    for (granularity, span) in document_spans(event) {
-                        let text = slice_chars(&event.content, &span)?;
-                        insert_span(&transaction, &span, &text)
-                            .map_err(|e| self.database_error(e))?;
-                        insert_document(&transaction, event, &span, granularity, &text)
-                            .map_err(|e| self.database_error(e))?;
+            if !table_has_column(&transaction, "answer_contexts", "identity_instruction")
+                .map_err(|e| self.database_error(e))?
+            {
+                transaction
+                    .execute_batch(
+                        "ALTER TABLE answer_contexts ADD COLUMN identity_instruction TEXT;",
+                    )
+                    .map_err(|e| self.database_error(e))?;
+            }
+            if version == 1 {
+                transaction
+                    .execute_batch(
+                        "DELETE FROM retrieval_documents_fts; DELETE FROM retrieval_documents;",
+                    )
+                    .map_err(|e| self.database_error(e))?;
+                let mut statement = transaction.prepare("SELECT event_id, session_id, turn_id, sequence, role, created_at, content, content_sha256, reply_to_event_id, token_count, turn_status, done_reason, error FROM events").map_err(|e| self.database_error(e))?;
+                let rows = statement
+                    .query_map([], map_event)
+                    .map_err(|e| self.database_error(e))?;
+                let events: Vec<_> = rows
+                    .collect::<Result<_, _>>()
+                    .map_err(|e| self.database_error(e))?;
+                drop(statement);
+                for event in &events {
+                    if event.role != EventRole::System && !event.content.trim().is_empty() {
+                        for (granularity, span) in document_spans(event) {
+                            let text = slice_chars(&event.content, &span)?;
+                            insert_span(&transaction, &span, &text)
+                                .map_err(|e| self.database_error(e))?;
+                            insert_document(&transaction, event, &span, granularity, &text)
+                                .map_err(|e| self.database_error(e))?;
+                        }
                     }
                 }
             }
@@ -1218,6 +1253,7 @@ struct DerivedContext {
     context_sha256: String,
     provenance_quality: ProvenanceQuality,
     request: Option<ModelRequestTrace>,
+    identity_instruction: Option<String>,
 }
 
 fn derive_events(session: &Session) -> Vec<StoredEvent> {
@@ -1331,6 +1367,7 @@ fn derive_context(
             context_sha256: context_hash,
             provenance_quality: ProvenanceQuality::Exact,
             request: Some(request),
+            identity_instruction: turn.context_trace.identity_instruction.clone(),
         });
     }
 
@@ -1369,6 +1406,7 @@ fn derive_context(
         context_sha256: context_sha256(&messages),
         provenance_quality: ProvenanceQuality::LegacyInferred,
         request: None,
+        identity_instruction: None,
     })
 }
 
@@ -1468,8 +1506,8 @@ fn insert_answer_context(
         "INSERT INTO answer_contexts
          (answer_event_id, turn_id, context_sha256, estimated_upper_tokens, exact_input_tokens,
           input_budget, decision, provenance_quality, request_model, request_think,
-          request_context_window, request_max_output_tokens)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+          request_context_window, request_max_output_tokens, identity_instruction)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             answer_event_id,
             turn.id,
@@ -1486,6 +1524,7 @@ fn insert_answer_context(
             request.map(|value| value.think),
             request_context_window,
             request_max_output_tokens,
+            derived.identity_instruction,
         ],
     )?;
     Ok(())
@@ -1562,6 +1601,7 @@ fn map_answer_context(row: &rusqlite::Row<'_>) -> rusqlite::Result<AnswerContext
         decision: row.get(6)?,
         provenance_quality: quality,
         request,
+        identity_instruction: row.get(12)?,
         items: Vec::new(),
         retrieval_trace: RetrievalTrace::default(),
     })
@@ -1620,6 +1660,14 @@ fn usize_to_i64(value: usize) -> rusqlite::Result<i64> {
 fn u64_to_i64(value: u64) -> rusqlite::Result<i64> {
     i64::try_from(value)
         .map_err(|_| conversion_error(format!("u64 exceeds SQLite INTEGER: {value}")))
+}
+
+fn table_has_column(connection: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let names = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(names.iter().any(|name| name == column))
 }
 
 fn slice_chars(content: &str, span: &SourceSpan) -> RetrievalResult<String> {
@@ -1757,7 +1805,8 @@ CREATE TABLE IF NOT EXISTS answer_contexts (
     request_model TEXT,
     request_think INTEGER,
     request_context_window INTEGER,
-    request_max_output_tokens INTEGER
+    request_max_output_tokens INTEGER,
+    identity_instruction TEXT
 );
 
 CREATE TABLE IF NOT EXISTS answer_context_items (
@@ -1834,6 +1883,7 @@ mod tests {
                 context_window: session.budget.context_window,
                 max_output_tokens: session.budget.max_output_tokens,
             }),
+            identity_instruction: Some(plan.identity_instruction),
             provenance_quality: ProvenanceQuality::Exact,
             retrieval: RetrievalTrace::default(),
         };
@@ -2184,7 +2234,7 @@ mod tests {
             connection
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            2
+            INDEX_SCHEMA_VERSION
         );
         assert!(
             connection

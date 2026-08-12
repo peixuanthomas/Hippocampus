@@ -493,7 +493,7 @@ fn draw_header(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
     let state = app.session.status.as_str();
     let title = Line::from(vec![
         Span::styled(
-            " HIPPOCAMPUS ",
+            format!(" {} ", app.session.ai_name.to_uppercase()),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -541,7 +541,13 @@ fn draw_messages(frame: &mut ratatui::Frame<'_>, app: &mut App, area: Rect) {
     let width = area.width.saturating_sub(3).max(1) as usize;
     let mut lines = Vec::new();
     for message in &app.messages {
-        append_message_lines(&mut lines, message.role, &message.content, width);
+        append_message_lines(
+            &mut lines,
+            message.role,
+            &message.content,
+            width,
+            &app.session.ai_name,
+        );
     }
     if !app.live_thinking.is_empty() {
         append_message_lines(
@@ -549,6 +555,7 @@ fn draw_messages(frame: &mut ratatui::Frame<'_>, app: &mut App, area: Rect) {
             Role::System,
             &format!("Thinking\n{}", app.live_thinking),
             width,
+            &app.session.ai_name,
         );
     }
     if !app.live_answer.is_empty() || app.activity == Activity::Generating {
@@ -561,6 +568,7 @@ fn draw_messages(frame: &mut ratatui::Frame<'_>, app: &mut App, area: Rect) {
                 &app.live_answer
             },
             width,
+            &app.session.ai_name,
         );
     }
     let viewport = area.height.saturating_sub(2) as usize;
@@ -580,15 +588,21 @@ fn draw_messages(frame: &mut ratatui::Frame<'_>, app: &mut App, area: Rect) {
     frame.render_widget(paragraph, area);
 }
 
-fn append_message_lines<'a>(lines: &mut Vec<Line<'a>>, role: Role, content: &str, width: usize) {
+fn append_message_lines<'a>(
+    lines: &mut Vec<Line<'a>>,
+    role: Role,
+    content: &str,
+    width: usize,
+    ai_name: &str,
+) {
     let (label, color) = match role {
-        Role::User => ("› You", Color::Cyan),
-        Role::Assistant => ("◆ Hippocampus", Color::Green),
-        Role::System => ("· System", Color::Yellow),
-        Role::Error => ("! Error", Color::Red),
+        Role::User => ("› You".to_owned(), Color::Cyan),
+        Role::Assistant => (format!("◆ {ai_name}"), Color::Green),
+        Role::System => ("· System".to_owned(), Color::Yellow),
+        Role::Error => ("! Error".to_owned(), Color::Red),
     };
     lines.push(Line::from(Span::styled(
-        label.to_owned(),
+        label,
         Style::default().fg(color).add_modifier(Modifier::BOLD),
     )));
     let content_style = match role {

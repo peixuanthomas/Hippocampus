@@ -1,3 +1,4 @@
+pub mod config;
 pub mod context;
 pub mod engine;
 pub mod model;
@@ -7,6 +8,9 @@ pub mod store;
 pub mod tui;
 pub mod web;
 
+pub use config::{
+    AppConfig, KnowledgeConfig, KnowledgeSourceConfig, KnowledgeSourceKind, WebSearchConfig,
+};
 pub use context::ContextAssembler;
 pub use engine::{ChatEngine, LimitAction, PreparedTurn};
 pub use model::{

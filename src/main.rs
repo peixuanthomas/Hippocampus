@@ -4,10 +4,9 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
+use hippocampus::config::AppConfig;
 use hippocampus::engine::PreparationStatus;
-use hippocampus::model::{
-    BudgetConfig, ChatEventKind, ChatMessage, DEFAULT_SYSTEM_PROMPT, Session, TokenUsage,
-};
+use hippocampus::model::{BudgetConfig, ChatEventKind, ChatMessage, Session, TokenUsage};
 use hippocampus::ollama::{ChatBackend, ChatRequest};
 use hippocampus::{ChatEngine, LimitAction, OllamaClient, SessionStore};
 use serde_json::json;
@@ -20,6 +19,9 @@ use tokio_util::sync::CancellationToken;
     about = "本地 Ollama 会话客户端：无参数进入 TUI，ask 用于脚本调用"
 )]
 struct Cli {
+    /// 配置文件；未指定时可选读取当前目录 config.toml
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
     #[arg(long, global = true, default_value = "sessions")]
     sessions_dir: PathBuf,
     #[arg(long, global = true, default_value = "http://127.0.0.1:11434")]
@@ -93,13 +95,15 @@ impl NewArgs {
         }
     }
 
-    fn read_prompt(&self) -> Result<Option<String>> {
+    fn read_prompt(&self, config: &AppConfig) -> Result<String> {
         if let Some(path) = &self.system_prompt_file {
-            return Ok(Some(std::fs::read_to_string(path).with_context(|| {
-                format!("无法读取系统提示文件 {}", path.display())
-            })?));
+            return std::fs::read_to_string(path)
+                .with_context(|| format!("无法读取系统提示文件 {}", path.display()));
         }
-        Ok(self.system_prompt.clone())
+        Ok(self
+            .system_prompt
+            .clone()
+            .unwrap_or_else(|| config.system_prompt.clone()))
     }
 
     fn thinking_enabled(&self) -> bool {
@@ -172,29 +176,36 @@ async fn main() {
 
 async fn run() -> Result<()> {
     let cli = Cli::parse();
+    let config = AppConfig::load(cli.config.as_deref())?.config;
     let store = SessionStore::new(&cli.sessions_dir)?;
     match cli.command {
-        None => run_new_tui(store, &cli.host, NewArgs::default()).await,
-        Some(Command::New(args)) => run_new_tui(store, &cli.host, args).await,
-        Some(Command::Resume { identifier }) => run_resume_tui(store, &identifier).await,
+        None => run_new_tui(store, &cli.host, NewArgs::default(), &config).await,
+        Some(Command::New(args)) => run_new_tui(store, &cli.host, args, &config).await,
+        Some(Command::Resume { identifier }) => run_resume_tui(store, &identifier, &config).await,
         Some(Command::List) => list_sessions(&store),
         Some(Command::Show { identifier, json }) => show_session(&store, &identifier, json),
-        Some(Command::Ask(args)) => run_ask(store, &cli.host, args).await,
-        Some(Command::Serve(args)) => run_serve(store, &cli.host, args).await,
+        Some(Command::Ask(args)) => run_ask(store, &cli.host, args, &config).await,
+        Some(Command::Serve(args)) => run_serve(store, &cli.host, args, &config).await,
     }
 }
 
-async fn run_serve(store: SessionStore, host: &str, args: ServeArgs) -> Result<()> {
+async fn run_serve(
+    store: SessionStore,
+    host: &str,
+    args: ServeArgs,
+    config: &AppConfig,
+) -> Result<()> {
     let mut session = if let Some(identifier) = &args.session {
         let mut session = store.load(identifier)?;
         store.reopen(&mut session)?;
         session
     } else {
-        let prompt = args.new.read_prompt()?;
-        store.create(
+        let prompt = args.new.read_prompt(config)?;
+        store.create_named(
             &args.new.model,
             host,
-            prompt.as_deref(),
+            config.ai_name(),
+            Some(&prompt),
             args.new.budget(),
             args.new.thinking_enabled(),
         )?
@@ -211,12 +222,18 @@ async fn run_serve(store: SessionStore, host: &str, args: ServeArgs) -> Result<(
     Ok(())
 }
 
-async fn run_new_tui(store: SessionStore, host: &str, args: NewArgs) -> Result<()> {
-    let prompt = args.read_prompt()?;
-    let mut session = store.create(
+async fn run_new_tui(
+    store: SessionStore,
+    host: &str,
+    args: NewArgs,
+    config: &AppConfig,
+) -> Result<()> {
+    let prompt = args.read_prompt(config)?;
+    let mut session = store.create_named(
         &args.model,
         host,
-        prompt.as_deref(),
+        config.ai_name(),
+        Some(&prompt),
         args.budget(),
         args.thinking_enabled(),
     )?;
@@ -230,7 +247,7 @@ async fn run_new_tui(store: SessionStore, host: &str, args: NewArgs) -> Result<(
     Ok(())
 }
 
-async fn run_resume_tui(store: SessionStore, identifier: &str) -> Result<()> {
+async fn run_resume_tui(store: SessionStore, identifier: &str, _config: &AppConfig) -> Result<()> {
     let mut session = store.load(identifier)?;
     store.reopen(&mut session)?;
     let client = OllamaClient::new(&session.ollama_host)?;
@@ -243,14 +260,19 @@ async fn run_resume_tui(store: SessionStore, identifier: &str) -> Result<()> {
     Ok(())
 }
 
-async fn run_ask(store: SessionStore, host: &str, args: AskArgs) -> Result<()> {
+async fn run_ask(store: SessionStore, host: &str, args: AskArgs, config: &AppConfig) -> Result<()> {
     if let Some(identifier) = args.session.clone() {
-        return run_contextual_ask(store, &identifier, args).await;
+        return run_contextual_ask(store, &identifier, args, config).await;
     }
-    run_stateless_ask(host, args).await
+    run_stateless_ask(host, args, config).await
 }
 
-async fn run_contextual_ask(store: SessionStore, identifier: &str, args: AskArgs) -> Result<()> {
+async fn run_contextual_ask(
+    store: SessionStore,
+    identifier: &str,
+    args: AskArgs,
+    _config: &AppConfig,
+) -> Result<()> {
     let mut session = store.load(identifier)?;
     store.reopen(&mut session)?;
     let client = OllamaClient::new(&session.ollama_host)?;
@@ -312,8 +334,8 @@ async fn run_contextual_ask(store: SessionStore, identifier: &str, args: AskArgs
     Ok(())
 }
 
-async fn run_stateless_ask(host: &str, args: AskArgs) -> Result<()> {
-    let system_prompt = read_ask_prompt(&args)?;
+async fn run_stateless_ask(host: &str, args: AskArgs, config: &AppConfig) -> Result<()> {
+    let system_prompt = read_ask_prompt(&args, config)?;
     let budget = BudgetConfig {
         context_window: args.context_window,
         max_output_tokens: args.max_output_tokens,
@@ -403,7 +425,7 @@ fn cancellation_on_ctrl_c() -> CancellationToken {
     token
 }
 
-fn read_ask_prompt(args: &AskArgs) -> Result<String> {
+fn read_ask_prompt(args: &AskArgs, config: &AppConfig) -> Result<String> {
     if let Some(path) = &args.system_prompt_file {
         return std::fs::read_to_string(path)
             .with_context(|| format!("无法读取系统提示文件 {}", path.display()));
@@ -411,7 +433,7 @@ fn read_ask_prompt(args: &AskArgs) -> Result<String> {
     Ok(args
         .system_prompt
         .clone()
-        .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.into()))
+        .unwrap_or_else(|| config.system_prompt.clone()))
 }
 
 fn list_sessions(store: &SessionStore) -> Result<()> {
@@ -441,10 +463,11 @@ fn show_session(store: &SessionStore, identifier: &str, json_output: bool) -> Re
         return Ok(());
     }
     println!(
-        "会话 {}｜{}｜{}\n模型：{}｜Ollama：{}｜thinking：{}\n系统提示：{}",
+        "会话 {}｜{}｜{}\nAI：{}｜模型：{}｜Ollama：{}｜thinking：{}\n系统提示：{}",
         session.id,
         session_status(&session),
         session.title,
+        session.ai_name,
         session.model,
         session.ollama_host,
         if session.think { "on" } else { "off" },

@@ -57,15 +57,28 @@ impl SessionStore {
         budget: BudgetConfig,
         think: bool,
     ) -> Result<Session> {
+        self.create_named(model, ollama_host, "LLM", system_prompt, budget, think)
+    }
+
+    pub fn create_named(
+        &self,
+        model: &str,
+        ollama_host: &str,
+        ai_name: &str,
+        system_prompt: Option<&str>,
+        budget: BudgetConfig,
+        think: bool,
+    ) -> Result<Session> {
         let id = format!(
             "{}-{}",
             Utc::now().format("%Y%m%d-%H%M%S"),
             &Uuid::new_v4().simple().to_string()[..8]
         );
-        let mut session = Session::new(
+        let mut session = Session::new_named(
             id,
             model.to_owned(),
             ollama_host.trim_end_matches('/').to_owned(),
+            ai_name.to_owned(),
             system_prompt.unwrap_or(DEFAULT_SYSTEM_PROMPT).to_owned(),
             budget,
             think,
@@ -205,6 +218,9 @@ fn validate_append_only(previous: &Session, next: &Session) -> Result<()> {
     }
     if previous.system_prompt != next.system_prompt {
         bail!("已保存的 system prompt 属于原始事件，不可修改");
+    }
+    if previous.ai_name != next.ai_name {
+        bail!("已保存的 AI 名称不可修改");
     }
     if next.turns.len() < previous.turns.len() {
         bail!("已保存的轮次不可删除");
