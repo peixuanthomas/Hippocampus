@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::knowledge::{KnowledgeStore, KnowledgeTrace};
 use crate::model::{
     ChatMessage, ContextItemTrace, EventRole, EvidenceKind, ModelRequestTrace, ProvenanceQuality,
     RankedCandidate, RetrievalConfig, RetrievalDocumentGranularity, RetrievalTrace, SCHEMA_VERSION,
@@ -117,6 +118,7 @@ pub struct AnswerContext {
     pub identity_instruction: Option<String>,
     pub items: Vec<AnswerContextItem>,
     pub retrieval_trace: RetrievalTrace,
+    pub knowledge_trace: KnowledgeTrace,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -609,6 +611,23 @@ impl RetrievalStore {
             })
             .transpose()?
             .unwrap_or_default();
+        let source = self.read_source(&self.root.join(&session.source_file))?;
+        let turn = source
+            .session
+            .turns
+            .iter()
+            .find(|turn| turn.id == answer.turn_id)
+            .ok_or_else(|| {
+                RetrievalError::CorruptIndex(format!(
+                    "回答 {answer_event_id} 在原始会话中缺少对应轮次"
+                ))
+            })?;
+        answer.knowledge_trace = turn.context_trace.knowledge.clone();
+        KnowledgeStore::new(&self.root)
+            .and_then(|store| store.verify_trace(&answer.knowledge_trace))
+            .map_err(|error| {
+                RetrievalError::CorruptIndex(format!("知识证据校验失败：{error:#}"))
+            })?;
         let mut statement = connection
             .prepare(
                 "SELECT i.ordinal, i.role, i.event_id, i.start_char, i.end_char,
@@ -634,7 +653,7 @@ impl RetrievalStore {
             })
             .map_err(|source| self.database_error(source))?;
         let mut messages = Vec::new();
-        let mut inserted_identity = false;
+        let mut inserted_generated = false;
         for row in rows {
             let (ordinal, role, span, expected_hash, content) =
                 row.map_err(|source| self.database_error(source))?;
@@ -656,19 +675,25 @@ impl RetrievalStore {
                     span.event_id
                 )));
             }
+            if !inserted_generated && role != EventRole::System {
+                push_generated_messages(
+                    &mut messages,
+                    answer.identity_instruction.as_deref(),
+                    answer.knowledge_trace.injected_message.as_deref(),
+                );
+                inserted_generated = true;
+            }
             messages.push(ChatMessage {
                 role: role.as_str().to_owned(),
                 content: content.clone(),
             });
-            if !inserted_identity
-                && role == EventRole::System
-                && let Some(identity) = &answer.identity_instruction
-            {
-                messages.push(ChatMessage {
-                    role: EventRole::System.as_str().to_owned(),
-                    content: identity.clone(),
-                });
-                inserted_identity = true;
+            if !inserted_generated && role == EventRole::System {
+                push_generated_messages(
+                    &mut messages,
+                    answer.identity_instruction.as_deref(),
+                    answer.knowledge_trace.injected_message.as_deref(),
+                );
+                inserted_generated = true;
             }
             answer.items.push(AnswerContextItem {
                 ordinal,
@@ -811,8 +836,19 @@ impl RetrievalStore {
                     ],
                 )
                 .map_err(|e| self.database_error(e))?;
-            let mut context_messages = Vec::with_capacity(derived.items.len() + 1);
-            let mut inserted_identity = false;
+            let store =
+                KnowledgeStore::new(&self.root).map_err(|error| RetrievalError::InvalidSource {
+                    path: source.path.clone(),
+                    message: error.to_string(),
+                })?;
+            store
+                .verify_trace(&derived.knowledge_trace)
+                .map_err(|error| RetrievalError::InvalidSource {
+                    path: source.path.clone(),
+                    message: format!("回答 {} 的知识证据无效：{error:#}", turn.id),
+                })?;
+            let mut context_messages = Vec::with_capacity(derived.items.len() + 2);
+            let mut inserted_generated = false;
             for (ordinal, item) in derived.items.iter().enumerate() {
                 let local = event_by_id.get(&item.span.event_id).copied();
                 let external = if local.is_none() {
@@ -853,19 +889,25 @@ impl RetrievalStore {
                         ),
                     });
                 }
+                if !inserted_generated && item.role != EventRole::System {
+                    push_generated_messages(
+                        &mut context_messages,
+                        derived.identity_instruction.as_deref(),
+                        derived.knowledge_trace.injected_message.as_deref(),
+                    );
+                    inserted_generated = true;
+                }
                 context_messages.push(ChatMessage {
                     role: item.role.as_str().to_owned(),
                     content: selected.clone(),
                 });
-                if !inserted_identity
-                    && item.role == EventRole::System
-                    && let Some(identity) = &derived.identity_instruction
-                {
-                    context_messages.push(ChatMessage {
-                        role: EventRole::System.as_str().to_owned(),
-                        content: identity.clone(),
-                    });
-                    inserted_identity = true;
+                if !inserted_generated && item.role == EventRole::System {
+                    push_generated_messages(
+                        &mut context_messages,
+                        derived.identity_instruction.as_deref(),
+                        derived.knowledge_trace.injected_message.as_deref(),
+                    );
+                    inserted_generated = true;
                 }
                 insert_span(transaction, &item.span, &selected)
                     .map_err(|error| self.database_error(error))?;
@@ -1194,7 +1236,7 @@ fn jieba() -> &'static jieba_rs::Jieba {
     static JIEBA: OnceLock<jieba_rs::Jieba> = OnceLock::new();
     JIEBA.get_or_init(jieba_rs::Jieba::new)
 }
-fn lexical_field(content: &str) -> String {
+pub(crate) fn lexical_field(content: &str) -> String {
     jieba()
         .cut(content, false)
         .iter()
@@ -1205,7 +1247,7 @@ fn lexical_field(content: &str) -> String {
 fn is_cjk(ch: char) -> bool {
     matches!(ch as u32, 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF)
 }
-fn ngram_field(content: &str) -> String {
+pub(crate) fn ngram_field(content: &str) -> String {
     let chars: Vec<_> = content.chars().collect();
     let mut output = Vec::new();
     for n in [2, 3] {
@@ -1217,7 +1259,7 @@ fn ngram_field(content: &str) -> String {
     }
     output.join(" ")
 }
-fn query_terms(raw: &str) -> Vec<String> {
+pub(crate) fn query_terms(raw: &str) -> Vec<String> {
     let mut terms = jieba()
         .cut(raw, false)
         .into_iter()
@@ -1254,6 +1296,7 @@ struct DerivedContext {
     provenance_quality: ProvenanceQuality,
     request: Option<ModelRequestTrace>,
     identity_instruction: Option<String>,
+    knowledge_trace: KnowledgeTrace,
 }
 
 fn derive_events(session: &Session) -> Vec<StoredEvent> {
@@ -1368,6 +1411,7 @@ fn derive_context(
             provenance_quality: ProvenanceQuality::Exact,
             request: Some(request),
             identity_instruction: turn.context_trace.identity_instruction.clone(),
+            knowledge_trace: turn.context_trace.knowledge.clone(),
         });
     }
 
@@ -1407,6 +1451,7 @@ fn derive_context(
         provenance_quality: ProvenanceQuality::LegacyInferred,
         request: None,
         identity_instruction: None,
+        knowledge_trace: KnowledgeTrace::default(),
     })
 }
 
@@ -1604,7 +1649,24 @@ fn map_answer_context(row: &rusqlite::Row<'_>) -> rusqlite::Result<AnswerContext
         identity_instruction: row.get(12)?,
         items: Vec::new(),
         retrieval_trace: RetrievalTrace::default(),
+        knowledge_trace: KnowledgeTrace::default(),
     })
+}
+
+fn push_generated_messages(
+    messages: &mut Vec<ChatMessage>,
+    identity_instruction: Option<&str>,
+    knowledge_message: Option<&str>,
+) {
+    for content in [identity_instruction, knowledge_message]
+        .into_iter()
+        .flatten()
+    {
+        messages.push(ChatMessage {
+            role: EventRole::System.as_str().to_owned(),
+            content: content.to_owned(),
+        });
+    }
 }
 
 fn parse_role(value: &str) -> rusqlite::Result<EventRole> {
@@ -1886,6 +1948,7 @@ mod tests {
             identity_instruction: Some(plan.identity_instruction),
             provenance_quality: ProvenanceQuality::Exact,
             retrieval: RetrievalTrace::default(),
+            knowledge: KnowledgeTrace::default(),
         };
         turn.request_started_at = Some(started_at);
         turn.assistant_content = assistant.to_owned();

@@ -3,7 +3,9 @@ use std::collections::HashMap;
 use anyhow::{Result, anyhow, bail};
 use tokio_util::sync::CancellationToken;
 
+use crate::config::AppConfig;
 use crate::context::ContextAssembler;
+use crate::knowledge::{KnowledgeRecall, KnowledgeTrace};
 use crate::model::{
     ChatEvent, ChatEventKind, ContextPlan, ContextTrace, ModelRequestTrace, ProvenanceQuality,
     Session, SessionStatus, TokenUsage, Turn, TurnStatus, utc_now,
@@ -51,6 +53,7 @@ pub struct ChatEngine<B: ChatBackend> {
     store: SessionStore,
     client: B,
     assembler: ContextAssembler,
+    config: AppConfig,
 }
 
 struct StreamSnapshot<'a> {
@@ -62,10 +65,15 @@ struct StreamSnapshot<'a> {
 
 impl<B: ChatBackend> ChatEngine<B> {
     pub fn new(store: SessionStore, client: B) -> Self {
+        Self::with_config(store, client, AppConfig::default())
+    }
+
+    pub fn with_config(store: SessionStore, client: B, config: AppConfig) -> Self {
         Self {
             store,
             client,
             assembler: ContextAssembler,
+            config,
         }
     }
 
@@ -75,6 +83,10 @@ impl<B: ChatBackend> ChatEngine<B> {
 
     pub fn client(&self) -> &B {
         &self.client
+    }
+
+    pub fn config(&self) -> &AppConfig {
+        &self.config
     }
 
     pub async fn prepare_turn(
@@ -173,14 +185,37 @@ impl<B: ChatBackend> ChatEngine<B> {
                     ..Default::default()
                 };
             })?;
+        let knowledge = self
+            .store
+            .knowledge()
+            .recall(&user_content, &self.config.knowledge)
+            .unwrap_or_else(|error| KnowledgeRecall {
+                trace: KnowledgeTrace {
+                    status: "failed".into(),
+                    candidate_limit: self.config.knowledge.candidate_limit,
+                    max_selected: self.config.knowledge.max_selected,
+                    evidence_char_budget: self.config.knowledge.evidence_char_budget,
+                    error: Some(format!("{error:#}")),
+                    warnings: vec![format!("知识检索失败：{error:#}")],
+                    ..Default::default()
+                },
+            });
         // Retrieval has succeeded independently of rendering/probing. Persist
         // it now so a later planning failure remains diagnosable.
         session.turns[turn_index].context_trace.retrieval = recall.trace.clone();
+        session.turns[turn_index].context_trace.knowledge = knowledge.trace.clone();
         session.turns[turn_index].context_trace.decision = "retrieval_completed".into();
         session.turns[turn_index].touch();
         self.store.save(session)?;
         let (mut plan, render_supported) = match self
-            .build_plan(session, turn_index, &history, &user_content, &recall)
+            .build_plan(
+                session,
+                turn_index,
+                &history,
+                &user_content,
+                &recall,
+                &knowledge,
+            )
             .await
         {
             Ok(plan) => plan,
@@ -202,7 +237,7 @@ impl<B: ChatBackend> ChatEngine<B> {
 
         if plan_metric(&plan)? >= session.budget.warning_threshold() {
             let (mut mandatory, _) = self
-                .build_plan(session, turn_index, &[], &user_content, &recall)
+                .build_plan(session, turn_index, &[], &user_content, &recall, &knowledge)
                 .await?;
             self.probe_plan(session, turn_index, &mut mandatory).await?;
             if plan_metric(&mandatory)? > session.budget.input_budget() {
@@ -276,12 +311,15 @@ impl<B: ChatBackend> ChatEngine<B> {
             .collect::<Vec<_>>();
         let mut cache = HashMap::from([(history.len(), prepared.plan.clone())]);
         let user_content = session.turns[prepared.turn_index].user_content.clone();
-        let mut mandatory = self.assembler.assemble_with_recall(
+        let recall = self.recall_from_plan(&prepared.plan)?;
+        let knowledge = self.knowledge_from_plan(&prepared.plan)?;
+        let mut mandatory = self.assembler.assemble_with_recall_and_knowledge(
             session,
             &user_content,
             Some(&[]),
             Some(prepared.turn_index),
-            Some(&self.recall_from_plan(&prepared.plan)?),
+            Some(&recall),
+            Some(&knowledge),
         );
         self.probe_plan(session, prepared.turn_index, &mut mandatory)
             .await?;
@@ -325,12 +363,13 @@ impl<B: ChatBackend> ChatEngine<B> {
                 plan_metric(candidate)?
             } else {
                 let start = history.len().saturating_sub(middle);
-                let mut candidate = self.assembler.assemble_with_recall(
+                let mut candidate = self.assembler.assemble_with_recall_and_knowledge(
                     session,
                     &user_content,
                     Some(&history[start..]),
                     Some(prepared.turn_index),
-                    Some(&self.recall_from_plan(&prepared.plan)?),
+                    Some(&recall),
+                    Some(&knowledge),
                 );
                 self.probe_plan(session, prepared.turn_index, &mut candidate)
                     .await?;
@@ -507,13 +546,15 @@ impl<B: ChatBackend> ChatEngine<B> {
         history: &[usize],
         user_content: &str,
         recall: &RecallResult,
+        knowledge: &KnowledgeRecall,
     ) -> Result<(ContextPlan, bool)> {
-        let mut plan = self.assembler.assemble_with_recall(
+        let mut plan = self.assembler.assemble_with_recall_and_knowledge(
             session,
             user_content,
             Some(history),
             Some(turn_index),
             Some(recall),
+            Some(knowledge),
         );
         match self
             .client
@@ -706,6 +747,13 @@ impl<B: ChatBackend> ChatEngine<B> {
             evidence,
         })
     }
+
+    fn knowledge_from_plan(&self, plan: &ContextPlan) -> Result<KnowledgeRecall> {
+        self.store.knowledge().verify_trace(&plan.knowledge_trace)?;
+        Ok(KnowledgeRecall {
+            trace: plan.knowledge_trace.clone(),
+        })
+    }
 }
 
 fn plan_metric(plan: &ContextPlan) -> Result<u64> {
@@ -744,6 +792,7 @@ fn apply_trace(
         identity_instruction: Some(plan.identity_instruction.clone()),
         provenance_quality: ProvenanceQuality::Exact,
         retrieval: plan.retrieval_trace.clone(),
+        knowledge: plan.knowledge_trace.clone(),
     };
 }
 

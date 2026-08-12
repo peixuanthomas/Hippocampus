@@ -1,3 +1,4 @@
+use crate::knowledge::KnowledgeRecall;
 use crate::model::{
     ChatMessage, ContextItemTrace, ContextPlan, EventRole, Session, SourceSpan, content_sha256,
     context_sha256, event_id, identity_instruction,
@@ -35,6 +36,25 @@ impl ContextAssembler {
         current_turn_index: Option<usize>,
         recall: Option<&RecallResult>,
     ) -> ContextPlan {
+        self.assemble_with_recall_and_knowledge(
+            session,
+            current_user,
+            history_indices,
+            current_turn_index,
+            recall,
+            None,
+        )
+    }
+
+    pub fn assemble_with_recall_and_knowledge(
+        &self,
+        session: &Session,
+        current_user: &str,
+        history_indices: Option<&[usize]>,
+        current_turn_index: Option<usize>,
+        recall: Option<&RecallResult>,
+        knowledge: Option<&KnowledgeRecall>,
+    ) -> ContextPlan {
         let selected_indices = history_indices.map_or_else(
             || {
                 session
@@ -63,6 +83,12 @@ impl ContextAssembler {
             role: EventRole::System.as_str().to_owned(),
             content: identity_instruction.clone(),
         });
+        if let Some(message) = knowledge.and_then(|value| value.trace.injected_message.as_ref()) {
+            messages.push(ChatMessage {
+                role: EventRole::System.as_str().to_owned(),
+                content: message.clone(),
+            });
+        }
         if let Some(recall) = recall {
             for item in &recall.evidence {
                 // Evidence messages are deliberately original-role spans, not
@@ -136,6 +162,9 @@ impl ContextAssembler {
             retrieval_trace: recall.map(|value| value.trace.clone()).unwrap_or_default(),
             evidence: recall
                 .map(|value| value.trace.selected_evidence.clone())
+                .unwrap_or_default(),
+            knowledge_trace: knowledge
+                .map(|value| value.trace.clone())
                 .unwrap_or_default(),
         }
     }

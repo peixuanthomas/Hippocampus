@@ -8,7 +8,7 @@ use hippocampus::config::AppConfig;
 use hippocampus::engine::PreparationStatus;
 use hippocampus::model::{BudgetConfig, ChatEventKind, ChatMessage, Session, TokenUsage};
 use hippocampus::ollama::{ChatBackend, ChatRequest};
-use hippocampus::{ChatEngine, LimitAction, OllamaClient, SessionStore};
+use hippocampus::{ChatEngine, KnowledgeSyncReport, LimitAction, OllamaClient, SessionStore};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
@@ -48,6 +48,33 @@ enum Command {
     Ask(AskArgs),
     /// 启动本地 Web UI 并保持服务运行
     Serve(ServeArgs),
+    /// 管理版本化本地知识库
+    Knowledge(KnowledgeArgs),
+}
+
+#[derive(Debug, Args)]
+struct KnowledgeArgs {
+    #[command(subcommand)]
+    command: KnowledgeCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum KnowledgeCommand {
+    /// 同步当前配置的全部知识源
+    Sync,
+    /// 列出当前配置来源与最近同步状态
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// 对当前知识索引执行确定性词法检索
+    Search {
+        query: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 删除派生索引并从不可变快照重建
+    Rebuild,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -186,6 +213,7 @@ async fn run() -> Result<()> {
         Some(Command::Show { identifier, json }) => show_session(&store, &identifier, json),
         Some(Command::Ask(args)) => run_ask(store, &cli.host, args, &config).await,
         Some(Command::Serve(args)) => run_serve(store, &cli.host, args, &config).await,
+        Some(Command::Knowledge(args)) => run_knowledge(store, &cli.host, args, &config).await,
     }
 }
 
@@ -195,6 +223,13 @@ async fn run_serve(
     args: ServeArgs,
     config: &AppConfig,
 ) -> Result<()> {
+    let sync_host = args
+        .session
+        .as_deref()
+        .map(|identifier| store.load(identifier).map(|session| session.ollama_host))
+        .transpose()?
+        .unwrap_or_else(|| host.to_owned());
+    auto_sync_knowledge(&store, &sync_host, config).await?;
     let mut session = if let Some(identifier) = &args.session {
         let mut session = store.load(identifier)?;
         store.reopen(&mut session)?;
@@ -214,7 +249,7 @@ async fn run_serve(
     let info = client
         .check_model(&session.model, session.budget.context_window)
         .await?;
-    let engine = ChatEngine::new(store.clone(), client);
+    let engine = ChatEngine::with_config(store.clone(), client, config.clone());
     let address = SocketAddr::new(args.bind, args.port);
     hippocampus::web::serve(engine, session.clone(), info, address).await?;
     session = store.load(&session.id)?;
@@ -228,6 +263,7 @@ async fn run_new_tui(
     args: NewArgs,
     config: &AppConfig,
 ) -> Result<()> {
+    auto_sync_knowledge(&store, host, config).await?;
     let prompt = args.read_prompt(config)?;
     let mut session = store.create_named(
         &args.model,
@@ -241,20 +277,21 @@ async fn run_new_tui(
     let info = client
         .check_model(&session.model, session.budget.context_window)
         .await?;
-    let engine = ChatEngine::new(store.clone(), client);
+    let engine = ChatEngine::with_config(store.clone(), client, config.clone());
     session = hippocampus::tui::run(engine, session, info).await?;
     store.save(&mut session)?;
     Ok(())
 }
 
-async fn run_resume_tui(store: SessionStore, identifier: &str, _config: &AppConfig) -> Result<()> {
+async fn run_resume_tui(store: SessionStore, identifier: &str, config: &AppConfig) -> Result<()> {
     let mut session = store.load(identifier)?;
+    auto_sync_knowledge(&store, &session.ollama_host, config).await?;
     store.reopen(&mut session)?;
     let client = OllamaClient::new(&session.ollama_host)?;
     let info = client
         .check_model(&session.model, session.budget.context_window)
         .await?;
-    let engine = ChatEngine::new(store.clone(), client);
+    let engine = ChatEngine::with_config(store.clone(), client, config.clone());
     session = hippocampus::tui::run(engine, session, info).await?;
     store.save(&mut session)?;
     Ok(())
@@ -271,15 +308,16 @@ async fn run_contextual_ask(
     store: SessionStore,
     identifier: &str,
     args: AskArgs,
-    _config: &AppConfig,
+    config: &AppConfig,
 ) -> Result<()> {
     let mut session = store.load(identifier)?;
+    auto_sync_knowledge(&store, &session.ollama_host, config).await?;
     store.reopen(&mut session)?;
     let client = OllamaClient::new(&session.ollama_host)?;
     client
         .check_model(&session.model, session.budget.context_window)
         .await?;
-    let engine = ChatEngine::new(store, client);
+    let engine = ChatEngine::with_config(store, client, config.clone());
     let mut prepared = engine.prepare_turn(&mut session, args.prompt).await?;
     if prepared.needs_limit_decision() {
         if !args.trim {
@@ -332,6 +370,96 @@ async fn run_contextual_ask(
         print_usage(session.turns.last().map(|turn| turn.usage));
     }
     Ok(())
+}
+
+async fn run_knowledge(
+    store: SessionStore,
+    host: &str,
+    args: KnowledgeArgs,
+    config: &AppConfig,
+) -> Result<()> {
+    match args.command {
+        KnowledgeCommand::Sync => {
+            let client = OllamaClient::new(host)?;
+            let report = store.knowledge().sync(&config.knowledge, &client).await?;
+            print_sync_report(&report);
+        }
+        KnowledgeCommand::List { json } => {
+            let statuses = store.knowledge().list(&config.knowledge)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&statuses)?);
+            } else if statuses.is_empty() {
+                println!("当前配置没有知识来源。");
+            } else {
+                for status in statuses {
+                    println!(
+                        "{}｜{:?}｜{}｜{} 篇｜成功={}｜错误={}",
+                        status.id,
+                        status.kind,
+                        if status.enabled { "active" } else { "inactive" },
+                        status.active_documents,
+                        status.last_success_at.as_deref().unwrap_or("从未"),
+                        status.last_error.as_deref().unwrap_or("无"),
+                    );
+                    println!("  {}", status.location);
+                }
+            }
+        }
+        KnowledgeCommand::Search { query, json } => {
+            let recall = store.knowledge().recall(&query, &config.knowledge)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&recall.trace)?);
+            } else {
+                println!("状态：{}", recall.trace.status);
+                for (index, evidence) in recall.trace.selected_evidence.iter().enumerate() {
+                    println!(
+                        "[K{}] {}｜{}｜{}..{}\n  source={}\n  revision={}",
+                        index + 1,
+                        evidence.title,
+                        evidence.fetched_at,
+                        evidence.start_char,
+                        evidence.end_char,
+                        evidence.source_location,
+                        evidence.revision_id,
+                    );
+                }
+                for warning in &recall.trace.warnings {
+                    eprintln!("警告：{warning}");
+                }
+            }
+        }
+        KnowledgeCommand::Rebuild => {
+            let documents = store.knowledge().rebuild()?;
+            println!("知识索引已从原始快照重建：{documents} 个 passage。");
+        }
+    }
+    Ok(())
+}
+
+async fn auto_sync_knowledge(store: &SessionStore, host: &str, config: &AppConfig) -> Result<()> {
+    if !config.knowledge.auto_sync {
+        return Ok(());
+    }
+    let client = OllamaClient::new(host)?;
+    let report = store.knowledge().sync(&config.knowledge, &client).await?;
+    for warning in &report.warnings {
+        eprintln!("警告：{warning}；继续使用最近成功的知识版本（如有）。");
+    }
+    Ok(())
+}
+
+fn print_sync_report(report: &KnowledgeSyncReport) {
+    println!(
+        "知识同步完成：来源 {}，成功 {}，失败 {}，活动文档 {}，新增 revision {}。",
+        report.configured_sources,
+        report.successful_sources,
+        report.failed_sources,
+        report.active_documents,
+        report.new_revisions,
+    );
+    for warning in &report.warnings {
+        eprintln!("警告：{warning}；继续使用最近成功的知识版本（如有）。");
+    }
 }
 
 async fn run_stateless_ask(host: &str, args: AskArgs, config: &AppConfig) -> Result<()> {
@@ -606,5 +734,28 @@ mod tests {
         assert_eq!(args.session.as_deref(), Some("20260811-abc"));
         assert!(args.bind.is_loopback());
         assert_eq!(args.port, 8080);
+    }
+
+    #[test]
+    fn knowledge_commands_parse_with_json_flags() {
+        let cli = Cli::try_parse_from([
+            "hippocampus",
+            "--config",
+            "custom.toml",
+            "knowledge",
+            "search",
+            "海棠计划",
+            "--json",
+        ])
+        .unwrap();
+        assert_eq!(cli.config, Some(PathBuf::from("custom.toml")));
+        let Some(Command::Knowledge(KnowledgeArgs {
+            command: KnowledgeCommand::Search { query, json },
+        })) = cli.command
+        else {
+            panic!("expected knowledge search command");
+        };
+        assert_eq!(query, "海棠计划");
+        assert!(json);
     }
 }

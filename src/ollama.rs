@@ -3,11 +3,34 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::{Client, StatusCode, Url};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 use crate::model::{ChatEvent, ChatEventKind, ChatMessage, TokenUsage};
+
+const MAX_WEB_RESPONSE_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WebSearchResult {
+    pub title: String,
+    pub url: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WebSearchResponse {
+    pub results: Vec<WebSearchResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WebFetchResponse {
+    pub title: String,
+    pub content: String,
+    #[serde(default)]
+    pub links: Vec<String>,
+}
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum OllamaError {
@@ -126,6 +149,82 @@ impl OllamaClient {
         &self.host
     }
 
+    pub async fn web_search(
+        &self,
+        query: &str,
+        max_results: usize,
+    ) -> Result<WebSearchResponse, OllamaError> {
+        if query.trim().is_empty() {
+            return Err(OllamaError::Other("联网搜索查询不能为空".into()));
+        }
+        if !(1..=10).contains(&max_results) {
+            return Err(OllamaError::Other(
+                "联网搜索结果数必须在 1..=10 之间".into(),
+            ));
+        }
+        self.web_request(
+            "web_search",
+            json!({"query": query, "max_results": max_results}),
+        )
+        .await
+    }
+
+    pub async fn web_fetch(&self, url: &str) -> Result<WebFetchResponse, OllamaError> {
+        validate_public_http_url(url)?;
+        self.web_request("web_fetch", json!({"url": url})).await
+    }
+
+    async fn web_request<T>(&self, operation: &str, payload: Value) -> Result<T, OllamaError>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        let api_key = std::env::var("OLLAMA_API_KEY")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        let url = if api_key.is_some() {
+            format!("https://ollama.com/api/{operation}")
+        } else {
+            format!("{}/api/experimental/{operation}", self.host)
+        };
+        let mut request = self
+            .client
+            .post(url)
+            .header("Accept", "application/json")
+            .json(&payload);
+        if let Some(api_key) = api_key {
+            request = request.bearer_auth(api_key);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|error| self.connection(error))?;
+        let status = response.status();
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_WEB_RESPONSE_BYTES as u64)
+        {
+            return Err(OllamaError::Other(format!(
+                "Ollama {operation} 响应超过 1 MiB 上限"
+            )));
+        }
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|error| self.connection(error))?;
+        if bytes.len() > MAX_WEB_RESPONSE_BYTES {
+            return Err(OllamaError::Other(format!(
+                "Ollama {operation} 响应超过 1 MiB 上限"
+            )));
+        }
+        let value: Value = serde_json::from_slice(&bytes)
+            .map_err(|error| OllamaError::Protocol(format!("Ollama 返回了无效 JSON: {error}")))?;
+        if !status.is_success() || value.get("error").is_some() {
+            return Err(api_error(&value, Some(status)));
+        }
+        serde_json::from_value(value)
+            .map_err(|error| OllamaError::Protocol(format!("Ollama Web 响应结构无效: {error}")))
+    }
+
     async fn request_json(
         &self,
         method: reqwest::Method,
@@ -188,6 +287,39 @@ impl OllamaClient {
             }
         })
     }
+}
+
+pub fn validate_public_http_url(raw: &str) -> Result<Url, OllamaError> {
+    let url = Url::parse(raw).map_err(|_| OllamaError::Other(format!("无效 URL: {raw:?}")))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(OllamaError::Other("仅允许 HTTP(S) URL".into()));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(OllamaError::Other("URL 不允许包含用户凭据".into()));
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| OllamaError::Other("URL 缺少主机名".into()))?;
+    let lowered = host.trim_end_matches('.').to_ascii_lowercase();
+    if lowered == "localhost" || lowered.ends_with(".localhost") || lowered.ends_with(".local") {
+        return Err(OllamaError::Other("拒绝访问本机或局域网 URL".into()));
+    }
+    let ip_literal = lowered
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(&lowered);
+    if let Ok(ip) = ip_literal.parse::<std::net::IpAddr>()
+        && (ip.is_loopback()
+            || ip.is_unspecified()
+            || ip.is_multicast()
+            || match ip {
+                std::net::IpAddr::V4(ip) => ip.is_private() || ip.is_link_local(),
+                std::net::IpAddr::V6(ip) => ip.is_unique_local() || ip.is_unicast_link_local(),
+            })
+    {
+        return Err(OllamaError::Other("拒绝访问本机或私有网络 URL".into()));
+    }
+    Ok(url)
 }
 
 #[async_trait]
@@ -571,5 +703,22 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn web_fetch_url_policy_rejects_local_and_non_http_targets() {
+        for url in [
+            "file:///etc/passwd",
+            "http://localhost:8080/",
+            "http://service.local/path",
+            "http://127.0.0.1/",
+            "http://10.1.2.3/",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[::1]/",
+            "https://user:secret@example.com/",
+        ] {
+            assert!(validate_public_http_url(url).is_err(), "accepted {url}");
+        }
+        assert!(validate_public_http_url("https://example.com/docs").is_ok());
     }
 }

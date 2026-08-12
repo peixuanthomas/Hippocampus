@@ -1,6 +1,7 @@
 pub mod config;
 pub mod context;
 pub mod engine;
+pub mod knowledge;
 pub mod model;
 pub mod ollama;
 pub mod retrieval;
@@ -13,6 +14,7 @@ pub use config::{
 };
 pub use context::ContextAssembler;
 pub use engine::{ChatEngine, LimitAction, PreparedTurn};
+pub use knowledge::{KnowledgeRecall, KnowledgeStore, KnowledgeSyncReport, KnowledgeTrace};
 pub use model::{
     BudgetConfig, EventRole, EvidenceKind, ProvenanceQuality, RetrievalConfig, RetrievalTrace,
     Session, SourceSpan, TokenUsage, Turn,

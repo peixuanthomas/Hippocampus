@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::knowledge::KnowledgeTrace;
+
 pub const SCHEMA_VERSION: u32 = 3;
 pub const LEGACY_SCHEMA_VERSION: u32 = 1;
 pub const PREVIOUS_SCHEMA_VERSION: u32 = 2;
@@ -336,6 +338,8 @@ pub struct ContextTrace {
     pub provenance_quality: ProvenanceQuality,
     #[serde(default)]
     pub retrieval: RetrievalTrace,
+    #[serde(default)]
+    pub knowledge: KnowledgeTrace,
 }
 
 fn default_decision() -> String {
@@ -359,6 +363,7 @@ impl Default for ContextTrace {
             identity_instruction: None,
             provenance_quality: ProvenanceQuality::Exact,
             retrieval: RetrievalTrace::default(),
+            knowledge: KnowledgeTrace::default(),
         }
     }
 }
@@ -625,6 +630,7 @@ pub struct ContextPlan {
     pub identity_instruction: String,
     pub retrieval_trace: RetrievalTrace,
     pub evidence: Vec<SelectedEvidence>,
+    pub knowledge_trace: KnowledgeTrace,
 }
 
 pub fn content_sha256(content: &str) -> String {

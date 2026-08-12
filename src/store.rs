@@ -7,6 +7,7 @@ use chrono::Utc;
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::knowledge::KnowledgeStore;
 use crate::model::{
     BudgetConfig, DEFAULT_SYSTEM_PROMPT, SCHEMA_VERSION, Session, SessionStatus, TurnStatus,
 };
@@ -26,6 +27,7 @@ pub struct IndexSyncAfterSourceCommit {
 pub struct SessionStore {
     root: PathBuf,
     retrieval: RetrievalStore,
+    knowledge: KnowledgeStore,
 }
 
 impl SessionStore {
@@ -38,7 +40,12 @@ impl SessionStore {
             std::env::current_dir()?.join(path)
         };
         let retrieval = RetrievalStore::new(&root)?;
-        Ok(Self { root, retrieval })
+        let knowledge = KnowledgeStore::new(&root)?;
+        Ok(Self {
+            root,
+            retrieval,
+            knowledge,
+        })
     }
 
     pub fn root(&self) -> &Path {
@@ -47,6 +54,10 @@ impl SessionStore {
 
     pub fn retrieval(&self) -> &RetrievalStore {
         &self.retrieval
+    }
+
+    pub fn knowledge(&self) -> &KnowledgeStore {
+        &self.knowledge
     }
 
     pub fn create(
@@ -91,6 +102,11 @@ impl SessionStore {
         validate_identifier(&session.id)?;
         session.normalize_legacy_provenance();
         session.validate()?;
+        for turn in &session.turns {
+            self.knowledge
+                .verify_trace(&turn.context_trace.knowledge)
+                .with_context(|| format!("轮次 {} 的知识证据无法由原始快照重建", turn.id))?;
+        }
         fs::create_dir_all(&self.root)
             .with_context(|| format!("无法创建会话目录 {}", self.root.display()))?;
         let target = self.root.join(format!("{}.json", session.id));
@@ -250,6 +266,14 @@ fn validate_append_only(previous: &Session, next: &Session) -> Result<()> {
             if old.request_started_at != new.request_started_at {
                 bail!("终态轮次 {} 的模型请求来源不可修改", old.id);
             }
+            if !same_authoritative_usage(old.usage, new.usage)
+                || !same_authoritative_usage(old.probe_usage, new.probe_usage)
+                || old.context_trace != new.context_trace
+                || old.done_reason != new.done_reason
+                || old.error != new.error
+            {
+                bail!("终态轮次 {} 的审计记录不可修改", old.id);
+            }
         } else if (!new.assistant_content.is_empty() || !new.thinking.is_empty())
             && new.request_started_at.is_none()
         {
@@ -257,6 +281,13 @@ fn validate_append_only(previous: &Session, next: &Session) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn same_authoritative_usage(
+    left: crate::model::TokenUsage,
+    right: crate::model::TokenUsage,
+) -> bool {
+    left.input_tokens == right.input_tokens && left.output_tokens == right.output_tokens
 }
 
 fn expand_tilde(path: &Path) -> PathBuf {
