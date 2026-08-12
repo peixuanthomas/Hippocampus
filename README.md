@@ -88,8 +88,11 @@ API key 不会写入配置、日志或会话。每轮最多执行配置的工具
 - `Enter`：发送
 - `Ctrl+J`、`Shift+Enter` 或 `Alt+Enter`：换行
 - `↑` / `↓`：浏览输入历史
-- `PageUp` / `PageDown`：滚动对话
+- 鼠标滚轮、`PageUp` / `PageDown`：滚动对话（输入或发送后自动回到最新消息）
 - `Ctrl+C`：中断生成并保存已收到内容；空闲时退出
+- `/list`：列出可切换的会话
+- `/session <id>`：按完整 ID 或唯一前缀切换会话
+- `/debug`、`/debug on|off`：查看或切换本次 TUI 的上下文组装调试输出（默认关闭）
 - `/budget`、`/think on|off`、`/save`、`/help`、`/exit`
 
 上下文达到 90% 警戒线时，TUI 会要求明确选择：裁剪最旧的完整轮次后继续，或暂停会话。裁剪只改变后续请求的活动起点，不删除原始记录。
