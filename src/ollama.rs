@@ -87,6 +87,39 @@ pub struct ChatRequest {
     pub num_predict: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EmbeddingRequest {
+    pub model: String,
+    pub input: Vec<String>,
+    pub dimensions: Option<usize>,
+    pub truncate: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EmbeddingResponse {
+    pub model: String,
+    pub embeddings: Vec<Vec<f32>>,
+    pub prompt_eval_count: Option<u64>,
+    pub total_duration: Option<u64>,
+    pub load_duration: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StructuredChatRequest {
+    pub model: String,
+    pub messages: Vec<ChatMessage>,
+    pub schema: Value,
+    pub num_ctx: u64,
+    pub num_predict: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StructuredChatResponse {
+    pub content: String,
+    pub usage: TokenUsage,
+    pub done_reason: Option<String>,
+}
+
 #[async_trait]
 pub trait ChatBackend: Clone + Send + Sync + 'static {
     async fn check_model(
@@ -117,6 +150,17 @@ pub trait ChatBackend: Clone + Send + Sync + 'static {
         cancellation: CancellationToken,
         emit: &mut (dyn FnMut(ChatEvent) + Send),
     ) -> Result<(), OllamaError>;
+
+    async fn embed(&self, _request: EmbeddingRequest) -> Result<EmbeddingResponse, OllamaError> {
+        Err(OllamaError::Other("当前聊天后端不支持嵌入".into()))
+    }
+
+    async fn structured_chat(
+        &self,
+        _request: StructuredChatRequest,
+    ) -> Result<StructuredChatResponse, OllamaError> {
+        Err(OllamaError::Other("当前聊天后端不支持结构化输出".into()))
+    }
 
     async fn probe_agent(&self, request: &AgentChatRequest) -> Result<TokenUsage, OllamaError> {
         let messages = request
@@ -183,6 +227,27 @@ impl OllamaClient {
 
     pub fn host(&self) -> &str {
         &self.host
+    }
+
+    pub async fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingResponse, OllamaError> {
+        validate_embedding_request(&request)?;
+        let payload = embedding_payload(&request);
+        let response = self
+            .request_json(reqwest::Method::POST, "/api/embed", Some(payload))
+            .await?;
+        parse_embedding_response(response, &request)
+    }
+
+    pub async fn structured_chat(
+        &self,
+        request: StructuredChatRequest,
+    ) -> Result<StructuredChatResponse, OllamaError> {
+        validate_structured_chat_request(&request)?;
+        let payload = structured_chat_payload(&request);
+        let response = self
+            .request_json(reqwest::Method::POST, "/api/chat", Some(payload))
+            .await?;
+        parse_structured_chat_response(&response)
     }
 
     pub async fn web_search(
@@ -345,6 +410,157 @@ impl OllamaClient {
     }
 }
 
+fn validate_embedding_request(request: &EmbeddingRequest) -> Result<(), OllamaError> {
+    if request.model.trim().is_empty() {
+        return Err(OllamaError::Other("嵌入模型不能为空".into()));
+    }
+    if request.input.is_empty() {
+        return Err(OllamaError::Other("嵌入输入不能为空".into()));
+    }
+    if request.input.iter().any(|text| text.trim().is_empty()) {
+        return Err(OllamaError::Other("嵌入输入不能包含空文本".into()));
+    }
+    Ok(())
+}
+
+fn embedding_payload(request: &EmbeddingRequest) -> Value {
+    let mut payload = json!({
+        "model": request.model,
+        "input": request.input,
+        "truncate": request.truncate,
+        "keep_alive": "5m",
+    });
+    if let Some(dimensions) = request.dimensions {
+        payload
+            .as_object_mut()
+            .expect("embedding payload is an object")
+            .insert("dimensions".into(), Value::from(dimensions));
+    }
+    payload
+}
+
+fn parse_embedding_response(
+    payload: Value,
+    request: &EmbeddingRequest,
+) -> Result<EmbeddingResponse, OllamaError> {
+    let response: EmbeddingResponse = serde_json::from_value(payload)
+        .map_err(|error| OllamaError::Protocol(format!("Ollama 嵌入响应结构无效: {error}")))?;
+    validate_embedding_response(response, request)
+}
+
+fn validate_embedding_response(
+    response: EmbeddingResponse,
+    request: &EmbeddingRequest,
+) -> Result<EmbeddingResponse, OllamaError> {
+    if response.model.trim().is_empty() {
+        return Err(OllamaError::Protocol("Ollama 嵌入响应缺少模型名".into()));
+    }
+    if response.embeddings.len() != request.input.len() {
+        return Err(OllamaError::Protocol(format!(
+            "Ollama 返回 {} 个向量，但请求包含 {} 个输入",
+            response.embeddings.len(),
+            request.input.len()
+        )));
+    }
+    let Some(dimension) = response.embeddings.first().map(Vec::len) else {
+        return Err(OllamaError::Protocol("Ollama 嵌入响应没有向量".into()));
+    };
+    if dimension == 0 {
+        return Err(OllamaError::Protocol("Ollama 返回了空向量".into()));
+    }
+    if response
+        .embeddings
+        .iter()
+        .any(|vector| vector.len() != dimension)
+    {
+        return Err(OllamaError::Protocol(
+            "Ollama 返回的嵌入向量维度不一致".into(),
+        ));
+    }
+    if request
+        .dimensions
+        .is_some_and(|expected| expected != dimension)
+    {
+        return Err(OllamaError::Protocol(format!(
+            "Ollama 返回的嵌入维度 {dimension} 与请求不一致"
+        )));
+    }
+    if response
+        .embeddings
+        .iter()
+        .flatten()
+        .any(|value| !value.is_finite())
+    {
+        return Err(OllamaError::Protocol(
+            "Ollama 返回的嵌入包含非有限值".into(),
+        ));
+    }
+    Ok(response)
+}
+
+fn validate_structured_chat_request(request: &StructuredChatRequest) -> Result<(), OllamaError> {
+    if request.model.trim().is_empty() {
+        return Err(OllamaError::Other("结构化输出模型不能为空".into()));
+    }
+    if request.messages.is_empty() {
+        return Err(OllamaError::Other("结构化输出消息不能为空".into()));
+    }
+    if !request.schema.is_object() {
+        return Err(OllamaError::Other(
+            "结构化输出 schema 必须是 JSON 对象".into(),
+        ));
+    }
+    if request.num_ctx == 0 || request.num_predict == 0 {
+        return Err(OllamaError::Other(
+            "结构化输出 num_ctx 与 num_predict 必须大于零".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn structured_chat_payload(request: &StructuredChatRequest) -> Value {
+    json!({
+        "model": request.model,
+        "messages": request.messages,
+        "stream": false,
+        "think": false,
+        "format": request.schema,
+        "truncate": false,
+        "shift": false,
+        "keep_alive": "5m",
+        "options": {
+            "num_ctx": request.num_ctx,
+            "num_predict": request.num_predict,
+            "temperature": 0,
+            "seed": 0,
+        }
+    })
+}
+
+fn parse_structured_chat_response(payload: &Value) -> Result<StructuredChatResponse, OllamaError> {
+    let content = payload
+        .get("message")
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_str)
+        .filter(|content| !content.trim().is_empty())
+        .ok_or_else(|| OllamaError::Protocol("Ollama 结构化响应缺少非空内容".into()))?;
+    let input = payload.get("prompt_eval_count").and_then(Value::as_u64);
+    let output = payload.get("eval_count").and_then(Value::as_u64);
+    let (Some(input), Some(output)) = (input, output) else {
+        return Err(OllamaError::Protocol(
+            "Ollama 结构化响应缺少 token 计数".into(),
+        ));
+    };
+    Ok(StructuredChatResponse {
+        content: content.to_owned(),
+        usage: TokenUsage::new(Some(input), Some(output)),
+        done_reason: payload
+            .get("done_reason")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+    })
+}
+
 pub fn validate_public_http_url(raw: &str) -> Result<Url, OllamaError> {
     let url = Url::parse(raw).map_err(|_| OllamaError::Other(format!("无效 URL: {raw:?}")))?;
     if !matches!(url.scheme(), "http" | "https") {
@@ -437,6 +653,17 @@ fn is_disallowed_web_ip(ip: std::net::IpAddr) -> bool {
 
 #[async_trait]
 impl ChatBackend for OllamaClient {
+    async fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingResponse, OllamaError> {
+        OllamaClient::embed(self, request).await
+    }
+
+    async fn structured_chat(
+        &self,
+        request: StructuredChatRequest,
+    ) -> Result<StructuredChatResponse, OllamaError> {
+        OllamaClient::structured_chat(self, request).await
+    }
+
     async fn check_model(
         &self,
         model: &str,
@@ -987,6 +1214,32 @@ fn api_error(payload: &Value, status: Option<StatusCode>) -> OllamaError {
 mod tests {
     use super::*;
 
+    fn embedding_request() -> EmbeddingRequest {
+        EmbeddingRequest {
+            model: "qwen3-embedding:8b".into(),
+            input: vec!["one".into(), "two".into()],
+            dimensions: Some(3),
+            truncate: true,
+        }
+    }
+
+    fn structured_request() -> StructuredChatRequest {
+        StructuredChatRequest {
+            model: "qwen".into(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: "extract".into(),
+            }],
+            schema: json!({
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"]
+            }),
+            num_ctx: 4_096,
+            num_predict: 256,
+        }
+    }
+
     #[test]
     fn stream_channels_and_authoritative_usage_are_separate() {
         let mut live = 0;
@@ -1065,5 +1318,127 @@ mod tests {
             assert!(validate_public_http_url(url).is_err(), "accepted {url}");
         }
         assert!(validate_public_http_url("https://example.com/docs").is_ok());
+    }
+
+    #[test]
+    fn embedding_payload_and_parser_follow_the_batch_contract() {
+        let request = embedding_request();
+        let payload = embedding_payload(&request);
+        assert_eq!(payload["model"], request.model);
+        assert_eq!(payload["input"], json!(["one", "two"]));
+        assert_eq!(payload["truncate"], true);
+        assert_eq!(payload["keep_alive"], "5m");
+        assert_eq!(payload["dimensions"], 3);
+
+        let response = parse_embedding_response(
+            json!({
+                "model": "qwen3-embedding:8b",
+                "embeddings": [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]],
+                "prompt_eval_count": 4,
+                "total_duration": 20,
+                "load_duration": 2
+            }),
+            &request,
+        )
+        .unwrap();
+        assert_eq!(response.embeddings.len(), 2);
+        assert_eq!(response.prompt_eval_count, Some(4));
+
+        let mut without_dimensions = request;
+        without_dimensions.dimensions = None;
+        assert!(
+            embedding_payload(&without_dimensions)
+                .get("dimensions")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn embedding_contract_rejects_invalid_requests_and_responses() {
+        let request = embedding_request();
+        for payload in [
+            json!({"model":"m","embeddings":[[1.0, 2.0, 3.0]]}),
+            json!({"model":"m","embeddings":[[1.0, 2.0], [3.0, 4.0]]}),
+            json!({"model":"m","embeddings":[[1.0, 2.0, 3.0], [4.0, 5.0]]}),
+            json!({"model":"m","embeddings":[[], []]}),
+            json!({"model":"","embeddings":[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]}),
+        ] {
+            assert!(parse_embedding_response(payload, &request).is_err());
+        }
+
+        let nonfinite = EmbeddingResponse {
+            model: "m".into(),
+            embeddings: vec![vec![1.0, f32::NAN, 3.0], vec![4.0, 5.0, 6.0]],
+            prompt_eval_count: None,
+            total_duration: None,
+            load_duration: None,
+        };
+        assert!(validate_embedding_response(nonfinite, &request).is_err());
+
+        let mut invalid = request.clone();
+        invalid.model = " ".into();
+        assert!(validate_embedding_request(&invalid).is_err());
+        invalid = request.clone();
+        invalid.input.clear();
+        assert!(validate_embedding_request(&invalid).is_err());
+        invalid = request;
+        invalid.input[1] = "\t".into();
+        assert!(validate_embedding_request(&invalid).is_err());
+    }
+
+    #[test]
+    fn structured_chat_payload_disables_thinking_and_tools() {
+        let request = structured_request();
+        let payload = structured_chat_payload(&request);
+        assert_eq!(payload["format"], request.schema);
+        assert_eq!(payload["stream"], false);
+        assert_eq!(payload["think"], false);
+        assert_eq!(payload["truncate"], false);
+        assert_eq!(payload["shift"], false);
+        assert_eq!(payload["keep_alive"], "5m");
+        assert_eq!(payload["options"]["num_ctx"], 4_096);
+        assert_eq!(payload["options"]["num_predict"], 256);
+        assert_eq!(payload["options"]["temperature"], 0);
+        assert_eq!(payload["options"]["seed"], 0);
+        assert!(payload.get("tools").is_none());
+
+        let response = parse_structured_chat_response(&json!({
+            "message": {"content": "{\"name\":\"Ada\"}"},
+            "prompt_eval_count": 12,
+            "eval_count": 5,
+            "done_reason": "stop"
+        }))
+        .unwrap();
+        assert_eq!(response.content, "{\"name\":\"Ada\"}");
+        assert_eq!(response.usage, TokenUsage::new(Some(12), Some(5)));
+        assert_eq!(response.done_reason.as_deref(), Some("stop"));
+    }
+
+    #[test]
+    fn structured_chat_rejects_invalid_requests_and_responses() {
+        let request = structured_request();
+        for payload in [
+            json!({"message":{"content":""},"prompt_eval_count":1,"eval_count":1}),
+            json!({"message":{"content":"{}"},"eval_count":1}),
+            json!({"message":{"content":"{}"},"prompt_eval_count":1}),
+        ] {
+            assert!(parse_structured_chat_response(&payload).is_err());
+        }
+
+        let mut invalid = request.clone();
+        invalid.model.clear();
+        assert!(validate_structured_chat_request(&invalid).is_err());
+        invalid = request.clone();
+        invalid.messages.clear();
+        assert!(validate_structured_chat_request(&invalid).is_err());
+        invalid = request.clone();
+        invalid.schema = json!([]);
+        assert!(validate_structured_chat_request(&invalid).is_err());
+        invalid = request.clone();
+        invalid.num_ctx = 0;
+        assert!(validate_structured_chat_request(&invalid).is_err());
+        invalid = request;
+        invalid.num_predict = 0;
+        assert!(validate_structured_chat_request(&invalid).is_err());
     }
 }

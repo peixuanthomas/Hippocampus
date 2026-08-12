@@ -16,6 +16,9 @@ candidate_limit = 64
 max_selected = 4
 evidence_char_budget = 3200
 
+[memory]
+enabled = true
+
 # [[knowledge.sources]]
 # id = "local-notes"
 # kind = "path"

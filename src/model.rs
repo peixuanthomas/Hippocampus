@@ -8,9 +8,10 @@ use uuid::Uuid;
 
 use crate::knowledge::KnowledgeTrace;
 
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 pub const LEGACY_SCHEMA_VERSION: u32 = 1;
 pub const PREVIOUS_SCHEMA_VERSION: u32 = 2;
+pub const PREVIOUS_SCHEMA_VERSION_V3: u32 = 3;
 pub const DEFAULT_SYSTEM_PROMPT: &str =
     "你是一个乐于助人的AI助手，你的任务是解决用户的问题或者与用户对话。";
 
@@ -81,6 +82,101 @@ impl RetrievalConfig {
 pub enum RetrievalDocumentGranularity {
     Message,
     Fragment,
+    Episode,
+    Session,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum QueryKind {
+    ExactFact,
+    #[default]
+    GeneralSemantic,
+    EventRecap,
+    TemporalState,
+    MultiHop,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RetrievalChannel {
+    #[default]
+    Bm25,
+    Vector,
+    Entity,
+    State,
+    Episode,
+    Graph,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChannelTrace {
+    #[serde(default)]
+    pub channel: RetrievalChannel,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub candidate_count: usize,
+    #[serde(default)]
+    pub elapsed_ms: u64,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BudgetAllocationTrace {
+    #[serde(default)]
+    pub query_kind: QueryKind,
+    #[serde(default = "default_recent_history_percent")]
+    pub recent_history_percent: u8,
+    #[serde(default = "default_exact_or_state_percent")]
+    pub exact_or_state_percent: u8,
+    #[serde(default = "default_episode_percent")]
+    pub episode_percent: u8,
+    #[serde(default = "default_graph_percent")]
+    pub graph_percent: u8,
+}
+
+const fn default_recent_history_percent() -> u8 {
+    45
+}
+
+const fn default_exact_or_state_percent() -> u8 {
+    30
+}
+
+const fn default_episode_percent() -> u8 {
+    15
+}
+
+const fn default_graph_percent() -> u8 {
+    10
+}
+
+impl Default for BudgetAllocationTrace {
+    fn default() -> Self {
+        Self {
+            query_kind: QueryKind::GeneralSemantic,
+            recent_history_percent: default_recent_history_percent(),
+            exact_or_state_percent: default_exact_or_state_percent(),
+            episode_percent: default_episode_percent(),
+            graph_percent: default_graph_percent(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct GraphPathTrace {
+    #[serde(default)]
+    pub seed_document_id: String,
+    #[serde(default)]
+    pub target_document_id: String,
+    #[serde(default)]
+    pub edge_types: Vec<String>,
+    #[serde(default)]
+    pub node_ids: Vec<String>,
+    #[serde(default)]
+    pub score: f64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -129,6 +225,18 @@ pub struct RetrievalTrace {
     pub selected_evidence: Vec<SelectedEvidence>,
     #[serde(default)]
     pub error: Option<String>,
+    #[serde(default)]
+    pub query_kind: QueryKind,
+    #[serde(default)]
+    pub channels: Vec<ChannelTrace>,
+    #[serde(default)]
+    pub graph_paths: Vec<GraphPathTrace>,
+    #[serde(default)]
+    pub budget_allocation: BudgetAllocationTrace,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    #[serde(default)]
+    pub elapsed_ms: u64,
 }
 
 impl Default for RetrievalTrace {
@@ -141,6 +249,12 @@ impl Default for RetrievalTrace {
             candidates: Vec::new(),
             selected_evidence: Vec::new(),
             error: None,
+            query_kind: QueryKind::default(),
+            channels: Vec::new(),
+            graph_paths: Vec::new(),
+            budget_allocation: BudgetAllocationTrace::default(),
+            warnings: Vec::new(),
+            elapsed_ms: 0,
         }
     }
 }
@@ -951,7 +1065,10 @@ impl Session {
     pub fn validate(&self) -> Result<()> {
         if !matches!(
             self.schema_version,
-            LEGACY_SCHEMA_VERSION | PREVIOUS_SCHEMA_VERSION | SCHEMA_VERSION
+            LEGACY_SCHEMA_VERSION
+                | PREVIOUS_SCHEMA_VERSION
+                | PREVIOUS_SCHEMA_VERSION_V3
+                | SCHEMA_VERSION
         ) {
             bail!("不支持的会话 schema 版本：{}", self.schema_version);
         }
@@ -1163,5 +1280,78 @@ mod tests {
         );
         assert_ne!(first, event_id("other", Some("turn"), EventRole::User));
         assert_eq!(first.len(), 68);
+    }
+
+    #[test]
+    fn version_three_retrieval_trace_gets_schema_four_defaults() {
+        let trace: RetrievalTrace = serde_json::from_value(serde_json::json!({
+            "status": "complete",
+            "current_query_event_id": "evt_previous",
+            "query_terms": ["memory"]
+        }))
+        .unwrap();
+        assert_eq!(trace.query_kind, QueryKind::GeneralSemantic);
+        assert_eq!(trace.channels, Vec::<ChannelTrace>::new());
+        assert_eq!(trace.graph_paths, Vec::<GraphPathTrace>::new());
+        assert_eq!(
+            trace.budget_allocation,
+            BudgetAllocationTrace {
+                query_kind: QueryKind::GeneralSemantic,
+                recent_history_percent: 45,
+                exact_or_state_percent: 30,
+                episode_percent: 15,
+                graph_percent: 10,
+            }
+        );
+        assert!(trace.warnings.is_empty());
+        assert_eq!(trace.elapsed_ms, 0);
+
+        let serialized = serde_json::to_value(trace).unwrap();
+        assert_eq!(serialized["query_kind"], "general_semantic");
+        assert_eq!(serialized["budget_allocation"]["graph_percent"], 10);
+    }
+
+    #[test]
+    fn version_three_session_round_trips_and_upgrades_to_version_four() {
+        let mut value = serde_json::to_value(
+            Session::new(
+                "session-v3".into(),
+                "model".into(),
+                "http://localhost:11434".into(),
+                DEFAULT_SYSTEM_PROMPT.into(),
+                BudgetConfig::default(),
+                false,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        value["schema_version"] = serde_json::json!(PREVIOUS_SCHEMA_VERSION_V3);
+
+        let mut session: Session = serde_json::from_value(value).unwrap();
+        session.validate().unwrap();
+        assert_eq!(session.schema_version, PREVIOUS_SCHEMA_VERSION_V3);
+
+        session.schema_version = SCHEMA_VERSION;
+        let saved = serde_json::to_value(session).unwrap();
+        assert_eq!(saved["schema_version"], SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn all_historical_session_schema_versions_remain_valid() {
+        let mut session = Session::new(
+            "compatible".into(),
+            "model".into(),
+            "http://localhost:11434".into(),
+            DEFAULT_SYSTEM_PROMPT.into(),
+            BudgetConfig::default(),
+            false,
+        )
+        .unwrap();
+        for version in 1..=SCHEMA_VERSION {
+            session.schema_version = version;
+            session.validate().unwrap();
+        }
+        session.schema_version = SCHEMA_VERSION + 1;
+        assert!(session.validate().is_err());
     }
 }

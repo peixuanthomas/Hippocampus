@@ -1231,7 +1231,7 @@ fn insert_document(
     content: &str,
 ) -> rusqlite::Result<()> {
     let id = format!("{}:{}:{}", event.id, span.start_char, span.end_char);
-    transaction.execute("INSERT INTO retrieval_documents (document_id,event_id,start_char,end_char,granularity,content_sha256,exact_content,lexical_content,ngram_content) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)", params![id, event.id, span.start_char as i64, span.end_char as i64, match granularity { RetrievalDocumentGranularity::Message => "message", RetrievalDocumentGranularity::Fragment => "fragment" }, content_sha256(content), content, lexical_field(content), ngram_field(content)])?;
+    transaction.execute("INSERT INTO retrieval_documents (document_id,event_id,start_char,end_char,granularity,content_sha256,exact_content,lexical_content,ngram_content) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)", params![id, event.id, span.start_char as i64, span.end_char as i64, match granularity { RetrievalDocumentGranularity::Message => "message", RetrievalDocumentGranularity::Fragment => "fragment", RetrievalDocumentGranularity::Episode => "episode", RetrievalDocumentGranularity::Session => "session" }, content_sha256(content), content, lexical_field(content), ngram_field(content)])?;
     let rowid = transaction.last_insert_rowid();
     transaction.execute("INSERT INTO retrieval_documents_fts(rowid, lexical_content, ngram_content) VALUES(?1,?2,?3)", params![rowid, lexical_field(content), ngram_field(content)])?;
     Ok(())
