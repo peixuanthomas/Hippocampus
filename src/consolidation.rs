@@ -4,7 +4,7 @@ use std::path::{Component, Path};
 
 use chrono::{DateTime, FixedOffset};
 use rusqlite::{Connection, OptionalExtension, Transaction, params, types::ValueRef};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -16,7 +16,7 @@ use crate::retrieval::{RetrievalError, RetrievalResult, RetrievalStore, StoredEv
 pub const CONSOLIDATION_MAX_TURNS: usize = 16;
 pub const CONSOLIDATION_MAX_CHARS: usize = 24_000;
 
-const CONSOLIDATION_BATCH_KEY_VERSION: &str = "hippocampus-consolidation-batch-v1";
+const CONSOLIDATION_BATCH_KEY_VERSION: &str = "hippocampus-consolidation-batch-v2";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConsolidationEvent {
@@ -186,6 +186,7 @@ pub struct ConsolidationQuote {
 pub struct EntityAliasOutput {
     pub text: String,
     pub kind: MemoryAliasKind,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub stable_identifier_kind: Option<String>,
     pub evidence: ConsolidationQuote,
     pub proof_evidence: ConsolidationQuote,
@@ -200,9 +201,12 @@ pub struct ConsolidatedEntityOutput {
     pub resolution: EntityResolution,
     pub disambiguation: EntityDisambiguation,
     pub basis: EntityResolutionBasis,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub existing_entity_id: Option<String>,
     pub name_evidence: ConsolidationQuote,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub existing_identity_evidence: Option<ConsolidationQuote>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub resolution_evidence: Option<ConsolidationQuote>,
     pub aliases: Vec<EntityAliasOutput>,
 }
@@ -227,8 +231,11 @@ impl ConsolidationClaimObjectKind {
 #[serde(deny_unknown_fields)]
 pub struct ConsolidatedClaimObject {
     pub kind: ConsolidationClaimObjectKind,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub text: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub entity_ref: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub span: Option<ConsolidationQuote>,
 }
 
@@ -341,6 +348,8 @@ pub struct ConsolidationClaimEvidence {
     pub subject_span: ConsolidationQuote,
     pub relation_span: ConsolidationQuote,
     pub object_span: ConsolidationQuote,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
+    pub speech_act_span: Option<ConsolidationQuote>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -356,8 +365,11 @@ pub struct ConsolidatedClaimOutput {
     pub disposition: ClaimDisposition,
     pub replaces_claim_ids: Vec<String>,
     pub conflicts_with_claim_ids: Vec<String>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub event_time: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub valid_from: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub valid_to: Option<String>,
     pub evidence: Vec<ConsolidationClaimEvidence>,
 }
@@ -394,6 +406,14 @@ pub struct StructuredConsolidationOutput {
     pub boundaries: Vec<ConsolidationBoundaryOutput>,
 }
 
+fn deserialize_required_nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MemoryAliasCandidate {
     pub alias_id: String,
@@ -407,6 +427,14 @@ pub struct MemoryAliasCandidate {
     pub start_char: usize,
     pub end_char: usize,
     pub content_sha256: String,
+    pub proof_event_id: String,
+    pub proof_start_char: usize,
+    pub proof_end_char: usize,
+    pub proof_sha256: String,
+    pub identity_event_id: String,
+    pub identity_start_char: usize,
+    pub identity_end_char: usize,
+    pub identity_sha256: String,
     pub created_at: String,
 }
 
@@ -425,6 +453,7 @@ pub struct MemoryClaimEvidenceCandidate {
     pub subject_span: ConsolidationQuote,
     pub relation_span: ConsolidationQuote,
     pub object_span: ConsolidationQuote,
+    pub speech_act_span: Option<ConsolidationQuote>,
     pub created_at: String,
 }
 
@@ -452,6 +481,7 @@ pub struct MemoryClaimCandidate {
     pub session_id: String,
     pub subject_entity_id: String,
     pub predicate_key: String,
+    pub normalized_relation: String,
     pub object_kind: ConsolidationClaimObjectKind,
     pub object_text: Option<String>,
     pub object_entity_id: Option<String>,
@@ -549,7 +579,7 @@ pub fn structured_consolidation_schema() -> Value {
             },
             "entity": {
                 "type": "object", "additionalProperties": false,
-                "required": ["local_id", "name", "kind", "resolution", "disambiguation", "basis", "existing_entity_id", "name_evidence", "resolution_evidence", "aliases"],
+                "required": ["local_id", "name", "kind", "resolution", "disambiguation", "basis", "existing_entity_id", "name_evidence", "existing_identity_evidence", "resolution_evidence", "aliases"],
                 "properties": {
                     "local_id": {"type": "string", "pattern": "^local_[A-Za-z0-9_-]{1,58}$", "maxLength": 64},
                     "name": {"type": "string", "minLength": 1, "maxLength": 512},
@@ -559,6 +589,7 @@ pub fn structured_consolidation_schema() -> Value {
                     "basis": {"enum": ["self_pronoun", "first_mention", "explicit_alias", "stable_identifier", "ambiguous"]},
                     "existing_entity_id": {"type": ["string", "null"], "maxLength": 128},
                     "name_evidence": {"$ref": "#/$defs/quote"},
+                    "existing_identity_evidence": {"anyOf": [{"$ref": "#/$defs/quote"}, {"type": "null"}]},
                     "resolution_evidence": {"anyOf": [{"$ref": "#/$defs/quote"}, {"type": "null"}]},
                     "aliases": {"type": "array", "maxItems": 16, "items": {"$ref": "#/$defs/alias"}}
                 }
@@ -575,10 +606,14 @@ pub fn structured_consolidation_schema() -> Value {
             },
             "claim_evidence": {
                 "type": "object", "additionalProperties": false,
-                "required": ["kind", "quote"],
+                "required": ["kind", "quote", "subject_span", "relation_span", "object_span", "speech_act_span"],
                 "properties": {
                     "kind": {"enum": ["assertion", "user_confirmation", "correction", "temporal"]},
-                    "quote": {"$ref": "#/$defs/quote"}
+                    "quote": {"$ref": "#/$defs/quote"},
+                    "subject_span": {"$ref": "#/$defs/quote"},
+                    "relation_span": {"$ref": "#/$defs/quote"},
+                    "object_span": {"$ref": "#/$defs/quote"},
+                    "speech_act_span": {"anyOf": [{"$ref": "#/$defs/quote"}, {"type": "null"}]}
                 }
             },
             "claim": {
@@ -1101,6 +1136,14 @@ struct StoredAliasCandidate {
     start_char: i64,
     end_char: i64,
     content_sha256: String,
+    proof_event_id: String,
+    proof_start_char: i64,
+    proof_end_char: i64,
+    proof_sha256: String,
+    identity_event_id: String,
+    identity_start_char: i64,
+    identity_end_char: i64,
+    identity_sha256: String,
     created_at: String,
 }
 
@@ -1110,6 +1153,7 @@ struct StoredClaimCandidate {
     session_id: String,
     subject_entity_id: String,
     predicate_key: String,
+    normalized_relation: String,
     object_kind: String,
     object_text: Option<String>,
     object_entity_id: Option<String>,
@@ -1150,6 +1194,10 @@ struct StoredClaimEvidenceCandidate {
     object_start_char: i64,
     object_end_char: i64,
     object_sha256: String,
+    speech_act_event_id: Option<String>,
+    speech_act_start_char: Option<i64>,
+    speech_act_end_char: Option<i64>,
+    speech_act_sha256: Option<String>,
     created_at: String,
 }
 
@@ -1177,7 +1225,11 @@ fn map_stored_claim_evidence(
         object_start_char: row.get(offset + 16)?,
         object_end_char: row.get(offset + 17)?,
         object_sha256: row.get(offset + 18)?,
-        created_at: row.get(offset + 19)?,
+        speech_act_event_id: row.get(offset + 19)?,
+        speech_act_start_char: row.get(offset + 20)?,
+        speech_act_end_char: row.get(offset + 21)?,
+        speech_act_sha256: row.get(offset + 22)?,
+        created_at: row.get(offset + 23)?,
     })
 }
 
@@ -1231,7 +1283,9 @@ fn load_candidate_snapshot(
             .prepare(
                 "SELECT alias_id, entity_id, alias_text, normalized_alias, alias_kind,
                         stable_identifier_kind, session_id, batch_key, event_id, start_char,
-                        end_char, content_sha256, created_at
+                        end_char, content_sha256, proof_event_id, proof_start_char,
+                        proof_end_char, proof_sha256, identity_event_id, identity_start_char,
+                        identity_end_char, identity_sha256, created_at
                  FROM memory_entity_aliases WHERE entity_id = ?1 ORDER BY alias_id",
             )
             .map_err(candidate_database_error)?;
@@ -1250,7 +1304,15 @@ fn load_candidate_snapshot(
                     start_char: row.get(9)?,
                     end_char: row.get(10)?,
                     content_sha256: row.get(11)?,
-                    created_at: row.get(12)?,
+                    proof_event_id: row.get(12)?,
+                    proof_start_char: row.get(13)?,
+                    proof_end_char: row.get(14)?,
+                    proof_sha256: row.get(15)?,
+                    identity_event_id: row.get(16)?,
+                    identity_start_char: row.get(17)?,
+                    identity_end_char: row.get(18)?,
+                    identity_sha256: row.get(19)?,
+                    created_at: row.get(20)?,
                 })
             })
             .map_err(candidate_database_error)?;
@@ -1282,7 +1344,7 @@ fn load_candidate_snapshot(
 
     let mut claim_statement = connection
         .prepare(
-            "SELECT claim_id, session_id, subject_entity_id, predicate_key, object_kind,
+            "SELECT claim_id, session_id, subject_entity_id, predicate_key, normalized_relation, object_kind,
                     object_text, object_entity_id, normalized_object, polarity, cardinality,
                     certainty, state, asserted_at, event_time, valid_from, valid_to,
                     reference_time, created_batch_key, updated_batch_key, created_at, updated_at
@@ -1296,23 +1358,24 @@ fn load_candidate_snapshot(
                 session_id: row.get(1)?,
                 subject_entity_id: row.get(2)?,
                 predicate_key: row.get(3)?,
-                object_kind: row.get(4)?,
-                object_text: row.get(5)?,
-                object_entity_id: row.get(6)?,
-                normalized_object: row.get(7)?,
-                polarity: row.get(8)?,
-                cardinality: row.get(9)?,
-                certainty: row.get(10)?,
-                state: row.get(11)?,
-                asserted_at: row.get(12)?,
-                event_time: row.get(13)?,
-                valid_from: row.get(14)?,
-                valid_to: row.get(15)?,
-                reference_time: row.get(16)?,
-                created_batch_key: row.get(17)?,
-                updated_batch_key: row.get(18)?,
-                created_at: row.get(19)?,
-                updated_at: row.get(20)?,
+                normalized_relation: row.get(4)?,
+                object_kind: row.get(5)?,
+                object_text: row.get(6)?,
+                object_entity_id: row.get(7)?,
+                normalized_object: row.get(8)?,
+                polarity: row.get(9)?,
+                cardinality: row.get(10)?,
+                certainty: row.get(11)?,
+                state: row.get(12)?,
+                asserted_at: row.get(13)?,
+                event_time: row.get(14)?,
+                valid_from: row.get(15)?,
+                valid_to: row.get(16)?,
+                reference_time: row.get(17)?,
+                created_batch_key: row.get(18)?,
+                updated_batch_key: row.get(19)?,
+                created_at: row.get(20)?,
+                updated_at: row.get(21)?,
             })
         })
         .map_err(candidate_database_error)?;
@@ -1328,6 +1391,8 @@ fn load_candidate_snapshot(
                         start_char, end_char, content_sha256, subject_start_char,
                         subject_end_char, subject_sha256, relation_start_char, relation_end_char,
                         relation_sha256, object_start_char, object_end_char, object_sha256,
+                        speech_act_event_id, speech_act_start_char, speech_act_end_char,
+                        speech_act_sha256,
                         created_at
                  FROM memory_claim_evidence WHERE claim_id = ?1 ORDER BY evidence_id",
             )
@@ -1580,7 +1645,8 @@ fn validate_full_derived_integrity(connection: &Connection) -> RetrievalResult<(
                     v.content_sha256, v.subject_start_char, v.subject_end_char,
                     v.subject_sha256, v.relation_start_char, v.relation_end_char,
                     v.relation_sha256, v.object_start_char, v.object_end_char,
-                    v.object_sha256, v.created_at
+                    v.object_sha256, v.speech_act_event_id, v.speech_act_start_char,
+                    v.speech_act_end_char, v.speech_act_sha256, v.created_at
              FROM memory_claim_evidence v
              JOIN memory_claims c ON c.claim_id = v.claim_id
              ORDER BY v.evidence_id",
@@ -1596,10 +1662,9 @@ fn validate_full_derived_integrity(connection: &Connection) -> RetrievalResult<(
         })
         .map_err(candidate_database_error)?;
     for row in rows {
-        let (claim_id, claim_session, stored) = row.map_err(candidate_database_error)?;
+        let (claim_id, _claim_session, stored) = row.map_err(candidate_database_error)?;
         let evidence = decode_claim_evidence_candidate(stored)?;
-        if evidence.session_id != claim_session
-            || evidence.batch_key.trim().is_empty()
+        if evidence.batch_key.trim().is_empty()
             || evidence.start_char >= evidence.end_char
             || !is_lower_sha256(&evidence.content_sha256)
             || matches!(
@@ -1787,7 +1852,8 @@ fn validate_full_derived_integrity(connection: &Connection) -> RetrievalResult<(
         }
         parse_stored_time(&created, "boundary.created_at")?;
     }
-    validate_global_stable_identifier_integrity(connection)
+    validate_global_stable_identifier_integrity(connection)?;
+    validate_memory_v2_semantics_and_history(connection)
 }
 
 fn global_stable_identifier_owners(
@@ -1835,6 +1901,914 @@ fn validate_global_stable_identifier_integrity(connection: &Connection) -> Retri
         if owners.len() > 1 {
             return Err(RetrievalError::CorruptIndex(format!(
                 "稳定标识 ({kind}, {value}) 同时属于多个实体"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_applied_batch_ref(
+    connection: &Connection,
+    session_id: &str,
+    batch_key: &str,
+    created_at: &str,
+    label: &str,
+) -> RetrievalResult<()> {
+    parse_stored_time(created_at, label)?;
+    let matches = connection
+        .query_row(
+            "SELECT count(*) FROM consolidation_batches
+             WHERE session_id = ?1 AND batch_key = ?2 AND status = 'applied'
+               AND completed_at = ?3",
+            params![session_id, batch_key, created_at],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(candidate_database_error)?;
+    if matches != 1 {
+        return Err(RetrievalError::CorruptIndex(format!(
+            "{label} 未连接到同会话唯一 applied 批次"
+        )));
+    }
+    Ok(())
+}
+
+fn load_event_quote(
+    connection: &Connection,
+    event_id: &str,
+    start: usize,
+    end: usize,
+    hash: &str,
+    expected_session: &str,
+) -> RetrievalResult<ValidatedQuote> {
+    let (session, sequence, role, created_at, content, event_hash) = connection
+        .query_row(
+            "SELECT session_id, sequence, role, created_at, content, content_sha256
+             FROM events WHERE event_id = ?1",
+            [event_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(candidate_database_error)?
+        .ok_or_else(|| RetrievalError::CorruptIndex(format!("记忆来源事件 {event_id} 不存在")))?;
+    if session != expected_session || sha256_bytes(content.as_bytes()) != event_hash {
+        return Err(RetrievalError::CorruptIndex(format!(
+            "记忆来源事件 {event_id} 的会话或原文哈希不匹配"
+        )));
+    }
+    let text = slice_unicode(&content, start, end).ok_or_else(|| {
+        RetrievalError::CorruptIndex(format!("记忆来源事件 {event_id} 的字符范围无效"))
+    })?;
+    if sha256_bytes(text.as_bytes()) != hash {
+        return Err(RetrievalError::CorruptIndex(format!(
+            "记忆来源事件 {event_id} 的精确片段不匹配"
+        )));
+    }
+    let role = match role.as_str() {
+        "user" => EventRole::User,
+        "assistant" => EventRole::Assistant,
+        _ => {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "记忆来源事件 {event_id} 的角色不适用于证据"
+            )));
+        }
+    };
+    parse_stored_time(&created_at, "event.created_at")?;
+    Ok(ValidatedQuote {
+        quote: ConsolidationQuote {
+            event_id: event_id.to_owned(),
+            start_char: start,
+            end_char: end,
+            content_sha256: hash.to_owned(),
+        },
+        text: text.to_owned(),
+        role,
+        sequence: nonnegative_usize(sequence, "event.sequence")?,
+        created_at,
+    })
+}
+
+fn stored_semantic_error(error: ConsolidationApplyError, evidence_id: &str) -> RetrievalError {
+    RetrievalError::CorruptIndex(format!("声明证据 {evidence_id} 的语义校验失败：{error}"))
+}
+
+fn validate_memory_v2_semantics_and_history(connection: &Connection) -> RetrievalResult<()> {
+    let entities = load_all_entities_for_integrity(connection)?;
+    let claims = load_all_claim_candidates(connection)?;
+    let claim_by_id = claims
+        .iter()
+        .map(|claim| (claim.claim_id.as_str(), claim))
+        .collect::<HashMap<_, _>>();
+
+    for entity in &entities {
+        let created = parse_stored_time(&entity.created_at, "entity.created_at")?;
+        let updated = parse_stored_time(&entity.updated_at, "entity.updated_at")?;
+        let created_quote = load_event_quote(
+            connection,
+            &entity.created_event_id,
+            entity.created_start,
+            entity.created_end,
+            &entity.created_hash,
+            &entity.created_session_id,
+        )?;
+        if created > updated
+            || entity.canonical_name.trim().is_empty()
+            || entity.normalized_name != normalize_match(&entity.canonical_name)
+            || created_quote.text != entity.canonical_name
+            || entity.entity_id != "ent_self" && created_quote.role != EventRole::User
+        {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "实体 {} 的名称、角色、规范化或时间字段损坏",
+                entity.entity_id
+            )));
+        }
+        validate_applied_batch_ref(
+            connection,
+            &entity.created_session_id,
+            &entity.created_batch_key,
+            &entity.created_at,
+            "entity.created_batch_key",
+        )?;
+        let expected = if entity.entity_id == "ent_self" {
+            "ent_self".to_owned()
+        } else {
+            deterministic_id(
+                "ent",
+                &[
+                    &entity.created_batch_key,
+                    entity.kind.as_str(),
+                    &entity.created_event_id,
+                    &entity.created_start.to_string(),
+                    &entity.created_end.to_string(),
+                    &entity.created_hash,
+                ],
+            )
+        };
+        if entity.entity_id != expected {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "实体 {} 的确定性 ID 不匹配",
+                entity.entity_id
+            )));
+        }
+        for alias in &entity.aliases {
+            validate_applied_batch_ref(
+                connection,
+                &alias.session_id,
+                &alias.batch_key,
+                &alias.created_at,
+                "alias.batch_key",
+            )?;
+            let expected = deterministic_id(
+                "alias",
+                &[
+                    &entity.entity_id,
+                    alias.kind.as_str(),
+                    alias.stable_identifier_kind.as_deref().unwrap_or(""),
+                    &alias.normalized_text,
+                    &alias.event_id,
+                    &alias.start_char.to_string(),
+                    &alias.end_char.to_string(),
+                    &alias.content_sha256,
+                    &alias.proof_event_id,
+                    &alias.proof_start_char.to_string(),
+                    &alias.proof_end_char.to_string(),
+                    &alias.proof_sha256,
+                    &alias.identity_event_id,
+                    &alias.identity_start_char.to_string(),
+                    &alias.identity_end_char.to_string(),
+                    &alias.identity_sha256,
+                ],
+            );
+            if alias.alias_id != expected {
+                return Err(RetrievalError::CorruptIndex(format!(
+                    "别名 {} 的确定性 ID 不匹配",
+                    alias.alias_id
+                )));
+            }
+            validate_stored_alias_proof(connection, entity, alias)?;
+        }
+    }
+
+    for claim in &claims {
+        let created_time = parse_stored_time(&claim.created_at, "claim.created_at")?;
+        let updated_time = parse_stored_time(&claim.updated_at, "claim.updated_at")?;
+        if created_time > updated_time
+            || !valid_predicate_key(&claim.predicate_key)
+            || claim.normalized_relation.trim().is_empty()
+            || normalize_match(&claim.normalized_relation) != claim.normalized_relation
+            || claim.normalized_object.trim().is_empty()
+            || claim.state == MemoryClaimState::Active && claim.certainty != ClaimCertainty::Certain
+            || claim.state == MemoryClaimState::Uncertain
+                && claim.certainty != ClaimCertainty::Uncertain
+            || claim.state == MemoryClaimState::Superseded && claim.valid_to.is_none()
+        {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "声明 {} 的结构、规范化、状态或时间字段损坏",
+                claim.claim_id
+            )));
+        }
+        match claim.object_kind {
+            ConsolidationClaimObjectKind::Text => {
+                let text = claim.object_text.as_deref().ok_or_else(|| {
+                    RetrievalError::CorruptIndex(format!(
+                        "文本声明 {} 缺少对象文本",
+                        claim.claim_id
+                    ))
+                })?;
+                if claim.object_entity_id.is_some()
+                    || text.trim().is_empty()
+                    || normalize_match(text) != claim.normalized_object
+                {
+                    return Err(RetrievalError::CorruptIndex(format!(
+                        "文本声明 {} 的对象字段损坏",
+                        claim.claim_id
+                    )));
+                }
+            }
+            ConsolidationClaimObjectKind::Entity => {
+                if claim.object_text.is_some()
+                    || claim.object_entity_id.as_deref() != Some(claim.normalized_object.as_str())
+                {
+                    return Err(RetrievalError::CorruptIndex(format!(
+                        "实体声明 {} 的对象字段损坏",
+                        claim.claim_id
+                    )));
+                }
+            }
+        }
+        validate_applied_batch_ref(
+            connection,
+            &claim.session_id,
+            &claim.created_batch_key,
+            &claim.created_at,
+            "claim.created_batch_key",
+        )?;
+        let updated_session = applied_batch_session(connection, &claim.updated_batch_key)?;
+        validate_applied_batch_ref(
+            connection,
+            &updated_session,
+            &claim.updated_batch_key,
+            &claim.updated_at,
+            "claim.updated_batch_key",
+        )?;
+        let subject = entities
+            .iter()
+            .find(|entity| entity.entity_id == claim.subject_entity_id)
+            .ok_or_else(|| RetrievalError::CorruptIndex("声明主语实体缺失".into()))?;
+        let object_entity = claim
+            .object_entity_id
+            .as_deref()
+            .and_then(|entity_id| entities.iter().find(|entity| entity.entity_id == entity_id));
+        let mut trusted = Vec::<&MemoryClaimEvidenceCandidate>::new();
+        let mut assistant_assertions = Vec::<&MemoryClaimEvidenceCandidate>::new();
+        for evidence in &claim.evidence {
+            validate_applied_batch_ref(
+                connection,
+                &evidence.session_id,
+                &evidence.batch_key,
+                &evidence.created_at,
+                "claim_evidence.batch_key",
+            )?;
+            let outer = load_event_quote(
+                connection,
+                &evidence.event_id,
+                evidence.start_char,
+                evidence.end_char,
+                &evidence.content_sha256,
+                &evidence.session_id,
+            )?;
+            if outer.sequence != evidence.sequence || outer.role != evidence.role {
+                return Err(RetrievalError::CorruptIndex(format!(
+                    "声明证据 {} 的来源序号或角色不匹配",
+                    evidence.evidence_id
+                )));
+            }
+            let subject_quote = load_event_quote_from_span(
+                connection,
+                &evidence.session_id,
+                &evidence.subject_span,
+            )?;
+            let relation_quote = load_event_quote_from_span(
+                connection,
+                &evidence.session_id,
+                &evidence.relation_span,
+            )?;
+            let object_quote = load_event_quote_from_span(
+                connection,
+                &evidence.session_id,
+                &evidence.object_span,
+            )?;
+            let speech_act = evidence
+                .speech_act_span
+                .as_ref()
+                .map(|span| load_event_quote_from_span(connection, &evidence.session_id, span))
+                .transpose()?;
+            if evidence.speech_act_span.as_ref().is_some_and(|span| {
+                span.event_id != evidence.event_id
+                    || span.start_char < evidence.start_char
+                    || span.end_char > evidence.end_char
+            }) {
+                return Err(RetrievalError::CorruptIndex(format!(
+                    "声明证据 {} 的 speech_act_span 越过外层证据",
+                    evidence.evidence_id
+                )));
+            }
+            let subject_view = resolved_entity_view(subject);
+            let subject_matches =
+                claim_subject_span_matches(&subject.entity_id, &subject_view, &subject_quote);
+            let object_matches = match claim.object_kind {
+                ConsolidationClaimObjectKind::Text => {
+                    claim.object_text.as_deref() == Some(object_quote.text.as_str())
+                }
+                ConsolidationClaimObjectKind::Entity => object_entity.is_some_and(|entity| {
+                    resolved_entity_view(entity)
+                        .normalized_names
+                        .contains(&normalize_match(&object_quote.text))
+                }),
+            };
+            if !subject_matches
+                || !object_matches
+                || normalize_match(&relation_quote.text) != claim.normalized_relation
+            {
+                return Err(RetrievalError::CorruptIndex(format!(
+                    "声明证据 {} 的主语、关系或对象不匹配声明",
+                    evidence.evidence_id
+                )));
+            }
+            validate_evidence_semantics(
+                evidence.kind,
+                claim.polarity,
+                &outer,
+                &subject_quote,
+                &object_quote,
+                speech_act.as_ref(),
+                "stored_evidence",
+            )
+            .map_err(|error| stored_semantic_error(error, &evidence.evidence_id))?;
+            let expected = deterministic_evidence_id(&claim.claim_id, evidence);
+            if evidence.evidence_id != expected {
+                return Err(RetrievalError::CorruptIndex(format!(
+                    "声明证据 {} 的确定性 ID 不匹配",
+                    evidence.evidence_id
+                )));
+            }
+            if evidence.role == EventRole::User
+                && matches!(
+                    evidence.kind,
+                    ConsolidationEvidenceKind::Assertion
+                        | ConsolidationEvidenceKind::UserConfirmation
+                        | ConsolidationEvidenceKind::Correction
+                )
+            {
+                trusted.push(evidence);
+            }
+            if evidence.role == EventRole::Assistant
+                && evidence.kind == ConsolidationEvidenceKind::Assertion
+            {
+                assistant_assertions.push(evidence);
+            }
+        }
+        for assertion in assistant_assertions {
+            if !claim.evidence.iter().any(|confirmation| {
+                confirmation.role == EventRole::User
+                    && confirmation.kind == ConsolidationEvidenceKind::UserConfirmation
+                    && confirmation.sequence > assertion.sequence
+            }) {
+                return Err(RetrievalError::CorruptIndex(format!(
+                    "声明 {} 包含未被后续用户确认的助手断言",
+                    claim.claim_id
+                )));
+            }
+        }
+        let first = trusted
+            .into_iter()
+            .filter(|evidence| evidence.batch_key == claim.created_batch_key)
+            .min_by_key(|evidence| (evidence.sequence, evidence.start_char, evidence.end_char))
+            .ok_or_else(|| {
+                RetrievalError::CorruptIndex(format!("声明 {} 缺少可信用户证据", claim.claim_id))
+            })?;
+        let expected = deterministic_id(
+            "claim",
+            &[
+                &claim.created_batch_key,
+                &claim.subject_entity_id,
+                &claim.predicate_key,
+                &claim.normalized_relation,
+                claim.object_kind.as_str(),
+                &claim.normalized_object,
+                claim.polarity.as_str(),
+                claim.cardinality.as_str(),
+                &first.event_id,
+                &first.start_char.to_string(),
+                &first.end_char.to_string(),
+                &first.content_sha256,
+            ],
+        );
+        if claim.claim_id != expected {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "声明 {} 的确定性 ID 不匹配",
+                claim.claim_id
+            )));
+        }
+    }
+
+    for left in 0..claims.len() {
+        for right in (left + 1)..claims.len() {
+            let left_claim = &claims[left];
+            let right_claim = &claims[right];
+            if left_claim.state.is_live()
+                && right_claim.state.is_live()
+                && left_claim.subject_entity_id == right_claim.subject_entity_id
+                && left_claim.predicate_key == right_claim.predicate_key
+                && left_claim.normalized_relation == right_claim.normalized_relation
+                && left_claim.object_kind == right_claim.object_kind
+                && left_claim.normalized_object == right_claim.normalized_object
+                && left_claim.polarity == right_claim.polarity
+                && left_claim.cardinality == right_claim.cardinality
+                && intervals_overlap(
+                    &left_claim.valid_from,
+                    left_claim.valid_to.as_deref(),
+                    &right_claim.valid_from,
+                    right_claim.valid_to.as_deref(),
+                )
+            {
+                return Err(RetrievalError::CorruptIndex(format!(
+                    "重叠活跃声明 {} 与 {} 具有重复语义",
+                    left_claim.claim_id, right_claim.claim_id
+                )));
+            }
+        }
+    }
+
+    validate_transition_history(connection, &claim_by_id)?;
+    validate_boundary_ids_and_batches(connection)?;
+    Ok(())
+}
+
+fn load_all_entities_for_integrity(
+    connection: &Connection,
+) -> RetrievalResult<Vec<MemoryEntityCandidate>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT entity_id, kind, canonical_name, normalized_name, disambiguation,
+                    created_session_id, created_batch_key, created_event_id, created_start,
+                    created_end, created_hash, created_at, updated_at
+             FROM memory_entities ORDER BY entity_id",
+        )
+        .map_err(candidate_database_error)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(StoredEntityCandidate {
+                entity_id: row.get(0)?,
+                kind: row.get(1)?,
+                canonical_name: row.get(2)?,
+                normalized_name: row.get(3)?,
+                disambiguation: row.get(4)?,
+                created_session_id: row.get(5)?,
+                created_batch_key: row.get(6)?,
+                created_event_id: row.get(7)?,
+                created_start: row.get(8)?,
+                created_end: row.get(9)?,
+                created_hash: row.get(10)?,
+                created_at: row.get(11)?,
+                updated_at: row.get(12)?,
+            })
+        })
+        .map_err(candidate_database_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(candidate_database_error)?;
+    drop(statement);
+    let mut entities = Vec::with_capacity(rows.len());
+    for stored in rows {
+        let mut alias_statement = connection
+            .prepare(
+                "SELECT alias_id, entity_id, alias_text, normalized_alias, alias_kind,
+                        stable_identifier_kind, session_id, batch_key, event_id, start_char,
+                        end_char, content_sha256, proof_event_id, proof_start_char,
+                        proof_end_char, proof_sha256, identity_event_id, identity_start_char,
+                        identity_end_char, identity_sha256, created_at
+                 FROM memory_entity_aliases WHERE entity_id = ?1 ORDER BY alias_id",
+            )
+            .map_err(candidate_database_error)?;
+        let alias_rows = alias_statement
+            .query_map([&stored.entity_id], |row| {
+                Ok(StoredAliasCandidate {
+                    alias_id: row.get(0)?,
+                    entity_id: row.get(1)?,
+                    text: row.get(2)?,
+                    normalized_text: row.get(3)?,
+                    kind: row.get(4)?,
+                    stable_identifier_kind: row.get(5)?,
+                    session_id: row.get(6)?,
+                    batch_key: row.get(7)?,
+                    event_id: row.get(8)?,
+                    start_char: row.get(9)?,
+                    end_char: row.get(10)?,
+                    content_sha256: row.get(11)?,
+                    proof_event_id: row.get(12)?,
+                    proof_start_char: row.get(13)?,
+                    proof_end_char: row.get(14)?,
+                    proof_sha256: row.get(15)?,
+                    identity_event_id: row.get(16)?,
+                    identity_start_char: row.get(17)?,
+                    identity_end_char: row.get(18)?,
+                    identity_sha256: row.get(19)?,
+                    created_at: row.get(20)?,
+                })
+            })
+            .map_err(candidate_database_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(candidate_database_error)?;
+        drop(alias_statement);
+        entities.push(MemoryEntityCandidate {
+            entity_id: stored.entity_id.clone(),
+            kind: parse_entity_kind(&stored.kind)?,
+            canonical_name: stored.canonical_name,
+            normalized_name: stored.normalized_name,
+            disambiguation: parse_disambiguation(&stored.disambiguation)?,
+            created_session_id: stored.created_session_id,
+            created_batch_key: stored.created_batch_key,
+            created_event_id: stored.created_event_id,
+            created_start: nonnegative_usize(stored.created_start, "entity.created_start")?,
+            created_end: nonnegative_usize(stored.created_end, "entity.created_end")?,
+            created_hash: stored.created_hash,
+            created_at: stored.created_at,
+            updated_at: stored.updated_at,
+            aliases: alias_rows
+                .into_iter()
+                .map(|alias| decode_alias_candidate(&stored.entity_id, alias))
+                .collect::<RetrievalResult<Vec<_>>>()?,
+        });
+    }
+    Ok(entities)
+}
+
+fn load_event_quote_from_span(
+    connection: &Connection,
+    session_id: &str,
+    span: &ConsolidationQuote,
+) -> RetrievalResult<ValidatedQuote> {
+    load_event_quote(
+        connection,
+        &span.event_id,
+        span.start_char,
+        span.end_char,
+        &span.content_sha256,
+        session_id,
+    )
+}
+
+fn resolved_entity_view(entity: &MemoryEntityCandidate) -> ResolvedEntityView {
+    let mut normalized_names = vec![entity.normalized_name.clone()];
+    normalized_names.extend(
+        entity
+            .aliases
+            .iter()
+            .map(|alias| alias.normalized_text.clone()),
+    );
+    normalized_names.sort();
+    normalized_names.dedup();
+    ResolvedEntityView { normalized_names }
+}
+
+fn validate_stored_alias_proof(
+    connection: &Connection,
+    entity: &MemoryEntityCandidate,
+    alias: &MemoryAliasCandidate,
+) -> RetrievalResult<()> {
+    let proof = load_event_quote(
+        connection,
+        &alias.proof_event_id,
+        alias.proof_start_char,
+        alias.proof_end_char,
+        &alias.proof_sha256,
+        &alias.session_id,
+    )?;
+    let evidence = load_event_quote(
+        connection,
+        &alias.event_id,
+        alias.start_char,
+        alias.end_char,
+        &alias.content_sha256,
+        &alias.session_id,
+    )?;
+    let identity = load_event_quote(
+        connection,
+        &alias.identity_event_id,
+        alias.identity_start_char,
+        alias.identity_end_char,
+        &alias.identity_sha256,
+        &alias.session_id,
+    )?;
+    let nested = |inner: &ValidatedQuote| {
+        inner.quote.event_id == proof.quote.event_id
+            && inner.quote.start_char >= proof.quote.start_char
+            && inner.quote.end_char <= proof.quote.end_char
+    };
+    let mut names = vec![entity.normalized_name.clone()];
+    names.extend(
+        entity
+            .aliases
+            .iter()
+            .filter(|candidate| candidate.alias_id != alias.alias_id)
+            .map(|candidate| candidate.normalized_text.clone()),
+    );
+    let identity_matches = names.contains(&normalize_match(&identity.text))
+        || alias.kind == MemoryAliasKind::StableIdentifier
+            && normalize_match(&identity.text) == alias.normalized_text;
+    if evidence.role != EventRole::User
+        || proof.role != EventRole::User
+        || identity.role != EventRole::User
+        || evidence.text != alias.text
+        || !nested(&evidence)
+        || !nested(&identity)
+        || !identity_matches
+        || alias.kind == MemoryAliasKind::ExplicitAlias && !contains_alias_marker(&proof.text)
+    {
+        return Err(RetrievalError::CorruptIndex(format!(
+            "别名 {} 的证明、标记或实体归属不匹配",
+            alias.alias_id
+        )));
+    }
+    Ok(())
+}
+
+fn deterministic_evidence_id(claim_id: &str, evidence: &MemoryClaimEvidenceCandidate) -> String {
+    let speech = evidence.speech_act_span.as_ref();
+    deterministic_id(
+        "evidence",
+        &[
+            claim_id,
+            evidence.kind.as_str(),
+            &evidence.event_id,
+            &evidence.start_char.to_string(),
+            &evidence.end_char.to_string(),
+            &evidence.content_sha256,
+            &evidence.subject_span.start_char.to_string(),
+            &evidence.subject_span.end_char.to_string(),
+            &evidence.subject_span.content_sha256,
+            &evidence.relation_span.start_char.to_string(),
+            &evidence.relation_span.end_char.to_string(),
+            &evidence.relation_span.content_sha256,
+            &evidence.object_span.start_char.to_string(),
+            &evidence.object_span.end_char.to_string(),
+            &evidence.object_span.content_sha256,
+            speech.map(|span| span.event_id.as_str()).unwrap_or(""),
+            &speech
+                .map(|span| span.start_char.to_string())
+                .unwrap_or_default(),
+            &speech
+                .map(|span| span.end_char.to_string())
+                .unwrap_or_default(),
+            speech
+                .map(|span| span.content_sha256.as_str())
+                .unwrap_or(""),
+        ],
+    )
+}
+
+fn applied_batch_session(connection: &Connection, batch_key: &str) -> RetrievalResult<String> {
+    let sessions = connection
+        .prepare(
+            "SELECT DISTINCT session_id FROM consolidation_batches
+             WHERE batch_key = ?1 AND status = 'applied' ORDER BY session_id",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map([batch_key], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(candidate_database_error)?;
+    if sessions.len() != 1 {
+        return Err(RetrievalError::CorruptIndex(format!(
+            "批次 {batch_key} 未唯一关联 applied 会话"
+        )));
+    }
+    Ok(sessions[0].clone())
+}
+
+#[derive(Debug)]
+struct StoredTransition {
+    id: String,
+    claim_id: String,
+    from: Option<MemoryClaimState>,
+    to: MemoryClaimState,
+    reason: String,
+    related: Option<String>,
+    session: String,
+    batch: String,
+    created_at: String,
+}
+
+fn validate_transition_history(
+    connection: &Connection,
+    claims: &HashMap<&str, &MemoryClaimCandidate>,
+) -> RetrievalResult<()> {
+    let mut statement = connection
+        .prepare(
+            "SELECT transition_id, claim_id, from_state, to_state, reason, related_claim_id,
+                    session_id, batch_key, created_at
+             FROM memory_claim_transitions ORDER BY claim_id, created_at, transition_id",
+        )
+        .map_err(candidate_database_error)?;
+    let rows = statement
+        .query_map([], |row| {
+            let from = row.get::<_, Option<String>>(2)?;
+            let to = row.get::<_, String>(3)?;
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                from,
+                to,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+            ))
+        })
+        .map_err(candidate_database_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(candidate_database_error)?;
+    drop(statement);
+    let mut grouped = HashMap::<String, Vec<StoredTransition>>::new();
+    for (id, claim_id, from, to, reason, related, session, batch, created_at) in rows {
+        grouped
+            .entry(claim_id.clone())
+            .or_default()
+            .push(StoredTransition {
+                id,
+                claim_id,
+                from: from.as_deref().map(parse_claim_state).transpose()?,
+                to: parse_claim_state(&to)?,
+                reason,
+                related,
+                session,
+                batch,
+                created_at,
+            });
+    }
+    for (claim_id, claim) in claims {
+        let chain = grouped
+            .remove(*claim_id)
+            .ok_or_else(|| RetrievalError::CorruptIndex(format!("声明 {claim_id} 缺少状态迁移")))?;
+        if chain.first().is_none_or(|transition| {
+            transition.created_at != claim.created_at
+                || transition.batch != claim.created_batch_key
+                || transition.session != claim.session_id
+        }) || chain.last().is_none_or(|transition| {
+            transition.created_at != claim.updated_at || transition.batch != claim.updated_batch_key
+        }) {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "声明 {claim_id} 的首尾迁移与声明创建/更新时间不一致"
+            )));
+        }
+        let mut previous = None;
+        for (index, transition) in chain.iter().enumerate() {
+            validate_applied_batch_ref(
+                connection,
+                &transition.session,
+                &transition.batch,
+                &transition.created_at,
+                "transition.batch_key",
+            )?;
+            let expected = deterministic_id(
+                "transition",
+                &[
+                    &transition.claim_id,
+                    transition.from.map(MemoryClaimState::as_str).unwrap_or(""),
+                    transition.to.as_str(),
+                    &transition.reason,
+                    transition.related.as_deref().unwrap_or(""),
+                    &transition.batch,
+                ],
+            );
+            if transition.id != expected
+                || (index == 0 && (transition.from.is_some() || transition.reason != "created"))
+                || (index > 0 && transition.from != previous)
+            {
+                return Err(RetrievalError::CorruptIndex(format!(
+                    "声明 {claim_id} 的迁移链或确定性 ID 损坏（index={index}, id_match={}, from={:?}, previous={previous:?}, reason={}）",
+                    transition.id == expected,
+                    transition.from,
+                    transition.reason,
+                )));
+            }
+            let related_required = matches!(
+                transition.reason.as_str(),
+                "conflicted" | "corrected" | "replaced"
+            );
+            let legal = match transition.reason.as_str() {
+                "created" => {
+                    index == 0
+                        && transition.related.is_none()
+                        && transition.to != MemoryClaimState::Superseded
+                        && (transition.to == MemoryClaimState::Conflicted
+                            || transition.to == MemoryClaimState::Active
+                                && claim.certainty == ClaimCertainty::Certain
+                            || transition.to == MemoryClaimState::Uncertain)
+                }
+                "confirmed" => {
+                    transition.from == Some(transition.to) && transition.related.is_none()
+                }
+                "certainty_upgraded" => {
+                    transition.from == Some(MemoryClaimState::Uncertain)
+                        && transition.to == MemoryClaimState::Active
+                        && transition.related.is_none()
+                }
+                "conflicted" => transition.to == MemoryClaimState::Conflicted && related_required,
+                "corrected" | "replaced" => {
+                    transition.to == MemoryClaimState::Superseded && related_required
+                }
+                _ => false,
+            };
+            if !legal {
+                return Err(RetrievalError::CorruptIndex(format!(
+                    "声明 {claim_id} 的迁移原因与状态不一致"
+                )));
+            }
+            if let Some(related_id) = transition.related.as_deref() {
+                let related = claims.get(related_id).ok_or_else(|| {
+                    RetrievalError::CorruptIndex(format!("迁移 {} 的关联声明缺失", transition.id))
+                })?;
+                if related.subject_entity_id != claim.subject_entity_id
+                    || related.predicate_key != claim.predicate_key
+                    || related.created_batch_key != transition.batch
+                {
+                    return Err(RetrievalError::CorruptIndex(format!(
+                        "迁移 {} 的关联声明语义或批次不匹配",
+                        transition.id
+                    )));
+                }
+                if matches!(transition.reason.as_str(), "corrected" | "replaced")
+                    && claim.valid_to.as_deref() != Some(related.valid_from.as_str())
+                {
+                    return Err(RetrievalError::CorruptIndex(format!(
+                        "迁移 {} 的 superseded 截止时间不等于替代声明起始时间",
+                        transition.id
+                    )));
+                }
+            }
+            previous = Some(transition.to);
+        }
+        if previous != Some(claim.state) {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "声明 {claim_id} 的终态与迁移链不一致"
+            )));
+        }
+    }
+    if !grouped.is_empty() {
+        return Err(RetrievalError::CorruptIndex("存在孤立声明迁移链".into()));
+    }
+    Ok(())
+}
+
+fn validate_boundary_ids_and_batches(connection: &Connection) -> RetrievalResult<()> {
+    let mut statement = connection
+        .prepare(
+            "SELECT boundary_id, session_id, batch_key, before_event_id, reason,
+                    evidence_json, created_at
+             FROM memory_boundary_suggestions ORDER BY boundary_id",
+        )
+        .map_err(candidate_database_error)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        })
+        .map_err(candidate_database_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(candidate_database_error)?;
+    for (id, session, batch, before_event, reason, evidence_json, created_at) in rows {
+        validate_applied_batch_ref(
+            connection,
+            &session,
+            &batch,
+            &created_at,
+            "boundary.batch_key",
+        )?;
+        let expected = deterministic_id(
+            "boundary",
+            &[&session, &batch, &before_event, &reason, &evidence_json],
+        );
+        if id != expected {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "边界 {id} 的确定性 ID 不匹配"
             )));
         }
     }
@@ -1899,27 +2873,31 @@ fn global_memory_state_hash(connection: &Connection) -> RetrievalResult<String> 
             "aliases",
             "SELECT alias_id, entity_id, alias_text, normalized_alias, alias_kind,
                     stable_identifier_kind, session_id, batch_key, event_id, start_char,
-                    end_char, content_sha256, created_at
+                    end_char, content_sha256, proof_event_id, proof_start_char, proof_end_char,
+                    proof_sha256, identity_event_id, identity_start_char, identity_end_char,
+                    identity_sha256, created_at
              FROM memory_entity_aliases ORDER BY alias_id",
-            13_usize,
+            21_usize,
         ),
         (
             "claims",
-            "SELECT claim_id, session_id, subject_entity_id, predicate_key, object_kind,
+            "SELECT claim_id, session_id, subject_entity_id, predicate_key, normalized_relation, object_kind,
                     object_text, object_entity_id, normalized_object, polarity, cardinality,
                     certainty, state, asserted_at, event_time, valid_from, valid_to,
                     reference_time, created_batch_key, updated_batch_key, created_at, updated_at
              FROM memory_claims ORDER BY claim_id",
-            21_usize,
+            22_usize,
         ),
         (
             "evidence",
             "SELECT evidence_id, claim_id, session_id, batch_key, event_id, sequence, role,
                     kind, start_char, end_char, content_sha256, subject_start_char,
                     subject_end_char, subject_sha256, relation_start_char, relation_end_char,
-                    relation_sha256, object_start_char, object_end_char, object_sha256, created_at
+                    relation_sha256, object_start_char, object_end_char, object_sha256,
+                    speech_act_event_id, speech_act_start_char, speech_act_end_char,
+                    speech_act_sha256, created_at
              FROM memory_claim_evidence ORDER BY evidence_id",
-            21_usize,
+            25_usize,
         ),
         (
             "transitions",
@@ -1991,6 +2969,17 @@ fn decode_alias_candidate(
         start_char: nonnegative_usize(stored.start_char, "alias.start_char")?,
         end_char: nonnegative_usize(stored.end_char, "alias.end_char")?,
         content_sha256: stored.content_sha256,
+        proof_event_id: stored.proof_event_id,
+        proof_start_char: nonnegative_usize(stored.proof_start_char, "alias.proof_start_char")?,
+        proof_end_char: nonnegative_usize(stored.proof_end_char, "alias.proof_end_char")?,
+        proof_sha256: stored.proof_sha256,
+        identity_event_id: stored.identity_event_id,
+        identity_start_char: nonnegative_usize(
+            stored.identity_start_char,
+            "alias.identity_start_char",
+        )?,
+        identity_end_char: nonnegative_usize(stored.identity_end_char, "alias.identity_end_char")?,
+        identity_sha256: stored.identity_sha256,
         created_at: stored.created_at,
     })
 }
@@ -2004,6 +2993,7 @@ fn decode_claim_candidate(
         session_id: stored.session_id,
         subject_entity_id: stored.subject_entity_id,
         predicate_key: stored.predicate_key,
+        normalized_relation: stored.normalized_relation,
         object_kind: parse_object_kind(&stored.object_kind)?,
         object_text: stored.object_text,
         object_entity_id: stored.object_entity_id,
@@ -2028,6 +3018,27 @@ fn decode_claim_candidate(
 fn decode_claim_evidence_candidate(
     stored: StoredClaimEvidenceCandidate,
 ) -> RetrievalResult<MemoryClaimEvidenceCandidate> {
+    let speech_act_span = match (
+        stored.speech_act_event_id,
+        stored.speech_act_start_char,
+        stored.speech_act_end_char,
+        stored.speech_act_sha256,
+    ) {
+        (None, None, None, None) => None,
+        (Some(event_id), Some(start_char), Some(end_char), Some(content_sha256)) => {
+            Some(ConsolidationQuote {
+                event_id,
+                start_char: nonnegative_usize(start_char, "claim_evidence.speech_act_start_char")?,
+                end_char: nonnegative_usize(end_char, "claim_evidence.speech_act_end_char")?,
+                content_sha256,
+            })
+        }
+        _ => {
+            return Err(RetrievalError::CorruptIndex(
+                "声明证据 speech_act_span 的可空字段不完整".into(),
+            ));
+        }
+    };
     Ok(MemoryClaimEvidenceCandidate {
         evidence_id: stored.evidence_id,
         session_id: stored.session_id,
@@ -2090,6 +3101,7 @@ fn decode_claim_evidence_candidate(
             end_char: nonnegative_usize(stored.object_end_char, "claim_evidence.object_end_char")?,
             content_sha256: stored.object_sha256,
         },
+        speech_act_span,
         created_at: stored.created_at,
     })
 }
@@ -2099,7 +3111,7 @@ fn load_all_claim_candidates(
 ) -> RetrievalResult<Vec<MemoryClaimCandidate>> {
     let mut statement = connection
         .prepare(
-            "SELECT claim_id, session_id, subject_entity_id, predicate_key, object_kind,
+            "SELECT claim_id, session_id, subject_entity_id, predicate_key, normalized_relation, object_kind,
                     object_text, object_entity_id, normalized_object, polarity, cardinality,
                     certainty, state, asserted_at, event_time, valid_from, valid_to,
                     reference_time, created_batch_key, updated_batch_key, created_at, updated_at
@@ -2113,23 +3125,24 @@ fn load_all_claim_candidates(
                 session_id: row.get(1)?,
                 subject_entity_id: row.get(2)?,
                 predicate_key: row.get(3)?,
-                object_kind: row.get(4)?,
-                object_text: row.get(5)?,
-                object_entity_id: row.get(6)?,
-                normalized_object: row.get(7)?,
-                polarity: row.get(8)?,
-                cardinality: row.get(9)?,
-                certainty: row.get(10)?,
-                state: row.get(11)?,
-                asserted_at: row.get(12)?,
-                event_time: row.get(13)?,
-                valid_from: row.get(14)?,
-                valid_to: row.get(15)?,
-                reference_time: row.get(16)?,
-                created_batch_key: row.get(17)?,
-                updated_batch_key: row.get(18)?,
-                created_at: row.get(19)?,
-                updated_at: row.get(20)?,
+                normalized_relation: row.get(4)?,
+                object_kind: row.get(5)?,
+                object_text: row.get(6)?,
+                object_entity_id: row.get(7)?,
+                normalized_object: row.get(8)?,
+                polarity: row.get(9)?,
+                cardinality: row.get(10)?,
+                certainty: row.get(11)?,
+                state: row.get(12)?,
+                asserted_at: row.get(13)?,
+                event_time: row.get(14)?,
+                valid_from: row.get(15)?,
+                valid_to: row.get(16)?,
+                reference_time: row.get(17)?,
+                created_batch_key: row.get(18)?,
+                updated_batch_key: row.get(19)?,
+                created_at: row.get(20)?,
+                updated_at: row.get(21)?,
             })
         })
         .map_err(candidate_database_error)?;
@@ -2137,10 +3150,31 @@ fn load_all_claim_candidates(
         .collect::<Result<Vec<_>, _>>()
         .map_err(candidate_database_error)?;
     drop(statement);
-    stored
-        .into_iter()
-        .map(|claim| decode_claim_candidate(claim, Vec::new()))
-        .collect()
+    let mut claims = Vec::with_capacity(stored.len());
+    for claim in stored {
+        let mut evidence_statement = connection
+            .prepare(
+                "SELECT evidence_id, session_id, batch_key, event_id, sequence, role, kind,
+                        start_char, end_char, content_sha256, subject_start_char,
+                        subject_end_char, subject_sha256, relation_start_char, relation_end_char,
+                        relation_sha256, object_start_char, object_end_char, object_sha256,
+                        speech_act_event_id, speech_act_start_char, speech_act_end_char,
+                        speech_act_sha256, created_at
+                 FROM memory_claim_evidence WHERE claim_id = ?1 ORDER BY evidence_id",
+            )
+            .map_err(candidate_database_error)?;
+        let evidence = evidence_statement
+            .query_map([&claim.claim_id], |row| map_stored_claim_evidence(row, 0))
+            .map_err(candidate_database_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(candidate_database_error)?
+            .into_iter()
+            .map(decode_claim_evidence_candidate)
+            .collect::<RetrievalResult<Vec<_>>>()?;
+        drop(evidence_statement);
+        claims.push(decode_claim_candidate(claim, evidence)?);
+    }
+    Ok(claims)
 }
 
 fn validate_plan_against_global_claims(
@@ -2451,6 +3485,12 @@ fn validate_candidate_snapshot(snapshot: &ConsolidationCandidateSnapshot) -> Ret
                 || alias.event_id.trim().is_empty()
                 || alias.start_char >= alias.end_char
                 || !is_lower_sha256(&alias.content_sha256)
+                || alias.proof_event_id.trim().is_empty()
+                || alias.proof_start_char >= alias.proof_end_char
+                || !is_lower_sha256(&alias.proof_sha256)
+                || alias.identity_event_id.trim().is_empty()
+                || alias.identity_start_char >= alias.identity_end_char
+                || !is_lower_sha256(&alias.identity_sha256)
                 || !alias_ids.insert(alias.alias_id.clone())
             {
                 return Err(RetrievalError::CorruptIndex(format!(
@@ -2487,6 +3527,8 @@ fn validate_candidate_snapshot(snapshot: &ConsolidationCandidateSnapshot) -> Ret
             || claim.session_id.trim().is_empty()
             || claim.subject_entity_id.trim().is_empty()
             || !valid_predicate_key(&claim.predicate_key)
+            || claim.normalized_relation.trim().is_empty()
+            || normalize_match(&claim.normalized_relation) != claim.normalized_relation
             || claim.normalized_object.trim().is_empty()
             || claim.created_batch_key.trim().is_empty()
             || claim.updated_batch_key.trim().is_empty()
@@ -2565,7 +3607,6 @@ fn validate_candidate_snapshot(snapshot: &ConsolidationCandidateSnapshot) -> Ret
         let mut evidence_ids = HashSet::new();
         for evidence in &claim.evidence {
             if evidence.evidence_id.trim().is_empty()
-                || evidence.session_id != claim.session_id
                 || evidence.batch_key.trim().is_empty()
                 || evidence.event_id.trim().is_empty()
                 || evidence.start_char >= evidence.end_char
@@ -2608,6 +3649,18 @@ fn validate_candidate_snapshot(snapshot: &ConsolidationCandidateSnapshot) -> Ret
                     claim.claim_id, evidence.evidence_id
                 )));
             }
+            if let Some(span) = &evidence.speech_act_span
+                && (span.event_id != evidence.event_id
+                    || span.start_char < evidence.start_char
+                    || span.end_char > evidence.end_char
+                    || span.start_char >= span.end_char
+                    || !is_lower_sha256(&span.content_sha256))
+            {
+                return Err(RetrievalError::CorruptIndex(format!(
+                    "声明 {} 的证据 {} 包含损坏的 speech_act 子片段",
+                    claim.claim_id, evidence.evidence_id
+                )));
+            }
             parse_stored_time(&evidence.created_at, "claim_evidence.created_at")?;
         }
     }
@@ -2643,6 +3696,30 @@ fn validate_candidate_provenance(
                 Some(&alias.text),
                 Some(&alias.session_id),
             )?;
+            for span in [
+                (
+                    &alias.proof_event_id,
+                    alias.proof_start_char,
+                    alias.proof_end_char,
+                    &alias.proof_sha256,
+                ),
+                (
+                    &alias.identity_event_id,
+                    alias.identity_start_char,
+                    alias.identity_end_char,
+                    &alias.identity_sha256,
+                ),
+            ] {
+                verify_stored_quote(
+                    connection,
+                    span.0,
+                    span.1,
+                    span.2,
+                    span.3,
+                    None,
+                    Some(&alias.session_id),
+                )?;
+            }
         }
     }
     for claim in &snapshot.claims {
@@ -2661,6 +3738,17 @@ fn validate_candidate_provenance(
                 &evidence.relation_span,
                 &evidence.object_span,
             ] {
+                verify_stored_quote(
+                    connection,
+                    &span.event_id,
+                    span.start_char,
+                    span.end_char,
+                    &span.content_sha256,
+                    None,
+                    Some(&evidence.session_id),
+                )?;
+            }
+            if let Some(span) = &evidence.speech_act_span {
                 verify_stored_quote(
                     connection,
                     &span.event_id,
@@ -2758,6 +3846,8 @@ struct ValidatedAlias {
     kind: MemoryAliasKind,
     stable_identifier_kind: Option<String>,
     evidence: ValidatedQuote,
+    proof: ValidatedQuote,
+    identity: ValidatedQuote,
 }
 
 #[derive(Debug)]
@@ -2785,6 +3875,7 @@ struct ValidatedEvidence {
     subject: ValidatedQuote,
     relation: ValidatedQuote,
     object: ValidatedQuote,
+    speech_act: Option<ValidatedQuote>,
 }
 
 #[derive(Debug)]
@@ -2794,6 +3885,7 @@ struct ValidatedEvidenceBinding {
     subject: ValidatedQuote,
     relation: ValidatedQuote,
     object: ValidatedQuote,
+    speech_act: Option<ValidatedQuote>,
 }
 
 #[derive(Debug)]
@@ -2818,6 +3910,7 @@ struct ValidatedClaim {
     action: ValidatedClaimAction,
     subject_entity_id: String,
     predicate_key: String,
+    normalized_relation: String,
     object_kind: ConsolidationClaimObjectKind,
     object_text: Option<String>,
     object_entity_id: Option<String>,
@@ -3170,7 +4263,6 @@ fn validate_entities(
                         "ent",
                         &[
                             batch.batch_key.as_str(),
-                            output.local_id.as_str(),
                             output.kind.as_str(),
                             output.name_evidence.event_id.as_str(),
                             &output.name_evidence.start_char.to_string(),
@@ -3521,15 +4613,20 @@ fn validate_entity_aliases(
             &alias.evidence,
             &format!("{alias_path}.evidence"),
         )?;
-        let name_in_proof = validate_nested_quote(
+        let identity_source = output
+            .existing_identity_evidence
+            .as_ref()
+            .unwrap_or(&output.name_evidence);
+        let identity = validate_nested_quote(
             batch,
             &alias.proof_evidence,
-            &output.name_evidence,
-            &format!("{path}.name_evidence"),
+            identity_source,
+            &format!("{alias_path}.identity_evidence"),
         )?;
-        if normalize_match(&alias_in_proof.text) != normalized
-            || !entity_names.contains(&normalize_match(&name_in_proof.text))
-        {
+        let normalized_identity = normalize_match(&identity.text);
+        let identity_matches = entity_names.contains(&normalized_identity)
+            || alias.kind == MemoryAliasKind::StableIdentifier && normalized_identity == normalized;
+        if normalize_match(&alias_in_proof.text) != normalized || !identity_matches {
             return Err(rejected(
                 "alias_proof",
                 format!("{alias_path}.proof_evidence"),
@@ -3585,6 +4682,14 @@ fn validate_entity_aliases(
                 &alias.evidence.start_char.to_string(),
                 &alias.evidence.end_char.to_string(),
                 &alias.evidence.content_sha256,
+                &alias.proof_evidence.event_id,
+                &alias.proof_evidence.start_char.to_string(),
+                &alias.proof_evidence.end_char.to_string(),
+                &alias.proof_evidence.content_sha256,
+                &identity_source.event_id,
+                &identity_source.start_char.to_string(),
+                &identity_source.end_char.to_string(),
+                &identity_source.content_sha256,
             ],
         );
         aliases.push(ValidatedAlias {
@@ -3595,6 +4700,8 @@ fn validate_entity_aliases(
             kind: alias.kind,
             stable_identifier_kind: stable_kind,
             evidence,
+            proof,
+            identity,
         });
     }
     Ok(aliases)
@@ -3799,6 +4906,18 @@ fn validate_claims(
                 &item.object_span,
                 &format!("{evidence_path}.object_span"),
             )?;
+            let speech_act = item
+                .speech_act_span
+                .as_ref()
+                .map(|span| {
+                    validate_nested_quote(
+                        batch,
+                        &item.quote,
+                        span,
+                        &format!("{evidence_path}.speech_act_span"),
+                    )
+                })
+                .transpose()?;
             validate_ascii_token_boundary(
                 batch,
                 &item.subject_span,
@@ -3855,13 +4974,22 @@ fn validate_claims(
             } else {
                 relation_identity = Some(normalized_relation);
             }
-            validate_evidence_polarity(item.kind, output.polarity, &quote, &evidence_path)?;
+            validate_evidence_semantics(
+                item.kind,
+                output.polarity,
+                &quote,
+                &subject,
+                &object,
+                speech_act.as_ref(),
+                &evidence_path,
+            )?;
             evidence.push(ValidatedEvidenceBinding {
                 kind: item.kind,
                 quote,
                 subject,
                 relation,
                 object,
+                speech_act,
             });
         }
 
@@ -3970,6 +5098,9 @@ fn validate_claims(
                 "valid_from 不得晚于 valid_to",
             ));
         }
+        let normalized_relation = relation_identity
+            .clone()
+            .expect("non-empty evidence establishes a relation identity");
 
         let exact = candidates
             .claims
@@ -3984,6 +5115,7 @@ fn validate_claims(
                     )
                     && claim.subject_entity_id == subject_entity_id
                     && claim.predicate_key == output.predicate_key
+                    && claim.normalized_relation == normalized_relation
                     && claim.object_kind == output.object.kind
                     && claim.normalized_object == normalized_object
                     && claim.polarity == output.polarity
@@ -4038,9 +5170,9 @@ fn validate_claims(
             "claim",
             &[
                 batch.batch_key.as_str(),
-                output.local_id.as_str(),
                 subject_entity_id.as_str(),
                 output.predicate_key.as_str(),
+                normalized_relation.as_str(),
                 output.object.kind.as_str(),
                 normalized_object.as_str(),
                 output.polarity.as_str(),
@@ -4195,6 +5327,24 @@ fn validate_claims(
                         &item.object.quote.start_char.to_string(),
                         &item.object.quote.end_char.to_string(),
                         item.object.quote.content_sha256.as_str(),
+                        item.speech_act
+                            .as_ref()
+                            .map(|quote| quote.quote.event_id.as_str())
+                            .unwrap_or(""),
+                        &item
+                            .speech_act
+                            .as_ref()
+                            .map(|quote| quote.quote.start_char.to_string())
+                            .unwrap_or_default(),
+                        &item
+                            .speech_act
+                            .as_ref()
+                            .map(|quote| quote.quote.end_char.to_string())
+                            .unwrap_or_default(),
+                        item.speech_act
+                            .as_ref()
+                            .map(|quote| quote.quote.content_sha256.as_str())
+                            .unwrap_or(""),
                     ],
                 ),
                 kind: item.kind,
@@ -4202,12 +5352,14 @@ fn validate_claims(
                 subject: item.subject,
                 relation: item.relation,
                 object: item.object,
+                speech_act: item.speech_act,
             })
             .collect();
         plans.push(ValidatedClaim {
             action,
             subject_entity_id,
             predicate_key: output.predicate_key.clone(),
+            normalized_relation,
             object_kind: output.object.kind,
             object_text,
             object_entity_id,
@@ -4700,57 +5852,284 @@ fn claim_subject_span_matches(
             }
 }
 
-fn validate_evidence_polarity(
+fn validate_evidence_semantics(
     kind: ConsolidationEvidenceKind,
     polarity: ClaimPolarity,
     quote: &ValidatedQuote,
+    subject: &ValidatedQuote,
+    object: &ValidatedQuote,
+    speech_act: Option<&ValidatedQuote>,
     path: &str,
 ) -> ConsolidationApplyResult<()> {
-    if kind == ConsolidationEvidenceKind::Temporal {
-        return Ok(());
-    }
-    let has_negation = contains_claim_marker(
-        &quote.text,
-        &["不", "不是", "没有", "并非"],
-        &["no", "not", "never"],
-    );
-    let has_correction = contains_claim_marker(&quote.text, &["错", "更正"], &["wrong", "instead"]);
-    if polarity == ClaimPolarity::Assert
-        && matches!(
-            kind,
-            ConsolidationEvidenceKind::Assertion | ConsolidationEvidenceKind::UserConfirmation
+    let semantic_start = subject
+        .quote
+        .start_char
+        .checked_sub(quote.quote.start_char)
+        .expect("nested subject starts inside outer evidence");
+    let semantic_end = object
+        .quote
+        .end_char
+        .checked_sub(quote.quote.start_char)
+        .expect("nested object ends inside outer evidence");
+    let semantic_envelope = slice_unicode(&quote.text, semantic_start, semantic_end)
+        .expect("nested triple envelope uses valid character offsets");
+    let invalid_context = evidence_has_invalid_context(&quote.text);
+
+    let reject_context = || {
+        rejected(
+            "evidence_context",
+            path,
+            "断言、确认或纠正证据不得是疑问、条件表达或转述他人话语",
         )
-        && (has_negation || has_correction)
-    {
-        return Err(rejected(
-            "evidence_polarity",
-            path,
-            "肯定断言/确认不得含独立否定或纠正标记",
-        ));
-    }
-    if polarity == ClaimPolarity::Deny && !has_negation {
-        return Err(rejected(
-            "evidence_polarity",
-            path,
-            "否定声明的断言、确认或纠正证据必须含独立否定标记",
-        ));
-    }
-    if kind == ConsolidationEvidenceKind::Correction && !has_correction {
-        return Err(rejected(
-            "correction_marker",
-            path,
-            "Correction 证据必须含独立纠正标记",
-        ));
+    };
+    match (kind, polarity) {
+        (ConsolidationEvidenceKind::Temporal, _) => {
+            if speech_act.is_some() {
+                return Err(rejected(
+                    "unexpected_speech_act",
+                    format!("{path}.speech_act_span"),
+                    "Temporal 证据的 speech_act_span 必须为 null",
+                ));
+            }
+        }
+        (ConsolidationEvidenceKind::Assertion, ClaimPolarity::Assert) => {
+            if speech_act.is_some() {
+                return Err(rejected(
+                    "unexpected_speech_act",
+                    format!("{path}.speech_act_span"),
+                    "肯定 Assertion 的 speech_act_span 必须为 null",
+                ));
+            }
+            if invalid_context {
+                return Err(reject_context());
+            }
+            if contains_negative_cue(semantic_envelope) {
+                return Err(rejected(
+                    "evidence_polarity",
+                    path,
+                    "肯定 Assertion 的主语到对象语义片段不得含否定提示",
+                ));
+            }
+        }
+        (ConsolidationEvidenceKind::Assertion, ClaimPolarity::Deny) => {
+            let marker =
+                require_speech_act(speech_act, path, "否定 Assertion 必须标注精确否定提示")?;
+            if invalid_context {
+                return Err(reject_context());
+            }
+            if !is_exact_negative_cue(&marker.text)
+                || marker.quote.start_char < subject.quote.start_char
+                || marker.quote.end_char > object.quote.end_char
+            {
+                return Err(rejected(
+                    "evidence_polarity",
+                    format!("{path}.speech_act_span"),
+                    "否定 Assertion 的 speech_act_span 必须是语义三元组内的精确否定提示",
+                ));
+            }
+        }
+        (ConsolidationEvidenceKind::UserConfirmation, ClaimPolarity::Assert) => {
+            let marker = require_speech_act(speech_act, path, "肯定确认必须标注精确确认提示")?;
+            if invalid_context {
+                return Err(reject_context());
+            }
+            if !is_exact_affirmative_cue(&marker.text) || contains_negative_cue(&quote.text) {
+                return Err(rejected(
+                    "confirmation_marker",
+                    format!("{path}.speech_act_span"),
+                    "肯定确认必须使用受支持的精确确认提示，且外层证据不得含否定提示",
+                ));
+            }
+        }
+        (ConsolidationEvidenceKind::UserConfirmation, ClaimPolarity::Deny) => {
+            let marker = require_speech_act(speech_act, path, "否定确认必须标注精确否定提示")?;
+            if invalid_context {
+                return Err(reject_context());
+            }
+            if !is_exact_negative_cue(&marker.text) {
+                return Err(rejected(
+                    "confirmation_marker",
+                    format!("{path}.speech_act_span"),
+                    "否定确认必须使用受支持的精确否定提示",
+                ));
+            }
+        }
+        (ConsolidationEvidenceKind::Correction, polarity) => {
+            let marker = require_speech_act(speech_act, path, "Correction 必须标注精确纠正提示")?;
+            if invalid_context {
+                return Err(reject_context());
+            }
+            if !is_exact_correction_cue(&marker.text)
+                || marker.quote.end_char > object.quote.end_char
+            {
+                return Err(rejected(
+                    "correction_marker",
+                    format!("{path}.speech_act_span"),
+                    "Correction 的 speech_act_span 必须是新对象之前受支持的精确纠正提示",
+                ));
+            }
+            let corrected_start = marker
+                .quote
+                .end_char
+                .checked_sub(quote.quote.start_char)
+                .expect("nested correction marker starts inside outer evidence");
+            let corrected_segment = slice_unicode(&quote.text, corrected_start, semantic_end)
+                .expect("correction segment uses valid character offsets");
+            let has_negative = contains_negative_cue(corrected_segment);
+            if (polarity == ClaimPolarity::Assert && has_negative)
+                || (polarity == ClaimPolarity::Deny && !has_negative)
+            {
+                return Err(rejected(
+                    "evidence_polarity",
+                    path,
+                    "Correction 在纠正提示到新对象之间的否定提示与声明极性不一致",
+                ));
+            }
+        }
     }
     Ok(())
 }
 
-fn contains_claim_marker(value: &str, cjk: &[&str], english: &[&str]) -> bool {
-    let normalized = normalize_match(value);
-    cjk.iter().any(|marker| normalized.contains(marker))
-        || english
+fn require_speech_act<'a>(
+    speech_act: Option<&'a ValidatedQuote>,
+    path: &str,
+    message: &str,
+) -> ConsolidationApplyResult<&'a ValidatedQuote> {
+    speech_act.ok_or_else(|| {
+        rejected(
+            "missing_speech_act",
+            format!("{path}.speech_act_span"),
+            message,
+        )
+    })
+}
+
+fn normalize_cue(value: &str) -> String {
+    normalize_match(value).replace('’', "'")
+}
+
+fn is_exact_affirmative_cue(value: &str) -> bool {
+    matches!(
+        normalize_cue(value).as_str(),
+        "是" | "对"
+            | "没错"
+            | "确实"
+            | "确认"
+            | "yes"
+            | "correct"
+            | "that's right"
+            | "indeed"
+            | "affirmative"
+    )
+}
+
+fn is_exact_correction_cue(value: &str) -> bool {
+    matches!(
+        normalize_cue(value).as_str(),
+        "更正" | "改为" | "其实" | "而是" | "instead" | "correction" | "rather" | "actually"
+    )
+}
+
+fn is_exact_negative_cue(value: &str) -> bool {
+    let normalized = normalize_cue(value);
+    CJK_NEGATIVE_CUES.contains(&normalized.as_str())
+        || ENGLISH_NEGATIVE_CUES.contains(&normalized.as_str())
+}
+
+const CJK_NEGATIVE_CUES: &[&str] = &[
+    "不是",
+    "没有",
+    "并非",
+    "不再",
+    "从不",
+    "不喜欢",
+    "不住",
+    "不在",
+    "不叫",
+    "不对",
+    "错误",
+];
+
+const ENGLISH_NEGATIVE_CUES: &[&str] = &[
+    "don't",
+    "doesn't",
+    "didn't",
+    "isn't",
+    "aren't",
+    "wasn't",
+    "weren't",
+    "can't",
+    "cannot",
+    "won't",
+    "wouldn't",
+    "shouldn't",
+    "couldn't",
+    "not",
+    "no",
+    "never",
+    "wrong",
+];
+
+fn contains_negative_cue(value: &str) -> bool {
+    let normalized = normalize_cue(value);
+    CJK_NEGATIVE_CUES
+        .iter()
+        .any(|marker| normalized.contains(marker))
+        || ENGLISH_NEGATIVE_CUES
             .iter()
             .any(|marker| contains_ascii_word(&normalized, marker))
+}
+
+fn evidence_has_invalid_context(value: &str) -> bool {
+    let normalized = normalize_cue(value);
+    let trimmed = normalized.trim();
+    let question = trimmed.chars().any(|ch| matches!(ch, '?' | '？'))
+        || trimmed
+            .trim_end_matches(['。', '.', '!', '！', '?', '？'])
+            .chars()
+            .next_back()
+            .is_some_and(|ch| matches!(ch, '吗' | '么' | '呢'))
+        || [
+            "do", "does", "did", "is", "are", "was", "were", "can", "could", "would", "should",
+        ]
+        .iter()
+        .any(|word| {
+            trimmed
+                .strip_prefix(word)
+                .is_some_and(|tail| tail.starts_with(' '))
+        });
+    let conditional = ["如果", "若是", "假如", "要是", "除非"]
+        .iter()
+        .any(|marker| normalized.contains(marker))
+        || ["if", "unless", "whether", "provided that"]
+            .iter()
+            .any(|marker| contains_ascii_word(&normalized, marker));
+    let attribution = [
+        "你说",
+        "您说",
+        "你之前说",
+        "他说",
+        "她说",
+        "他们说",
+        "据说",
+        "听说",
+        "声称",
+        "提到",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+        || [
+            "you said",
+            "he said",
+            "she said",
+            "they said",
+            "according to",
+            "claimed that",
+            "mentioned that",
+        ]
+        .iter()
+        .any(|marker| contains_ascii_word(&normalized, marker));
+    question || conditional || attribution
 }
 
 fn contains_ascii_word(value: &str, needle: &str) -> bool {
@@ -4823,7 +6202,7 @@ fn compatible_kind(left: MemoryEntityKind, right: MemoryEntityKind) -> bool {
 
 fn deterministic_id(prefix: &str, parts: &[&str]) -> String {
     let mut hasher = Sha256::new();
-    hash_length_delimited(&mut hasher, b"hippocampus-derived-memory-id-v1");
+    hash_length_delimited(&mut hasher, b"hippocampus-derived-memory-id-v2");
     hash_length_delimited(&mut hasher, prefix.as_bytes());
     for part in parts {
         hash_length_delimited(&mut hasher, part.as_bytes());
@@ -5098,8 +6477,11 @@ fn apply_validated_plan(
                 "INSERT INTO memory_entity_aliases
                  (alias_id, entity_id, alias_text, normalized_alias, alias_kind,
                   stable_identifier_kind, session_id, batch_key, event_id, start_char,
-                  end_char, content_sha256, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                  end_char, content_sha256, proof_event_id, proof_start_char, proof_end_char,
+                  proof_sha256, identity_event_id, identity_start_char, identity_end_char,
+                  identity_sha256, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                         ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
                 params![
                     alias.alias_id,
                     alias.entity_id,
@@ -5115,6 +6497,18 @@ fn apply_validated_plan(
                     i64::try_from(alias.evidence.quote.end_char)
                         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
                     alias.evidence.quote.content_sha256,
+                    alias.proof.quote.event_id,
+                    i64::try_from(alias.proof.quote.start_char)
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+                    i64::try_from(alias.proof.quote.end_char)
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+                    alias.proof.quote.content_sha256,
+                    alias.identity.quote.event_id,
+                    i64::try_from(alias.identity.quote.start_char)
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+                    i64::try_from(alias.identity.quote.end_char)
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+                    alias.identity.quote.content_sha256,
                     attempt.completed_at,
                 ],
             )?;
@@ -5133,17 +6527,18 @@ fn apply_validated_plan(
             } => {
                 transaction.execute(
                     "INSERT INTO memory_claims
-                     (claim_id, session_id, subject_entity_id, predicate_key, object_kind,
-                      object_text, object_entity_id, normalized_object, polarity, cardinality,
+                     (claim_id, session_id, subject_entity_id, predicate_key, normalized_relation,
+                      object_kind, object_text, object_entity_id, normalized_object, polarity, cardinality,
                       certainty, state, asserted_at, event_time, valid_from, valid_to,
                       reference_time, created_batch_key, updated_batch_key, created_at, updated_at)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                             ?14, ?15, ?16, ?17, ?18, ?18, ?19, ?19)",
+                             ?14, ?15, ?16, ?17, ?18, ?19, ?19, ?20, ?20)",
                     params![
                         claim_id,
                         batch.session_id,
                         claim.subject_entity_id,
                         claim.predicate_key,
+                        claim.normalized_relation,
                         claim.object_kind.as_str(),
                         claim.object_text,
                         claim.object_entity_id,
@@ -5454,6 +6849,26 @@ fn insert_claim_evidence(
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
     let object_end = i64::try_from(evidence.object.quote.end_char)
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    let speech_act_event_id = evidence
+        .speech_act
+        .as_ref()
+        .map(|quote| quote.quote.event_id.as_str());
+    let speech_act_start = evidence
+        .speech_act
+        .as_ref()
+        .map(|quote| i64::try_from(quote.quote.start_char))
+        .transpose()
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    let speech_act_end = evidence
+        .speech_act
+        .as_ref()
+        .map(|quote| i64::try_from(quote.quote.end_char))
+        .transpose()
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    let speech_act_sha256 = evidence
+        .speech_act
+        .as_ref()
+        .map(|quote| quote.quote.content_sha256.as_str());
     if existing.is_some() {
         let matches = transaction.query_row(
             "SELECT count(*) FROM memory_claim_evidence
@@ -5462,7 +6877,9 @@ fn insert_claim_evidence(
                AND start_char = ?9 AND end_char = ?10 AND content_sha256 = ?11
                AND subject_start_char = ?12 AND subject_end_char = ?13 AND subject_sha256 = ?14
                AND relation_start_char = ?15 AND relation_end_char = ?16 AND relation_sha256 = ?17
-               AND object_start_char = ?18 AND object_end_char = ?19 AND object_sha256 = ?20",
+               AND object_start_char = ?18 AND object_end_char = ?19 AND object_sha256 = ?20
+               AND speech_act_event_id IS ?21 AND speech_act_start_char IS ?22
+               AND speech_act_end_char IS ?23 AND speech_act_sha256 IS ?24",
             params![
                 evidence.evidence_id,
                 claim_id,
@@ -5484,6 +6901,10 @@ fn insert_claim_evidence(
                 object_start,
                 object_end,
                 evidence.object.quote.content_sha256,
+                speech_act_event_id,
+                speech_act_start,
+                speech_act_end,
+                speech_act_sha256,
             ],
             |row| row.get::<_, i64>(0),
         )?;
@@ -5497,9 +6918,10 @@ fn insert_claim_evidence(
          (evidence_id, claim_id, session_id, batch_key, event_id, sequence, role, kind,
           start_char, end_char, content_sha256, subject_start_char, subject_end_char,
           subject_sha256, relation_start_char, relation_end_char, relation_sha256,
-          object_start_char, object_end_char, object_sha256, created_at)
+          object_start_char, object_end_char, object_sha256, speech_act_event_id,
+          speech_act_start_char, speech_act_end_char, speech_act_sha256, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                 ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+                 ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
         params![
             evidence.evidence_id,
             claim_id,
@@ -5521,6 +6943,10 @@ fn insert_claim_evidence(
             object_start,
             object_end,
             evidence.object.quote.content_sha256,
+            speech_act_event_id,
+            speech_act_start,
+            speech_act_end,
+            speech_act_sha256,
             created_at,
         ],
     )?;
@@ -6135,6 +7561,7 @@ mod tests {
                 subject_span,
                 relation_span,
                 object_span,
+                speech_act_span: None,
             }],
         }
     }
@@ -6143,6 +7570,14 @@ mod tests {
         batch: &ConsolidationInputBatch,
         output: &StructuredConsolidationOutput,
     ) -> ConsolidationAttemptRecord {
+        let started_at = batch
+            .events
+            .last()
+            .map(|event| event.created_at.clone())
+            .unwrap_or_else(|| "2026-01-01T00:00:00Z".into());
+        let completed_at = (DateTime::parse_from_rfc3339(&started_at).unwrap()
+            + chrono::Duration::seconds(1))
+        .to_rfc3339();
         let request_json = serde_json::to_string(&json!({
             "batch_key": batch.batch_key,
             "candidate_snapshot": "test"
@@ -6175,8 +7610,8 @@ mod tests {
             input_tokens: Some(10),
             output_tokens: Some(5),
             latency_ms: 1,
-            started_at: "2026-01-01T00:00:00Z".into(),
-            completed_at: "2026-01-01T00:00:01Z".into(),
+            started_at,
+            completed_at,
             validation_json: Some("{\"valid\":true}".into()),
             error_json: None,
         }
@@ -6770,6 +8205,80 @@ mod tests {
             }
         }
 
+        fn schema_accepts(root: &Value, schema: &Value, value: &Value) -> bool {
+            if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+                let Some(name) = reference.strip_prefix("#/$defs/") else {
+                    return false;
+                };
+                return schema_accepts(root, &root["$defs"][name], value);
+            }
+            if let Some(options) = schema.get("anyOf").and_then(Value::as_array) {
+                return options
+                    .iter()
+                    .any(|option| schema_accepts(root, option, value));
+            }
+            if let Some(values) = schema.get("enum").and_then(Value::as_array)
+                && !values.contains(value)
+            {
+                return false;
+            }
+            let type_matches = |kind: &str| match kind {
+                "object" => value.is_object(),
+                "array" => value.is_array(),
+                "string" => value.is_string(),
+                "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+                "null" => value.is_null(),
+                _ => false,
+            };
+            if let Some(kind) = schema.get("type") {
+                let matches = kind.as_str().is_some_and(&type_matches)
+                    || kind.as_array().is_some_and(|kinds| {
+                        kinds.iter().filter_map(Value::as_str).any(type_matches)
+                    });
+                if !matches {
+                    return false;
+                }
+            }
+            if let Some(object) = value.as_object() {
+                let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+                    return true;
+                };
+                if schema
+                    .get("required")
+                    .and_then(Value::as_array)
+                    .is_some_and(|required| {
+                        required
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .any(|key| !object.contains_key(key))
+                    })
+                {
+                    return false;
+                }
+                if schema.get("additionalProperties") == Some(&Value::Bool(false))
+                    && object.keys().any(|key| !properties.contains_key(key))
+                {
+                    return false;
+                }
+                if object.iter().any(|(key, child)| {
+                    properties
+                        .get(key)
+                        .is_some_and(|child_schema| !schema_accepts(root, child_schema, child))
+                }) {
+                    return false;
+                }
+            }
+            if let Some(items) = value.as_array()
+                && let Some(item_schema) = schema.get("items")
+                && items
+                    .iter()
+                    .any(|item| !schema_accepts(root, item_schema, item))
+            {
+                return false;
+            }
+            true
+        }
+
         let schema = structured_consolidation_schema();
         assert_strict_objects(&schema, "$");
         assert_eq!(schema["properties"]["entities"]["maxItems"], 128);
@@ -6787,6 +8296,63 @@ mod tests {
             schema["$defs"]["boundary"]["properties"]["evidence"]["maxItems"],
             8
         );
+        let entity_required = schema["$defs"]["entity"]["required"].as_array().unwrap();
+        assert!(entity_required.contains(&json!("existing_identity_evidence")));
+        let evidence_required = schema["$defs"]["claim_evidence"]["required"]
+            .as_array()
+            .unwrap();
+        for field in [
+            "subject_span",
+            "relation_span",
+            "object_span",
+            "speech_act_span",
+        ] {
+            assert!(evidence_required.contains(&json!(field)));
+        }
+
+        let quote = json!({
+            "event_id": "event", "start_char": 0, "end_char": 1,
+            "content_sha256": "0".repeat(64)
+        });
+        let payload = json!({
+            "entities": [{
+                "local_id": "local_alice", "name": "A", "kind": "person",
+                "resolution": "existing", "disambiguation": "resolved",
+                "basis": "explicit_alias", "existing_entity_id": "ent_alice",
+                "name_evidence": quote.clone(), "existing_identity_evidence": quote.clone(),
+                "resolution_evidence": quote.clone(), "aliases": []
+            }],
+            "claims": [{
+                "local_id": "local_claim", "subject_ref": "ent_alice",
+                "predicate_key": "profile.name",
+                "object": {"kind":"text", "text":"A", "entity_ref":null, "span":quote.clone()},
+                "polarity":"assert", "cardinality":"single", "certainty":"certain",
+                "disposition":"new", "replaces_claim_ids":[], "conflicts_with_claim_ids":[],
+                "event_time":null, "valid_from":null, "valid_to":null,
+                "evidence":[{"kind":"assertion", "quote":quote.clone(), "subject_span":quote.clone(),
+                    "relation_span":quote.clone(), "object_span":quote, "speech_act_span":null}]
+            }], "boundaries": []
+        });
+        assert!(schema_accepts(&schema, &schema, &payload));
+        assert!(serde_json::from_value::<StructuredConsolidationOutput>(payload.clone()).is_ok());
+        let mut missing = payload.clone();
+        missing["entities"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("existing_identity_evidence");
+        assert!(!schema_accepts(&schema, &schema, &missing));
+        assert!(serde_json::from_value::<StructuredConsolidationOutput>(missing).is_err());
+        let mut missing = payload.clone();
+        missing["claims"][0]["evidence"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("speech_act_span");
+        assert!(!schema_accepts(&schema, &schema, &missing));
+        assert!(serde_json::from_value::<StructuredConsolidationOutput>(missing).is_err());
+        let mut extra = payload;
+        extra["claims"][0]["evidence"][0]["extra"] = json!(true);
+        assert!(!schema_accepts(&schema, &schema, &extra));
+        assert!(serde_json::from_value::<StructuredConsolidationOutput>(extra).is_err());
 
         assert!(
             serde_json::from_value::<StructuredConsolidationOutput>(json!({
@@ -6799,6 +8365,135 @@ mod tests {
                 "event_id": "e", "start_char": 0, "end_char": 1,
                 "content_sha256": "0".repeat(64), "extra": true
             }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn speech_act_semantics_reject_context_and_bind_exact_polarity_cues() {
+        fn check(
+            content: &str,
+            subject: (&str, usize),
+            object: (&str, usize),
+            kind: ConsolidationEvidenceKind,
+            polarity: ClaimPolarity,
+            speech: Option<(&str, usize)>,
+        ) -> ConsolidationApplyResult<()> {
+            let event = ConsolidationEvent {
+                event_id: "event".into(),
+                turn_id: "turn".into(),
+                sequence: 1,
+                role: EventRole::User,
+                created_at: "2026-01-01T00:00:00Z".into(),
+                content: content.into(),
+                content_sha256: sha256_bytes(content.as_bytes()),
+            };
+            let validated = |quote: ConsolidationQuote| ValidatedQuote {
+                text: slice_unicode(&event.content, quote.start_char, quote.end_char)
+                    .unwrap()
+                    .to_owned(),
+                quote,
+                role: EventRole::User,
+                sequence: 1,
+                created_at: event.created_at.clone(),
+            };
+            let outer = validated(full_quote(&event));
+            let subject = validated(quote_nth(&event, subject.0, subject.1));
+            let object = validated(quote_nth(&event, object.0, object.1));
+            let speech =
+                speech.map(|(text, occurrence)| validated(quote_nth(&event, text, occurrence)));
+            validate_evidence_semantics(
+                kind,
+                polarity,
+                &outer,
+                &subject,
+                &object,
+                speech.as_ref(),
+                "evidence",
+            )
+        }
+
+        for context in [
+            "Does Alice live in Paris?",
+            "You said Alice lives in Paris.",
+            "If Alice lives in Paris, call me.",
+        ] {
+            assert!(
+                check(
+                    context,
+                    ("Alice", 0),
+                    ("Paris", 0),
+                    ConsolidationEvidenceKind::Assertion,
+                    ClaimPolarity::Assert,
+                    None,
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            check(
+                "Alice lives in 不丹。",
+                ("Alice", 0),
+                ("不丹", 0),
+                ConsolidationEvidenceKind::Assertion,
+                ClaimPolarity::Assert,
+                None,
+            )
+            .is_ok()
+        );
+        assert!(
+            check(
+                "Alice doesn't live in Paris.",
+                ("Alice", 0),
+                ("Paris", 0),
+                ConsolidationEvidenceKind::Assertion,
+                ClaimPolarity::Deny,
+                Some(("doesn't", 0)),
+            )
+            .is_ok()
+        );
+        assert!(
+            check(
+                "Alice didn't live in Rome; actually Alice lives in Paris.",
+                ("Alice", 1),
+                ("Paris", 0),
+                ConsolidationEvidenceKind::Correction,
+                ClaimPolarity::Assert,
+                Some(("actually", 0)),
+            )
+            .is_ok()
+        );
+        assert!(
+            check(
+                "Correction: Alice doesn't live in Paris.",
+                ("Alice", 0),
+                ("Paris", 0),
+                ConsolidationEvidenceKind::Correction,
+                ClaimPolarity::Deny,
+                Some(("Correction", 0)),
+            )
+            .is_ok()
+        );
+        assert!(
+            check(
+                "Yes, Paris is nice.",
+                ("Paris", 0),
+                ("nice", 0),
+                ConsolidationEvidenceKind::UserConfirmation,
+                ClaimPolarity::Assert,
+                Some(("Yes", 0)),
+            )
+            .is_ok()
+        );
+        assert!(
+            check(
+                "Alice doesn't live in Paris.",
+                ("Alice", 0),
+                ("Paris", 0),
+                ConsolidationEvidenceKind::Assertion,
+                ClaimPolarity::Deny,
+                None,
+            )
             .is_err()
         );
     }
@@ -7501,6 +9196,7 @@ mod tests {
             subject_span: quote_nth(confirmation, "Alice", 0),
             relation_span: quote_nth(confirmation, "喜欢", 0),
             object_span: quote_nth(confirmation, "蓝色", 0),
+            speech_act_span: Some(quote_nth(confirmation, "确认", 0)),
         });
         claim.evidence.push(ConsolidationClaimEvidence {
             kind: ConsolidationEvidenceKind::Temporal,
@@ -7508,6 +9204,7 @@ mod tests {
             subject_span: quote_nth(confirmation, "Alice", 0),
             relation_span: quote_nth(confirmation, "喜欢", 0),
             object_span: quote_nth(confirmation, "蓝色", 0),
+            speech_act_span: None,
         });
         claim.event_time = Some("2026-02-01T00:00:00Z".into());
         let output = StructuredConsolidationOutput {
@@ -7701,6 +9398,7 @@ mod tests {
         correction.disposition = ClaimDisposition::Correct;
         correction.replaces_claim_ids = replaced_ids.clone();
         correction.evidence[0].kind = ConsolidationEvidenceKind::Correction;
+        correction.evidence[0].speech_act_span = Some(quote_nth(correction_event, "更正", 0));
         let report = apply_output(
             &store,
             &correction_batch,
@@ -7826,6 +9524,7 @@ mod tests {
         );
         denial.cardinality = ClaimCardinality::Multi;
         denial.polarity = ClaimPolarity::Deny;
+        denial.evidence[0].speech_act_span = Some(quote_nth(denial_event, "不喜欢", 0));
         denial.conflicts_with_claim_ids = vec![tea_id];
         apply_output(
             &store,
@@ -7916,6 +9615,7 @@ mod tests {
             subject_span: quote_nth(&event, "Alice", 0),
             relation_span: quote_nth(&event, "状态为", 0),
             object_span: quote_nth(&event, "蓝色", 0),
+            speech_act_span: None,
         });
         let valid = StructuredConsolidationOutput {
             entities: vec![entity.clone()],
@@ -8125,7 +9825,7 @@ mod tests {
             "confirmation",
             7,
             EventRole::User,
-            "I confirm Alice lives in Paris.",
+            "Yes, Alice lives in Paris.",
         );
         let events = vec![
             origin.clone(),
@@ -8161,6 +9861,7 @@ mod tests {
             subject_span: quote_nth(&assistant, "Alice", 0),
             relation_span: quote_nth(&assistant, "lives in", 0),
             object_span: quote_nth(&assistant, "Paris", 0),
+            speech_act_span: None,
         };
         let base_claim = ConsolidatedClaimOutput {
             local_id: "local_residence".into(),
@@ -8196,6 +9897,7 @@ mod tests {
             subject_span: quote_nth(&unrelated, "Paris", 0),
             relation_span: quote_nth(&unrelated, "is", 0),
             object_span: quote_nth(&unrelated, "nice", 0),
+            speech_act_span: None,
         });
         assert!(matches!(
             validate_structured_output(&batch, &empty_candidates(), &output(unrelated_claim)),
@@ -8209,6 +9911,7 @@ mod tests {
             subject_span: quote_nth(&wrong_subject, "Bob", 0),
             relation_span: quote_nth(&wrong_subject, "lives in", 0),
             object_span: quote_nth(&wrong_subject, "Paris", 0),
+            speech_act_span: None,
         }];
         assert!(matches!(
             validate_structured_output(&batch, &empty_candidates(), &output(wrong_claim)),
@@ -8222,6 +9925,7 @@ mod tests {
             subject_span: quote_nth(&swapped, "Alice", 0),
             relation_span: quote_nth(&swapped, "lives in", 0),
             object_span: quote_nth(&swapped, "Paris", 0),
+            speech_act_span: None,
         }];
         assert!(matches!(
             validate_structured_output(&batch, &empty_candidates(), &output(swapped_claim)),
@@ -8235,6 +9939,7 @@ mod tests {
             subject_span: quote_nth(&negated, "Alice", 0),
             relation_span: quote_nth(&negated, "not", 0),
             object_span: quote_nth(&negated, "Paris", 0),
+            speech_act_span: None,
         }];
         assert!(matches!(
             validate_structured_output(&batch, &empty_candidates(), &output(negated_claim)),
@@ -8248,6 +9953,7 @@ mod tests {
             subject_span: quote_nth(&confirmation, "Alice", 0),
             relation_span: quote_nth(&confirmation, "lives in", 0),
             object_span: quote_nth(&confirmation, "Paris", 0),
+            speech_act_span: Some(quote_nth(&confirmation, "Yes", 0)),
         });
         assert!(
             validate_structured_output(&batch, &empty_candidates(), &output(confirmed_claim))
@@ -8394,6 +10100,14 @@ mod tests {
             start_char: 0,
             end_char: 4,
             content_sha256: content_sha256("E123"),
+            proof_event_id: "old-event".into(),
+            proof_start_char: 0,
+            proof_end_char: 4,
+            proof_sha256: content_sha256("E123"),
+            identity_event_id: "old-event".into(),
+            identity_start_char: 0,
+            identity_end_char: 4,
+            identity_sha256: content_sha256("E123"),
             created_at: "2025-01-01T00:00:00Z".into(),
         };
         let stable_candidate = snapshot(candidate("ent_device", "Device", vec![stable_alias]));
@@ -8580,6 +10294,7 @@ mod tests {
                     subject_span: quote_nth(event, "Alice", 0),
                     relation_span: quote_nth(event, "lives in", 0),
                     object_span: quote_nth(event, "Paris", 0),
+                    speech_act_span: None,
                 }],
             };
             let tea = text_claim_output(
@@ -8616,11 +10331,24 @@ mod tests {
         for mutation in [
             "UPDATE memory_entities SET created_event_id = 'event_missing', updated_at = '1900-01-01T00:00:00Z' WHERE canonical_name = 'Alice'",
             "UPDATE memory_entity_aliases SET entity_id = 'ent_missing'",
+            "UPDATE memory_entity_aliases SET entity_id = (SELECT entity_id FROM memory_entities WHERE canonical_name = 'Paris')",
+            "UPDATE memory_entity_aliases SET alias_id = 'alias_tampered'",
             "UPDATE memory_claims SET subject_entity_id = 'ent_missing', updated_at = '1900-01-01T00:00:00Z' WHERE predicate_key = 'residence.city'",
             "UPDATE memory_claims SET object_entity_id = 'ent_missing', updated_at = '1900-01-01T00:00:00Z' WHERE predicate_key = 'residence.city'",
+            "UPDATE memory_claims SET predicate_key = 'tampered.key' WHERE predicate_key = 'preference.drink'",
+            "UPDATE memory_claims SET normalized_relation = 'tampered' WHERE predicate_key = 'preference.drink'",
+            "UPDATE memory_claims SET object_text = 'coffee', normalized_object = 'coffee' WHERE predicate_key = 'preference.drink'",
             "UPDATE memory_claim_evidence SET claim_id = 'claim_missing' WHERE claim_id = (SELECT claim_id FROM memory_claims WHERE predicate_key = 'residence.city')",
+            "UPDATE memory_claim_evidence SET claim_id = (SELECT claim_id FROM memory_claims WHERE predicate_key = 'preference.drink') WHERE claim_id = (SELECT claim_id FROM memory_claims WHERE predicate_key = 'residence.city')",
+            "UPDATE memory_claim_evidence SET evidence_id = 'evidence_tampered' WHERE claim_id = (SELECT claim_id FROM memory_claims WHERE predicate_key = 'preference.drink')",
+            "UPDATE memory_claim_evidence SET object_sha256 = subject_sha256 WHERE claim_id = (SELECT claim_id FROM memory_claims WHERE predicate_key = 'preference.drink')",
             "UPDATE memory_claim_transitions SET claim_id = 'claim_missing' WHERE claim_id = (SELECT claim_id FROM memory_claims WHERE predicate_key = 'residence.city')",
+            "UPDATE memory_claim_transitions SET from_state = 'active' WHERE transition_id = (SELECT transition_id FROM memory_claim_transitions ORDER BY transition_id LIMIT 1)",
+            "UPDATE memory_claim_transitions SET transition_id = 'transition_tampered' WHERE transition_id = (SELECT transition_id FROM memory_claim_transitions ORDER BY transition_id LIMIT 1)",
+            "UPDATE memory_claim_transitions SET to_state = 'superseded' WHERE transition_id = (SELECT transition_id FROM memory_claim_transitions ORDER BY transition_id LIMIT 1)",
             "UPDATE memory_boundary_suggestions SET evidence_json = '[]'",
+            "UPDATE memory_boundary_suggestions SET boundary_id = 'boundary_tampered'",
+            "UPDATE memory_boundary_suggestions SET batch_key = 'missing-batch'",
         ] {
             let (_root, store) = seed();
             let connection = Connection::open(store.retrieval().index_path()).unwrap();
