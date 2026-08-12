@@ -93,6 +93,7 @@ struct App {
     activity: Activity,
     live_thinking: String,
     live_answer: String,
+    live_answer_started: bool,
     live_tokens: u64,
     scroll: usize,
     follow_output: bool,
@@ -120,6 +121,7 @@ impl App {
             activity: Activity::Idle,
             live_thinking: String::new(),
             live_answer: String::new(),
+            live_answer_started: false,
             live_tokens: 0,
             scroll: 0,
             follow_output: true,
@@ -142,6 +144,7 @@ impl App {
         self.editor.remember(input.clone());
         self.live_thinking.clear();
         self.live_answer.clear();
+        self.live_answer_started = false;
         self.live_tokens = 0;
         self.activity = Activity::Preparing;
         self.status = "正在组装上下文…".into();
@@ -265,19 +268,22 @@ impl App {
                     if let Some(tokens) = event.live_output_tokens {
                         self.live_tokens = tokens;
                     }
-                    match event.kind {
-                        ChatEventKind::Thinking => self.live_thinking.push_str(&event.text),
-                        ChatEventKind::Content => self.live_answer.push_str(&event.text),
-                        ChatEventKind::Usage | ChatEventKind::Completed => {}
-                    }
+                    append_live_stream_event(
+                        &mut self.live_thinking,
+                        &mut self.live_answer,
+                        &mut self.live_answer_started,
+                        &event,
+                    );
                 }
                 BackgroundEvent::Finished { session, result } => {
                     self.session = *session;
-                    if !self.live_thinking.is_empty() {
+                    if !self.live_answer_started && !self.live_thinking.is_empty() {
                         self.messages.push(Message {
                             role: Role::Thinking,
                             content: std::mem::take(&mut self.live_thinking),
                         });
+                    } else {
+                        self.live_thinking.clear();
                     }
                     if !self.live_answer.is_empty() {
                         self.messages.push(Message {
@@ -285,6 +291,7 @@ impl App {
                             content: std::mem::take(&mut self.live_answer),
                         });
                     }
+                    self.live_answer_started = false;
                     if let Some(summary) = self.session.turns.last().and_then(provenance_summary) {
                         self.messages.push(Message {
                             role: Role::Debug,
@@ -525,6 +532,23 @@ const fn same_session_status() -> &'static str {
     "已是当前会话。"
 }
 
+fn append_live_stream_event(
+    live_thinking: &mut String,
+    live_answer: &mut String,
+    live_answer_started: &mut bool,
+    event: &ChatEvent,
+) {
+    match event.kind {
+        ChatEventKind::Thinking if !*live_answer_started => live_thinking.push_str(&event.text),
+        ChatEventKind::Content => {
+            *live_answer_started = true;
+            live_thinking.clear();
+            live_answer.push_str(&event.text);
+        }
+        ChatEventKind::Thinking | ChatEventKind::Usage | ChatEventKind::Completed => {}
+    }
+}
+
 fn messages_from_session(session: &Session) -> Vec<Message> {
     let mut messages = vec![Message {
         role: Role::System,
@@ -535,7 +559,7 @@ fn messages_from_session(session: &Session) -> Vec<Message> {
             role: Role::User,
             content: turn.user_content.clone(),
         });
-        if !turn.thinking.is_empty() {
+        if !turn.thinking.is_empty() && turn.assistant_content.is_empty() {
             messages.push(Message {
                 role: Role::Thinking,
                 content: turn.thinking.clone(),
@@ -1406,7 +1430,21 @@ fn byte_at_character_column(text: &str, start: usize, end: usize, column: usize)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ChatMessage, ContextPlan, Session};
+    use crate::model::{ChatMessage, ContextPlan, Session, Turn};
+
+    fn session_with_turn(turn: Turn) -> Session {
+        let mut session = Session::new(
+            "session-id".into(),
+            "model-name".into(),
+            "http://localhost:11434".into(),
+            "system".into(),
+            Default::default(),
+            true,
+        )
+        .unwrap();
+        session.turns.push(turn);
+        session
+    }
 
     #[test]
     fn editor_handles_utf8_boundaries() {
@@ -1448,6 +1486,81 @@ mod tests {
         ];
         assert_eq!(visible_messages(&messages, false).count(), 1);
         assert_eq!(visible_messages(&messages, true).count(), 2);
+    }
+
+    #[test]
+    fn live_thinking_is_cleared_when_answer_starts_and_stays_hidden() {
+        let mut thinking = String::new();
+        let mut answer = String::new();
+        let mut answer_started = false;
+
+        append_live_stream_event(
+            &mut thinking,
+            &mut answer,
+            &mut answer_started,
+            &ChatEvent::text(ChatEventKind::Thinking, "working through it".into(), 1),
+        );
+        assert_eq!(thinking, "working through it");
+
+        append_live_stream_event(
+            &mut thinking,
+            &mut answer,
+            &mut answer_started,
+            &ChatEvent::text(ChatEventKind::Content, String::new(), 2),
+        );
+        assert!(answer_started);
+        assert!(thinking.is_empty());
+        assert!(answer.is_empty());
+
+        append_live_stream_event(
+            &mut thinking,
+            &mut answer,
+            &mut answer_started,
+            &ChatEvent::text(ChatEventKind::Thinking, "late thought".into(), 3),
+        );
+        append_live_stream_event(
+            &mut thinking,
+            &mut answer,
+            &mut answer_started,
+            &ChatEvent::text(ChatEventKind::Content, "final answer".into(), 4),
+        );
+        assert!(thinking.is_empty());
+        assert_eq!(answer, "final answer");
+    }
+
+    #[test]
+    fn session_messages_hide_thinking_when_answer_exists() {
+        let mut turn = Turn::pending("question".into());
+        turn.thinking = "private reasoning".into();
+        turn.assistant_content = "answer".into();
+        let session = session_with_turn(turn);
+
+        let messages = messages_from_session(&session);
+
+        assert!(
+            messages
+                .iter()
+                .any(|message| { message.role == Role::Assistant && message.content == "answer" })
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message.role == Role::Thinking)
+        );
+        assert_eq!(session.turns[0].thinking, "private reasoning");
+    }
+
+    #[test]
+    fn session_messages_keep_thinking_without_answer() {
+        let mut turn = Turn::pending("question".into());
+        turn.thinking = "unfinished reasoning".into();
+        let session = session_with_turn(turn);
+
+        let messages = messages_from_session(&session);
+
+        assert!(messages.iter().any(|message| {
+            message.role == Role::Thinking && message.content == "unfinished reasoning"
+        }));
     }
 
     #[test]
