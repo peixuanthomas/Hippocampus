@@ -420,6 +420,9 @@ fn validate_embedding_request(request: &EmbeddingRequest) -> Result<(), OllamaEr
     if request.input.iter().any(|text| text.trim().is_empty()) {
         return Err(OllamaError::Other("嵌入输入不能包含空文本".into()));
     }
+    if request.dimensions == Some(0) {
+        return Err(OllamaError::Other("嵌入维度必须大于零".into()));
+    }
     Ok(())
 }
 
@@ -544,6 +547,8 @@ fn parse_structured_chat_response(payload: &Value) -> Result<StructuredChatRespo
         .and_then(Value::as_str)
         .filter(|content| !content.trim().is_empty())
         .ok_or_else(|| OllamaError::Protocol("Ollama 结构化响应缺少非空内容".into()))?;
+    serde_json::from_str::<Value>(content)
+        .map_err(|_| OllamaError::Protocol("Ollama 结构化响应内容不是有效 JSON".into()))?;
     let input = payload.get("prompt_eval_count").and_then(Value::as_u64);
     let output = payload.get("eval_count").and_then(Value::as_u64);
     let (Some(input), Some(output)) = (input, output) else {
@@ -1356,6 +1361,7 @@ mod tests {
     #[test]
     fn embedding_contract_rejects_invalid_requests_and_responses() {
         let request = embedding_request();
+        assert!(validate_embedding_request(&request).is_ok());
         for payload in [
             json!({"model":"m","embeddings":[[1.0, 2.0, 3.0]]}),
             json!({"model":"m","embeddings":[[1.0, 2.0], [3.0, 4.0]]}),
@@ -1381,8 +1387,11 @@ mod tests {
         invalid = request.clone();
         invalid.input.clear();
         assert!(validate_embedding_request(&invalid).is_err());
-        invalid = request;
+        invalid = request.clone();
         invalid.input[1] = "\t".into();
+        assert!(validate_embedding_request(&invalid).is_err());
+        invalid = request;
+        invalid.dimensions = Some(0);
         assert!(validate_embedding_request(&invalid).is_err());
     }
 
@@ -1424,6 +1433,15 @@ mod tests {
         ] {
             assert!(parse_structured_chat_response(&payload).is_err());
         }
+        assert_eq!(
+            parse_structured_chat_response(&json!({
+                "message": {"content": "not json"},
+                "prompt_eval_count": 1,
+                "eval_count": 1
+            }))
+            .unwrap_err(),
+            OllamaError::Protocol("Ollama 结构化响应内容不是有效 JSON".into())
+        );
 
         let mut invalid = request.clone();
         invalid.model.clear();
