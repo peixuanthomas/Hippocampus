@@ -27,6 +27,7 @@ use unicode_width::UnicodeWidthChar;
 use crate::engine::{ChatEngine, LimitAction, PreparationStatus};
 use crate::model::{ChatEvent, ChatEventKind, Session, Turn};
 use crate::ollama::{ChatBackend, ModelInfo, OllamaClient};
+use crate::store::IndexSyncAfterSourceCommit;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Role {
@@ -54,7 +55,18 @@ enum Activity {
     Switching,
 }
 
-type SwitchResult = std::result::Result<(ChatEngine<OllamaClient>, Session, ModelInfo), String>;
+enum SwitchOutcome {
+    Noop,
+    Ready(Box<SwitchReady>),
+}
+
+struct SwitchReady {
+    engine: ChatEngine<OllamaClient>,
+    session: Session,
+    model_info: ModelInfo,
+}
+
+type SwitchResult = std::result::Result<SwitchOutcome, String>;
 
 enum BackgroundEvent {
     Status(String),
@@ -198,27 +210,30 @@ impl App {
     }
 
     fn start_session_switch(&mut self, identifier: String) {
-        if identifier == self.session.id {
-            self.push_system("已是当前会话。".to_owned());
-            return;
-        }
         self.activity = Activity::Switching;
         self.status = format!("正在切换到会话 {identifier}…");
         self.switch_generation = self.switch_generation.wrapping_add(1);
         let generation = self.switch_generation;
         let store = self.engine.store().clone();
         let config = self.engine.config().clone();
+        let active_session_id = self.session.id.clone();
         let tx = self.tx.clone();
         self.switch_task = Some(tokio::spawn(async move {
             let result: Result<_> = async {
-                let mut target = store.load(&identifier)?;
+                let target = store.load(&identifier)?;
+                if target.id == active_session_id {
+                    return Ok(SwitchOutcome::Noop);
+                }
                 let client = OllamaClient::new(&target.ollama_host)?;
                 let info = client
                     .check_model(&target.model, target.budget.context_window)
                     .await?;
-                store.reopen(&mut target)?;
                 let engine = ChatEngine::with_config(store, client, config);
-                Ok((engine, target, info))
+                Ok(SwitchOutcome::Ready(Box::new(SwitchReady {
+                    engine,
+                    session: target,
+                    model_info: info,
+                })))
             }
             .await;
             let _ = tx.send(BackgroundEvent::SessionSwitched {
@@ -312,14 +327,38 @@ impl App {
                     self.switch_task = None;
                     self.activity = Activity::Idle;
                     match *result {
-                        Ok((engine, session, model_info)) => {
-                            self.engine = engine;
-                            self.session = session;
-                            self.model_info = model_info;
-                            self.messages = messages_from_session(&self.session);
-                            self.scroll = 0;
-                            self.follow_output = true;
-                            self.status = "已切换会话。".into();
+                        Ok(SwitchOutcome::Noop) => self.push_system("已是当前会话。"),
+                        Ok(SwitchOutcome::Ready(ready)) => {
+                            let SwitchReady {
+                                engine,
+                                mut session,
+                                model_info,
+                            } = *ready;
+                            match engine.store().reopen(&mut session) {
+                                Ok(()) => {
+                                    self.accept_session_switch(engine, session, model_info, None)
+                                }
+                                Err(error) => {
+                                    let committed = error
+                                        .downcast_ref::<IndexSyncAfterSourceCommit>()
+                                        .is_some();
+                                    let warning = error.to_string();
+                                    if committed
+                                        && let Ok(persisted) = engine.store().load(&session.id)
+                                        && persisted.status == crate::model::SessionStatus::Active
+                                    {
+                                        self.accept_session_switch(
+                                            engine,
+                                            persisted,
+                                            model_info,
+                                            Some(warning),
+                                        );
+                                    } else {
+                                        self.status = format!("切换会话失败：{warning}");
+                                        self.push_error(self.status.clone());
+                                    }
+                                }
+                            }
                         }
                         Err(error) => {
                             self.status = format!("切换会话失败：{error}");
@@ -344,6 +383,25 @@ impl App {
             self.switch_generation = self.switch_generation.wrapping_add(1);
             self.activity = Activity::Idle;
             self.status = "已取消会话切换。".into();
+        }
+    }
+
+    fn accept_session_switch(
+        &mut self,
+        engine: ChatEngine<OllamaClient>,
+        session: Session,
+        model_info: ModelInfo,
+        warning: Option<String>,
+    ) {
+        self.engine = engine;
+        self.session = session;
+        self.model_info = model_info;
+        self.messages = messages_from_session(&self.session);
+        self.scroll = 0;
+        self.follow_output = true;
+        self.status = "已切换会话。".into();
+        if let Some(warning) = warning {
+            self.push_error(format!("会话已切换，但派生索引同步失败：{warning}"));
         }
     }
 
@@ -641,12 +699,12 @@ pub async fn run(
     let mut bracketed_paste = false;
     let mut mouse_capture = false;
     let result: Result<Session> = async {
-        execute!(terminal.backend_mut(), EnterAlternateScreen)?;
         alternate_screen = true;
-        execute!(terminal.backend_mut(), EnableBracketedPaste)?;
+        execute!(terminal.backend_mut(), EnterAlternateScreen)?;
         bracketed_paste = true;
-        execute!(terminal.backend_mut(), EnableMouseCapture)?;
+        execute!(terminal.backend_mut(), EnableBracketedPaste)?;
         mouse_capture = true;
+        execute!(terminal.backend_mut(), EnableMouseCapture)?;
         terminal.clear()?;
         run_loop(&mut terminal, App::new(engine, session, model_info)).await
     }
@@ -727,26 +785,24 @@ async fn run_loop(
 }
 
 fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
-    if app.activity == Activity::AwaitingLimit {
-        match key.code {
-            KeyCode::Enter | KeyCode::Char('c' | 'C' | 'y' | 'Y') => {
-                app.resolve_limit(LimitAction::ContinueWithTrim)
-            }
-            KeyCode::Esc | KeyCode::Char('e' | 'E' | 'n' | 'N') => {
-                app.resolve_limit(LimitAction::EndSession)
-            }
-            _ => {}
-        }
-        return Ok(true);
-    }
-
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        if app.activity == Activity::AwaitingLimit {
+            app.resolve_limit(limit_action_for_key(key).expect("Ctrl+C ends pending limit"));
+            return Ok(true);
+        }
         if app.activity == Activity::Idle {
             return Ok(false);
         }
         app.cancel_generation();
         return Ok(true);
     }
+    if app.activity == Activity::AwaitingLimit {
+        if let Some(action) = limit_action_for_key(key) {
+            app.resolve_limit(action);
+        }
+        return Ok(true);
+    }
+
     match key.code {
         KeyCode::PageUp => {
             app.scroll_up(8);
@@ -793,6 +849,19 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
         _ => {}
     }
     Ok(true)
+}
+
+fn limit_action_for_key(key: KeyEvent) -> Option<LimitAction> {
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        return Some(LimitAction::EndSession);
+    }
+    match key.code {
+        KeyCode::Enter | KeyCode::Char('c' | 'C' | 'y' | 'Y') => {
+            Some(LimitAction::ContinueWithTrim)
+        }
+        KeyCode::Esc | KeyCode::Char('e' | 'E' | 'n' | 'N') => Some(LimitAction::EndSession),
+        _ => None,
+    }
 }
 
 fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
@@ -1428,5 +1497,11 @@ mod tests {
         assert_eq!(window.len(), 3);
         assert_eq!(window[0].to_string(), "65536");
         assert_eq!(window[2].to_string(), "65538");
+    }
+
+    #[test]
+    fn ctrl_c_ends_a_pending_limit_instead_of_continuing() {
+        let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(limit_action_for_key(key), Some(LimitAction::EndSession));
     }
 }
