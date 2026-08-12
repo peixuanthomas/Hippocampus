@@ -327,7 +327,11 @@ impl App {
                     self.switch_task = None;
                     self.activity = Activity::Idle;
                     match *result {
-                        Ok(SwitchOutcome::Noop) => self.push_system("已是当前会话。"),
+                        Ok(SwitchOutcome::Noop) => {
+                            self.activity = Activity::Idle;
+                            self.status = same_session_status().into();
+                            self.push_system(same_session_status());
+                        }
                         Ok(SwitchOutcome::Ready(ready)) => {
                             let SwitchReady {
                                 engine,
@@ -517,6 +521,10 @@ impl App {
     }
 }
 
+const fn same_session_status() -> &'static str {
+    "已是当前会话。"
+}
+
 fn messages_from_session(session: &Session) -> Vec<Message> {
     let mut messages = vec![Message {
         role: Role::System,
@@ -686,7 +694,10 @@ pub async fn run(
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         bail!("TUI 需要交互终端；脚本调用请使用 `hippocampus ask \"问题\"`");
     }
-    enable_raw_mode()?;
+    if let Err(error) = enable_raw_mode() {
+        let _ = disable_raw_mode();
+        return Err(error.into());
+    }
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = match Terminal::new(backend) {
         Ok(terminal) => terminal,
@@ -1503,5 +1514,10 @@ mod tests {
     fn ctrl_c_ends_a_pending_limit_instead_of_continuing() {
         let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert_eq!(limit_action_for_key(key), Some(LimitAction::EndSession));
+    }
+
+    #[test]
+    fn same_session_switch_reports_idle_status() {
+        assert_eq!(same_session_status(), "已是当前会话。");
     }
 }
