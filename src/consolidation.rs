@@ -2248,6 +2248,7 @@ fn validate_memory_v2_semantics_and_history(connection: &Connection) -> Retrieva
                 claim.polarity,
                 &outer,
                 &subject_quote,
+                &relation_quote,
                 &object_quote,
                 speech_act.as_ref(),
                 "stored_evidence",
@@ -2466,6 +2467,29 @@ fn load_event_quote_from_span(
     )
 }
 
+fn validate_stored_ascii_token_boundary(
+    connection: &Connection,
+    session_id: &str,
+    quote: &ConsolidationQuote,
+    label: &str,
+) -> RetrievalResult<()> {
+    let content = connection
+        .query_row(
+            "SELECT content FROM events WHERE event_id = ?1 AND session_id = ?2",
+            params![quote.event_id, session_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(candidate_database_error)?
+        .ok_or_else(|| RetrievalError::CorruptIndex(format!("{label} 的身份片段来源事件不存在")))?;
+    if !identity_span_has_complete_token_boundary(&content, quote.start_char, quote.end_char) {
+        return Err(RetrievalError::CorruptIndex(format!(
+            "{label} 截取了更长的 ASCII/NFKC 身份 token"
+        )));
+    }
+    Ok(())
+}
+
 fn resolved_entity_view(entity: &MemoryEntityCandidate) -> ResolvedEntityView {
     let mut normalized_names = vec![entity.normalized_name.clone()];
     normalized_names.extend(
@@ -2524,6 +2548,24 @@ fn validate_stored_alias_proof(
     let identity_matches = names.contains(&normalize_match(&identity.text))
         || alias.kind == MemoryAliasKind::StableIdentifier
             && normalize_match(&identity.text) == alias.normalized_text;
+    validate_stored_ascii_token_boundary(
+        connection,
+        &alias.session_id,
+        &evidence.quote,
+        "alias.evidence",
+    )?;
+    validate_stored_ascii_token_boundary(
+        connection,
+        &alias.session_id,
+        &identity.quote,
+        "alias.identity_evidence",
+    )?;
+    let proof_semantics_valid = match alias.kind {
+        MemoryAliasKind::ExplicitAlias => has_exact_alias_connector(&proof, &evidence, &identity),
+        MemoryAliasKind::StableIdentifier => {
+            spans_share_strong_clause(&proof, &[&evidence, &identity])
+        }
+    };
     if evidence.role != EventRole::User
         || proof.role != EventRole::User
         || identity.role != EventRole::User
@@ -2531,7 +2573,7 @@ fn validate_stored_alias_proof(
         || !nested(&evidence)
         || !nested(&identity)
         || !identity_matches
-        || alias.kind == MemoryAliasKind::ExplicitAlias && !contains_alias_marker(&proof.text)
+        || !proof_semantics_valid
     {
         return Err(RetrievalError::CorruptIndex(format!(
             "别名 {} 的证明、标记或实体归属不匹配",
@@ -2606,6 +2648,7 @@ struct StoredTransition {
     session: String,
     batch: String,
     created_at: String,
+    created_instant: DateTime<FixedOffset>,
 }
 
 fn validate_transition_history(
@@ -2616,7 +2659,7 @@ fn validate_transition_history(
         .prepare(
             "SELECT transition_id, claim_id, from_state, to_state, reason, related_claim_id,
                     session_id, batch_key, created_at
-             FROM memory_claim_transitions ORDER BY claim_id, created_at, transition_id",
+             FROM memory_claim_transitions ORDER BY claim_id, transition_id",
         )
         .map_err(candidate_database_error)?;
     let rows = statement
@@ -2641,6 +2684,7 @@ fn validate_transition_history(
     drop(statement);
     let mut grouped = HashMap::<String, Vec<StoredTransition>>::new();
     for (id, claim_id, from, to, reason, related, session, batch, created_at) in rows {
+        let created_instant = parse_stored_time(&created_at, "transition.created_at")?;
         grouped
             .entry(claim_id.clone())
             .or_default()
@@ -2654,18 +2698,28 @@ fn validate_transition_history(
                 session,
                 batch,
                 created_at,
+                created_instant,
             });
     }
     for (claim_id, claim) in claims {
-        let chain = grouped
+        let mut chain = grouped
             .remove(*claim_id)
             .ok_or_else(|| RetrievalError::CorruptIndex(format!("声明 {claim_id} 缺少状态迁移")))?;
+        chain.sort_by(|left, right| {
+            left.created_instant
+                .cmp(&right.created_instant)
+                .then_with(|| (left.reason != "created").cmp(&(right.reason != "created")))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        let claim_created = parse_stored_time(&claim.created_at, "claim.created_at")?;
+        let claim_updated = parse_stored_time(&claim.updated_at, "claim.updated_at")?;
         if chain.first().is_none_or(|transition| {
-            transition.created_at != claim.created_at
+            transition.created_instant != claim_created
                 || transition.batch != claim.created_batch_key
                 || transition.session != claim.session_id
         }) || chain.last().is_none_or(|transition| {
-            transition.created_at != claim.updated_at || transition.batch != claim.updated_batch_key
+            transition.created_instant != claim_updated
+                || transition.batch != claim.updated_batch_key
         }) {
             return Err(RetrievalError::CorruptIndex(format!(
                 "声明 {claim_id} 的首尾迁移与声明创建/更新时间不一致"
@@ -2702,14 +2756,10 @@ fn validate_transition_history(
                     transition.reason,
                 )));
             }
-            let related_required = matches!(
-                transition.reason.as_str(),
-                "conflicted" | "corrected" | "replaced"
-            );
+            let has_related = transition.related.is_some();
             let legal = match transition.reason.as_str() {
                 "created" => {
                     index == 0
-                        && transition.related.is_none()
                         && transition.to != MemoryClaimState::Superseded
                         && (transition.to == MemoryClaimState::Conflicted
                             || transition.to == MemoryClaimState::Active
@@ -2724,9 +2774,9 @@ fn validate_transition_history(
                         && transition.to == MemoryClaimState::Active
                         && transition.related.is_none()
                 }
-                "conflicted" => transition.to == MemoryClaimState::Conflicted && related_required,
+                "conflicted" => transition.to == MemoryClaimState::Conflicted && has_related,
                 "corrected" | "replaced" => {
-                    transition.to == MemoryClaimState::Superseded && related_required
+                    transition.to == MemoryClaimState::Superseded && has_related
                 }
                 _ => false,
             };
@@ -2742,6 +2792,7 @@ fn validate_transition_history(
                 if related.subject_entity_id != claim.subject_entity_id
                     || related.predicate_key != claim.predicate_key
                     || related.created_batch_key != transition.batch
+                    || !stored_claims_contradict(claim, related)
                 {
                     return Err(RetrievalError::CorruptIndex(format!(
                         "迁移 {} 的关联声明语义或批次不匹配",
@@ -2756,6 +2807,13 @@ fn validate_transition_history(
                         transition.id
                     )));
                 }
+            }
+            if transition.reason == "created"
+                && (transition.to != MemoryClaimState::Conflicted && transition.related.is_some())
+            {
+                return Err(RetrievalError::CorruptIndex(format!(
+                    "声明 {claim_id} 的 created 迁移关联声明不合法"
+                )));
             }
             previous = Some(transition.to);
         }
@@ -4477,7 +4535,7 @@ fn validate_existing_explicit_alias(
     if !matching
         || normalize_match(&name_quote.text) != output_name
         || !candidate_names.contains(&normalize_match(&identity_quote.text))
-        || !contains_alias_marker(&resolution_quote.text)
+        || !has_exact_alias_connector(&resolution_quote, &name_quote, &identity_quote)
     {
         return Err(rejected(
             "explicit_alias_proof",
@@ -4521,11 +4579,29 @@ fn validate_existing_stable_id(
         &output.name_evidence,
         &format!("{path}.name_evidence"),
     )?;
+    let identity_quote = validate_nested_quote(
+        batch,
+        resolution,
+        identity,
+        &format!("{path}.existing_identity_evidence"),
+    )?;
+    validate_ascii_token_boundary(
+        batch,
+        identity,
+        &format!("{path}.existing_identity_evidence"),
+    )?;
     if name_quote.text != output.name {
         return Err(rejected(
             "stable_identifier_name",
             format!("{path}.name_evidence"),
             "稳定标识合并的名称必须由证明中的实体名称精确片段提供",
+        ));
+    }
+    if !spans_share_strong_clause(&resolution_quote, &[&name_quote, &identity_quote]) {
+        return Err(rejected(
+            "stable_identifier_clause",
+            format!("{path}.resolution_evidence"),
+            "稳定标识和实体名称必须位于同一强分句",
         ));
     }
     let mut matched = false;
@@ -4623,6 +4699,11 @@ fn validate_entity_aliases(
             identity_source,
             &format!("{alias_path}.identity_evidence"),
         )?;
+        validate_ascii_token_boundary(
+            batch,
+            identity_source,
+            &format!("{alias_path}.identity_evidence"),
+        )?;
         let normalized_identity = normalize_match(&identity.text);
         let identity_matches = entity_names.contains(&normalized_identity)
             || alias.kind == MemoryAliasKind::StableIdentifier && normalized_identity == normalized;
@@ -4635,7 +4716,9 @@ fn validate_entity_aliases(
         }
         let stable_kind = match alias.kind {
             MemoryAliasKind::ExplicitAlias => {
-                if alias.stable_identifier_kind.is_some() || !contains_alias_marker(&proof.text) {
+                if alias.stable_identifier_kind.is_some()
+                    || !has_exact_alias_connector(&proof, &alias_in_proof, &identity)
+                {
                     return Err(rejected(
                         "explicit_alias_contract",
                         alias_path,
@@ -4645,6 +4728,13 @@ fn validate_entity_aliases(
                 None
             }
             MemoryAliasKind::StableIdentifier => {
+                if !spans_share_strong_clause(&proof, &[&alias_in_proof, &identity]) {
+                    return Err(rejected(
+                        "stable_identifier_clause",
+                        alias_path.clone(),
+                        "稳定标识和实体名称必须位于同一强分句",
+                    ));
+                }
                 let kind = alias
                     .stable_identifier_kind
                     .as_deref()
@@ -4979,6 +5069,7 @@ fn validate_claims(
                 output.polarity,
                 &quote,
                 &subject,
+                &relation,
                 &object,
                 speech_act.as_ref(),
                 &evidence_path,
@@ -5498,6 +5589,27 @@ fn claim_contradicts(
     }
 }
 
+fn stored_claims_contradict(
+    transitioned: &MemoryClaimCandidate,
+    related: &MemoryClaimCandidate,
+) -> bool {
+    transitioned.subject_entity_id == related.subject_entity_id
+        && transitioned.predicate_key == related.predicate_key
+        && intervals_overlap(
+            &transitioned.valid_from,
+            transitioned.valid_to.as_deref(),
+            &related.valid_from,
+            related.valid_to.as_deref(),
+        )
+        && claim_contradicts(
+            transitioned,
+            related.object_kind,
+            &related.normalized_object,
+            related.polarity,
+            related.cardinality,
+        )
+}
+
 fn planned_claims_contradict(left: &ValidatedClaim, right: &ValidatedClaim) -> bool {
     let same_object =
         left.object_kind == right.object_kind && left.normalized_object == right.normalized_object;
@@ -5721,10 +5833,23 @@ fn validate_ascii_token_boundary(
         .iter()
         .find(|event| event.event_id == quote.event_id)
         .ok_or_else(|| rejected("quote_event", path, "身份片段引用了批次外事件"))?;
-    let chars = event.content.chars().collect::<Vec<_>>();
-    let text = chars[quote.start_char..quote.end_char]
-        .iter()
-        .collect::<String>();
+    if !identity_span_has_complete_token_boundary(&event.content, quote.start_char, quote.end_char)
+    {
+        return Err(rejected(
+            "identity_boundary",
+            path,
+            "ASCII/NFKC 身份片段必须具有完整词边界，不能截取名称或标识前缀",
+        ));
+    }
+    Ok(())
+}
+
+fn identity_span_has_complete_token_boundary(content: &str, start: usize, end: usize) -> bool {
+    let chars = content.chars().collect::<Vec<_>>();
+    let Some(span) = chars.get(start..end) else {
+        return false;
+    };
+    let text = span.iter().collect::<String>();
     let normalized = normalize_match(&text);
     let ascii_identity = normalized.chars().any(|ch| ch.is_ascii_alphanumeric())
         && normalized.chars().all(|ch| {
@@ -5738,25 +5863,16 @@ fn validate_ascii_token_boundary(
             .nfkc()
             .any(|normalized| normalized.is_ascii_alphanumeric() || normalized == '_')
     };
-    if ascii_identity
-        && (quote
-            .start_char
+    !(ascii_identity
+        && (start
             .checked_sub(1)
             .and_then(|index| chars.get(index))
             .copied()
             .is_some_and(adjacent_is_ascii_identity)
             || chars
-                .get(quote.end_char)
+                .get(end)
                 .copied()
-                .is_some_and(adjacent_is_ascii_identity))
-    {
-        return Err(rejected(
-            "identity_boundary",
-            path,
-            "ASCII/NFKC 身份片段必须具有完整词边界，不能截取名称或标识前缀",
-        ));
-    }
-    Ok(())
+                .is_some_and(adjacent_is_ascii_identity)))
 }
 
 fn validate_exact_text(value: &str, max: usize, path: &str) -> ConsolidationApplyResult<()> {
@@ -5852,15 +5968,37 @@ fn claim_subject_span_matches(
             }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_evidence_semantics(
     kind: ConsolidationEvidenceKind,
     polarity: ClaimPolarity,
     quote: &ValidatedQuote,
     subject: &ValidatedQuote,
+    relation: &ValidatedQuote,
     object: &ValidatedQuote,
     speech_act: Option<&ValidatedQuote>,
     path: &str,
 ) -> ConsolidationApplyResult<()> {
+    let mut clause_spans = vec![subject, relation, object];
+    if let Some(speech_act) = speech_act {
+        clause_spans.push(speech_act);
+    }
+    if !spans_share_strong_clause(quote, &clause_spans) {
+        return Err(rejected(
+            "evidence_clause",
+            path,
+            "speech_act 与完整主语、关系、对象片段必须位于同一强分句",
+        ));
+    }
+    if subject.quote.end_char > relation.quote.start_char
+        || relation.quote.end_char > object.quote.start_char
+    {
+        return Err(rejected(
+            "evidence_role_order",
+            path,
+            "三元组片段必须按主语、关系、对象顺序出现且不得重叠",
+        ));
+    }
     let semantic_start = subject
         .quote
         .start_char
@@ -5933,11 +6071,14 @@ fn validate_evidence_semantics(
             if invalid_context {
                 return Err(reject_context());
             }
-            if !is_exact_affirmative_cue(&marker.text) || contains_negative_cue(&quote.text) {
+            if !is_exact_affirmative_cue(&marker.text)
+                || marker.quote.end_char > subject.quote.start_char
+                || contains_negative_cue(&quote.text)
+            {
                 return Err(rejected(
                     "confirmation_marker",
                     format!("{path}.speech_act_span"),
-                    "肯定确认必须使用受支持的精确确认提示，且外层证据不得含否定提示",
+                    "肯定确认必须在三元组前使用受支持的精确确认提示，且外层证据不得含否定提示",
                 ));
             }
         }
@@ -5946,11 +6087,13 @@ fn validate_evidence_semantics(
             if invalid_context {
                 return Err(reject_context());
             }
-            if !is_exact_negative_cue(&marker.text) {
+            if !is_exact_negative_cue(&marker.text)
+                || marker.quote.end_char > subject.quote.start_char
+            {
                 return Err(rejected(
                     "confirmation_marker",
                     format!("{path}.speech_act_span"),
-                    "否定确认必须使用受支持的精确否定提示",
+                    "否定确认必须在三元组前使用受支持的精确否定提示",
                 ));
             }
         }
@@ -6084,11 +6227,27 @@ fn evidence_has_invalid_context(value: &str) -> bool {
     let normalized = normalize_cue(value);
     let trimmed = normalized.trim();
     let question = trimmed.chars().any(|ch| matches!(ch, '?' | '？'))
+        || [
+            "是否",
+            "是不是",
+            "有没有",
+            "会不会",
+            "能不能",
+            "可不可以",
+            "要不要",
+            "对不对",
+            "喜不喜欢",
+            "住不住",
+            "在不在",
+            "叫不叫",
+        ]
+        .iter()
+        .any(|marker| normalized.contains(marker))
         || trimmed
             .trim_end_matches(['。', '.', '!', '！', '?', '？'])
             .chars()
             .next_back()
-            .is_some_and(|ch| matches!(ch, '吗' | '么' | '呢'))
+            .is_some_and(|ch| matches!(ch, '吗' | '么' | '呢' | '嘛'))
         || [
             "do", "does", "did", "is", "are", "was", "were", "can", "could", "would", "should",
         ]
@@ -6129,7 +6288,10 @@ fn evidence_has_invalid_context(value: &str) -> bool {
         ]
         .iter()
         .any(|marker| contains_ascii_word(&normalized, marker));
-    question || conditional || attribution
+    let quoted_envelope = value
+        .chars()
+        .any(|ch| matches!(ch, '"' | '“' | '”' | '「' | '」' | '『' | '』' | '`'));
+    question || conditional || attribution || quoted_envelope
 }
 
 fn contains_ascii_word(value: &str, needle: &str) -> bool {
@@ -6147,22 +6309,101 @@ fn contains_ascii_word(value: &str, needle: &str) -> bool {
     })
 }
 
-fn contains_alias_marker(value: &str) -> bool {
-    let normalized = normalize_match(value);
-    [
-        "也叫",
-        "又叫",
-        "昵称",
-        "别名",
-        "即",
-        "简称",
-        "aka",
-        "also known as",
-        "call me",
-        "叫我",
-    ]
-    .iter()
-    .any(|marker| normalized.contains(marker))
+fn spans_share_strong_clause(outer: &ValidatedQuote, spans: &[&ValidatedQuote]) -> bool {
+    let chars = outer.text.chars().collect::<Vec<_>>();
+    let is_separator = |ch: char| {
+        matches!(
+            ch,
+            '.' | '。' | '!' | '！' | '?' | '？' | ';' | '；' | '\n' | '\r'
+        )
+    };
+    let mut expected_segment = None;
+    for span in spans {
+        if span.quote.event_id != outer.quote.event_id
+            || span.quote.start_char < outer.quote.start_char
+            || span.quote.end_char > outer.quote.end_char
+        {
+            return false;
+        }
+        let start = span.quote.start_char - outer.quote.start_char;
+        let end = span.quote.end_char - outer.quote.start_char;
+        let Some(span_chars) = chars.get(start..end) else {
+            return false;
+        };
+        if span_chars.iter().copied().any(is_separator) {
+            return false;
+        }
+        let segment = chars[..start]
+            .iter()
+            .copied()
+            .filter(|ch| is_separator(*ch))
+            .count();
+        if expected_segment
+            .replace(segment)
+            .is_some_and(|expected| expected != segment)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn has_exact_alias_connector(
+    proof: &ValidatedQuote,
+    first_identity: &ValidatedQuote,
+    second_identity: &ValidatedQuote,
+) -> bool {
+    if !spans_share_strong_clause(proof, &[first_identity, second_identity]) {
+        return false;
+    }
+    let (left, right) = if first_identity.quote.start_char <= second_identity.quote.start_char {
+        (first_identity, second_identity)
+    } else {
+        (second_identity, first_identity)
+    };
+    if left.quote.end_char > right.quote.start_char {
+        return false;
+    }
+    let start = left.quote.end_char - proof.quote.start_char;
+    let end = right.quote.start_char - proof.quote.start_char;
+    let Some(connector) = slice_unicode(&proof.text, start, end) else {
+        return false;
+    };
+    let normalized = normalize_match(connector);
+    let trimmed = normalized.trim_matches(|ch: char| {
+        ch.is_whitespace()
+            || matches!(
+                ch,
+                ',' | '，'
+                    | ':'
+                    | '：'
+                    | ';'
+                    | '；'
+                    | '('
+                    | ')'
+                    | '（'
+                    | '）'
+                    | '['
+                    | ']'
+                    | '【'
+                    | '】'
+            )
+    });
+    matches!(
+        trimmed,
+        "也叫"
+            | "又叫"
+            | "昵称"
+            | "昵称是"
+            | "别名"
+            | "别名是"
+            | "即"
+            | "简称"
+            | "简称是"
+            | "aka"
+            | "also known as"
+            | "call me"
+    )
 }
 
 fn is_pronoun_like(value: &str) -> bool {
@@ -8374,6 +8615,7 @@ mod tests {
         fn check(
             content: &str,
             subject: (&str, usize),
+            relation: (&str, usize),
             object: (&str, usize),
             kind: ConsolidationEvidenceKind,
             polarity: ClaimPolarity,
@@ -8399,6 +8641,7 @@ mod tests {
             };
             let outer = validated(full_quote(&event));
             let subject = validated(quote_nth(&event, subject.0, subject.1));
+            let relation = validated(quote_nth(&event, relation.0, relation.1));
             let object = validated(quote_nth(&event, object.0, object.1));
             let speech =
                 speech.map(|(text, occurrence)| validated(quote_nth(&event, text, occurrence)));
@@ -8407,6 +8650,7 @@ mod tests {
                 polarity,
                 &outer,
                 &subject,
+                &relation,
                 &object,
                 speech.as_ref(),
                 "evidence",
@@ -8417,11 +8661,17 @@ mod tests {
             "Does Alice live in Paris?",
             "You said Alice lives in Paris.",
             "If Alice lives in Paris, call me.",
+            "\"Alice lives in Paris.\"",
+            "“Alice lives in Paris.”",
+            "「Alice lives in Paris.」",
+            "『Alice lives in Paris.』",
+            "`Alice lives in Paris.`",
         ] {
             assert!(
                 check(
                     context,
                     ("Alice", 0),
+                    ("live", 0),
                     ("Paris", 0),
                     ConsolidationEvidenceKind::Assertion,
                     ClaimPolarity::Assert,
@@ -8434,6 +8684,7 @@ mod tests {
             check(
                 "Alice lives in 不丹。",
                 ("Alice", 0),
+                ("lives in", 0),
                 ("不丹", 0),
                 ConsolidationEvidenceKind::Assertion,
                 ClaimPolarity::Assert,
@@ -8443,8 +8694,82 @@ mod tests {
         );
         assert!(
             check(
+                "Yes, Bob likes coffee. Alice likes tea.",
+                ("Alice", 0),
+                ("likes", 1),
+                ("tea", 0),
+                ConsolidationEvidenceKind::UserConfirmation,
+                ClaimPolarity::Assert,
+                Some(("Yes", 0)),
+            )
+            .is_err()
+        );
+        assert!(
+            check(
+                "Alice likes tea, yes.",
+                ("Alice", 0),
+                ("likes", 0),
+                ("tea", 0),
+                ConsolidationEvidenceKind::UserConfirmation,
+                ClaimPolarity::Assert,
+                Some(("yes", 0)),
+            )
+            .is_err()
+        );
+        assert!(
+            check(
+                "对，Alice喜欢茶",
+                ("Alice", 0),
+                ("喜欢", 0),
+                ("茶", 0),
+                ConsolidationEvidenceKind::UserConfirmation,
+                ClaimPolarity::Assert,
+                Some(("对", 0)),
+            )
+            .is_ok()
+        );
+        for (question, relation, object) in [
+            ("Alice是否住Paris", "住", "Paris"),
+            ("Alice是不是住Paris", "住", "Paris"),
+            ("Alice有没有住Paris", "住", "Paris"),
+            ("Alice会不会住Paris", "住", "Paris"),
+            ("Alice能不能住Paris", "住", "Paris"),
+            ("Alice可不可以住Paris", "住", "Paris"),
+            ("Alice要不要住Paris", "住", "Paris"),
+            ("Alice对不对Bob友好", "对", "Bob"),
+            ("Alice喜不喜欢茶", "喜欢", "茶"),
+            ("Alice住不住Paris", "住", "Paris"),
+            ("Alice在不在Paris", "在", "Paris"),
+            ("Alice叫不叫Ann", "叫", "Ann"),
+            ("Alice住Paris吗", "住", "Paris"),
+            ("Alice住Paris么", "住", "Paris"),
+            ("Alice住Paris呢", "住", "Paris"),
+            ("Alice住Paris嘛", "住", "Paris"),
+        ] {
+            let speech = question.contains("不是").then_some(("不是", 0));
+            assert!(
+                check(
+                    question,
+                    ("Alice", 0),
+                    (relation, 0),
+                    (object, 0),
+                    ConsolidationEvidenceKind::Assertion,
+                    if speech.is_some() {
+                        ClaimPolarity::Deny
+                    } else {
+                        ClaimPolarity::Assert
+                    },
+                    speech,
+                )
+                .is_err(),
+                "question accepted: {question}"
+            );
+        }
+        assert!(
+            check(
                 "Alice doesn't live in Paris.",
                 ("Alice", 0),
+                ("live in", 0),
                 ("Paris", 0),
                 ConsolidationEvidenceKind::Assertion,
                 ClaimPolarity::Deny,
@@ -8456,6 +8781,7 @@ mod tests {
             check(
                 "Alice didn't live in Rome; actually Alice lives in Paris.",
                 ("Alice", 1),
+                ("lives in", 0),
                 ("Paris", 0),
                 ConsolidationEvidenceKind::Correction,
                 ClaimPolarity::Assert,
@@ -8467,6 +8793,7 @@ mod tests {
             check(
                 "Correction: Alice doesn't live in Paris.",
                 ("Alice", 0),
+                ("live in", 0),
                 ("Paris", 0),
                 ConsolidationEvidenceKind::Correction,
                 ClaimPolarity::Deny,
@@ -8478,6 +8805,7 @@ mod tests {
             check(
                 "Yes, Paris is nice.",
                 ("Paris", 0),
+                ("is", 1),
                 ("nice", 0),
                 ConsolidationEvidenceKind::UserConfirmation,
                 ClaimPolarity::Assert,
@@ -8489,6 +8817,7 @@ mod tests {
             check(
                 "Alice doesn't live in Paris.",
                 ("Alice", 0),
+                ("live in", 0),
                 ("Paris", 0),
                 ConsolidationEvidenceKind::Assertion,
                 ClaimPolarity::Deny,
@@ -8496,6 +8825,100 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn structured_claims_reject_cross_clause_cues_quotes_and_cjk_questions() {
+        let validate = |content: &str,
+                        relation: (&str, usize),
+                        object: &str,
+                        kind: ConsolidationEvidenceKind,
+                        polarity: ClaimPolarity,
+                        speech: Option<(&str, usize)>| {
+            let event = ConsolidationEvent {
+                event_id: "event".into(),
+                turn_id: "turn".into(),
+                sequence: 1,
+                role: EventRole::User,
+                created_at: "2026-01-01T00:00:00Z".into(),
+                content: content.into(),
+                content_sha256: content_sha256(content),
+            };
+            let batch = ConsolidationInputBatch {
+                batch_key: "manual".into(),
+                session_id: "session".into(),
+                watermark_before: 0,
+                from_sequence: 1,
+                through_sequence: 1,
+                through_event_id: event.event_id.clone(),
+                through_event_sha256: event.content_sha256.clone(),
+                turn_count: 1,
+                char_count: content.chars().count(),
+                events: vec![event.clone()],
+            };
+            let subject_occurrence = content.matches("Alice").count() - 1;
+            let mut claim = text_claim_output(
+                "local_claim",
+                "local_alice",
+                "profile.value",
+                object,
+                quote_nth(&event, "Alice", subject_occurrence),
+                quote_nth(&event, relation.0, relation.1),
+                quote_nth(&event, object, 0),
+                full_quote(&event),
+            );
+            claim.polarity = polarity;
+            claim.evidence[0].kind = kind;
+            claim.evidence[0].speech_act_span =
+                speech.map(|(cue, occurrence)| quote_nth(&event, cue, occurrence));
+            validate_structured_output(
+                &batch,
+                &empty_candidates(),
+                &StructuredConsolidationOutput {
+                    entities: vec![new_entity_output(
+                        "local_alice",
+                        "Alice",
+                        quote_nth(&event, "Alice", subject_occurrence),
+                    )],
+                    claims: vec![claim],
+                    boundaries: Vec::new(),
+                },
+            )
+        };
+
+        assert!(matches!(
+            validate(
+                "Yes, Bob likes coffee. Alice likes tea.",
+                ("likes", 1),
+                "tea",
+                ConsolidationEvidenceKind::UserConfirmation,
+                ClaimPolarity::Assert,
+                Some(("Yes", 0)),
+            ),
+            Err(ConsolidationApplyError::Rejected { .. })
+        ));
+        assert!(matches!(
+            validate(
+                "“Alice likes tea.”",
+                ("likes", 0),
+                "tea",
+                ConsolidationEvidenceKind::Assertion,
+                ClaimPolarity::Assert,
+                None,
+            ),
+            Err(ConsolidationApplyError::Rejected { .. })
+        ));
+        assert!(matches!(
+            validate(
+                "Alice是不是住Paris",
+                ("住", 0),
+                "Paris",
+                ConsolidationEvidenceKind::UserConfirmation,
+                ClaimPolarity::Deny,
+                Some(("不是", 0)),
+            ),
+            Err(ConsolidationApplyError::Rejected { .. })
+        ));
     }
 
     #[test]
@@ -8937,7 +9360,7 @@ mod tests {
         let (alias_store, mut alias_session) = new_session(alias_root.path());
         push_complete_at(
             &mut alias_session,
-            "王明的别名是小明。",
+            "王明别名是小明。",
             None,
             "2026-01-01T00:00:00Z",
         );
@@ -9565,6 +9988,245 @@ mod tests {
     }
 
     #[test]
+    fn transition_replay_orders_mixed_offsets_by_absolute_instant() {
+        let root = tempfile::tempdir().unwrap();
+        let (store, mut session) = new_session(root.path());
+        push_complete_at(
+            &mut session,
+            "Alice likes tea.",
+            None,
+            "2026-01-01T00:59:59+01:00",
+        );
+        let first_batch = next_batch(&store, &mut session);
+        let first_event = &first_batch.events[0];
+        let initial = text_claim_output(
+            "local_tea",
+            "local_alice",
+            "preference.drink",
+            "tea",
+            quote_nth(first_event, "Alice", 0),
+            quote_nth(first_event, "likes", 0),
+            quote_nth(first_event, "tea", 0),
+            full_quote(first_event),
+        );
+        apply_output(
+            &store,
+            &first_batch,
+            &empty_candidates(),
+            &StructuredConsolidationOutput {
+                entities: vec![new_entity_output(
+                    "local_alice",
+                    "Alice",
+                    quote_nth(first_event, "Alice", 0),
+                )],
+                claims: vec![initial],
+                boundaries: Vec::new(),
+            },
+        )
+        .unwrap();
+        let candidates = store
+            .retrieval()
+            .consolidation_candidates(512, 512)
+            .unwrap();
+        let entity_id = candidates.entities[0].entity_id.clone();
+
+        push_complete_at(
+            &mut session,
+            "Yes, Alice likes tea.",
+            None,
+            "2026-01-01T00:29:59Z",
+        );
+        let second_batch = next_batch(&store, &mut session);
+        let second_event = &second_batch.events[0];
+        let mut confirmation = text_claim_output(
+            "local_confirm",
+            &entity_id,
+            "preference.drink",
+            "tea",
+            quote_nth(second_event, "Alice", 0),
+            quote_nth(second_event, "likes", 0),
+            quote_nth(second_event, "tea", 0),
+            full_quote(second_event),
+        );
+        confirmation.disposition = ClaimDisposition::Confirm;
+        confirmation.evidence[0].kind = ConsolidationEvidenceKind::UserConfirmation;
+        confirmation.evidence[0].speech_act_span = Some(quote_nth(second_event, "Yes", 0));
+        apply_output(
+            &store,
+            &second_batch,
+            &candidates,
+            &StructuredConsolidationOutput {
+                entities: Vec::new(),
+                claims: vec![confirmation],
+                boundaries: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let connection = Connection::open(store.retrieval().index_path()).unwrap();
+        let times = connection
+            .prepare("SELECT created_at FROM memory_claim_transitions ORDER BY created_at")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            times,
+            ["2026-01-01T00:30:00+00:00", "2026-01-01T01:00:00+01:00"]
+        );
+        assert!(
+            DateTime::parse_from_rfc3339(&times[1]).unwrap()
+                < DateTime::parse_from_rfc3339(&times[0]).unwrap()
+        );
+        drop(connection);
+        assert!(store.retrieval().consolidation_candidates(512, 512).is_ok());
+    }
+
+    #[test]
+    fn transition_related_claim_must_be_the_actual_contradiction() {
+        let root = tempfile::tempdir().unwrap();
+        let (store, mut session) = new_session(root.path());
+        push_complete_at(
+            &mut session,
+            "Alice likes tea.",
+            None,
+            "2026-01-01T00:00:00Z",
+        );
+        let first_batch = next_batch(&store, &mut session);
+        let first_event = &first_batch.events[0];
+        let mut tea = text_claim_output(
+            "local_tea",
+            "local_alice",
+            "preference.drink",
+            "tea",
+            quote_nth(first_event, "Alice", 0),
+            quote_nth(first_event, "likes", 0),
+            quote_nth(first_event, "tea", 0),
+            full_quote(first_event),
+        );
+        tea.cardinality = ClaimCardinality::Multi;
+        apply_output(
+            &store,
+            &first_batch,
+            &empty_candidates(),
+            &StructuredConsolidationOutput {
+                entities: vec![new_entity_output(
+                    "local_alice",
+                    "Alice",
+                    quote_nth(first_event, "Alice", 0),
+                )],
+                claims: vec![tea],
+                boundaries: Vec::new(),
+            },
+        )
+        .unwrap();
+        let candidates = store
+            .retrieval()
+            .consolidation_candidates(512, 512)
+            .unwrap();
+        let entity_id = candidates.entities[0].entity_id.clone();
+        let tea_id = candidates.claims[0].claim_id.clone();
+
+        push_complete_at(
+            &mut session,
+            "Alice likes coffee. Alice doesn't like tea.",
+            None,
+            "2026-01-02T00:00:00Z",
+        );
+        let second_batch = next_batch(&store, &mut session);
+        let event = &second_batch.events[0];
+        let mut coffee = text_claim_output(
+            "local_coffee",
+            &entity_id,
+            "preference.drink",
+            "coffee",
+            quote_nth(event, "Alice", 0),
+            quote_nth(event, "likes", 0),
+            quote_nth(event, "coffee", 0),
+            quote_nth(event, "Alice likes coffee", 0),
+        );
+        coffee.cardinality = ClaimCardinality::Multi;
+        let mut denial = text_claim_output(
+            "local_denial",
+            &entity_id,
+            "preference.drink",
+            "tea",
+            quote_nth(event, "Alice", 1),
+            quote_nth(event, "like", 1),
+            quote_nth(event, "tea", 0),
+            quote_nth(event, "Alice doesn't like tea", 0),
+        );
+        denial.cardinality = ClaimCardinality::Multi;
+        denial.polarity = ClaimPolarity::Deny;
+        denial.evidence[0].speech_act_span = Some(quote_nth(event, "doesn't", 0));
+        denial.conflicts_with_claim_ids = vec![tea_id.clone()];
+        apply_output(
+            &store,
+            &second_batch,
+            &candidates,
+            &StructuredConsolidationOutput {
+                entities: Vec::new(),
+                claims: vec![coffee, denial],
+                boundaries: Vec::new(),
+            },
+        )
+        .unwrap();
+        let current = store
+            .retrieval()
+            .consolidation_candidates(512, 512)
+            .unwrap();
+        let coffee_id = current
+            .claims
+            .iter()
+            .find(|claim| claim.object_text.as_deref() == Some("coffee"))
+            .unwrap()
+            .claim_id
+            .clone();
+        let connection = Connection::open(store.retrieval().index_path()).unwrap();
+        let (old_transition_id, from_state, to_state, reason, batch_key) = connection
+            .query_row(
+                "SELECT transition_id, from_state, to_state, reason, batch_key
+                 FROM memory_claim_transitions
+                 WHERE claim_id = ?1 AND reason = 'conflicted'",
+                [&tea_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        let tampered_id = deterministic_id(
+            "transition",
+            &[
+                &tea_id,
+                &from_state,
+                &to_state,
+                &reason,
+                &coffee_id,
+                &batch_key,
+            ],
+        );
+        connection
+            .execute(
+                "UPDATE memory_claim_transitions
+                 SET transition_id = ?1, related_claim_id = ?2 WHERE transition_id = ?3",
+                params![tampered_id, coffee_id, old_transition_id],
+            )
+            .unwrap();
+        drop(connection);
+        assert!(matches!(
+            store.retrieval().consolidation_candidates(512, 512),
+            Err(RetrievalError::CorruptIndex(_))
+        ));
+    }
+
+    #[test]
     fn temporal_fields_require_user_evidence_rfc3339_and_ordered_intervals() {
         let event = ConsolidationEvent {
             event_id: "event".into(),
@@ -10088,6 +10750,22 @@ mod tests {
         };
         assert!(validate_structured_output(&batch_for(cjk), &cjk_candidate, &cjk_output).is_ok());
 
+        let future = event("future", "小明即将拜访王明。");
+        let future_output = StructuredConsolidationOutput {
+            entities: vec![explicit_output(
+                &future,
+                "小明",
+                quote_nth(&future, "王明", 0),
+                "ent_wang",
+            )],
+            claims: Vec::new(),
+            boundaries: Vec::new(),
+        };
+        assert!(matches!(
+            validate_structured_output(&batch_for(future), &cjk_candidate, &future_output),
+            Err(ConsolidationApplyError::Rejected { .. })
+        ));
+
         let stable_alias = MemoryAliasCandidate {
             alias_id: "alias-e123".into(),
             text: "E123".into(),
@@ -10245,6 +10923,229 @@ mod tests {
         assert!(saved_rx.recv_timeout(Duration::from_secs(2)).unwrap());
         save_thread.join().unwrap();
         store.retrieval().set_consolidation_test_hook(None);
+    }
+
+    #[test]
+    fn stored_aliases_reject_rehashed_ascii_token_subspans() {
+        let seed = |content: &str,
+                    canonical: &str,
+                    alias_text: &str,
+                    kind: MemoryAliasKind,
+                    stable_kind: Option<&str>| {
+            let root = tempfile::tempdir().unwrap();
+            let (store, mut session) = new_session(root.path());
+            push_complete_at(&mut session, content, None, "2026-01-01T00:00:00Z");
+            let batch = next_batch(&store, &mut session);
+            let event = &batch.events[0];
+            let mut entity =
+                new_entity_output("local_entity", canonical, quote_nth(event, canonical, 0));
+            entity.aliases = vec![EntityAliasOutput {
+                text: alias_text.into(),
+                kind,
+                stable_identifier_kind: stable_kind.map(str::to_owned),
+                evidence: quote_nth(event, alias_text, 0),
+                proof_evidence: full_quote(event),
+            }];
+            apply_output(
+                &store,
+                &batch,
+                &empty_candidates(),
+                &StructuredConsolidationOutput {
+                    entities: vec![entity],
+                    claims: Vec::new(),
+                    boundaries: Vec::new(),
+                },
+            )
+            .unwrap();
+            (root, store)
+        };
+
+        let tamper = |store: &SessionStore, new_text: &str, start: usize, end: usize| {
+            let snapshot = store
+                .retrieval()
+                .consolidation_candidates(512, 512)
+                .unwrap();
+            let entity = &snapshot.entities[0];
+            let alias = &entity.aliases[0];
+            let normalized = normalize_match(new_text);
+            let hash = content_sha256(new_text);
+            let new_id = deterministic_id(
+                "alias",
+                &[
+                    &entity.entity_id,
+                    alias.kind.as_str(),
+                    alias.stable_identifier_kind.as_deref().unwrap_or(""),
+                    &normalized,
+                    &alias.event_id,
+                    &start.to_string(),
+                    &end.to_string(),
+                    &hash,
+                    &alias.proof_event_id,
+                    &alias.proof_start_char.to_string(),
+                    &alias.proof_end_char.to_string(),
+                    &alias.proof_sha256,
+                    &alias.identity_event_id,
+                    &alias.identity_start_char.to_string(),
+                    &alias.identity_end_char.to_string(),
+                    &alias.identity_sha256,
+                ],
+            );
+            let connection = Connection::open(store.retrieval().index_path()).unwrap();
+            connection
+                .execute(
+                    "UPDATE memory_entity_aliases
+                     SET alias_id = ?1, alias_text = ?2, normalized_alias = ?3,
+                         start_char = ?4, end_char = ?5, content_sha256 = ?6
+                     WHERE alias_id = ?7",
+                    params![
+                        new_id,
+                        new_text,
+                        normalized,
+                        start as i64,
+                        end as i64,
+                        hash,
+                        alias.alias_id,
+                    ],
+                )
+                .unwrap();
+        };
+
+        let (_explicit_root, explicit_store) = seed(
+            "JoAnn aka Annie",
+            "Annie",
+            "JoAnn",
+            MemoryAliasKind::ExplicitAlias,
+            None,
+        );
+        tamper(&explicit_store, "Ann", 2, 5);
+        assert!(matches!(
+            explicit_store
+                .retrieval()
+                .consolidation_candidates(512, 512),
+            Err(RetrievalError::CorruptIndex(_))
+        ));
+
+        let (_stable_root, stable_store) = seed(
+            "Device serial E1234",
+            "Device",
+            "E1234",
+            MemoryAliasKind::StableIdentifier,
+            Some("serial"),
+        );
+        let stable_alias = stable_store
+            .retrieval()
+            .consolidation_candidates(512, 512)
+            .unwrap()
+            .entities[0]
+            .aliases[0]
+            .clone();
+        tamper(
+            &stable_store,
+            "E123",
+            stable_alias.start_char,
+            stable_alias.end_char - 1,
+        );
+        assert!(matches!(
+            stable_store.retrieval().consolidation_candidates(512, 512),
+            Err(RetrievalError::CorruptIndex(_))
+        ));
+    }
+
+    #[test]
+    fn stored_evidence_reuses_clause_and_quotation_semantics() {
+        let seed = |content: &str, relation_occurrence: usize| {
+            let root = tempfile::tempdir().unwrap();
+            let (store, mut session) = new_session(root.path());
+            push_complete_at(&mut session, content, None, "2026-01-01T00:00:00Z");
+            let batch = next_batch(&store, &mut session);
+            let event = &batch.events[0];
+            let claim = text_claim_output(
+                "local_tea",
+                "local_alice",
+                "preference.drink",
+                "tea",
+                quote_nth(event, "Alice", 0),
+                quote_nth(event, "likes", relation_occurrence),
+                quote_nth(event, "tea", 0),
+                quote_nth(event, "Alice likes tea", 0),
+            );
+            apply_output(
+                &store,
+                &batch,
+                &empty_candidates(),
+                &StructuredConsolidationOutput {
+                    entities: vec![new_entity_output(
+                        "local_alice",
+                        "Alice",
+                        quote_nth(event, "Alice", 0),
+                    )],
+                    claims: vec![claim],
+                    boundaries: Vec::new(),
+                },
+            )
+            .unwrap();
+            (root, store, event.clone())
+        };
+        let recompute_evidence_id = |connection: &Connection| {
+            let claim = load_all_claim_candidates(connection).unwrap().remove(0);
+            let evidence = &claim.evidence[0];
+            let expected = deterministic_evidence_id(&claim.claim_id, evidence);
+            connection
+                .execute(
+                    "UPDATE memory_claim_evidence SET evidence_id = ?1 WHERE evidence_id = ?2",
+                    params![expected, evidence.evidence_id],
+                )
+                .unwrap();
+        };
+
+        let (_cross_root, cross_store, cross_event) =
+            seed("Yes, Bob likes coffee. Alice likes tea.", 1);
+        {
+            let connection = Connection::open(cross_store.retrieval().index_path()).unwrap();
+            let speech = quote_nth(&cross_event, "Yes", 0);
+            connection
+                .execute(
+                    "UPDATE memory_claim_evidence
+                     SET kind = 'user_confirmation', start_char = 0, end_char = ?1,
+                         content_sha256 = ?2, speech_act_event_id = ?3,
+                         speech_act_start_char = ?4, speech_act_end_char = ?5,
+                         speech_act_sha256 = ?6",
+                    params![
+                        cross_event.content.chars().count() as i64,
+                        cross_event.content_sha256,
+                        speech.event_id,
+                        speech.start_char as i64,
+                        speech.end_char as i64,
+                        speech.content_sha256,
+                    ],
+                )
+                .unwrap();
+            recompute_evidence_id(&connection);
+        }
+        assert!(matches!(
+            cross_store.retrieval().consolidation_candidates(512, 512),
+            Err(RetrievalError::CorruptIndex(_))
+        ));
+
+        let (_quoted_root, quoted_store, quoted_event) = seed("“Alice likes tea.”", 0);
+        {
+            let connection = Connection::open(quoted_store.retrieval().index_path()).unwrap();
+            connection
+                .execute(
+                    "UPDATE memory_claim_evidence
+                     SET start_char = 0, end_char = ?1, content_sha256 = ?2",
+                    params![
+                        quoted_event.content.chars().count() as i64,
+                        quoted_event.content_sha256,
+                    ],
+                )
+                .unwrap();
+            recompute_evidence_id(&connection);
+        }
+        assert!(matches!(
+            quoted_store.retrieval().consolidation_candidates(512, 512),
+            Err(RetrievalError::CorruptIndex(_))
+        ));
     }
 
     #[test]

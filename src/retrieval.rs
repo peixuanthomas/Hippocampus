@@ -198,27 +198,29 @@ fn shared_root_lock(root: &Path) -> RetrievalResult<Arc<RwLock<()>>> {
 }
 
 fn canonical_root_key(root: &Path) -> PathBuf {
-    let normalized = lexical_normalize_absolute(root);
-    if let Ok(path) = fs::canonicalize(&normalized) {
-        return path;
-    }
+    canonicalize_with_missing_suffix(root).unwrap_or_else(|| {
+        let normalized = lexical_normalize_absolute(root);
+        canonicalize_with_missing_suffix(&normalized).unwrap_or(normalized)
+    })
+}
+
+fn canonicalize_with_missing_suffix(path: &Path) -> Option<PathBuf> {
     let mut missing = Vec::new();
-    let mut ancestor = normalized.as_path();
+    let mut ancestor = path.to_path_buf();
     while !ancestor.exists() {
-        let Some(name) = ancestor.file_name() else {
-            return normalized;
+        let Some(Component::Normal(name)) = ancestor.components().next_back() else {
+            return None;
         };
         missing.push(name.to_os_string());
-        let Some(parent) = ancestor.parent() else {
-            return normalized;
-        };
-        ancestor = parent;
+        if !ancestor.pop() {
+            return None;
+        }
     }
-    let mut key = fs::canonicalize(ancestor).unwrap_or_else(|_| ancestor.to_path_buf());
+    let mut key = fs::canonicalize(&ancestor).ok()?;
     for name in missing.into_iter().rev() {
         key.push(name);
     }
-    key
+    Some(key)
 }
 
 fn lexical_normalize_absolute(path: &Path) -> PathBuf {
@@ -3358,6 +3360,40 @@ CREATE INDEX memory_boundary_suggestions_session_event
         let direct = parent.path().join("root");
         assert!(!direct.exists());
         let first = RetrievalStore::new(&through_missing).unwrap();
+        let second = RetrievalStore::new(&direct).unwrap();
+        assert!(Arc::ptr_eq(&first.root_lock, &second.root_lock));
+
+        let guard = first.acquire_root_write().unwrap();
+        let (sent, received) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let _guard = second.acquire_root_write().unwrap();
+            sent.send(()).unwrap();
+        });
+        assert!(received.recv_timeout(Duration::from_millis(100)).is_err());
+        drop(guard);
+        received.recv_timeout(Duration::from_secs(2)).unwrap();
+        worker.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_parent_nonexistent_roots_share_the_same_lock() {
+        use std::os::unix::fs::symlink;
+        use std::sync::mpsc;
+        use std::thread;
+
+        let parent = tempfile::tempdir().unwrap();
+        let target_parent = parent.path().join("else");
+        let target_child = target_parent.join("child");
+        fs::create_dir_all(&target_child).unwrap();
+        let link = parent.path().join("link");
+        symlink(&target_child, &link).unwrap();
+
+        let through_symlink_parent = link.join("..").join("shared");
+        let direct = target_parent.join("shared");
+        assert!(!through_symlink_parent.exists());
+        assert!(!direct.exists());
+        let first = RetrievalStore::new(&through_symlink_parent).unwrap();
         let second = RetrievalStore::new(&direct).unwrap();
         assert!(Arc::ptr_eq(&first.root_lock, &second.root_lock));
 
