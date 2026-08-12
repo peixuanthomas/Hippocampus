@@ -568,10 +568,22 @@ mod tests {
         assert!(error.downcast_ref::<IndexSyncAfterSourceCommit>().is_some());
         assert!(error.to_string().contains("原始会话已安全保存"));
         assert_eq!(store.load(&session.id).unwrap().title, "source committed");
-        store.retrieval().rebuild().unwrap();
+        let source_path = root.path().join(format!("{}.json", session.id));
+        let source_bytes = fs::read(&source_path).unwrap();
+        let index_path = store.retrieval().index_path().to_path_buf();
+        let index_bytes = fs::read(&index_path).unwrap();
+        assert!(matches!(
+            store.retrieval().rebuild(),
+            Err(RetrievalError::UnsupportedIndexVersion(99))
+        ));
+        assert_eq!(fs::read(&source_path).unwrap(), source_bytes);
+        assert_eq!(fs::read(&index_path).unwrap(), index_bytes);
         assert_eq!(
-            store.retrieval().get_session(&session.id).unwrap().title,
-            "source committed"
+            rusqlite::Connection::open(&index_path)
+                .unwrap()
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            99
         );
     }
 }

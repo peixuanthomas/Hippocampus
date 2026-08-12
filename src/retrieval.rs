@@ -204,14 +204,7 @@ impl RetrievalStore {
 
     pub fn rebuild(&self) -> RetrievalResult<SyncReport> {
         let sources = self.load_all_sources()?;
-        let mut connection = match self.open_connection() {
-            Ok(connection) => connection,
-            Err(RetrievalError::UnsupportedIndexVersion(_)) => {
-                self.remove_index_files()?;
-                self.open_connection()?
-            }
-            Err(error) => return Err(error),
-        };
+        let mut connection = self.open_connection()?;
         let transaction = connection
             .transaction()
             .map_err(|source| self.database_error(source))?;
@@ -1175,21 +1168,6 @@ impl RetrievalStore {
             source,
         }
     }
-
-    fn remove_index_files(&self) -> RetrievalResult<()> {
-        for path in [
-            self.index_path.clone(),
-            index_sidecar(&self.index_path, "-wal"),
-            index_sidecar(&self.index_path, "-shm"),
-        ] {
-            match fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(source) => return Err(RetrievalError::Io { path, source }),
-            }
-        }
-        Ok(())
-    }
 }
 
 fn document_spans(event: &StoredEvent) -> Vec<(RetrievalDocumentGranularity, SourceSpan)> {
@@ -1782,12 +1760,6 @@ fn verify_event_hash(event: &StoredEvent) -> RetrievalResult<()> {
 
 fn bytes_sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
-}
-
-fn index_sidecar(path: &Path, suffix: &str) -> PathBuf {
-    let mut value = path.as_os_str().to_os_string();
-    value.push(suffix);
-    PathBuf::from(value)
 }
 
 fn source_file_name(root: &Path, path: &Path) -> RetrievalResult<String> {
@@ -2403,6 +2375,117 @@ mod tests {
                 )
                 .unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn rebuild_preserves_unknown_future_index_without_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let index = root.path().join(INDEX_FILENAME);
+        let connection = Connection::open(&index).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE future_sentinel (
+                     sentinel_key TEXT PRIMARY KEY,
+                     sentinel_value BLOB NOT NULL
+                 );
+                 INSERT INTO future_sentinel VALUES ('keep-me', X'00FF1020');
+                 CREATE TABLE consolidation_watermarks (
+                     session_id TEXT PRIMARY KEY,
+                     through_sequence INTEGER NOT NULL,
+                     through_event_id TEXT,
+                     through_event_sha256 TEXT,
+                     updated_at TEXT,
+                     future_column TEXT NOT NULL
+                 );
+                 INSERT INTO consolidation_watermarks VALUES
+                     ('future-session', 42, 'future-event', 'future-hash',
+                      '2026-01-01T00:00:00Z', 'future-watermark');
+                 CREATE TABLE consolidation_batches (
+                     attempt_id TEXT PRIMARY KEY,
+                     status TEXT NOT NULL,
+                     future_payload TEXT NOT NULL
+                 );
+                 INSERT INTO consolidation_batches VALUES
+                     ('future-attempt', 'future-applied', '{\"future\":true}');
+                 PRAGMA user_version=5;",
+            )
+            .unwrap();
+        drop(connection);
+        let original_bytes = fs::read(&index).unwrap();
+
+        let store = RetrievalStore::new(root.path()).unwrap();
+        assert!(matches!(
+            store.rebuild(),
+            Err(RetrievalError::UnsupportedIndexVersion(5))
+        ));
+        assert!(index.is_file());
+        assert_eq!(fs::read(&index).unwrap(), original_bytes);
+
+        let connection = Connection::open(&index).unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            5
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT sentinel_key, hex(sentinel_value) FROM future_sentinel",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                )
+                .unwrap(),
+            ("keep-me".to_owned(), "00FF1020".to_owned())
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT session_id, through_sequence, through_event_id,
+                            through_event_sha256, updated_at, future_column
+                     FROM consolidation_watermarks",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                        ))
+                    }
+                )
+                .unwrap(),
+            (
+                "future-session".to_owned(),
+                42,
+                "future-event".to_owned(),
+                "future-hash".to_owned(),
+                "2026-01-01T00:00:00Z".to_owned(),
+                "future-watermark".to_owned(),
+            )
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT attempt_id, status, future_payload FROM consolidation_batches",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    }
+                )
+                .unwrap(),
+            (
+                "future-attempt".to_owned(),
+                "future-applied".to_owned(),
+                "{\"future\":true}".to_owned(),
+            )
         );
     }
 
