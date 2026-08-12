@@ -1,4 +1,5 @@
 pub mod config;
+pub mod consolidation;
 pub mod context;
 pub mod engine;
 pub mod knowledge;
@@ -11,6 +12,11 @@ pub mod web;
 
 pub use config::{
     AppConfig, KnowledgeConfig, KnowledgeSourceConfig, KnowledgeSourceKind, WebSearchConfig,
+};
+pub use consolidation::{
+    CONSOLIDATION_MAX_CHARS, CONSOLIDATION_MAX_TURNS, ConsolidationAttemptRecord,
+    ConsolidationAttemptStatus, ConsolidationEvent, ConsolidationInputBatch,
+    ConsolidationWatermark,
 };
 pub use context::ContextAssembler;
 pub use engine::{ChatEngine, LimitAction, PreparedTurn};

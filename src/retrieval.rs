@@ -19,7 +19,7 @@ use crate::model::{
 };
 
 pub const INDEX_FILENAME: &str = ".hippocampus-index.sqlite3";
-const INDEX_SCHEMA_VERSION: i64 = 3;
+const INDEX_SCHEMA_VERSION: i64 = 4;
 
 #[derive(Debug, Error)]
 pub enum RetrievalError {
@@ -1020,7 +1020,7 @@ impl RetrievalStore {
         paths.iter().map(|path| self.read_source(path)).collect()
     }
 
-    fn open_connection(&self) -> RetrievalResult<Connection> {
+    pub(crate) fn open_connection(&self) -> RetrievalResult<Connection> {
         fs::create_dir_all(&self.root).map_err(|source| RetrievalError::Io {
             path: self.root.clone(),
             source,
@@ -1030,6 +1030,12 @@ impl RetrievalStore {
         connection
             .busy_timeout(Duration::from_secs(5))
             .map_err(|source| self.database_error(source))?;
+        let version = connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .map_err(|source| self.database_error(source))?;
+        if !matches!(version, 0 | 1 | 2 | 3 | INDEX_SCHEMA_VERSION) {
+            return Err(RetrievalError::UnsupportedIndexVersion(version));
+        }
         connection
             .execute_batch(
                 "PRAGMA foreign_keys = ON;
@@ -1037,12 +1043,6 @@ impl RetrievalStore {
                  PRAGMA synchronous = FULL;",
             )
             .map_err(|source| self.database_error(source))?;
-        let version = connection
-            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
-            .map_err(|source| self.database_error(source))?;
-        if !matches!(version, 0 | 1 | 2 | INDEX_SCHEMA_VERSION) {
-            return Err(RetrievalError::UnsupportedIndexVersion(version));
-        }
         if matches!(version, 1 | 2) {
             // v1 contains all immutable events, so a transactional rebuild of
             // only derived tables is deterministic and loses no source data.
@@ -1091,7 +1091,7 @@ impl RetrievalStore {
                 .pragma_update(None, "user_version", INDEX_SCHEMA_VERSION)
                 .map_err(|e| self.database_error(e))?;
             transaction.commit().map_err(|e| self.database_error(e))?;
-        } else if version == 0 {
+        } else if matches!(version, 0 | 3) {
             let transaction = connection
                 .transaction()
                 .map_err(|e| self.database_error(e))?;
@@ -1169,7 +1169,7 @@ impl RetrievalStore {
         Ok(())
     }
 
-    fn database_error(&self, source: rusqlite::Error) -> RetrievalError {
+    pub(crate) fn database_error(&self, source: rusqlite::Error) -> RetrievalError {
         RetrievalError::Database {
             path: self.index_path.clone(),
             source,
@@ -1914,6 +1914,47 @@ CREATE INDEX IF NOT EXISTS events_session_sequence
     ON events(session_id, sequence);
 CREATE INDEX IF NOT EXISTS events_reply_to
     ON events(reply_to_event_id);
+
+CREATE TABLE IF NOT EXISTS consolidation_watermarks (
+    session_id TEXT PRIMARY KEY,
+    through_sequence INTEGER NOT NULL CHECK(through_sequence >= 0),
+    through_event_id TEXT,
+    through_event_sha256 TEXT,
+    updated_at TEXT,
+    CHECK((through_event_id IS NULL AND through_event_sha256 IS NULL)
+       OR (through_event_id IS NOT NULL AND through_event_sha256 IS NOT NULL))
+);
+
+CREATE TABLE IF NOT EXISTS consolidation_batches (
+    attempt_id TEXT PRIMARY KEY,
+    batch_key TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    from_sequence INTEGER NOT NULL CHECK(from_sequence >= 0),
+    through_sequence INTEGER NOT NULL CHECK(through_sequence >= 0),
+    trigger TEXT NOT NULL,
+    model TEXT NOT NULL,
+    request_json TEXT NOT NULL,
+    request_sha256 TEXT NOT NULL,
+    input_event_ids TEXT NOT NULL,
+    input_event_hashes TEXT NOT NULL,
+    response_json TEXT,
+    response_sha256 TEXT,
+    status TEXT NOT NULL CHECK(status IN ('rejected', 'model_error', 'cancelled')),
+    input_tokens INTEGER CHECK(input_tokens IS NULL OR input_tokens >= 0),
+    output_tokens INTEGER CHECK(output_tokens IS NULL OR output_tokens >= 0),
+    latency_ms INTEGER NOT NULL CHECK(latency_ms >= 0),
+    started_at TEXT NOT NULL,
+    completed_at TEXT NOT NULL,
+    validation_json TEXT,
+    error_json TEXT,
+    CHECK(from_sequence <= through_sequence),
+    CHECK((response_json IS NULL AND response_sha256 IS NULL)
+       OR (response_json IS NOT NULL AND response_sha256 IS NOT NULL))
+);
+CREATE INDEX IF NOT EXISTS consolidation_batches_session_started
+    ON consolidation_batches(session_id, started_at, attempt_id);
+CREATE INDEX IF NOT EXISTS consolidation_batches_batch_key
+    ON consolidation_batches(batch_key);
 "#;
 
 #[cfg(test)]
