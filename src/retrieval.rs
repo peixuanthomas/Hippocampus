@@ -14,8 +14,8 @@ use crate::knowledge::{KnowledgeStore, KnowledgeTrace};
 use crate::model::{
     ChatMessage, ContextItemTrace, EventRole, EvidenceKind, ModelRequestTrace, ProvenanceQuality,
     RankedCandidate, RetrievalConfig, RetrievalDocumentGranularity, RetrievalTrace, SCHEMA_VERSION,
-    SelectedEvidence, Session, SourceSpan, Turn, TurnStatus, content_sha256, context_sha256,
-    event_id,
+    SelectedEvidence, Session, SourceSpan, Turn, TurnStatus, WebTrace, content_sha256,
+    context_sha256, event_id,
 };
 
 pub const INDEX_FILENAME: &str = ".hippocampus-index.sqlite3";
@@ -119,6 +119,7 @@ pub struct AnswerContext {
     pub items: Vec<AnswerContextItem>,
     pub retrieval_trace: RetrievalTrace,
     pub knowledge_trace: KnowledgeTrace,
+    pub web_trace: WebTrace,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -628,6 +629,10 @@ impl RetrievalStore {
             .map_err(|error| {
                 RetrievalError::CorruptIndex(format!("知识证据校验失败：{error:#}"))
             })?;
+        answer.web_trace = turn.context_trace.web.clone();
+        answer.web_trace.validate().map_err(|error| {
+            RetrievalError::CorruptIndex(format!("联网 trace 校验失败：{error:#}"))
+        })?;
         let mut statement = connection
             .prepare(
                 "SELECT i.ordinal, i.role, i.event_id, i.start_char, i.end_char,
@@ -1650,6 +1655,7 @@ fn map_answer_context(row: &rusqlite::Row<'_>) -> rusqlite::Result<AnswerContext
         items: Vec::new(),
         retrieval_trace: RetrievalTrace::default(),
         knowledge_trace: KnowledgeTrace::default(),
+        web_trace: WebTrace::default(),
     })
 }
 
@@ -1949,6 +1955,7 @@ mod tests {
             provenance_quality: ProvenanceQuality::Exact,
             retrieval: RetrievalTrace::default(),
             knowledge: KnowledgeTrace::default(),
+            web: Default::default(),
         };
         turn.request_started_at = Some(started_at);
         turn.assistant_content = assistant.to_owned();

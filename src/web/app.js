@@ -44,6 +44,45 @@ function formatUsage(usage) {
   return `input ${input} · output ${output}`;
 }
 
+function renderProvenance(container, options = {}) {
+  container.replaceChildren();
+  const warnings = options.warnings ?? [];
+  const knowledge = options.knowledgeSources ?? [];
+  const web = options.webSources ?? [];
+  for (const warning of warnings) {
+    const item = document.createElement("div");
+    item.className = "provenance-warning";
+    item.textContent = `警告：${warning}`;
+    container.append(item);
+  }
+  if (knowledge.length) {
+    const heading = document.createElement("strong");
+    heading.textContent = "知识来源（程序 trace）";
+    container.append(heading);
+    for (const source of knowledge) {
+      const item = document.createElement("div");
+      item.textContent = `${source.title} · ${source.source_location} · revision=${source.revision_id} · ${source.start_char}..${source.end_char}`;
+      container.append(item);
+    }
+  }
+  if (web.length) {
+    const heading = document.createElement("strong");
+    heading.textContent = "实时来源（程序 trace）";
+    container.append(heading);
+    for (const source of web) {
+      const item = document.createElement("div");
+      const link = document.createElement("a");
+      link.href = source.url;
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      link.textContent = `${source.kind} · ${source.title || source.url}`;
+      item.append(link);
+      container.append(item);
+    }
+  }
+  container.classList.toggle("hidden", !container.childElementCount);
+}
+
 function createMessage(role, content, options = {}) {
   elements.empty?.classList.add("hidden");
   const node = elements.template.content.firstElementChild.cloneNode(true);
@@ -52,6 +91,7 @@ function createMessage(role, content, options = {}) {
   const label = node.querySelector(".role-label");
   const markdown = node.querySelector(".markdown");
   const thinking = node.querySelector(".thinking");
+  const provenance = node.querySelector(".provenance");
   const meta = node.querySelector(".message-meta");
   if (role === "user") {
     icon.textContent = "›";
@@ -71,9 +111,10 @@ function createMessage(role, content, options = {}) {
     thinking.classList.remove("hidden");
     thinking.querySelector("pre").textContent = options.thinking;
   }
+  renderProvenance(provenance, options);
   meta.textContent = options.meta ?? "";
   elements.conversation.append(node);
-  return { node, markdown, thinking, meta };
+  return { node, markdown, thinking, provenance, meta };
 }
 
 function renderSession(session) {
@@ -94,10 +135,18 @@ function renderSession(session) {
         aiName: session.ai_name,
         html: turn.assistant_html,
         thinking: turn.thinking,
+        knowledgeSources: turn.knowledge_sources,
+        webSources: turn.web_sources,
+        warnings: turn.warnings,
         meta: `${turn.status} · ${formatUsage(turn.usage)}`,
       });
     } else if (turn.error) {
-      createMessage("error", `[${turn.status}] ${turn.error}`);
+      createMessage("error", `[${turn.status}] ${turn.error}`, {
+        knowledgeSources: turn.knowledge_sources,
+        webSources: turn.web_sources,
+        warnings: turn.warnings,
+        meta: `${turn.status} · ${formatUsage(turn.usage)}`,
+      });
     }
   }
   elements.empty.classList.toggle("hidden", session.turns.length > 0);
@@ -222,6 +271,11 @@ function handleStreamEvent(name, payload) {
   if (name === "done" && live) {
     live.markdown.innerHTML = payload.html;
     live.meta.textContent = `${payload.status} · ${formatUsage(payload.usage)}`;
+    renderProvenance(live.provenance, {
+      knowledgeSources: payload.knowledge_sources,
+      webSources: payload.web_sources,
+      warnings: payload.warnings,
+    });
     elements.sessionStatus.textContent = payload.session_status;
     setRuntime(payload.error ?? "完成");
   }

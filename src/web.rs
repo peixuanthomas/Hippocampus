@@ -20,7 +20,8 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::engine::{ChatEngine, LimitAction, PreparationStatus};
-use crate::model::{ChatEvent, ChatEventKind, Session, TokenUsage};
+use crate::knowledge::KnowledgeEvidence;
+use crate::model::{ChatEvent, ChatEventKind, Session, TokenUsage, Turn, WebSourceTrace};
 use crate::ollama::{ModelInfo, OllamaClient};
 
 const INDEX_HTML: &str = include_str!("web/index.html");
@@ -85,6 +86,10 @@ struct TurnView {
     usage: TokenUsage,
     probe_usage: TokenUsage,
     error: Option<String>,
+    knowledge_sources: Vec<KnowledgeEvidence>,
+    web_sources: Vec<WebSourceTrace>,
+    warnings: Vec<String>,
+    unverified_realtime: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -373,6 +378,10 @@ async fn generate(
             "html": render_markdown(&turn.assistant_content),
             "usage": turn.usage,
             "error": turn.error,
+            "knowledge_sources": turn.context_trace.knowledge.selected_evidence,
+            "web_sources": turn.context_trace.web.sources,
+            "warnings": turn_warnings(turn),
+            "unverified_realtime": turn.context_trace.web.unverified_realtime,
             "session_status": session.status.as_str(),
             "title": session.title,
         }),
@@ -538,9 +547,21 @@ fn session_view(session: &Session, model_info: &ModelInfo, busy: bool) -> Sessio
                 usage: turn.usage,
                 probe_usage: turn.probe_usage,
                 error: turn.error.clone(),
+                knowledge_sources: turn.context_trace.knowledge.selected_evidence.clone(),
+                web_sources: turn.context_trace.web.sources.clone(),
+                warnings: turn_warnings(turn),
+                unverified_realtime: turn.context_trace.web.unverified_realtime,
             })
             .collect(),
     }
+}
+
+fn turn_warnings(turn: &Turn) -> Vec<String> {
+    let mut warnings = turn.context_trace.knowledge.warnings.clone();
+    warnings.extend(turn.context_trace.web.warnings.clone());
+    warnings.sort();
+    warnings.dedup();
+    warnings
 }
 
 pub fn render_markdown(markdown: &str) -> String {

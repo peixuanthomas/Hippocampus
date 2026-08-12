@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Result, bail};
 use chrono::{SecondsFormat, Utc};
@@ -310,6 +310,427 @@ pub struct ModelRequestTrace {
     pub max_output_tokens: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolFunctionDefinition {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolDefinition {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub function: ToolFunctionDefinition,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolCallFunction {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<usize>,
+    pub name: String,
+    #[serde(default)]
+    pub arguments: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolCall {
+    #[serde(rename = "type", default = "function_tool_kind")]
+    pub kind: String,
+    pub function: ToolCallFunction,
+}
+
+fn function_tool_kind() -> String {
+    "function".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentMessage {
+    pub role: String,
+    #[serde(default)]
+    pub content: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub thinking: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCall>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+}
+
+impl From<&ChatMessage> for AgentMessage {
+    fn from(value: &ChatMessage) -> Self {
+        Self {
+            role: value.role.clone(),
+            content: value.content.clone(),
+            thinking: String::new(),
+            tool_calls: Vec::new(),
+            tool_name: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentChatRequest {
+    pub model: String,
+    pub messages: Vec<AgentMessage>,
+    #[serde(default)]
+    pub tools: Vec<ToolDefinition>,
+    pub think: bool,
+    pub num_ctx: u64,
+    pub num_predict: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentRoundResult {
+    pub thinking: String,
+    pub content: String,
+    pub tool_calls: Vec<ToolCall>,
+    pub usage: TokenUsage,
+    pub done_reason: Option<String>,
+    pub live_output_tokens: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolResultTrace {
+    pub call_ordinal: usize,
+    pub name: String,
+    pub arguments: serde_json::Value,
+    pub started_at: String,
+    pub completed_at: String,
+    pub status: String,
+    pub full_response: String,
+    pub full_response_sha256: String,
+    pub injected_response: String,
+    #[serde(default)]
+    pub urls: Vec<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolRoundTrace {
+    pub round: usize,
+    pub started_at: String,
+    pub completed_at: String,
+    pub request_context_sha256: String,
+    pub request_messages: Vec<AgentMessage>,
+    #[serde(default)]
+    pub tools: Vec<ToolDefinition>,
+    pub estimated_input_tokens: u64,
+    pub exact_input_tokens: Option<u64>,
+    pub assistant_thinking: String,
+    pub assistant_content: String,
+    #[serde(default)]
+    pub tool_calls: Vec<ToolCall>,
+    #[serde(default)]
+    pub tool_results: Vec<ToolResultTrace>,
+    pub usage: Option<TokenUsage>,
+    pub done_reason: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WebSourceTrace {
+    pub kind: String,
+    pub title: String,
+    pub url: String,
+    pub round: usize,
+    pub tool_call_ordinal: usize,
+    pub observed_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WebTrace {
+    pub status: String,
+    pub enabled: bool,
+    pub max_tool_rounds: usize,
+    pub max_tool_calls: usize,
+    #[serde(default)]
+    pub steps: Vec<ToolRoundTrace>,
+    #[serde(default)]
+    pub sources: Vec<WebSourceTrace>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    #[serde(default)]
+    pub unverified_realtime: bool,
+    #[serde(default)]
+    pub final_request_context_sha256: Option<String>,
+}
+
+impl Default for WebTrace {
+    fn default() -> Self {
+        Self {
+            status: "disabled".into(),
+            enabled: false,
+            max_tool_rounds: 0,
+            max_tool_calls: 0,
+            steps: Vec::new(),
+            sources: Vec::new(),
+            warnings: Vec::new(),
+            unverified_realtime: false,
+            final_request_context_sha256: None,
+        }
+    }
+}
+
+impl WebTrace {
+    pub fn normalize(&mut self) {
+        for step in &mut self.steps {
+            if let Some(usage) = &mut step.usage {
+                usage.refresh();
+            }
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if !self.enabled {
+            if !self.steps.is_empty() || !self.sources.is_empty() {
+                bail!("禁用的联网 trace 不能包含工具步骤或来源");
+            }
+            return Ok(());
+        }
+        if self.max_tool_rounds == 0 || self.max_tool_calls == 0 {
+            bail!("启用的联网 trace 缺少有界预算");
+        }
+        let enabled_rounds = self
+            .steps
+            .iter()
+            .filter(|step| !step.tools.is_empty())
+            .count();
+        if enabled_rounds > self.max_tool_rounds {
+            bail!("联网 trace 超过工具轮次上限");
+        }
+        if self
+            .steps
+            .iter()
+            .enumerate()
+            .any(|(index, step)| step.tools.is_empty() && index + 1 != self.steps.len())
+        {
+            bail!("禁用工具的降级轮次只能出现在 trace 末尾");
+        }
+        let mut call_ordinals = HashSet::new();
+        let mut results_by_origin = HashMap::new();
+        let mut result_count = 0usize;
+        for (index, step) in self.steps.iter().enumerate() {
+            if step.round == 0 || (index > 0 && step.round <= self.steps[index - 1].round) {
+                bail!("联网工具步骤 round 必须严格递增");
+            }
+            if agent_context_sha256(&step.request_messages, &step.tools)
+                != step.request_context_sha256
+            {
+                bail!("联网工具步骤 {} 的请求哈希不匹配", step.round);
+            }
+            if let Some(usage) = step.usage {
+                if step.completed_at.is_empty() {
+                    bail!("已完成的联网工具步骤缺少完成时间");
+                }
+                if step.error.is_none()
+                    && step.exact_input_tokens.is_some()
+                    && step.exact_input_tokens != usage.input_tokens
+                {
+                    bail!("联网工具步骤 {} 的 probe/formal token 不匹配", step.round);
+                }
+            }
+            if step.tool_results.len() > step.tool_calls.len() {
+                bail!("联网工具步骤 {} 的结果多于 tool call", step.round);
+            }
+            for (result_index, result) in step.tool_results.iter().enumerate() {
+                result_count += 1;
+                if result_count > self.max_tool_calls {
+                    bail!("联网 trace 超过工具调用上限");
+                }
+                if result.call_ordinal != result_count {
+                    bail!("联网工具调用序号必须从 1 连续递增");
+                }
+                if !call_ordinals.insert(result.call_ordinal) {
+                    bail!("联网 trace 包含重复工具调用序号 {}", result.call_ordinal);
+                }
+                if content_sha256(&result.full_response) != result.full_response_sha256 {
+                    bail!("联网工具结果 {} 的完整响应哈希不匹配", result.call_ordinal);
+                }
+                if result.full_response.len() > 1024 * 1024 {
+                    bail!("联网工具结果 {} 超过 1 MiB", result.call_ordinal);
+                }
+                let call = &step.tool_calls[result_index];
+                if call.function.name != result.name || call.function.arguments != result.arguments
+                {
+                    bail!("联网工具结果 {} 找不到对应 tool call", result.call_ordinal);
+                }
+                validate_tool_result_payload(result)?;
+                results_by_origin.insert((step.round, result.call_ordinal), result);
+            }
+        }
+        for source in &self.sources {
+            let result = results_by_origin
+                .get(&(source.round, source.tool_call_ordinal))
+                .ok_or_else(|| {
+                    anyhow::anyhow!("联网来源 {:?} 找不到对应轮次与工具调用", source.url)
+                })?;
+            validate_web_source(source, result)?;
+        }
+        if let Some(hash) = &self.final_request_context_sha256
+            && self.steps.last().map(|step| &step.request_context_sha256) != Some(hash)
+        {
+            bail!("联网 trace 的最终请求哈希不是最后一个工具步骤");
+        }
+        Ok(())
+    }
+}
+
+fn validate_tool_result_payload(result: &ToolResultTrace) -> Result<()> {
+    if result.status == "error" {
+        if result.error.is_none() || !result.urls.is_empty() {
+            bail!("失败的联网工具结果缺少错误或包含来源 URL");
+        }
+        let value: serde_json::Value = serde_json::from_str(&result.full_response)
+            .map_err(|error| anyhow::anyhow!("联网错误响应不是 JSON：{error}"))?;
+        if value.get("error").and_then(serde_json::Value::as_str) != result.error.as_deref()
+            || !result.injected_response.contains(&result.full_response)
+        {
+            bail!("失败的联网工具结果与错误响应不一致");
+        }
+        return Ok(());
+    }
+    if result.status != "ok" || result.error.is_some() {
+        bail!("联网工具结果状态无效");
+    }
+    let full: serde_json::Value = serde_json::from_str(&result.full_response)
+        .map_err(|error| anyhow::anyhow!("联网完整响应不是 JSON：{error}"))?;
+    let injected: serde_json::Value = serde_json::from_str(&result.injected_response)
+        .map_err(|error| anyhow::anyhow!("联网注入响应不是 JSON：{error}"))?;
+    match result.name.as_str() {
+        "web_search" => {
+            let full_results = full
+                .get("results")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| anyhow::anyhow!("web_search 完整响应缺少 results"))?;
+            let injected_results = injected
+                .get("results")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| anyhow::anyhow!("web_search 注入响应缺少 results"))?;
+            if !injected_results
+                .iter()
+                .all(|item| full_results.contains(item))
+            {
+                bail!("web_search 注入结果不是完整响应的子集");
+            }
+            let urls = injected_results
+                .iter()
+                .filter_map(|item| item.get("url").and_then(serde_json::Value::as_str))
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>();
+            if urls != result.urls {
+                bail!("web_search 记录的 URL 与注入响应不一致");
+            }
+        }
+        "web_fetch" => {
+            let requested_url = result
+                .arguments
+                .get("url")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("web_fetch 参数缺少 url"))?;
+            if injected.get("url").and_then(serde_json::Value::as_str) != Some(requested_url)
+                || injected.get("title") != full.get("title")
+            {
+                bail!("web_fetch 注入元数据与完整响应不一致");
+            }
+            let full_content = full
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("web_fetch 完整响应缺少 content"))?;
+            let injected_content = injected
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("web_fetch 注入响应缺少 content"))?;
+            const TRUNCATION_NOTICE: &str = "\n[抓取正文已按配置截断；完整响应保存在会话 trace 中]";
+            let content_matches =
+                if let Some(prefix) = injected_content.strip_suffix(TRUNCATION_NOTICE) {
+                    !prefix.is_empty() && full_content.starts_with(prefix) && prefix != full_content
+                } else {
+                    injected_content == full_content
+                };
+            if !content_matches {
+                bail!("web_fetch 注入正文不是完整响应的前缀");
+            }
+            let full_links = full
+                .get("links")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let injected_links = injected
+                .get("links")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if !injected_links.iter().all(|link| full_links.contains(link)) {
+                bail!("web_fetch 注入链接不是完整响应的子集");
+            }
+            let mut urls = vec![requested_url.to_owned()];
+            urls.extend(
+                injected_links
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned),
+            );
+            urls.sort();
+            urls.dedup();
+            if urls != result.urls {
+                bail!("web_fetch 记录的 URL 与注入响应不一致");
+            }
+        }
+        name => bail!("未知联网工具结果 {name:?}"),
+    }
+    Ok(())
+}
+
+fn validate_web_source(source: &WebSourceTrace, result: &ToolResultTrace) -> Result<()> {
+    if result.status != "ok"
+        || source.observed_at != result.completed_at
+        || !result.urls.contains(&source.url)
+    {
+        bail!("联网来源 {:?} 与对应工具结果不一致", source.url);
+    }
+    let full: serde_json::Value = serde_json::from_str(&result.full_response)
+        .map_err(|error| anyhow::anyhow!("联网完整响应不是 JSON：{error}"))?;
+    let valid = match (result.name.as_str(), source.kind.as_str()) {
+        ("web_search", "search") => full
+            .get("results")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|items| {
+                items.iter().any(|item| {
+                    item.get("url").and_then(serde_json::Value::as_str) == Some(source.url.as_str())
+                        && item.get("title").and_then(serde_json::Value::as_str)
+                            == Some(source.title.as_str())
+                })
+            }),
+        ("web_fetch", "fetch") => {
+            result
+                .arguments
+                .get("url")
+                .and_then(serde_json::Value::as_str)
+                == Some(source.url.as_str())
+                && full.get("title").and_then(serde_json::Value::as_str)
+                    == Some(source.title.as_str())
+        }
+        ("web_fetch", "fetch_link") => {
+            full.get("title").and_then(serde_json::Value::as_str) == Some(source.title.as_str())
+                && full
+                    .get("links")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|links| {
+                        links
+                            .iter()
+                            .any(|link| link.as_str() == Some(source.url.as_str()))
+                    })
+        }
+        _ => false,
+    };
+    if !valid {
+        bail!("联网来源 {:?} 无法由完整工具响应重建", source.url);
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ContextTrace {
     #[serde(default)]
@@ -340,6 +761,8 @@ pub struct ContextTrace {
     pub retrieval: RetrievalTrace,
     #[serde(default)]
     pub knowledge: KnowledgeTrace,
+    #[serde(default)]
+    pub web: WebTrace,
 }
 
 fn default_decision() -> String {
@@ -364,6 +787,7 @@ impl Default for ContextTrace {
             provenance_quality: ProvenanceQuality::Exact,
             retrieval: RetrievalTrace::default(),
             knowledge: KnowledgeTrace::default(),
+            web: WebTrace::default(),
         }
     }
 }
@@ -424,6 +848,7 @@ impl Turn {
     pub fn normalize(&mut self) {
         self.usage.refresh();
         self.probe_usage.refresh();
+        self.context_trace.web.normalize();
     }
 }
 
@@ -547,6 +972,7 @@ impl Session {
             bail!("会话包含重复的轮次 ID");
         }
         for turn in &self.turns {
+            turn.context_trace.web.validate()?;
             if turn.request_started_at.is_some()
                 && turn.context_trace.provenance_quality == ProvenanceQuality::Exact
                 && (turn.context_trace.context_items.is_empty()
@@ -653,6 +1079,16 @@ pub fn context_sha256(messages: &[ChatMessage]) -> String {
         hash_part(&mut hasher, message.role.as_bytes());
         hash_part(&mut hasher, message.content.as_bytes());
     }
+    format!("{:x}", hasher.finalize())
+}
+
+pub fn agent_context_sha256(messages: &[AgentMessage], tools: &[ToolDefinition]) -> String {
+    let mut hasher = Sha256::new();
+    hash_part(&mut hasher, b"hippocampus:agent-context:v1");
+    let messages = serde_json::to_vec(messages).expect("agent messages are serializable");
+    let tools = serde_json::to_vec(tools).expect("tool definitions are serializable");
+    hash_part(&mut hasher, &messages);
+    hash_part(&mut hasher, &tools);
     format!("{:x}", hasher.finalize())
 }
 

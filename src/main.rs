@@ -6,7 +6,9 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use hippocampus::config::AppConfig;
 use hippocampus::engine::PreparationStatus;
-use hippocampus::model::{BudgetConfig, ChatEventKind, ChatMessage, Session, TokenUsage};
+use hippocampus::model::{
+    BudgetConfig, ChatEventKind, ChatMessage, Session, TokenUsage, Turn, identity_instruction,
+};
 use hippocampus::ollama::{ChatBackend, ChatRequest};
 use hippocampus::{ChatEngine, KnowledgeSyncReport, LimitAction, OllamaClient, SessionStore};
 use serde_json::json;
@@ -362,12 +364,20 @@ async fn run_contextual_ask(
                 "thinking": turn.thinking,
                 "content": turn.assistant_content,
                 "usage": turn.usage,
+                "knowledge": turn.context_trace.knowledge,
+                "web": turn.context_trace.web,
+                "knowledge_sources": turn.context_trace.knowledge.selected_evidence,
+                "web_sources": turn.context_trace.web.sources,
+                "warnings": turn_warnings(turn),
             }))?
         );
     } else {
         println!();
         io::stdout().flush()?;
         print_usage(session.turns.last().map(|turn| turn.usage));
+        if let Some(turn) = session.turns.last() {
+            print_turn_sources(turn);
+        }
     }
     Ok(())
 }
@@ -429,7 +439,7 @@ async fn run_knowledge(
             }
         }
         KnowledgeCommand::Rebuild => {
-            let documents = store.knowledge().rebuild()?;
+            let documents = store.knowledge().rebuild_for_config(&config.knowledge)?;
             println!("知识索引已从原始快照重建：{documents} 个 passage。");
         }
     }
@@ -483,6 +493,10 @@ async fn run_stateless_ask(host: &str, args: AskArgs, config: &AppConfig) -> Res
             content: system_prompt,
         });
     }
+    messages.push(ChatMessage {
+        role: "system".into(),
+        content: identity_instruction(config.ai_name()),
+    });
     messages.push(ChatMessage {
         role: "user".into(),
         content: args.prompt,
@@ -626,6 +640,7 @@ fn show_session(store: &SessionStore, identifier: &str, json_output: bool) -> Re
             optional(turn.probe_usage.output_tokens),
             optional(turn.probe_usage.total_tokens),
         );
+        print_turn_sources(turn);
     }
     Ok(())
 }
@@ -658,6 +673,39 @@ fn print_usage(usage: Option<TokenUsage>) {
             optional(usage.output_tokens),
             optional(usage.total_tokens)
         );
+    }
+}
+
+fn turn_warnings(turn: &Turn) -> Vec<String> {
+    let mut warnings = turn.context_trace.knowledge.warnings.clone();
+    warnings.extend(turn.context_trace.web.warnings.clone());
+    warnings.sort();
+    warnings.dedup();
+    warnings
+}
+
+fn print_turn_sources(turn: &Turn) {
+    if !turn.context_trace.knowledge.selected_evidence.is_empty() {
+        eprintln!("知识来源：");
+        for evidence in &turn.context_trace.knowledge.selected_evidence {
+            eprintln!(
+                "  - {}｜{}｜revision={}｜{}..{}",
+                evidence.title,
+                evidence.source_location,
+                evidence.revision_id,
+                evidence.start_char,
+                evidence.end_char,
+            );
+        }
+    }
+    if !turn.context_trace.web.sources.is_empty() {
+        eprintln!("实时来源：");
+        for source in &turn.context_trace.web.sources {
+            eprintln!("  - {}｜{}｜{}", source.kind, source.title, source.url);
+        }
+    }
+    for warning in turn_warnings(turn) {
+        eprintln!("警告：{warning}");
     }
 }
 
@@ -715,6 +763,25 @@ mod tests {
         assert_eq!(args.context_window, 2048);
         assert!(!args.thinking_enabled());
         assert_eq!(args.system_prompt.as_deref(), Some("system"));
+    }
+
+    #[test]
+    fn command_line_system_prompts_override_config() {
+        let config = AppConfig {
+            system_prompt: "from config".into(),
+            ..AppConfig::default()
+        };
+        let mut new_args = NewArgs::default();
+        assert_eq!(new_args.read_prompt(&config).unwrap(), "from config");
+        new_args.system_prompt = Some("from cli".into());
+        assert_eq!(new_args.read_prompt(&config).unwrap(), "from cli");
+
+        let root = tempfile::tempdir().unwrap();
+        let prompt_file = root.path().join("system.txt");
+        std::fs::write(&prompt_file, "from file").unwrap();
+        new_args.system_prompt = None;
+        new_args.system_prompt_file = Some(prompt_file);
+        assert_eq!(new_args.read_prompt(&config).unwrap(), "from file");
     }
 
     #[test]

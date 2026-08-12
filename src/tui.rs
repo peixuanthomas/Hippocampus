@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 use unicode_width::UnicodeWidthChar;
 
 use crate::engine::{ChatEngine, LimitAction, PreparationStatus};
-use crate::model::{ChatEvent, ChatEventKind, Session};
+use crate::model::{ChatEvent, ChatEventKind, Session, Turn};
 use crate::ollama::{ModelInfo, OllamaClient};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +97,12 @@ impl App {
                 messages.push(Message {
                     role: Role::Error,
                     content: format!("[{}] {error}", turn.status.as_str()),
+                });
+            }
+            if let Some(summary) = provenance_summary(turn) {
+                messages.push(Message {
+                    role: Role::System,
+                    content: summary,
                 });
             }
         }
@@ -218,6 +224,12 @@ impl App {
                         self.messages.push(Message {
                             role: Role::Assistant,
                             content: std::mem::take(&mut self.live_answer),
+                        });
+                    }
+                    if let Some(summary) = self.session.turns.last().and_then(provenance_summary) {
+                        self.messages.push(Message {
+                            role: Role::System,
+                            content: summary,
                         });
                     }
                     self.live_thinking.clear();
@@ -343,6 +355,42 @@ impl App {
         });
         self.follow_output = true;
     }
+}
+
+fn provenance_summary(turn: &Turn) -> Option<String> {
+    let mut lines = Vec::new();
+    if !turn.context_trace.knowledge.selected_evidence.is_empty() {
+        lines.push("知识来源（由程序 trace 生成）".to_owned());
+        for evidence in &turn.context_trace.knowledge.selected_evidence {
+            lines.push(format!(
+                "[K] {} · {} · revision={} · {}..{}",
+                evidence.title,
+                evidence.source_location,
+                evidence.revision_id,
+                evidence.start_char,
+                evidence.end_char
+            ));
+        }
+    }
+    if !turn.context_trace.web.sources.is_empty() {
+        lines.push("实时来源（由程序 trace 生成）".to_owned());
+        for source in &turn.context_trace.web.sources {
+            lines.push(format!(
+                "[W] {} · {} · {}",
+                source.kind, source.title, source.url
+            ));
+        }
+    }
+    let mut warnings = turn.context_trace.knowledge.warnings.clone();
+    warnings.extend(turn.context_trace.web.warnings.clone());
+    warnings.sort();
+    warnings.dedup();
+    lines.extend(
+        warnings
+            .into_iter()
+            .map(|warning| format!("警告：{warning}")),
+    );
+    (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
 pub async fn run(

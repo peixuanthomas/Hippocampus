@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::config::{KnowledgeConfig, KnowledgeSourceConfig, KnowledgeSourceKind};
 use crate::model::{content_sha256, utc_now};
-use crate::ollama::{OllamaClient, WebFetchResponse};
+use crate::ollama::{ChatBackend, WebFetchResponse};
 use crate::retrieval::{lexical_field, ngram_field, query_terms};
 
 const KNOWLEDGE_DIR: &str = ".knowledge";
@@ -216,10 +216,10 @@ impl KnowledgeStore {
         &self.index_path
     }
 
-    pub async fn sync(
+    pub async fn sync<B: ChatBackend>(
         &self,
         config: &KnowledgeConfig,
-        client: &OllamaClient,
+        client: &B,
     ) -> Result<KnowledgeSyncReport> {
         config.validate()?;
         fs::create_dir_all(&self.snapshots)
@@ -235,6 +235,9 @@ impl KnowledgeStore {
         for source in &config.sources {
             let now = utc_now();
             let previous = state.sources.get(&source.id).cloned();
+            let compatible_previous = previous
+                .as_ref()
+                .filter(|value| value.kind == source.kind && value.location == source.location);
             let result = match source.kind {
                 KnowledgeSourceKind::Path => self.read_path_source(source),
                 KnowledgeSourceKind::Url => self.fetch_url_source(source, client).await,
@@ -242,8 +245,7 @@ impl KnowledgeStore {
             match result {
                 Ok(documents) => {
                     let previous_by_document = self.latest_by_document(
-                        previous
-                            .as_ref()
+                        compatible_previous
                             .map(|value| value.active_revisions.as_slice())
                             .unwrap_or_default(),
                     )?;
@@ -295,15 +297,19 @@ impl KnowledgeStore {
                     report.failed_sources += 1;
                     let warning = format!("知识源 {} 更新失败：{error:#}", source.id);
                     report.warnings.push(warning.clone());
-                    let mut preserved = previous.unwrap_or(KnowledgeSourceState {
-                        kind: source.kind,
-                        location: source.location.clone(),
-                        enabled: true,
-                        active_revisions: Vec::new(),
-                        last_sync_at: now.clone(),
-                        last_success_at: None,
-                        last_error: None,
-                    });
+                    let mut preserved = previous
+                        .filter(|value| {
+                            value.kind == source.kind && value.location == source.location
+                        })
+                        .unwrap_or(KnowledgeSourceState {
+                            kind: source.kind,
+                            location: source.location.clone(),
+                            enabled: true,
+                            active_revisions: Vec::new(),
+                            last_sync_at: now.clone(),
+                            last_success_at: None,
+                            last_error: None,
+                        });
                     preserved.kind = source.kind;
                     preserved.location = source.location.clone();
                     preserved.enabled = true;
@@ -325,6 +331,24 @@ impl KnowledgeStore {
         self.rebuild_from_state(&state)
     }
 
+    pub fn rebuild_for_config(&self, config: &KnowledgeConfig) -> Result<usize> {
+        config.validate()?;
+        let configured = config
+            .sources
+            .iter()
+            .map(|source| (source.id.as_str(), source))
+            .collect::<HashMap<_, _>>();
+        let mut state = self.load_state()?;
+        for (source_id, saved) in &mut state.sources {
+            saved.enabled = configured.get(source_id.as_str()).is_some_and(|source| {
+                source.kind == saved.kind && source.location == saved.location
+            });
+        }
+        self.save_state(&state)?;
+        self.remove_index_files()?;
+        self.rebuild_from_state(&state)
+    }
+
     pub fn list(&self, config: &KnowledgeConfig) -> Result<Vec<KnowledgeSourceStatus>> {
         let state = self.load_state()?;
         Ok(config
@@ -336,7 +360,11 @@ impl KnowledgeStore {
                     id: source.id.clone(),
                     kind: source.kind,
                     location: source.location.clone(),
-                    enabled: saved.is_some_and(|value| value.enabled),
+                    enabled: saved.is_some_and(|value| {
+                        value.enabled
+                            && value.kind == source.kind
+                            && value.location == source.location
+                    }),
                     active_documents: saved.map_or(0, |value| value.active_revisions.len()),
                     last_sync_at: saved.map(|value| value.last_sync_at.clone()),
                     last_success_at: saved.and_then(|value| value.last_success_at.clone()),
@@ -350,6 +378,12 @@ impl KnowledgeStore {
         config.validate()?;
         let terms = query_terms(query);
         let state = self.load_state()?;
+        let active_revisions = self.active_revision_owners(&state)?;
+        let configured_sources = config
+            .sources
+            .iter()
+            .map(|source| (source.id.as_str(), source))
+            .collect::<HashMap<_, _>>();
         let warnings = state
             .sources
             .values()
@@ -423,9 +457,27 @@ impl KnowledgeStore {
                 exact_content,
                 score,
             ) = row;
+            if !configured_sources
+                .get(source_id.as_str())
+                .is_some_and(|configured| {
+                    state.sources.get(&source_id).is_some_and(|saved| {
+                        saved.enabled
+                            && saved.kind == configured.kind
+                            && saved.location == configured.location
+                    })
+                })
+            {
+                continue;
+            }
             let snapshot = self.load_snapshot(&revision)?;
             let resolved = slice_chars(&snapshot.content, start, end)?;
-            if snapshot.content_sha256 != content_hash
+            if active_revisions.get(&revision).map(String::as_str) != Some(source_id.as_str())
+                || snapshot.source_id != source_id
+                || snapshot.document_key != document_key
+                || snapshot.title != title
+                || snapshot.source_location != location
+                || snapshot.fetched_at != fetched_at
+                || snapshot.content_sha256 != content_hash
                 || content_sha256(&resolved) != span_hash
                 || resolved != exact_content
             {
@@ -447,7 +499,8 @@ impl KnowledgeStore {
                 selected: false,
                 reason: String::new(),
             };
-            if selected_documents.contains(&document_key) {
+            let document_identity = (source_id.clone(), document_key.clone());
+            if selected_documents.contains(&document_identity) {
                 candidate.reason = "duplicate_document".into();
             } else if selected_hashes.contains(&span_hash) {
                 candidate.reason = "duplicate_content".into();
@@ -459,7 +512,7 @@ impl KnowledgeStore {
                 candidate.selected = true;
                 candidate.reason = "selected_core".into();
                 used_chars += resolved.chars().count();
-                selected_documents.insert(document_key.clone());
+                selected_documents.insert(document_identity);
                 selected_hashes.insert(span_hash.clone());
                 trace.selected_evidence.push(KnowledgeEvidence {
                     revision_id: revision,
@@ -509,7 +562,13 @@ impl KnowledgeStore {
         );
         for (index, item) in evidence.iter().enumerate() {
             let snapshot = self.load_snapshot(&item.revision_id)?;
-            if snapshot.content_sha256 != item.content_sha256 {
+            if snapshot.source_id != item.source_id
+                || snapshot.document_key != item.document_key
+                || snapshot.title != item.title
+                || snapshot.source_location != item.source_location
+                || snapshot.fetched_at != item.fetched_at
+                || snapshot.content_sha256 != item.content_sha256
+            {
                 bail!("知识证据 {} 快照哈希不匹配", item.revision_id);
             }
             let content = slice_chars(&snapshot.content, item.start_char, item.end_char)?;
@@ -529,10 +588,10 @@ impl KnowledgeStore {
         Ok(output)
     }
 
-    async fn fetch_url_source(
+    async fn fetch_url_source<B: ChatBackend>(
         &self,
         source: &KnowledgeSourceConfig,
-        client: &OllamaClient,
+        client: &B,
     ) -> Result<Vec<SourceDocument>> {
         let WebFetchResponse {
             title,
@@ -619,7 +678,10 @@ impl KnowledgeStore {
         if path.is_file() {
             let existing = self.load_snapshot(&snapshot.revision_id)?;
             if existing.source_id != snapshot.source_id
+                || existing.source_kind != snapshot.source_kind
+                || existing.configured_location != snapshot.configured_location
                 || existing.document_key != snapshot.document_key
+                || existing.source_location != snapshot.source_location
                 || existing.content_sha256 != snapshot.content_sha256
             {
                 bail!("知识 revision ID 冲突：{}", snapshot.revision_id);
@@ -655,6 +717,7 @@ impl KnowledgeStore {
         if state.schema_version != KNOWLEDGE_SCHEMA_VERSION {
             bail!("不支持的知识状态版本 {}", state.schema_version);
         }
+        self.active_revision_owners(&state)?;
         Ok(state)
     }
 
@@ -662,10 +725,31 @@ impl KnowledgeStore {
         if state.schema_version != KNOWLEDGE_SCHEMA_VERSION {
             bail!("不能写入知识状态版本 {}", state.schema_version);
         }
+        self.active_revision_owners(state)?;
         atomic_json_write(&self.state_path, state)
     }
 
+    fn active_revision_owners(&self, state: &KnowledgeState) -> Result<HashMap<String, String>> {
+        let mut owners = HashMap::new();
+        for (source_id, source) in &state.sources {
+            if source_id.trim().is_empty() || source.last_sync_at.is_empty() {
+                bail!("知识状态包含无效来源");
+            }
+            let mut source_revisions = HashSet::new();
+            for revision in &source.active_revisions {
+                if !is_hash_id(revision) || !source_revisions.insert(revision) {
+                    bail!("知识源 {source_id} 包含无效或重复 revision");
+                }
+                if source.enabled && owners.insert(revision.clone(), source_id.clone()).is_some() {
+                    bail!("知识 revision {revision} 同时属于多个启用来源");
+                }
+            }
+        }
+        Ok(owners)
+    }
+
     fn rebuild_from_state(&self, state: &KnowledgeState) -> Result<usize> {
+        self.active_revision_owners(state)?;
         fs::create_dir_all(&self.root)?;
         let mut connection = self.open_connection()?;
         let transaction = connection.transaction()?;
@@ -674,9 +758,15 @@ impl KnowledgeStore {
              DELETE FROM knowledge_documents;",
         )?;
         let mut count = 0usize;
-        for source in state.sources.values().filter(|source| source.enabled) {
+        for (source_id, source) in state.sources.iter().filter(|(_, source)| source.enabled) {
             for revision in &source.active_revisions {
                 let snapshot = self.load_snapshot(revision)?;
+                if snapshot.source_id != *source_id
+                    || snapshot.source_kind != source.kind
+                    || snapshot.configured_location != source.location
+                {
+                    bail!("知识 revision {revision} 与当前来源状态不一致");
+                }
                 for (start, end, granularity) in passage_spans(&snapshot.content) {
                     let content = slice_chars(&snapshot.content, start, end)?;
                     let document_id = format!("{}:{start}:{end}", snapshot.revision_id);
@@ -897,6 +987,78 @@ CREATE INDEX IF NOT EXISTS knowledge_documents_source ON knowledge_documents(sou
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    use async_trait::async_trait;
+    use tokio_util::sync::CancellationToken;
+
+    use crate::model::{ChatEvent, ChatMessage, TokenUsage};
+    use crate::ollama::{ChatRequest, ModelInfo, OllamaClient, OllamaError};
+
+    #[derive(Clone)]
+    struct FetchBackend {
+        responses: Arc<Mutex<VecDeque<std::result::Result<WebFetchResponse, OllamaError>>>>,
+    }
+
+    impl FetchBackend {
+        fn new(responses: Vec<std::result::Result<WebFetchResponse, OllamaError>>) -> Self {
+            Self {
+                responses: Arc::new(Mutex::new(responses.into())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ChatBackend for FetchBackend {
+        async fn check_model(
+            &self,
+            _model: &str,
+            _requested_context: u64,
+        ) -> std::result::Result<ModelInfo, OllamaError> {
+            unreachable!("knowledge sync only uses web_fetch")
+        }
+
+        async fn render_prompt(
+            &self,
+            _model: &str,
+            _messages: &[ChatMessage],
+            _think: bool,
+            _num_ctx: u64,
+        ) -> std::result::Result<Option<String>, OllamaError> {
+            unreachable!("knowledge sync only uses web_fetch")
+        }
+
+        async fn probe(
+            &self,
+            _model: &str,
+            _messages: &[ChatMessage],
+            _think: bool,
+            _num_ctx: u64,
+        ) -> std::result::Result<TokenUsage, OllamaError> {
+            unreachable!("knowledge sync only uses web_fetch")
+        }
+
+        async fn stream_chat(
+            &self,
+            _request: ChatRequest,
+            _cancellation: CancellationToken,
+            _emit: &mut (dyn FnMut(ChatEvent) + Send),
+        ) -> std::result::Result<(), OllamaError> {
+            unreachable!("knowledge sync only uses web_fetch")
+        }
+
+        async fn web_fetch(
+            &self,
+            _url: &str,
+        ) -> std::result::Result<WebFetchResponse, OllamaError> {
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("configured fetch response")
+        }
+    }
 
     fn local_config(path: &Path) -> KnowledgeConfig {
         KnowledgeConfig {
@@ -908,6 +1070,20 @@ mod tests {
                 id: "notes".into(),
                 kind: KnowledgeSourceKind::Path,
                 location: path.to_string_lossy().into_owned(),
+            }],
+        }
+    }
+
+    fn url_config() -> KnowledgeConfig {
+        KnowledgeConfig {
+            auto_sync: true,
+            candidate_limit: 64,
+            max_selected: 4,
+            evidence_char_budget: 3_200,
+            sources: vec![KnowledgeSourceConfig {
+                id: "remote-docs".into(),
+                kind: KnowledgeSourceKind::Url,
+                location: "https://example.com/docs".into(),
             }],
         }
     }
@@ -933,6 +1109,7 @@ mod tests {
 
         let recall = store.recall("海棠计划暗号", &config).unwrap();
         assert_eq!(recall.trace.selected_evidence.len(), 1);
+        let first_revision = recall.trace.selected_evidence[0].revision_id.clone();
         assert!(
             recall
                 .trace
@@ -945,13 +1122,15 @@ mod tests {
         fs::write(docs.join("facts.md"), "海棠计划暗号更新为银杏晨光。").unwrap();
         let updated = store.sync(&config, &client).await.unwrap();
         assert_eq!(updated.new_revisions, 1);
-        assert!(
+        let updated_recall = store.recall("银杏晨光", &config).unwrap();
+        let updated_revision = &updated_recall.trace.selected_evidence[0].revision_id;
+        assert_eq!(
             store
-                .recall("银杏晨光", &config)
+                .load_snapshot(updated_revision)
                 .unwrap()
-                .trace
-                .injected_message
-                .is_some()
+                .previous_revision
+                .as_deref(),
+            Some(first_revision.as_str())
         );
         assert_eq!(store.rebuild().unwrap(), 1);
     }
@@ -986,5 +1165,88 @@ mod tests {
                 .is_none()
         );
         assert_eq!(fs::read_dir(&store.snapshots).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn removed_config_source_is_disabled_but_history_is_retained() {
+        let root = tempfile::tempdir().unwrap();
+        let document = root.path().join("facts.md");
+        fs::write(&document, "配置移除前的唯一词是琥珀星环").unwrap();
+        let store = KnowledgeStore::new(root.path().join("sessions")).unwrap();
+        let client = OllamaClient::new("http://127.0.0.1:11434").unwrap();
+        let config = local_config(&document);
+        store.sync(&config, &client).await.unwrap();
+
+        let empty = KnowledgeConfig {
+            sources: Vec::new(),
+            ..config.clone()
+        };
+        assert!(
+            store
+                .recall("琥珀星环", &empty)
+                .unwrap()
+                .trace
+                .selected_evidence
+                .is_empty()
+        );
+        assert_eq!(store.rebuild_for_config(&empty).unwrap(), 0);
+        assert_eq!(fs::read_dir(&store.snapshots).unwrap().count(), 1);
+        let state = store.load_state().unwrap();
+        assert!(!state.sources["notes"].enabled);
+    }
+
+    #[tokio::test]
+    async fn url_failure_preserves_latest_success_and_reports_staleness() {
+        let root = tempfile::tempdir().unwrap();
+        let store = KnowledgeStore::new(root.path().join("sessions")).unwrap();
+        let client = FetchBackend::new(vec![
+            Ok(WebFetchResponse {
+                title: "Remote docs".into(),
+                content: "远程资料的稳定事实是松石轨道".into(),
+                links: vec!["https://example.com/next".into()],
+            }),
+            Err(OllamaError::Other("simulated timeout".into())),
+        ]);
+        let config = url_config();
+        let first = store.sync(&config, &client).await.unwrap();
+        assert_eq!(first.new_revisions, 1);
+        let failed = store.sync(&config, &client).await.unwrap();
+        assert_eq!(failed.failed_sources, 1);
+        assert_eq!(failed.active_documents, 1);
+        assert!(failed.warnings[0].contains("simulated timeout"));
+
+        let recall = store.recall("松石轨道", &config).unwrap();
+        assert_eq!(recall.trace.selected_evidence.len(), 1);
+        assert!(
+            recall
+                .trace
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("simulated timeout"))
+        );
+        assert_eq!(fs::read_dir(&store.snapshots).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn tampered_derived_row_is_rejected_and_rebuild_restores_it() {
+        let root = tempfile::tempdir().unwrap();
+        let document = root.path().join("facts.md");
+        fs::write(&document, "索引校验词是紫藤罗盘").unwrap();
+        let store = KnowledgeStore::new(root.path().join("sessions")).unwrap();
+        let client = OllamaClient::new("http://127.0.0.1:11434").unwrap();
+        let config = local_config(&document);
+        store.sync(&config, &client).await.unwrap();
+
+        let connection = Connection::open(store.index_path()).unwrap();
+        connection
+            .execute("UPDATE knowledge_documents SET title = 'forged title'", [])
+            .unwrap();
+        drop(connection);
+        assert!(store.recall("紫藤罗盘", &config).is_err());
+
+        store.rebuild().unwrap();
+        let recall = store.recall("紫藤罗盘", &config).unwrap();
+        assert_eq!(recall.trace.selected_evidence.len(), 1);
+        assert_eq!(recall.trace.selected_evidence[0].title, "facts.md");
     }
 }

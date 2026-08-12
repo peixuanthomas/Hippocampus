@@ -16,10 +16,14 @@ pub use context::ContextAssembler;
 pub use engine::{ChatEngine, LimitAction, PreparedTurn};
 pub use knowledge::{KnowledgeRecall, KnowledgeStore, KnowledgeSyncReport, KnowledgeTrace};
 pub use model::{
-    BudgetConfig, EventRole, EvidenceKind, ProvenanceQuality, RetrievalConfig, RetrievalTrace,
-    Session, SourceSpan, TokenUsage, Turn,
+    AgentChatRequest, AgentMessage, AgentRoundResult, BudgetConfig, EventRole, EvidenceKind,
+    ProvenanceQuality, RetrievalConfig, RetrievalTrace, Session, SourceSpan, TokenUsage, ToolCall,
+    ToolDefinition, ToolResultTrace, ToolRoundTrace, Turn, WebSourceTrace, WebTrace,
 };
-pub use ollama::{ModelInfo, OllamaClient};
+pub use ollama::{
+    ModelInfo, OllamaClient, WebFetchResponse, WebSearchResponse, WebSearchResult,
+    validate_public_http_url, validate_public_http_url_resolved,
+};
 pub use retrieval::{
     AnswerContext, AnswerContextItem, IndexedSession, RecallResult, RecalledEvidence, ResolvedSpan,
     RetrievalError, RetrievalStore, StoredEvent, SyncReport,

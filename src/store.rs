@@ -439,6 +439,7 @@ mod tests {
         fs::write(root.path().join("20260811-abcdef12.json"), legacy).unwrap();
         let mut session = store.load("20260811-abc").unwrap();
         assert_eq!(session.title, "旧会话");
+        assert_eq!(session.ai_name, "LLM");
         assert_eq!(session.turns[0].thinking, "不会回注");
         assert_eq!(session.cumulative_usage.total_tokens, Some(16));
         store.save(&mut session).unwrap();
@@ -451,6 +452,39 @@ mod tests {
         );
         let trace = store.retrieval().answer_context(&answer_id).unwrap();
         assert_eq!(trace.provenance_quality, ProvenanceQuality::LegacyInferred);
+    }
+
+    #[test]
+    fn loads_schema_v2_without_name_as_llm() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let session = Session::new_named(
+            "legacy-v2".into(),
+            "model".into(),
+            "http://localhost".into(),
+            "temporary".into(),
+            "original system".into(),
+            BudgetConfig::default(),
+            false,
+        )
+        .unwrap();
+        let mut value = serde_json::to_value(session).unwrap();
+        value["schema_version"] = serde_json::json!(2);
+        value.as_object_mut().unwrap().remove("ai_name");
+        fs::write(
+            root.path().join("legacy-v2.json"),
+            serde_json::to_vec_pretty(&value).unwrap(),
+        )
+        .unwrap();
+
+        let mut loaded = store.load("legacy-v2").unwrap();
+        assert_eq!(loaded.ai_name, "LLM");
+        assert_eq!(loaded.system_prompt, "original system");
+        store.save(&mut loaded).unwrap();
+        assert_eq!(
+            store.load("legacy-v2").unwrap().schema_version,
+            SCHEMA_VERSION
+        );
     }
 
     #[test]
@@ -478,6 +512,9 @@ mod tests {
         store.save(&mut session).unwrap();
 
         session.system_prompt = "changed".into();
+        assert!(store.save(&mut session).is_err());
+        session = store.load(&session.id).unwrap();
+        session.ai_name = "changed".into();
         assert!(store.save(&mut session).is_err());
         session = store.load(&session.id).unwrap();
         session.turns[0].user_content = "changed".into();

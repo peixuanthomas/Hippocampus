@@ -111,6 +111,11 @@ button { cursor: pointer; }
 .assistant .role-label { color: var(--green); }
 .error .role-label { color: var(--red); }
 .message-meta { margin-top: 9px; color: #687181; font: .72rem ui-monospace, monospace; }
+.provenance { margin-top: 15px; padding: 11px 13px; border: 1px solid var(--border); border-radius: 9px; color: #9ba5b5; background: #11161c; font: .76rem/1.6 ui-monospace, monospace; overflow-wrap: anywhere; }
+.provenance strong { display: block; margin-top: 5px; color: #c9d2df; }
+.provenance strong:first-child { margin-top: 0; }
+.provenance a { color: var(--cyan); }
+.provenance-warning { color: var(--yellow); }
 
 .thinking {
   margin: 0 0 15px;

@@ -252,6 +252,8 @@ mod tests {
         ];
         session.active_context_start_index = 1;
         let plan = ContextAssembler.assemble(&session, "current", None, None);
+        assert!(plan.identity_instruction.contains("LLM"));
+        assert_eq!(plan.messages[1].content, plan.identity_instruction);
         assert_eq!(plan.included_turn_ids, vec![session.turns[1].id.clone()]);
         assert!(!format!("{:?}", plan.messages).contains("secret"));
         assert_eq!(plan.messages.last().unwrap().content, "current");

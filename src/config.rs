@@ -239,6 +239,13 @@ mod tests {
     }
 
     #[test]
+    fn missing_explicit_config_is_an_error() {
+        let root = tempfile::tempdir().unwrap();
+        let error = AppConfig::load(Some(&root.path().join("missing.toml"))).unwrap_err();
+        assert!(error.to_string().contains("找不到配置文件"));
+    }
+
+    #[test]
     fn strict_config_resolves_relative_paths() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("custom.toml");
@@ -286,5 +293,12 @@ location = "notes"
             },
         ];
         assert!(config.validate().is_err());
+
+        let mut invalid_budget = AppConfig::default();
+        invalid_budget.web_search.max_tool_calls = 0;
+        assert!(invalid_budget.validate().is_err());
+
+        let empty_name: Result<AppConfig, _> = toml::from_str("ai_name = '   '");
+        assert!(empty_name.unwrap().validate().is_err());
     }
 }
