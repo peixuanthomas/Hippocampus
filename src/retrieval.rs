@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
 use std::time::Duration;
 
 use chrono::Utc;
@@ -58,6 +58,8 @@ pub enum RetrievalError {
     },
     #[error("派生索引内容校验失败：{0}")]
     CorruptIndex(String),
+    #[error("会话根目录锁已损坏，拒绝继续访问：{path}")]
+    RootLockPoisoned { path: PathBuf },
 }
 
 pub type RetrievalResult<T> = std::result::Result<T, RetrievalError>;
@@ -147,6 +149,72 @@ pub struct RecallResult {
 pub struct RetrievalStore {
     root: PathBuf,
     index_path: PathBuf,
+    root_lock: Arc<RwLock<()>>,
+    #[cfg(test)]
+    test_hooks: RetrievalTestHooks,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConsolidationHookPoint {
+    AfterPendingBatchCheck,
+    AfterTransactionSourceCheck,
+}
+
+#[cfg(test)]
+pub(crate) type ConsolidationHook = Arc<dyn Fn(ConsolidationHookPoint) + Send + Sync>;
+
+#[cfg(test)]
+#[derive(Clone, Default)]
+struct RetrievalTestHooks {
+    consolidation: Arc<Mutex<Option<ConsolidationHook>>>,
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for RetrievalTestHooks {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RetrievalTestHooks(..)")
+    }
+}
+
+static ROOT_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<RwLock<()>>>>> = OnceLock::new();
+
+fn shared_root_lock(root: &Path) -> RetrievalResult<Arc<RwLock<()>>> {
+    let key = canonical_root_key(root);
+    let registry = ROOT_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut registry = registry
+        .lock()
+        .map_err(|_| RetrievalError::RootLockPoisoned { path: key.clone() })?;
+    registry.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = registry.get(&key).and_then(Weak::upgrade) {
+        return Ok(lock);
+    }
+    let lock = Arc::new(RwLock::new(()));
+    registry.insert(key, Arc::downgrade(&lock));
+    Ok(lock)
+}
+
+fn canonical_root_key(root: &Path) -> PathBuf {
+    if let Ok(path) = fs::canonicalize(root) {
+        return path;
+    }
+    let mut missing = Vec::new();
+    let mut ancestor = root;
+    while !ancestor.exists() {
+        let Some(name) = ancestor.file_name() else {
+            return root.to_path_buf();
+        };
+        missing.push(name.to_os_string());
+        let Some(parent) = ancestor.parent() else {
+            return root.to_path_buf();
+        };
+        ancestor = parent;
+    }
+    let mut key = fs::canonicalize(ancestor).unwrap_or_else(|_| ancestor.to_path_buf());
+    for name in missing.into_iter().rev() {
+        key.push(name);
+    }
+    key
 }
 
 impl RetrievalStore {
@@ -162,9 +230,13 @@ impl RetrievalStore {
                 })?
                 .join(path)
         };
+        let root_lock = shared_root_lock(&root)?;
         Ok(Self {
             index_path: root.join(INDEX_FILENAME),
             root,
+            root_lock,
+            #[cfg(test)]
+            test_hooks: RetrievalTestHooks::default(),
         })
     }
 
@@ -177,6 +249,15 @@ impl RetrievalStore {
     }
 
     pub fn sync_session(
+        &self,
+        expected_session: &Session,
+        source_path: &Path,
+    ) -> RetrievalResult<SyncReport> {
+        let _guard = self.acquire_root_write()?;
+        self.sync_session_under_root_write(expected_session, source_path)
+    }
+
+    pub(crate) fn sync_session_under_root_write(
         &self,
         expected_session: &Session,
         source_path: &Path,
@@ -203,6 +284,11 @@ impl RetrievalStore {
     }
 
     pub fn rebuild(&self) -> RetrievalResult<SyncReport> {
+        let _guard = self.acquire_root_write()?;
+        self.rebuild_under_root_write()
+    }
+
+    fn rebuild_under_root_write(&self) -> RetrievalResult<SyncReport> {
         let sources = self.load_all_sources()?;
         let mut connection = self.open_connection()?;
         let transaction = connection
@@ -235,6 +321,44 @@ impl RetrievalStore {
             .commit()
             .map_err(|source| self.database_error(source))?;
         Ok(total)
+    }
+
+    pub(crate) fn acquire_root_read(&self) -> RetrievalResult<RwLockReadGuard<'_, ()>> {
+        self.root_lock
+            .read()
+            .map_err(|_| RetrievalError::RootLockPoisoned {
+                path: self.root.clone(),
+            })
+    }
+
+    pub(crate) fn acquire_root_write(&self) -> RetrievalResult<RwLockWriteGuard<'_, ()>> {
+        self.root_lock
+            .write()
+            .map_err(|_| RetrievalError::RootLockPoisoned {
+                path: self.root.clone(),
+            })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_consolidation_test_hook(&self, hook: Option<ConsolidationHook>) {
+        *self
+            .test_hooks
+            .consolidation
+            .lock()
+            .expect("test hook mutex must not be poisoned") = hook;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run_consolidation_test_hook(&self, point: ConsolidationHookPoint) {
+        let hook = self
+            .test_hooks
+            .consolidation
+            .lock()
+            .expect("test hook mutex must not be poisoned")
+            .clone();
+        if let Some(hook) = hook {
+            hook(point);
+        }
     }
 
     pub fn get_session(&self, session_id: &str) -> RetrievalResult<IndexedSession> {
@@ -1100,6 +1224,8 @@ impl RetrievalStore {
                 .execute_batch(SCHEMA_SQL)
                 .map_err(|source| self.database_error(source))?;
         }
+        ensure_memory_evidence_binding_columns(&connection)
+            .map_err(|source| self.database_error(source))?;
         Ok(connection)
     }
 
@@ -1716,6 +1842,27 @@ fn table_has_column(connection: &Connection, table: &str, column: &str) -> rusql
     Ok(names.iter().any(|name| name == column))
 }
 
+fn ensure_memory_evidence_binding_columns(connection: &Connection) -> rusqlite::Result<()> {
+    for (column, sql_type) in [
+        ("subject_start_char", "INTEGER"),
+        ("subject_end_char", "INTEGER"),
+        ("subject_sha256", "TEXT"),
+        ("relation_start_char", "INTEGER"),
+        ("relation_end_char", "INTEGER"),
+        ("relation_sha256", "TEXT"),
+        ("object_start_char", "INTEGER"),
+        ("object_end_char", "INTEGER"),
+        ("object_sha256", "TEXT"),
+    ] {
+        if !table_has_column(connection, "memory_claim_evidence", column)? {
+            connection.execute_batch(&format!(
+                "ALTER TABLE memory_claim_evidence ADD COLUMN {column} {sql_type};"
+            ))?;
+        }
+    }
+    Ok(())
+}
+
 fn slice_chars(content: &str, span: &SourceSpan) -> RetrievalResult<String> {
     let char_count = content.chars().count();
     if span.start_char > span.end_char || span.end_char > char_count {
@@ -1960,6 +2107,7 @@ CREATE TABLE IF NOT EXISTS memory_entity_aliases (
     end_char INTEGER NOT NULL CHECK(end_char > start_char),
     content_sha256 TEXT NOT NULL CHECK(length(content_sha256) = 64),
     created_at TEXT NOT NULL,
+    FOREIGN KEY(entity_id) REFERENCES memory_entities(entity_id),
     CHECK((alias_kind = 'explicit_alias' AND stable_identifier_kind IS NULL)
        OR (alias_kind = 'stable_identifier' AND stable_identifier_kind IS NOT NULL
            AND length(stable_identifier_kind) > 0))
@@ -1992,7 +2140,9 @@ CREATE TABLE IF NOT EXISTS memory_claims (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     CHECK((object_kind = 'text' AND object_text IS NOT NULL AND object_entity_id IS NULL)
-       OR (object_kind = 'entity' AND object_text IS NULL AND object_entity_id IS NOT NULL))
+       OR (object_kind = 'entity' AND object_text IS NULL AND object_entity_id IS NOT NULL)),
+    FOREIGN KEY(subject_entity_id) REFERENCES memory_entities(entity_id),
+    FOREIGN KEY(object_entity_id) REFERENCES memory_entities(entity_id)
 );
 CREATE INDEX IF NOT EXISTS memory_claims_subject_predicate
     ON memory_claims(subject_entity_id, predicate_key, state, claim_id);
@@ -2011,7 +2161,17 @@ CREATE TABLE IF NOT EXISTS memory_claim_evidence (
     start_char INTEGER NOT NULL CHECK(start_char >= 0),
     end_char INTEGER NOT NULL CHECK(end_char > start_char),
     content_sha256 TEXT NOT NULL CHECK(length(content_sha256) = 64),
-    created_at TEXT NOT NULL
+    subject_start_char INTEGER NOT NULL CHECK(subject_start_char >= start_char),
+    subject_end_char INTEGER NOT NULL CHECK(subject_end_char > subject_start_char AND subject_end_char <= end_char),
+    subject_sha256 TEXT NOT NULL CHECK(length(subject_sha256) = 64),
+    relation_start_char INTEGER NOT NULL CHECK(relation_start_char >= start_char),
+    relation_end_char INTEGER NOT NULL CHECK(relation_end_char > relation_start_char AND relation_end_char <= end_char),
+    relation_sha256 TEXT NOT NULL CHECK(length(relation_sha256) = 64),
+    object_start_char INTEGER NOT NULL CHECK(object_start_char >= start_char),
+    object_end_char INTEGER NOT NULL CHECK(object_end_char > object_start_char AND object_end_char <= end_char),
+    object_sha256 TEXT NOT NULL CHECK(length(object_sha256) = 64),
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(claim_id) REFERENCES memory_claims(claim_id)
 );
 CREATE INDEX IF NOT EXISTS memory_claim_evidence_claim
     ON memory_claim_evidence(claim_id, event_id, start_char, end_char, evidence_id);
@@ -2027,7 +2187,9 @@ CREATE TABLE IF NOT EXISTS memory_claim_transitions (
     related_claim_id TEXT,
     session_id TEXT NOT NULL CHECK(length(session_id) > 0),
     batch_key TEXT NOT NULL CHECK(length(batch_key) > 0),
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(claim_id) REFERENCES memory_claims(claim_id),
+    FOREIGN KEY(related_claim_id) REFERENCES memory_claims(claim_id)
 );
 CREATE INDEX IF NOT EXISTS memory_claim_transitions_claim
     ON memory_claim_transitions(claim_id, created_at, transition_id);

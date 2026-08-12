@@ -107,6 +107,10 @@ impl SessionStore {
                 .verify_trace(&turn.context_trace.knowledge)
                 .with_context(|| format!("轮次 {} 的知识证据无法由原始快照重建", turn.id))?;
         }
+        let _root_guard = self
+            .retrieval
+            .acquire_root_write()
+            .context("无法锁定会话目录以原子保存原文和派生索引")?;
         fs::create_dir_all(&self.root)
             .with_context(|| format!("无法创建会话目录 {}", self.root.display()))?;
         let target = self.root.join(format!("{}.json", session.id));
@@ -138,7 +142,7 @@ impl SessionStore {
         }
         result.with_context(|| format!("无法原子保存会话 {}", target.display()))?;
         self.retrieval
-            .sync_session(session, &target)
+            .sync_session_under_root_write(session, &target)
             .map_err(|source| IndexSyncAfterSourceCommit {
                 source_path: target.clone(),
                 source,

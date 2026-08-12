@@ -1,4 +1,6 @@
 use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::{Component, Path};
 
 use chrono::{DateTime, FixedOffset};
 use rusqlite::{Connection, OptionalExtension, Transaction, params, types::ValueRef};
@@ -200,6 +202,7 @@ pub struct ConsolidatedEntityOutput {
     pub basis: EntityResolutionBasis,
     pub existing_entity_id: Option<String>,
     pub name_evidence: ConsolidationQuote,
+    pub existing_identity_evidence: Option<ConsolidationQuote>,
     pub resolution_evidence: Option<ConsolidationQuote>,
     pub aliases: Vec<EntityAliasOutput>,
 }
@@ -335,6 +338,9 @@ impl ConsolidationEvidenceKind {
 pub struct ConsolidationClaimEvidence {
     pub kind: ConsolidationEvidenceKind,
     pub quote: ConsolidationQuote,
+    pub subject_span: ConsolidationQuote,
+    pub relation_span: ConsolidationQuote,
+    pub object_span: ConsolidationQuote,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -416,6 +422,9 @@ pub struct MemoryClaimEvidenceCandidate {
     pub start_char: usize,
     pub end_char: usize,
     pub content_sha256: String,
+    pub subject_span: ConsolidationQuote,
+    pub relation_span: ConsolidationQuote,
+    pub object_span: ConsolidationQuote,
     pub created_at: String,
 }
 
@@ -777,7 +786,7 @@ impl RetrievalStore {
         validate_candidate_limit(entity_limit, "entity_limit")?;
         validate_candidate_limit(claim_limit, "claim_limit")?;
         let connection = self.open_connection()?;
-        validate_global_stable_identifier_integrity(&connection)?;
+        validate_full_derived_integrity(&connection)?;
         let snapshot = load_candidate_snapshot(&connection, entity_limit, claim_limit)?;
         self.verify_snapshot_source_freshness(&snapshot)?;
         Ok(snapshot)
@@ -814,10 +823,16 @@ impl RetrievalStore {
             })?;
         let plan = validate_structured_output(batch, candidates, &output)?;
 
+        let _source_guard = self
+            .acquire_root_read()
+            .map_err(ConsolidationApplyError::Retrieval)?;
         let preflight_connection = self.open_connection()?;
+        validate_full_derived_integrity(&preflight_connection)?;
         validate_global_stable_aliases(&preflight_connection, &plan)?;
         validate_plan_against_global_claims(&preflight_connection, &plan)?;
         let global_state_sha256 = global_memory_state_hash(&preflight_connection)?;
+        verify_indexed_source_file(self, &preflight_connection, &batch.session_id)
+            .map_err(map_source_staleness)?;
         drop(preflight_connection);
         self.verify_snapshot_source_freshness(candidates)
             .map_err(map_source_staleness)?;
@@ -828,6 +843,10 @@ impl RetrievalStore {
         if pending.as_ref() != Some(batch) {
             return Err(stale("当前待巩固批次已变化"));
         }
+        #[cfg(test)]
+        self.run_consolidation_test_hook(
+            crate::retrieval::ConsolidationHookPoint::AfterPendingBatchCheck,
+        );
 
         let entity_limit = candidates.entities.len().max(1);
         let claim_limit = candidates.claims.len().max(1);
@@ -836,8 +855,16 @@ impl RetrievalStore {
             .transaction()
             .map_err(|e| self.database_error(e))?;
 
+        verify_indexed_source_file(self, &transaction, &batch.session_id)
+            .map_err(map_source_staleness)?;
+        #[cfg(test)]
+        self.run_consolidation_test_hook(
+            crate::retrieval::ConsolidationHookPoint::AfterTransactionSourceCheck,
+        );
         verify_batch_rows(&transaction, batch).map_err(ConsolidationApplyError::Retrieval)?;
         verify_watermark_before(&transaction, batch)?;
+        validate_full_derived_integrity(&transaction)
+            .map_err(ConsolidationApplyError::Retrieval)?;
         let current = load_candidate_snapshot(&transaction, entity_limit, claim_limit)
             .map_err(ConsolidationApplyError::Retrieval)?;
         if current != *candidates {
@@ -868,6 +895,10 @@ impl RetrievalStore {
             .map_err(|e| self.database_error(e))?;
         insert_attempt(&transaction, attempt).map_err(|e| self.database_error(e))?;
         compare_and_swap_watermark(&transaction, batch, &attempt.completed_at)?;
+        validate_full_derived_integrity(&transaction)
+            .map_err(ConsolidationApplyError::Retrieval)?;
+        verify_indexed_source_file(self, &transaction, &batch.session_id)
+            .map_err(map_source_staleness)?;
         transaction.commit().map_err(|e| self.database_error(e))?;
         Ok(report)
     }
@@ -991,6 +1022,45 @@ fn consolidation_event(event: &StoredEvent) -> ConsolidationEvent {
     }
 }
 
+fn verify_indexed_source_file(
+    store: &RetrievalStore,
+    connection: &Connection,
+    session_id: &str,
+) -> RetrievalResult<()> {
+    let stored = connection
+        .query_row(
+            "SELECT source_file, source_sha256 FROM indexed_sessions WHERE session_id = ?1",
+            [session_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(|error| store.database_error(error))?;
+    let Some((source_file, source_sha256)) = stored else {
+        return Err(RetrievalError::StaleIndex {
+            session_id: session_id.to_owned(),
+        });
+    };
+    let mut components = Path::new(&source_file).components();
+    if !matches!(components.next(), Some(Component::Normal(_)))
+        || components.next().is_some()
+        || !is_lower_sha256(&source_sha256)
+    {
+        return Err(RetrievalError::CorruptIndex(format!(
+            "会话 {session_id} 的源文件记录损坏"
+        )));
+    }
+    let path = store.root().join(source_file);
+    let bytes = fs::read(&path).map_err(|_| RetrievalError::StaleIndex {
+        session_id: session_id.to_owned(),
+    })?;
+    if sha256_bytes(&bytes) != source_sha256 {
+        return Err(RetrievalError::StaleIndex {
+            session_id: session_id.to_owned(),
+        });
+    }
+    Ok(())
+}
+
 fn validate_candidate_limit(value: usize, name: &str) -> RetrievalResult<()> {
     if !(1..=512).contains(&value) {
         return Err(RetrievalError::CorruptIndex(format!(
@@ -1071,7 +1141,44 @@ struct StoredClaimEvidenceCandidate {
     start_char: i64,
     end_char: i64,
     content_sha256: String,
+    subject_start_char: i64,
+    subject_end_char: i64,
+    subject_sha256: String,
+    relation_start_char: i64,
+    relation_end_char: i64,
+    relation_sha256: String,
+    object_start_char: i64,
+    object_end_char: i64,
+    object_sha256: String,
     created_at: String,
+}
+
+fn map_stored_claim_evidence(
+    row: &rusqlite::Row<'_>,
+    offset: usize,
+) -> rusqlite::Result<StoredClaimEvidenceCandidate> {
+    Ok(StoredClaimEvidenceCandidate {
+        evidence_id: row.get(offset)?,
+        session_id: row.get(offset + 1)?,
+        batch_key: row.get(offset + 2)?,
+        event_id: row.get(offset + 3)?,
+        sequence: row.get(offset + 4)?,
+        role: row.get(offset + 5)?,
+        kind: row.get(offset + 6)?,
+        start_char: row.get(offset + 7)?,
+        end_char: row.get(offset + 8)?,
+        content_sha256: row.get(offset + 9)?,
+        subject_start_char: row.get(offset + 10)?,
+        subject_end_char: row.get(offset + 11)?,
+        subject_sha256: row.get(offset + 12)?,
+        relation_start_char: row.get(offset + 13)?,
+        relation_end_char: row.get(offset + 14)?,
+        relation_sha256: row.get(offset + 15)?,
+        object_start_char: row.get(offset + 16)?,
+        object_end_char: row.get(offset + 17)?,
+        object_sha256: row.get(offset + 18)?,
+        created_at: row.get(offset + 19)?,
+    })
 }
 
 fn load_candidate_snapshot(
@@ -1218,26 +1325,15 @@ fn load_candidate_snapshot(
         let mut evidence_statement = connection
             .prepare(
                 "SELECT evidence_id, session_id, batch_key, event_id, sequence, role, kind,
-                        start_char, end_char, content_sha256, created_at
+                        start_char, end_char, content_sha256, subject_start_char,
+                        subject_end_char, subject_sha256, relation_start_char, relation_end_char,
+                        relation_sha256, object_start_char, object_end_char, object_sha256,
+                        created_at
                  FROM memory_claim_evidence WHERE claim_id = ?1 ORDER BY evidence_id",
             )
             .map_err(candidate_database_error)?;
         let rows = evidence_statement
-            .query_map([&stored.claim_id], |row| {
-                Ok(StoredClaimEvidenceCandidate {
-                    evidence_id: row.get(0)?,
-                    session_id: row.get(1)?,
-                    batch_key: row.get(2)?,
-                    event_id: row.get(3)?,
-                    sequence: row.get(4)?,
-                    role: row.get(5)?,
-                    kind: row.get(6)?,
-                    start_char: row.get(7)?,
-                    end_char: row.get(8)?,
-                    content_sha256: row.get(9)?,
-                    created_at: row.get(10)?,
-                })
-            })
+            .query_map([&stored.claim_id], |row| map_stored_claim_evidence(row, 0))
             .map_err(candidate_database_error)?;
         let stored_evidence = rows
             .collect::<Result<Vec<_>, _>>()
@@ -1265,6 +1361,433 @@ fn load_candidate_snapshot(
 
 fn candidate_database_error(source: rusqlite::Error) -> RetrievalError {
     RetrievalError::CorruptIndex(format!("无法读取巩固候选：{source}"))
+}
+
+fn validate_full_derived_integrity(connection: &Connection) -> RetrievalResult<()> {
+    for (query, label) in [
+        (
+            "SELECT a.alias_id FROM memory_entity_aliases a
+             LEFT JOIN memory_entities e ON e.entity_id = a.entity_id
+             WHERE e.entity_id IS NULL ORDER BY a.alias_id LIMIT 1",
+            "孤立实体别名",
+        ),
+        (
+            "SELECT c.claim_id FROM memory_claims c
+             LEFT JOIN memory_entities e ON e.entity_id = c.subject_entity_id
+             WHERE e.entity_id IS NULL ORDER BY c.claim_id LIMIT 1",
+            "缺失主语实体的声明",
+        ),
+        (
+            "SELECT c.claim_id FROM memory_claims c
+             LEFT JOIN memory_entities e ON e.entity_id = c.object_entity_id
+             WHERE c.object_kind = 'entity' AND e.entity_id IS NULL
+             ORDER BY c.claim_id LIMIT 1",
+            "缺失对象实体的声明",
+        ),
+        (
+            "SELECT v.evidence_id FROM memory_claim_evidence v
+             LEFT JOIN memory_claims c ON c.claim_id = v.claim_id
+             WHERE c.claim_id IS NULL ORDER BY v.evidence_id LIMIT 1",
+            "孤立声明证据",
+        ),
+        (
+            "SELECT c.claim_id FROM memory_claims c
+             LEFT JOIN memory_claim_evidence v ON v.claim_id = c.claim_id
+             WHERE v.evidence_id IS NULL ORDER BY c.claim_id LIMIT 1",
+            "缺少证据的声明",
+        ),
+        (
+            "SELECT t.transition_id FROM memory_claim_transitions t
+             LEFT JOIN memory_claims c ON c.claim_id = t.claim_id
+             LEFT JOIN memory_claims r ON r.claim_id = t.related_claim_id
+             WHERE c.claim_id IS NULL
+                OR (t.related_claim_id IS NOT NULL AND r.claim_id IS NULL)
+             ORDER BY t.transition_id LIMIT 1",
+            "孤立声明迁移",
+        ),
+    ] {
+        if let Some(id) = connection
+            .query_row(query, [], |row| row.get::<_, String>(0))
+            .optional()
+            .map_err(candidate_database_error)?
+        {
+            return Err(RetrievalError::CorruptIndex(format!("{label}：{id}")));
+        }
+    }
+
+    let mut entity_ids = HashSet::new();
+    let mut statement = connection
+        .prepare(
+            "SELECT entity_id, canonical_name, normalized_name, created_session_id,
+                    created_event_id, created_start, created_end, created_hash,
+                    created_at, updated_at
+             FROM memory_entities ORDER BY entity_id",
+        )
+        .map_err(candidate_database_error)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, String>(9)?,
+            ))
+        })
+        .map_err(candidate_database_error)?;
+    for row in rows {
+        let (id, name, normalized, session, event, start, end, hash, created, updated) =
+            row.map_err(candidate_database_error)?;
+        let start = nonnegative_usize(start, "entity.created_start")?;
+        let end = nonnegative_usize(end, "entity.created_end")?;
+        if id.trim().is_empty()
+            || !entity_ids.insert(id.clone())
+            || name.trim().is_empty()
+            || normalized != normalize_match(&name)
+            || session.trim().is_empty()
+            || start >= end
+            || !is_lower_sha256(&hash)
+        {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "全局实体 {id} 的结构字段损坏"
+            )));
+        }
+        parse_stored_time(&created, "entity.created_at")?;
+        parse_stored_time(&updated, "entity.updated_at")?;
+        verify_stored_quote(
+            connection,
+            &event,
+            start,
+            end,
+            &hash,
+            Some(&name),
+            Some(&session),
+        )?;
+    }
+    drop(statement);
+
+    let mut statement = connection
+        .prepare(
+            "SELECT alias_id, alias_text, normalized_alias, alias_kind,
+                    stable_identifier_kind, session_id, event_id, start_char, end_char,
+                    content_sha256, created_at
+             FROM memory_entity_aliases ORDER BY alias_id",
+        )
+        .map_err(candidate_database_error)?;
+    let mut rows = statement.query([]).map_err(candidate_database_error)?;
+    while let Some(row) = rows.next().map_err(candidate_database_error)? {
+        let id: String = row.get(0).map_err(candidate_database_error)?;
+        let text: String = row.get(1).map_err(candidate_database_error)?;
+        let normalized: String = row.get(2).map_err(candidate_database_error)?;
+        let kind: String = row.get(3).map_err(candidate_database_error)?;
+        let stable_kind: Option<String> = row.get(4).map_err(candidate_database_error)?;
+        let session: String = row.get(5).map_err(candidate_database_error)?;
+        let event: String = row.get(6).map_err(candidate_database_error)?;
+        let start = nonnegative_usize(
+            row.get(7).map_err(candidate_database_error)?,
+            "alias.start_char",
+        )?;
+        let end = nonnegative_usize(
+            row.get(8).map_err(candidate_database_error)?,
+            "alias.end_char",
+        )?;
+        let hash: String = row.get(9).map_err(candidate_database_error)?;
+        let created: String = row.get(10).map_err(candidate_database_error)?;
+        let kind = parse_alias_kind(&kind)?;
+        if id.trim().is_empty()
+            || text.trim().is_empty()
+            || normalized != normalize_match(&text)
+            || session.trim().is_empty()
+            || start >= end
+            || !is_lower_sha256(&hash)
+            || matches!(kind, MemoryAliasKind::ExplicitAlias) && stable_kind.is_some()
+            || matches!(kind, MemoryAliasKind::StableIdentifier)
+                && stable_kind.as_deref().is_none_or(str::is_empty)
+        {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "全局实体别名 {id} 的结构字段损坏"
+            )));
+        }
+        parse_stored_time(&created, "alias.created_at")?;
+        verify_stored_quote(
+            connection,
+            &event,
+            start,
+            end,
+            &hash,
+            Some(&text),
+            Some(&session),
+        )?;
+        let role = connection
+            .query_row(
+                "SELECT role FROM events WHERE event_id = ?1",
+                [&event],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(candidate_database_error)?;
+        if role != EventRole::User.as_str() {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "实体别名 {id} 的来源不是用户事件"
+            )));
+        }
+    }
+    drop(rows);
+    drop(statement);
+
+    for claim in load_all_claim_candidates(connection)? {
+        if !entity_ids.contains(&claim.subject_entity_id)
+            || claim.object_kind == ConsolidationClaimObjectKind::Entity
+                && claim
+                    .object_entity_id
+                    .as_ref()
+                    .is_none_or(|id| !entity_ids.contains(id))
+        {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "全局声明 {} 引用了缺失实体",
+                claim.claim_id
+            )));
+        }
+        let asserted = parse_stored_time(&claim.asserted_at, "claim.asserted_at")?;
+        let reference = parse_stored_time(&claim.reference_time, "claim.reference_time")?;
+        let valid_from = parse_stored_time(&claim.valid_from, "claim.valid_from")?;
+        let valid_to = claim
+            .valid_to
+            .as_deref()
+            .map(|value| parse_stored_time(value, "claim.valid_to"))
+            .transpose()?;
+        if asserted != reference || valid_to.is_some_and(|value| valid_from > value) {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "全局声明 {} 的时间字段损坏",
+                claim.claim_id
+            )));
+        }
+        if let Some(value) = &claim.event_time {
+            parse_stored_time(value, "claim.event_time")?;
+        }
+        parse_stored_time(&claim.created_at, "claim.created_at")?;
+        parse_stored_time(&claim.updated_at, "claim.updated_at")?;
+    }
+
+    let mut statement = connection
+        .prepare(
+            "SELECT v.claim_id, c.session_id, v.evidence_id, v.session_id, v.batch_key,
+                    v.event_id, v.sequence, v.role, v.kind, v.start_char, v.end_char,
+                    v.content_sha256, v.subject_start_char, v.subject_end_char,
+                    v.subject_sha256, v.relation_start_char, v.relation_end_char,
+                    v.relation_sha256, v.object_start_char, v.object_end_char,
+                    v.object_sha256, v.created_at
+             FROM memory_claim_evidence v
+             JOIN memory_claims c ON c.claim_id = v.claim_id
+             ORDER BY v.evidence_id",
+        )
+        .map_err(candidate_database_error)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                map_stored_claim_evidence(row, 2)?,
+            ))
+        })
+        .map_err(candidate_database_error)?;
+    for row in rows {
+        let (claim_id, claim_session, stored) = row.map_err(candidate_database_error)?;
+        let evidence = decode_claim_evidence_candidate(stored)?;
+        if evidence.session_id != claim_session
+            || evidence.batch_key.trim().is_empty()
+            || evidence.start_char >= evidence.end_char
+            || !is_lower_sha256(&evidence.content_sha256)
+            || matches!(
+                evidence.kind,
+                ConsolidationEvidenceKind::UserConfirmation
+                    | ConsolidationEvidenceKind::Correction
+                    | ConsolidationEvidenceKind::Temporal
+            ) && evidence.role != EventRole::User
+        {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "声明 {claim_id} 的全局证据 {} 结构损坏",
+                evidence.evidence_id
+            )));
+        }
+        verify_stored_quote(
+            connection,
+            &evidence.event_id,
+            evidence.start_char,
+            evidence.end_char,
+            &evidence.content_sha256,
+            None,
+            Some(&evidence.session_id),
+        )?;
+        for span in [
+            &evidence.subject_span,
+            &evidence.relation_span,
+            &evidence.object_span,
+        ] {
+            if span.event_id != evidence.event_id
+                || span.start_char < evidence.start_char
+                || span.end_char > evidence.end_char
+            {
+                return Err(RetrievalError::CorruptIndex(format!(
+                    "声明证据 {} 的三元组片段越过外层证据",
+                    evidence.evidence_id
+                )));
+            }
+            verify_stored_quote(
+                connection,
+                &span.event_id,
+                span.start_char,
+                span.end_char,
+                &span.content_sha256,
+                None,
+                Some(&evidence.session_id),
+            )?;
+        }
+        if evidence.subject_span.end_char > evidence.relation_span.start_char
+            || evidence.relation_span.end_char > evidence.object_span.start_char
+        {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "声明证据 {} 的三元组角色顺序损坏",
+                evidence.evidence_id
+            )));
+        }
+        let (sequence, role) = connection
+            .query_row(
+                "SELECT sequence, role FROM events WHERE event_id = ?1",
+                [&evidence.event_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map_err(candidate_database_error)?;
+        if nonnegative_usize(sequence, "evidence.source_sequence")? != evidence.sequence
+            || role != evidence.role.as_str()
+        {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "声明证据 {} 的来源序号或角色不匹配",
+                evidence.evidence_id
+            )));
+        }
+        parse_stored_time(&evidence.created_at, "claim_evidence.created_at")?;
+    }
+    drop(statement);
+
+    let mut statement = connection
+        .prepare(
+            "SELECT transition_id, from_state, to_state, reason, related_claim_id,
+                    session_id, batch_key, created_at
+             FROM memory_claim_transitions ORDER BY transition_id",
+        )
+        .map_err(candidate_database_error)?;
+    let mut rows = statement.query([]).map_err(candidate_database_error)?;
+    while let Some(row) = rows.next().map_err(candidate_database_error)? {
+        let id: String = row.get(0).map_err(candidate_database_error)?;
+        let from: Option<String> = row.get(1).map_err(candidate_database_error)?;
+        let to: String = row.get(2).map_err(candidate_database_error)?;
+        let reason: String = row.get(3).map_err(candidate_database_error)?;
+        let related: Option<String> = row.get(4).map_err(candidate_database_error)?;
+        let session: String = row.get(5).map_err(candidate_database_error)?;
+        let batch_key: String = row.get(6).map_err(candidate_database_error)?;
+        let created: String = row.get(7).map_err(candidate_database_error)?;
+        if id.trim().is_empty()
+            || session.trim().is_empty()
+            || batch_key.trim().is_empty()
+            || !matches!(
+                reason.as_str(),
+                "created"
+                    | "confirmed"
+                    | "certainty_upgraded"
+                    | "conflicted"
+                    | "corrected"
+                    | "replaced"
+            )
+        {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "声明迁移 {id} 的结构字段损坏"
+            )));
+        }
+        if let Some(value) = from.as_deref() {
+            parse_claim_state(value)?;
+        }
+        parse_claim_state(&to)?;
+        if matches!(reason.as_str(), "conflicted" | "corrected" | "replaced") != related.is_some() {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "声明迁移 {id} 的关联声明不符合原因"
+            )));
+        }
+        parse_stored_time(&created, "transition.created_at")?;
+    }
+    drop(rows);
+    drop(statement);
+
+    let mut statement = connection
+        .prepare(
+            "SELECT boundary_id, session_id, before_event_id, reason, evidence_json, created_at
+             FROM memory_boundary_suggestions ORDER BY boundary_id",
+        )
+        .map_err(candidate_database_error)?;
+    let mut rows = statement.query([]).map_err(candidate_database_error)?;
+    while let Some(row) = rows.next().map_err(candidate_database_error)? {
+        let id: String = row.get(0).map_err(candidate_database_error)?;
+        let session: String = row.get(1).map_err(candidate_database_error)?;
+        let before_event: String = row.get(2).map_err(candidate_database_error)?;
+        let reason: String = row.get(3).map_err(candidate_database_error)?;
+        let evidence_json: String = row.get(4).map_err(candidate_database_error)?;
+        let created: String = row.get(5).map_err(candidate_database_error)?;
+        let quotes = serde_json::from_str::<Vec<ConsolidationQuote>>(&evidence_json)
+            .map_err(|_| RetrievalError::CorruptIndex(format!("边界 {id} 的证据 JSON 损坏")))?;
+        if id.trim().is_empty()
+            || session.trim().is_empty()
+            || quotes.is_empty()
+            || !matches!(
+                reason.as_str(),
+                "explicit_topic_transition" | "model_topic_shift"
+            )
+        {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "边界 {id} 的结构字段损坏"
+            )));
+        }
+        let (before_session, before_role) = connection
+            .query_row(
+                "SELECT session_id, role FROM events WHERE event_id = ?1",
+                [&before_event],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map_err(candidate_database_error)?;
+        if before_session != session || before_role != EventRole::User.as_str() {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "边界 {id} 的 before_event 不是同会话用户事件"
+            )));
+        }
+        for quote in quotes {
+            verify_stored_quote(
+                connection,
+                &quote.event_id,
+                quote.start_char,
+                quote.end_char,
+                &quote.content_sha256,
+                None,
+                Some(&session),
+            )?;
+            let role = connection
+                .query_row(
+                    "SELECT role FROM events WHERE event_id = ?1",
+                    [&quote.event_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(candidate_database_error)?;
+            if role != EventRole::User.as_str() {
+                return Err(RetrievalError::CorruptIndex(format!(
+                    "边界 {id} 包含非用户证据"
+                )));
+            }
+        }
+        parse_stored_time(&created, "boundary.created_at")?;
+    }
+    validate_global_stable_identifier_integrity(connection)
 }
 
 fn global_stable_identifier_owners(
@@ -1392,9 +1915,11 @@ fn global_memory_state_hash(connection: &Connection) -> RetrievalResult<String> 
         (
             "evidence",
             "SELECT evidence_id, claim_id, session_id, batch_key, event_id, sequence, role,
-                    kind, start_char, end_char, content_sha256, created_at
+                    kind, start_char, end_char, content_sha256, subject_start_char,
+                    subject_end_char, subject_sha256, relation_start_char, relation_end_char,
+                    relation_sha256, object_start_char, object_end_char, object_sha256, created_at
              FROM memory_claim_evidence ORDER BY evidence_id",
-            12_usize,
+            21_usize,
         ),
         (
             "transitions",
@@ -1462,7 +1987,7 @@ fn decode_alias_candidate(
         stable_identifier_kind: stored.stable_identifier_kind,
         session_id: stored.session_id,
         batch_key: stored.batch_key,
-        event_id: stored.event_id,
+        event_id: stored.event_id.clone(),
         start_char: nonnegative_usize(stored.start_char, "alias.start_char")?,
         end_char: nonnegative_usize(stored.end_char, "alias.end_char")?,
         content_sha256: stored.content_sha256,
@@ -1507,7 +2032,7 @@ fn decode_claim_evidence_candidate(
         evidence_id: stored.evidence_id,
         session_id: stored.session_id,
         batch_key: stored.batch_key,
-        event_id: stored.event_id,
+        event_id: stored.event_id.clone(),
         sequence: nonnegative_usize(stored.sequence, "claim_evidence.sequence")?,
         role: match stored.role.as_str() {
             "user" => EventRole::User,
@@ -1532,6 +2057,39 @@ fn decode_claim_evidence_candidate(
         start_char: nonnegative_usize(stored.start_char, "claim_evidence.start_char")?,
         end_char: nonnegative_usize(stored.end_char, "claim_evidence.end_char")?,
         content_sha256: stored.content_sha256,
+        subject_span: ConsolidationQuote {
+            event_id: stored.event_id.clone(),
+            start_char: nonnegative_usize(
+                stored.subject_start_char,
+                "claim_evidence.subject_start_char",
+            )?,
+            end_char: nonnegative_usize(
+                stored.subject_end_char,
+                "claim_evidence.subject_end_char",
+            )?,
+            content_sha256: stored.subject_sha256,
+        },
+        relation_span: ConsolidationQuote {
+            event_id: stored.event_id.clone(),
+            start_char: nonnegative_usize(
+                stored.relation_start_char,
+                "claim_evidence.relation_start_char",
+            )?,
+            end_char: nonnegative_usize(
+                stored.relation_end_char,
+                "claim_evidence.relation_end_char",
+            )?,
+            content_sha256: stored.relation_sha256,
+        },
+        object_span: ConsolidationQuote {
+            event_id: stored.event_id,
+            start_char: nonnegative_usize(
+                stored.object_start_char,
+                "claim_evidence.object_start_char",
+            )?,
+            end_char: nonnegative_usize(stored.object_end_char, "claim_evidence.object_end_char")?,
+            content_sha256: stored.object_sha256,
+        },
         created_at: stored.created_at,
     })
 }
@@ -1997,6 +2555,7 @@ fn validate_candidate_snapshot(snapshot: &ConsolidationCandidateSnapshot) -> Ret
             .evidence
             .windows(2)
             .any(|pair| pair[0].evidence_id >= pair[1].evidence_id)
+            || claim.evidence.is_empty()
         {
             return Err(RetrievalError::CorruptIndex(format!(
                 "声明 {} 的证据未按 ID 严格排序",
@@ -2021,6 +2580,31 @@ fn validate_candidate_snapshot(snapshot: &ConsolidationCandidateSnapshot) -> Ret
             {
                 return Err(RetrievalError::CorruptIndex(format!(
                     "声明 {} 的证据 {} 结构损坏",
+                    claim.claim_id, evidence.evidence_id
+                )));
+            }
+            for (name, span) in [
+                ("subject", &evidence.subject_span),
+                ("relation", &evidence.relation_span),
+                ("object", &evidence.object_span),
+            ] {
+                if span.event_id != evidence.event_id
+                    || span.start_char < evidence.start_char
+                    || span.end_char > evidence.end_char
+                    || span.start_char >= span.end_char
+                    || !is_lower_sha256(&span.content_sha256)
+                {
+                    return Err(RetrievalError::CorruptIndex(format!(
+                        "声明 {} 的证据 {} 包含损坏的 {name} 子片段",
+                        claim.claim_id, evidence.evidence_id
+                    )));
+                }
+            }
+            if evidence.subject_span.end_char > evidence.relation_span.start_char
+                || evidence.relation_span.end_char > evidence.object_span.start_char
+            {
+                return Err(RetrievalError::CorruptIndex(format!(
+                    "声明 {} 的证据 {} 三元组角色顺序损坏",
                     claim.claim_id, evidence.evidence_id
                 )));
             }
@@ -2072,6 +2656,21 @@ fn validate_candidate_provenance(
                 None,
                 Some(&evidence.session_id),
             )?;
+            for span in [
+                &evidence.subject_span,
+                &evidence.relation_span,
+                &evidence.object_span,
+            ] {
+                verify_stored_quote(
+                    connection,
+                    &span.event_id,
+                    span.start_char,
+                    span.end_char,
+                    &span.content_sha256,
+                    None,
+                    Some(&evidence.session_id),
+                )?;
+            }
             let stored = connection
                 .query_row(
                     "SELECT sequence, role FROM events WHERE event_id = ?1",
@@ -2183,6 +2782,18 @@ struct ValidatedEvidence {
     evidence_id: String,
     kind: ConsolidationEvidenceKind,
     quote: ValidatedQuote,
+    subject: ValidatedQuote,
+    relation: ValidatedQuote,
+    object: ValidatedQuote,
+}
+
+#[derive(Debug)]
+struct ValidatedEvidenceBinding {
+    kind: ConsolidationEvidenceKind,
+    quote: ValidatedQuote,
+    subject: ValidatedQuote,
+    relation: ValidatedQuote,
+    object: ValidatedQuote,
 }
 
 #[derive(Debug)]
@@ -2243,7 +2854,7 @@ type ValidatedEntitySet = (
     HashMap<String, ResolvedEntityView>,
 );
 
-type ValidatedClaimObjectFields = (Option<String>, Option<String>, String, Vec<String>);
+type ValidatedClaimObjectFields = (Option<String>, Option<String>, String);
 
 fn rejected(
     code: impl Into<String>,
@@ -2467,6 +3078,11 @@ fn validate_entities(
             &output.name_evidence,
             &format!("{path}.name_evidence"),
         )?;
+        validate_ascii_token_boundary(
+            batch,
+            &output.name_evidence,
+            &format!("{path}.name_evidence"),
+        )?;
         if output.name != name_quote.text {
             return Err(rejected(
                 "rewritten_text",
@@ -2513,7 +3129,10 @@ fn validate_entities(
                     }
                 }
                 EntityResolution::New => {
-                    if output.existing_entity_id.is_some() || output.resolution_evidence.is_some() {
+                    if output.existing_entity_id.is_some()
+                        || output.existing_identity_evidence.is_some()
+                        || output.resolution_evidence.is_some()
+                    {
                         return Err(rejected(
                             "new_entity_contract",
                             path.clone(),
@@ -2589,6 +3208,15 @@ fn validate_entities(
                             "existing 实体必须指向明确候选 ID",
                         )
                     })?;
+                    if output.existing_identity_evidence.is_none()
+                        || output.resolution_evidence.is_none()
+                    {
+                        return Err(rejected(
+                            "missing_identity_evidence",
+                            path.clone(),
+                            "existing 实体必须提供候选身份精确片段和完整解析证明",
+                        ));
+                    }
                     let candidate = candidate_by_id.get(existing_id).ok_or_else(|| {
                         rejected(
                             "unknown_entity_reference",
@@ -2676,6 +3304,7 @@ fn validate_self_entity(
     if output.basis != EntityResolutionBasis::SelfPronoun
         || output.disambiguation != EntityDisambiguation::Resolved
         || output.existing_entity_id.is_some()
+        || output.existing_identity_evidence.is_some()
         || output.resolution_evidence.is_some()
         || !output.aliases.is_empty()
     {
@@ -2725,6 +3354,27 @@ fn validate_existing_explicit_alias(
             "实体合并证明必须来自用户原文",
         ));
     }
+    let identity = output
+        .existing_identity_evidence
+        .as_ref()
+        .expect("existing contract checked");
+    let identity_quote = validate_nested_quote(
+        batch,
+        resolution,
+        identity,
+        &format!("{path}.existing_identity_evidence"),
+    )?;
+    validate_ascii_token_boundary(
+        batch,
+        identity,
+        &format!("{path}.existing_identity_evidence"),
+    )?;
+    let name_quote = validate_nested_quote(
+        batch,
+        resolution,
+        &output.name_evidence,
+        &format!("{path}.name_evidence"),
+    )?;
     let output_name = normalize_match(&output.name);
     let candidate_names = candidate_normalized_names(candidate);
     let matching = output.aliases.iter().any(|alias| {
@@ -2733,10 +3383,8 @@ fn validate_existing_explicit_alias(
             && alias.proof_evidence == *resolution
     });
     if !matching
-        || !normalized_contains(&resolution_quote.text, &output_name)
-        || !candidate_names
-            .iter()
-            .any(|name| normalized_contains(&resolution_quote.text, name))
+        || normalize_match(&name_quote.text) != output_name
+        || !candidate_names.contains(&normalize_match(&identity_quote.text))
         || !contains_alias_marker(&resolution_quote.text)
     {
         return Err(rejected(
@@ -2771,7 +3419,23 @@ fn validate_existing_stable_id(
             "稳定标识证明必须来自用户原文",
         ));
     }
-    let candidate_names = candidate_normalized_names(candidate);
+    let identity = output
+        .existing_identity_evidence
+        .as_ref()
+        .expect("existing contract checked");
+    let name_quote = validate_nested_quote(
+        batch,
+        resolution,
+        &output.name_evidence,
+        &format!("{path}.name_evidence"),
+    )?;
+    if name_quote.text != output.name {
+        return Err(rejected(
+            "stable_identifier_name",
+            format!("{path}.name_evidence"),
+            "稳定标识合并的名称必须由证明中的实体名称精确片段提供",
+        ));
+    }
     let mut matched = false;
     for alias in &output.aliases {
         if alias.kind != MemoryAliasKind::StableIdentifier || alias.proof_evidence != *resolution {
@@ -2789,12 +3453,7 @@ fn validate_existing_stable_id(
                 "稳定标识在多个当前实体间不唯一",
             ));
         }
-        if owners.len() == 1
-            && owners.contains(&candidate.entity_id)
-            && normalized_contains(&resolution_quote.text, &key.1)
-            && candidate_names
-                .iter()
-                .any(|name| normalized_contains(&resolution_quote.text, name))
+        if owners.len() == 1 && owners.contains(&candidate.entity_id) && alias.evidence == *identity
         {
             matched = true;
             break;
@@ -2843,6 +3502,7 @@ fn validate_entity_aliases(
                 "别名文本必须与 alias-only 精确片段逐字一致",
             ));
         }
+        validate_ascii_token_boundary(batch, &alias.evidence, &format!("{alias_path}.evidence"))?;
         if !evidence_quotes.insert(alias.evidence.clone()) {
             return Err(rejected(
                 "duplicate_quote",
@@ -2855,10 +3515,20 @@ fn validate_entity_aliases(
             normalize_match(&output.name),
             normalize_match(canonical_name),
         ];
-        if !normalized_contains(&proof.text, &normalized)
-            || !entity_names
-                .iter()
-                .any(|name| normalized_contains(&proof.text, name))
+        let alias_in_proof = validate_nested_quote(
+            batch,
+            &alias.proof_evidence,
+            &alias.evidence,
+            &format!("{alias_path}.evidence"),
+        )?;
+        let name_in_proof = validate_nested_quote(
+            batch,
+            &alias.proof_evidence,
+            &output.name_evidence,
+            &format!("{path}.name_evidence"),
+        )?;
+        if normalize_match(&alias_in_proof.text) != normalized
+            || !entity_names.contains(&normalize_match(&name_in_proof.text))
         {
             return Err(rejected(
                 "alias_proof",
@@ -3045,14 +3715,23 @@ fn validate_claims(
             entity_views,
             &format!("{path}.subject_ref"),
         )?;
-        let (object_text, object_entity_id, normalized_object, confirmation_targets) =
-            validate_claim_object(
-                batch,
-                &output.object,
-                entity_refs,
-                entity_views,
-                &format!("{path}.object"),
-            )?;
+        let (object_text, object_entity_id, normalized_object) = validate_claim_object(
+            batch,
+            &output.object,
+            entity_refs,
+            entity_views,
+            &format!("{path}.object"),
+        )?;
+        let subject_view = entity_views.get(&subject_entity_id).ok_or_else(|| {
+            rejected(
+                "unknown_entity_reference",
+                format!("{path}.subject_ref"),
+                "主语实体不在声明可见候选中",
+            )
+        })?;
+        let object_view = object_entity_id
+            .as_ref()
+            .and_then(|entity_id| entity_views.get(entity_id));
         let semantic_key = format!(
             "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
             subject_entity_id,
@@ -3078,6 +3757,7 @@ fn validate_claims(
 
         let mut evidence = Vec::with_capacity(output.evidence.len());
         let mut evidence_keys = HashSet::new();
+        let mut relation_identity = None::<String>;
         for (evidence_index, item) in output.evidence.iter().enumerate() {
             let evidence_path = format!("{path}.evidence[{evidence_index}]");
             let quote = validate_quote(batch, &item.quote, &format!("{evidence_path}.quote"))?;
@@ -3101,15 +3781,96 @@ fn validate_claims(
                     "确认、纠正和时态证据必须来自用户事件",
                 ));
             }
-            evidence.push((item.kind, quote));
+            let subject = validate_nested_quote(
+                batch,
+                &item.quote,
+                &item.subject_span,
+                &format!("{evidence_path}.subject_span"),
+            )?;
+            let relation = validate_nested_quote(
+                batch,
+                &item.quote,
+                &item.relation_span,
+                &format!("{evidence_path}.relation_span"),
+            )?;
+            let object = validate_nested_quote(
+                batch,
+                &item.quote,
+                &item.object_span,
+                &format!("{evidence_path}.object_span"),
+            )?;
+            validate_ascii_token_boundary(
+                batch,
+                &item.subject_span,
+                &format!("{evidence_path}.subject_span"),
+            )?;
+            if output.object.kind == ConsolidationClaimObjectKind::Entity {
+                validate_ascii_token_boundary(
+                    batch,
+                    &item.object_span,
+                    &format!("{evidence_path}.object_span"),
+                )?;
+            }
+            if subject.quote.end_char > relation.quote.start_char
+                || relation.quote.end_char > object.quote.start_char
+            {
+                return Err(rejected(
+                    "evidence_role_order",
+                    evidence_path.clone(),
+                    "三元组片段必须按主语、关系、对象顺序出现且不得重叠",
+                ));
+            }
+            if !claim_subject_span_matches(&subject_entity_id, subject_view, &subject) {
+                return Err(rejected(
+                    "evidence_subject",
+                    format!("{evidence_path}.subject_span"),
+                    "主语片段必须精确匹配已解析实体名称、别名或合法 self 代词",
+                ));
+            }
+            let object_matches = match output.object.kind {
+                ConsolidationClaimObjectKind::Text => {
+                    object_text.as_deref() == Some(object.text.as_str())
+                }
+                ConsolidationClaimObjectKind::Entity => object_view.is_some_and(|view| {
+                    view.normalized_names
+                        .contains(&normalize_match(&object.text))
+                }),
+            };
+            if !object_matches {
+                return Err(rejected(
+                    "evidence_object",
+                    format!("{evidence_path}.object_span"),
+                    "对象片段必须精确匹配文本对象或已解析对象实体名称/别名",
+                ));
+            }
+            let normalized_relation = normalize_match(&relation.text);
+            if let Some(expected) = &relation_identity {
+                if expected != &normalized_relation {
+                    return Err(rejected(
+                        "evidence_relation",
+                        format!("{evidence_path}.relation_span"),
+                        "同一声明的全部证据必须使用相同的规范化关系文本",
+                    ));
+                }
+            } else {
+                relation_identity = Some(normalized_relation);
+            }
+            validate_evidence_polarity(item.kind, output.polarity, &quote, &evidence_path)?;
+            evidence.push(ValidatedEvidenceBinding {
+                kind: item.kind,
+                quote,
+                subject,
+                relation,
+                object,
+            });
         }
 
         let trusted = evidence
             .iter()
-            .filter(|(kind, quote)| {
-                quote.role == EventRole::User
+            .filter(|item| {
+                item.quote.role == EventRole::User
                     && matches!(
-                        kind,
+                        item.kind,
                         ConsolidationEvidenceKind::Assertion
                             | ConsolidationEvidenceKind::UserConfirmation
                             | ConsolidationEvidenceKind::Correction
@@ -3123,16 +3884,16 @@ fn validate_claims(
                 "声明至少需要一条用户断言、确认或纠正证据",
             ));
         }
-        for (_, assertion) in evidence.iter().filter(|(kind, quote)| {
-            *kind == ConsolidationEvidenceKind::Assertion && quote.role == EventRole::Assistant
+        for assertion in evidence.iter().filter(|item| {
+            item.kind == ConsolidationEvidenceKind::Assertion
+                && item.quote.role == EventRole::Assistant
         }) {
-            let confirmed = evidence.iter().any(|(kind, confirmation)| {
-                *kind == ConsolidationEvidenceKind::UserConfirmation
-                    && confirmation.role == EventRole::User
-                    && confirmation.sequence > assertion.sequence
-                    && confirmation_targets
-                        .iter()
-                        .any(|target| normalized_contains(&confirmation.text, target))
+            let confirmed = evidence.iter().any(|confirmation| {
+                confirmation.kind == ConsolidationEvidenceKind::UserConfirmation
+                    && confirmation.quote.role == EventRole::User
+                    && confirmation.quote.sequence > assertion.quote.sequence
+                    && normalize_match(&confirmation.relation.text)
+                        == normalize_match(&assertion.relation.text)
             });
             if !confirmed {
                 return Err(rejected(
@@ -3146,7 +3907,7 @@ fn validate_claims(
         let earliest = trusted
             .iter()
             .copied()
-            .map(|(_, quote)| quote)
+            .map(|item| &item.quote)
             .min_by(|left, right| {
                 let left_time = DateTime::parse_from_rfc3339(&left.created_at);
                 let right_time = DateTime::parse_from_rfc3339(&right.created_at);
@@ -3174,8 +3935,9 @@ fn validate_claims(
         let has_temporal_input =
             output.event_time.is_some() || output.valid_from.is_some() || output.valid_to.is_some();
         if has_temporal_input
-            && !evidence.iter().any(|(kind, quote)| {
-                *kind == ConsolidationEvidenceKind::Temporal && quote.role == EventRole::User
+            && !evidence.iter().any(|item| {
+                item.kind == ConsolidationEvidenceKind::Temporal
+                    && item.quote.role == EventRole::User
             })
         {
             return Err(rejected(
@@ -3269,7 +4031,7 @@ fn validate_claims(
         let first_trusted = trusted
             .iter()
             .copied()
-            .map(|(_, quote)| quote)
+            .map(|item| &item.quote)
             .min_by_key(|quote| (quote.sequence, quote.quote.start_char, quote.quote.end_char))
             .expect("trusted evidence is non-empty");
         let generated_claim_id = deterministic_id(
@@ -3349,9 +4111,9 @@ fn validate_claims(
                     }
                 }
                 ClaimDisposition::Correct | ClaimDisposition::Replace => {
-                    if !evidence.iter().any(|(kind, quote)| {
-                        *kind == ConsolidationEvidenceKind::Correction
-                            && quote.role == EventRole::User
+                    if !evidence.iter().any(|item| {
+                        item.kind == ConsolidationEvidenceKind::Correction
+                            && item.quote.role == EventRole::User
                     }) {
                         return Err(rejected(
                             "missing_correction_evidence",
@@ -3414,20 +4176,32 @@ fn validate_claims(
         };
         let validated_evidence = evidence
             .into_iter()
-            .map(|(kind, quote)| ValidatedEvidence {
+            .map(|item| ValidatedEvidence {
                 evidence_id: deterministic_id(
                     "evidence",
                     &[
                         target_claim_id,
-                        kind.as_str(),
-                        quote.quote.event_id.as_str(),
-                        &quote.quote.start_char.to_string(),
-                        &quote.quote.end_char.to_string(),
-                        quote.quote.content_sha256.as_str(),
+                        item.kind.as_str(),
+                        item.quote.quote.event_id.as_str(),
+                        &item.quote.quote.start_char.to_string(),
+                        &item.quote.quote.end_char.to_string(),
+                        item.quote.quote.content_sha256.as_str(),
+                        &item.subject.quote.start_char.to_string(),
+                        &item.subject.quote.end_char.to_string(),
+                        item.subject.quote.content_sha256.as_str(),
+                        &item.relation.quote.start_char.to_string(),
+                        &item.relation.quote.end_char.to_string(),
+                        item.relation.quote.content_sha256.as_str(),
+                        &item.object.quote.start_char.to_string(),
+                        &item.object.quote.end_char.to_string(),
+                        item.object.quote.content_sha256.as_str(),
                     ],
                 ),
-                kind,
-                quote,
+                kind: item.kind,
+                quote: item.quote,
+                subject: item.subject,
+                relation: item.relation,
+                object: item.object,
             })
             .collect();
         plans.push(ValidatedClaim {
@@ -3511,12 +4285,7 @@ fn validate_claim_object(
                 ));
             }
             let normalized = normalize_match(text);
-            Ok((
-                Some(text.to_owned()),
-                None,
-                normalized.clone(),
-                vec![normalized],
-            ))
+            Ok((Some(text.to_owned()), None, normalized))
         }
         ConsolidationClaimObjectKind::Entity => {
             if object.text.is_some() || object.span.is_some() {
@@ -3535,19 +4304,7 @@ fn validate_claim_object(
                 entity_views,
                 &format!("{path}.entity_ref"),
             )?;
-            let view = entity_views.get(&entity_id).ok_or_else(|| {
-                rejected(
-                    "unknown_entity_reference",
-                    format!("{path}.entity_ref"),
-                    "对象实体不在声明可见候选中",
-                )
-            })?;
-            Ok((
-                None,
-                Some(entity_id.clone()),
-                entity_id,
-                view.normalized_names.clone(),
-            ))
+            Ok((None, Some(entity_id.clone()), entity_id))
         }
     }
 }
@@ -3679,7 +4436,6 @@ fn validate_boundaries(
         }
         let mut quotes = Vec::with_capacity(output.evidence.len());
         let mut quote_ids = HashSet::new();
-        let mut has_user = false;
         for (quote_index, quote) in output.evidence.iter().enumerate() {
             let validated =
                 validate_quote(batch, quote, &format!("{path}.evidence[{quote_index}]"))?;
@@ -3690,15 +4446,14 @@ fn validate_boundaries(
                     "边界包含重复证据片段",
                 ));
             }
-            has_user |= validated.role == EventRole::User;
+            if validated.role != EventRole::User {
+                return Err(rejected(
+                    "boundary_trust",
+                    format!("{path}.evidence[{quote_index}]"),
+                    "每条边界证据都必须来自用户原文",
+                ));
+            }
             quotes.push((validated.sequence, quote.clone()));
-        }
-        if !has_user {
-            return Err(rejected(
-                "boundary_trust",
-                format!("{path}.evidence"),
-                "边界至少需要一条用户精确证据",
-            ));
         }
         quotes.sort_by(|left, right| {
             left.0
@@ -3785,6 +4540,73 @@ fn validate_quote(
     })
 }
 
+fn validate_nested_quote(
+    batch: &ConsolidationInputBatch,
+    outer: &ConsolidationQuote,
+    inner: &ConsolidationQuote,
+    path: &str,
+) -> ConsolidationApplyResult<ValidatedQuote> {
+    if inner.event_id != outer.event_id
+        || inner.start_char < outer.start_char
+        || inner.end_char > outer.end_char
+    {
+        return Err(rejected(
+            "nested_quote",
+            path,
+            "精确子片段必须位于同一事件的外层证明片段内",
+        ));
+    }
+    validate_quote(batch, inner, path)
+}
+
+fn validate_ascii_token_boundary(
+    batch: &ConsolidationInputBatch,
+    quote: &ConsolidationQuote,
+    path: &str,
+) -> ConsolidationApplyResult<()> {
+    let event = batch
+        .events
+        .iter()
+        .find(|event| event.event_id == quote.event_id)
+        .ok_or_else(|| rejected("quote_event", path, "身份片段引用了批次外事件"))?;
+    let chars = event.content.chars().collect::<Vec<_>>();
+    let text = chars[quote.start_char..quote.end_char]
+        .iter()
+        .collect::<String>();
+    let normalized = normalize_match(&text);
+    let ascii_identity = normalized.chars().any(|ch| ch.is_ascii_alphanumeric())
+        && normalized.chars().all(|ch| {
+            ch.is_ascii_alphanumeric()
+                || ch.is_ascii_whitespace()
+                || matches!(ch, '_' | '-' | '.' | '@' | ':' | '/')
+        });
+    let adjacent_is_ascii_identity = |character: char| {
+        character
+            .to_string()
+            .nfkc()
+            .any(|normalized| normalized.is_ascii_alphanumeric() || normalized == '_')
+    };
+    if ascii_identity
+        && (quote
+            .start_char
+            .checked_sub(1)
+            .and_then(|index| chars.get(index))
+            .copied()
+            .is_some_and(adjacent_is_ascii_identity)
+            || chars
+                .get(quote.end_char)
+                .copied()
+                .is_some_and(adjacent_is_ascii_identity))
+    {
+        return Err(rejected(
+            "identity_boundary",
+            path,
+            "ASCII/NFKC 身份片段必须具有完整词边界，不能截取名称或标识前缀",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_exact_text(value: &str, max: usize, path: &str) -> ConsolidationApplyResult<()> {
     let count = value.chars().count();
     if count == 0 || count > max || value.trim().is_empty() {
@@ -3859,8 +4681,91 @@ fn normalize_match(value: &str) -> String {
     lowered.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn normalized_contains(haystack: &str, needle: &str) -> bool {
-    !needle.is_empty() && normalize_match(haystack).contains(needle)
+fn claim_subject_span_matches(
+    entity_id: &str,
+    view: &ResolvedEntityView,
+    quote: &ValidatedQuote,
+) -> bool {
+    let normalized = normalize_match(&quote.text);
+    view.normalized_names.contains(&normalized)
+        || entity_id == "ent_self"
+            && match quote.role {
+                EventRole::User => {
+                    matches!(normalized.as_str(), "我" | "本人" | "i" | "me" | "my")
+                }
+                EventRole::Assistant => {
+                    matches!(normalized.as_str(), "你" | "您" | "you" | "your")
+                }
+                EventRole::System => false,
+            }
+}
+
+fn validate_evidence_polarity(
+    kind: ConsolidationEvidenceKind,
+    polarity: ClaimPolarity,
+    quote: &ValidatedQuote,
+    path: &str,
+) -> ConsolidationApplyResult<()> {
+    if kind == ConsolidationEvidenceKind::Temporal {
+        return Ok(());
+    }
+    let has_negation = contains_claim_marker(
+        &quote.text,
+        &["不", "不是", "没有", "并非"],
+        &["no", "not", "never"],
+    );
+    let has_correction = contains_claim_marker(&quote.text, &["错", "更正"], &["wrong", "instead"]);
+    if polarity == ClaimPolarity::Assert
+        && matches!(
+            kind,
+            ConsolidationEvidenceKind::Assertion | ConsolidationEvidenceKind::UserConfirmation
+        )
+        && (has_negation || has_correction)
+    {
+        return Err(rejected(
+            "evidence_polarity",
+            path,
+            "肯定断言/确认不得含独立否定或纠正标记",
+        ));
+    }
+    if polarity == ClaimPolarity::Deny && !has_negation {
+        return Err(rejected(
+            "evidence_polarity",
+            path,
+            "否定声明的断言、确认或纠正证据必须含独立否定标记",
+        ));
+    }
+    if kind == ConsolidationEvidenceKind::Correction && !has_correction {
+        return Err(rejected(
+            "correction_marker",
+            path,
+            "Correction 证据必须含独立纠正标记",
+        ));
+    }
+    Ok(())
+}
+
+fn contains_claim_marker(value: &str, cjk: &[&str], english: &[&str]) -> bool {
+    let normalized = normalize_match(value);
+    cjk.iter().any(|marker| normalized.contains(marker))
+        || english
+            .iter()
+            .any(|marker| contains_ascii_word(&normalized, marker))
+}
+
+fn contains_ascii_word(value: &str, needle: &str) -> bool {
+    value.match_indices(needle).any(|(start, matched)| {
+        let end = start + matched.len();
+        let left_is_word = value[..start]
+            .chars()
+            .next_back()
+            .is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_');
+        let right_is_word = value[end..]
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_');
+        !left_is_word && !right_is_word
+    })
 }
 
 fn contains_alias_marker(value: &str) -> bool {
@@ -4526,24 +5431,9 @@ fn insert_claim_evidence(
 ) -> rusqlite::Result<bool> {
     let existing = transaction
         .query_row(
-            "SELECT claim_id, session_id, batch_key, event_id, sequence, role, kind,
-                    start_char, end_char, content_sha256
-             FROM memory_claim_evidence WHERE evidence_id = ?1",
+            "SELECT 1 FROM memory_claim_evidence WHERE evidence_id = ?1",
             [&evidence.evidence_id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, i64>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, String>(6)?,
-                    row.get::<_, i64>(7)?,
-                    row.get::<_, i64>(8)?,
-                    row.get::<_, String>(9)?,
-                ))
-            },
+            |_| Ok(()),
         )
         .optional()?;
     let sequence = i64::try_from(evidence.quote.sequence)
@@ -4552,20 +5442,52 @@ fn insert_claim_evidence(
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
     let end = i64::try_from(evidence.quote.quote.end_char)
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-    if let Some(existing) = existing {
-        let expected = (
-            claim_id.to_owned(),
-            batch.session_id.clone(),
-            batch.batch_key.clone(),
-            evidence.quote.quote.event_id.clone(),
-            sequence,
-            evidence.quote.role.as_str().to_owned(),
-            evidence.kind.as_str().to_owned(),
-            start,
-            end,
-            evidence.quote.quote.content_sha256.clone(),
-        );
-        if existing == expected {
+    let subject_start = i64::try_from(evidence.subject.quote.start_char)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    let subject_end = i64::try_from(evidence.subject.quote.end_char)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    let relation_start = i64::try_from(evidence.relation.quote.start_char)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    let relation_end = i64::try_from(evidence.relation.quote.end_char)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    let object_start = i64::try_from(evidence.object.quote.start_char)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    let object_end = i64::try_from(evidence.object.quote.end_char)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    if existing.is_some() {
+        let matches = transaction.query_row(
+            "SELECT count(*) FROM memory_claim_evidence
+             WHERE evidence_id = ?1 AND claim_id = ?2 AND session_id = ?3 AND batch_key = ?4
+               AND event_id = ?5 AND sequence = ?6 AND role = ?7 AND kind = ?8
+               AND start_char = ?9 AND end_char = ?10 AND content_sha256 = ?11
+               AND subject_start_char = ?12 AND subject_end_char = ?13 AND subject_sha256 = ?14
+               AND relation_start_char = ?15 AND relation_end_char = ?16 AND relation_sha256 = ?17
+               AND object_start_char = ?18 AND object_end_char = ?19 AND object_sha256 = ?20",
+            params![
+                evidence.evidence_id,
+                claim_id,
+                batch.session_id,
+                batch.batch_key,
+                evidence.quote.quote.event_id,
+                sequence,
+                evidence.quote.role.as_str(),
+                evidence.kind.as_str(),
+                start,
+                end,
+                evidence.quote.quote.content_sha256,
+                subject_start,
+                subject_end,
+                evidence.subject.quote.content_sha256,
+                relation_start,
+                relation_end,
+                evidence.relation.quote.content_sha256,
+                object_start,
+                object_end,
+                evidence.object.quote.content_sha256,
+            ],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if matches == 1 {
             return Ok(false);
         }
         return Err(rusqlite::Error::InvalidQuery);
@@ -4573,8 +5495,11 @@ fn insert_claim_evidence(
     transaction.execute(
         "INSERT INTO memory_claim_evidence
          (evidence_id, claim_id, session_id, batch_key, event_id, sequence, role, kind,
-          start_char, end_char, content_sha256, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+          start_char, end_char, content_sha256, subject_start_char, subject_end_char,
+          subject_sha256, relation_start_char, relation_end_char, relation_sha256,
+          object_start_char, object_end_char, object_sha256, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                 ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
         params![
             evidence.evidence_id,
             claim_id,
@@ -4587,6 +5512,15 @@ fn insert_claim_evidence(
             start,
             end,
             evidence.quote.quote.content_sha256,
+            subject_start,
+            subject_end,
+            evidence.subject.quote.content_sha256,
+            relation_start,
+            relation_end,
+            evidence.relation.quote.content_sha256,
+            object_start,
+            object_end,
+            evidence.object.quote.content_sha256,
             created_at,
         ],
     )?;
@@ -4660,6 +5594,13 @@ fn hash_length_delimited(hasher: &mut Sha256, value: &[u8]) {
 }
 
 fn validate_attempt(record: &ConsolidationAttemptRecord) -> RetrievalResult<()> {
+    let started_at = DateTime::parse_from_rfc3339(&record.started_at)
+        .map_err(|_| invalid_attempt("started_at 必须是严格 RFC3339"))?;
+    let completed_at = DateTime::parse_from_rfc3339(&record.completed_at)
+        .map_err(|_| invalid_attempt("completed_at 必须是严格 RFC3339"))?;
+    if started_at > completed_at {
+        return Err(invalid_attempt("started_at 不得晚于 completed_at"));
+    }
     for (name, value) in [
         ("attempt_id", record.attempt_id.as_str()),
         ("batch_key", record.batch_key.as_str()),
@@ -5152,17 +6093,21 @@ mod tests {
             basis: EntityResolutionBasis::FirstMention,
             existing_entity_id: None,
             name_evidence: evidence,
+            existing_identity_evidence: None,
             resolution_evidence: None,
             aliases: Vec::new(),
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn text_claim_output(
         local_id: &str,
         subject_ref: &str,
         predicate_key: &str,
         text: &str,
-        span: ConsolidationQuote,
+        subject_span: ConsolidationQuote,
+        relation_span: ConsolidationQuote,
+        object_span: ConsolidationQuote,
         assertion: ConsolidationQuote,
     ) -> ConsolidatedClaimOutput {
         ConsolidatedClaimOutput {
@@ -5173,7 +6118,7 @@ mod tests {
                 kind: ConsolidationClaimObjectKind::Text,
                 text: Some(text.to_owned()),
                 entity_ref: None,
-                span: Some(span),
+                span: Some(object_span.clone()),
             },
             polarity: ClaimPolarity::Assert,
             cardinality: ClaimCardinality::Single,
@@ -5187,6 +6132,9 @@ mod tests {
             evidence: vec![ConsolidationClaimEvidence {
                 kind: ConsolidationEvidenceKind::Assertion,
                 quote: assertion,
+                subject_span,
+                relation_span,
+                object_span,
             }],
         }
     }
@@ -5969,6 +6917,8 @@ mod tests {
             "local_alice",
             "likes_color",
             "蓝色",
+            quote_nth(event, "Alice", 0),
+            quote_nth(event, "喜欢", 0),
             quote_nth(event, "蓝色", 0),
             full_quote(event),
         );
@@ -6031,6 +6981,8 @@ mod tests {
                     "local_a",
                     "appearance.hair",
                     "长发",
+                    quote_nth(event, "A", 0),
+                    quote_nth(event, "是", 0),
                     quote_nth(event, "长发", 0),
                     quote_nth(event, "A是长发", 0),
                 ),
@@ -6039,6 +6991,8 @@ mod tests {
                     "local_b",
                     "appearance.hair",
                     "短发",
+                    quote_nth(event, "B", 0),
+                    quote_nth(event, "是", 1),
                     quote_nth(event, "短发", 0),
                     quote_nth(event, "B是短发", 0),
                 ),
@@ -6139,6 +7093,7 @@ mod tests {
             basis: EntityResolutionBasis::FirstMention,
             existing_entity_id: Some(target.entity_id.clone()),
             name_evidence: quote_nth(second_event, "小王", 0),
+            existing_identity_evidence: None,
             resolution_evidence: None,
             aliases: Vec::new(),
         };
@@ -6177,6 +7132,7 @@ mod tests {
             basis: EntityResolutionBasis::SelfPronoun,
             existing_entity_id: None,
             name_evidence: quote_nth(event, "我", 0),
+            existing_identity_evidence: None,
             resolution_evidence: None,
             aliases: Vec::new(),
         };
@@ -6214,6 +7170,7 @@ mod tests {
             basis: EntityResolutionBasis::SelfPronoun,
             existing_entity_id: None,
             name_evidence: quote_nth(wrong_event, "你", 0),
+            existing_identity_evidence: None,
             resolution_evidence: None,
             aliases: Vec::new(),
         };
@@ -6261,6 +7218,7 @@ mod tests {
             basis: EntityResolutionBasis::SelfPronoun,
             existing_entity_id: None,
             name_evidence: full_quote(&assistant_event),
+            existing_identity_evidence: None,
             resolution_evidence: None,
             aliases: Vec::new(),
         };
@@ -6333,6 +7291,7 @@ mod tests {
             basis: EntityResolutionBasis::ExplicitAlias,
             existing_entity_id: Some(target_id.clone()),
             name_evidence: quote_nth(alias_event, "小明", 0),
+            existing_identity_evidence: Some(quote_nth(alias_event, "王明", 0)),
             resolution_evidence: Some(proof.clone()),
             aliases: vec![EntityAliasOutput {
                 text: "小明".into(),
@@ -6417,6 +7376,7 @@ mod tests {
             basis: EntityResolutionBasis::StableIdentifier,
             existing_entity_id: Some(stable_target.clone()),
             name_evidence: quote_nth(merge_event, "李雷", 0),
+            existing_identity_evidence: Some(quote_nth(merge_event, "E123", 0)),
             resolution_evidence: Some(stable_proof.clone()),
             aliases: vec![EntityAliasOutput {
                 text: "E123".into(),
@@ -6491,6 +7451,8 @@ mod tests {
             "local_alice",
             "preference.color",
             "蓝色",
+            quote_nth(assistant, "Alice", 0),
+            quote_nth(assistant, "喜欢", 0),
             quote_nth(assistant, "蓝色", 0),
             full_quote(assistant),
         );
@@ -6528,16 +7490,24 @@ mod tests {
             "local_alice",
             "preference.color",
             "蓝色",
+            quote_nth(assistant, "Alice", 0),
+            quote_nth(assistant, "喜欢", 0),
             quote_nth(assistant, "蓝色", 0),
             full_quote(assistant),
         );
         claim.evidence.push(ConsolidationClaimEvidence {
             kind: ConsolidationEvidenceKind::UserConfirmation,
             quote: quote_nth(confirmation, "我确认Alice喜欢蓝色", 0),
+            subject_span: quote_nth(confirmation, "Alice", 0),
+            relation_span: quote_nth(confirmation, "喜欢", 0),
+            object_span: quote_nth(confirmation, "蓝色", 0),
         });
         claim.evidence.push(ConsolidationClaimEvidence {
             kind: ConsolidationEvidenceKind::Temporal,
-            quote: quote_nth(confirmation, "2026-02-01", 0),
+            quote: full_quote(confirmation),
+            subject_span: quote_nth(confirmation, "Alice", 0),
+            relation_span: quote_nth(confirmation, "喜欢", 0),
+            object_span: quote_nth(confirmation, "蓝色", 0),
         });
         claim.event_time = Some("2026-02-01T00:00:00Z".into());
         let output = StructuredConsolidationOutput {
@@ -6583,6 +7553,8 @@ mod tests {
             "local_alice",
             "profile.state",
             "旧值",
+            quote_nth(first_event, "Alice", 0),
+            quote_nth(first_event, "状态是", 0),
             quote_nth(first_event, "旧值", 0),
             full_quote(first_event),
         );
@@ -6620,6 +7592,8 @@ mod tests {
             &entity_id,
             "profile.state",
             "旧值",
+            quote_nth(confirm_event, "Alice", 0),
+            quote_nth(confirm_event, "状态是", 0),
             quote_nth(confirm_event, "旧值", 0),
             full_quote(confirm_event),
         );
@@ -6669,6 +7643,8 @@ mod tests {
             &entity_id,
             "profile.state",
             "新值",
+            quote_nth(conflict_event, "Alice", 0),
+            quote_nth(conflict_event, "状态是", 0),
             quote_nth(conflict_event, "新值", 0),
             full_quote(conflict_event),
         );
@@ -6717,6 +7693,8 @@ mod tests {
             &entity_id,
             "profile.state",
             "最终值",
+            quote_nth(correction_event, "Alice", 0),
+            quote_nth(correction_event, "状态应为", 0),
             quote_nth(correction_event, "最终值", 0),
             full_quote(correction_event),
         );
@@ -6777,6 +7755,8 @@ mod tests {
             &entity_id,
             "preference.drink",
             "茶",
+            quote_nth(multi_event, "Alice", 0),
+            quote_nth(multi_event, "喜欢", 0),
             quote_nth(multi_event, "茶", 0),
             quote_nth(multi_event, "Alice喜欢茶", 0),
         );
@@ -6786,8 +7766,10 @@ mod tests {
             &entity_id,
             "preference.drink",
             "咖啡",
+            quote_nth(multi_event, "Alice", 0),
+            quote_nth(multi_event, "喜欢", 1),
             quote_nth(multi_event, "咖啡", 0),
-            quote_nth(multi_event, "也喜欢咖啡", 0),
+            full_quote(multi_event),
         );
         coffee.cardinality = ClaimCardinality::Multi;
         apply_output(
@@ -6837,6 +7819,8 @@ mod tests {
             &entity_id,
             "preference.drink",
             "茶",
+            quote_nth(denial_event, "Alice", 0),
+            quote_nth(denial_event, "喜欢", 0),
             quote_nth(denial_event, "茶", 0),
             full_quote(denial_event),
         );
@@ -6910,6 +7894,8 @@ mod tests {
             "local_alice",
             "profile.color",
             "蓝色",
+            quote_nth(&event, "Alice", 0),
+            quote_nth(&event, "状态为", 0),
             quote_nth(&event, "蓝色", 0),
             quote_nth(&event, "Alice状态为蓝色", 0),
         );
@@ -6926,7 +7912,10 @@ mod tests {
 
         base.evidence.push(ConsolidationClaimEvidence {
             kind: ConsolidationEvidenceKind::Temporal,
-            quote: quote_nth(&event, "2026-02-01", 0),
+            quote: full_quote(&event),
+            subject_span: quote_nth(&event, "Alice", 0),
+            relation_span: quote_nth(&event, "状态为", 0),
+            object_span: quote_nth(&event, "蓝色", 0),
         });
         let valid = StructuredConsolidationOutput {
             entities: vec![entity.clone()],
@@ -7028,5 +8017,622 @@ mod tests {
             store.retrieval().consolidation_candidates(512, 512),
             Err(RetrievalError::CorruptIndex(_))
         ));
+    }
+
+    #[test]
+    fn attempt_times_are_rfc3339_and_monotonic_for_every_status() {
+        for status in [
+            ConsolidationAttemptStatus::Applied,
+            ConsolidationAttemptStatus::Rejected,
+            ConsolidationAttemptStatus::ModelError,
+            ConsolidationAttemptStatus::Cancelled,
+        ] {
+            let mut invalid = failed_attempt("bad-time", "batch", "session");
+            invalid.status = status;
+            invalid.started_at = "not-a-time".into();
+            assert!(matches!(
+                validate_attempt(&invalid),
+                Err(RetrievalError::CorruptIndex(_))
+            ));
+
+            let mut reversed = failed_attempt("reversed-time", "batch", "session");
+            reversed.status = status;
+            reversed.started_at = "2026-01-02T00:00:00Z".into();
+            reversed.completed_at = "2026-01-01T00:00:00Z".into();
+            assert!(matches!(
+                validate_attempt(&reversed),
+                Err(RetrievalError::CorruptIndex(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn every_boundary_evidence_quote_must_be_user_authored() {
+        let user = ConsolidationEvent {
+            event_id: "user".into(),
+            turn_id: "turn-user".into(),
+            sequence: 1,
+            role: EventRole::User,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            content: "change topic".into(),
+            content_sha256: content_sha256("change topic"),
+        };
+        let assistant = ConsolidationEvent {
+            event_id: "assistant".into(),
+            turn_id: "turn-assistant".into(),
+            sequence: 2,
+            role: EventRole::Assistant,
+            created_at: "2026-01-01T00:00:01Z".into(),
+            content: "acknowledged".into(),
+            content_sha256: content_sha256("acknowledged"),
+        };
+        let batch = ConsolidationInputBatch {
+            batch_key: "manual".into(),
+            session_id: "session".into(),
+            watermark_before: 0,
+            from_sequence: 1,
+            through_sequence: 2,
+            through_event_id: assistant.event_id.clone(),
+            through_event_sha256: assistant.content_sha256.clone(),
+            turn_count: 2,
+            char_count: user.content.chars().count() + assistant.content.chars().count(),
+            events: vec![user.clone(), assistant.clone()],
+        };
+        let output = StructuredConsolidationOutput {
+            entities: Vec::new(),
+            claims: Vec::new(),
+            boundaries: vec![ConsolidationBoundaryOutput {
+                before_event_id: user.event_id.clone(),
+                reason: BoundarySuggestionReason::ExplicitTopicTransition,
+                evidence: vec![full_quote(&user), full_quote(&assistant)],
+            }],
+        };
+        assert!(matches!(
+            validate_structured_output(&batch, &empty_candidates(), &output),
+            Err(ConsolidationApplyError::Rejected { .. })
+        ));
+    }
+
+    #[test]
+    fn claim_evidence_binds_exact_subject_relation_and_object_roles() {
+        let make_event =
+            |id: &str, sequence: usize, role: EventRole, content: &str| ConsolidationEvent {
+                event_id: id.into(),
+                turn_id: format!("turn-{id}"),
+                sequence,
+                role,
+                created_at: format!("2026-01-01T00:00:{sequence:02}Z"),
+                content: content.into(),
+                content_sha256: content_sha256(content),
+            };
+        let origin = make_event(
+            "origin",
+            1,
+            EventRole::User,
+            "Alice and Paris are entities.",
+        );
+        let assistant = make_event(
+            "assistant",
+            2,
+            EventRole::Assistant,
+            "Alice lives in Paris.",
+        );
+        let unrelated = make_event("unrelated", 3, EventRole::User, "Paris weather is nice.");
+        let wrong_subject = make_event("wrong-subject", 4, EventRole::User, "Bob lives in Paris.");
+        let swapped = make_event("swapped", 5, EventRole::User, "Paris lives in Alice.");
+        let negated = make_event("negated", 6, EventRole::User, "Alice? No, not Paris.");
+        let confirmation = make_event(
+            "confirmation",
+            7,
+            EventRole::User,
+            "I confirm Alice lives in Paris.",
+        );
+        let events = vec![
+            origin.clone(),
+            assistant.clone(),
+            unrelated.clone(),
+            wrong_subject.clone(),
+            swapped.clone(),
+            negated.clone(),
+            confirmation.clone(),
+        ];
+        let batch = ConsolidationInputBatch {
+            batch_key: "manual".into(),
+            session_id: "session".into(),
+            watermark_before: 0,
+            from_sequence: 1,
+            through_sequence: 7,
+            through_event_id: confirmation.event_id.clone(),
+            through_event_sha256: confirmation.content_sha256.clone(),
+            turn_count: events.len(),
+            char_count: events
+                .iter()
+                .map(|event| event.content.chars().count())
+                .sum(),
+            events,
+        };
+        let entities = vec![
+            new_entity_output("local_alice", "Alice", quote_nth(&origin, "Alice", 0)),
+            new_entity_output("local_paris", "Paris", quote_nth(&origin, "Paris", 0)),
+        ];
+        let assistant_evidence = ConsolidationClaimEvidence {
+            kind: ConsolidationEvidenceKind::Assertion,
+            quote: full_quote(&assistant),
+            subject_span: quote_nth(&assistant, "Alice", 0),
+            relation_span: quote_nth(&assistant, "lives in", 0),
+            object_span: quote_nth(&assistant, "Paris", 0),
+        };
+        let base_claim = ConsolidatedClaimOutput {
+            local_id: "local_residence".into(),
+            subject_ref: "local_alice".into(),
+            predicate_key: "residence.city".into(),
+            object: ConsolidatedClaimObject {
+                kind: ConsolidationClaimObjectKind::Entity,
+                text: None,
+                entity_ref: Some("local_paris".into()),
+                span: None,
+            },
+            polarity: ClaimPolarity::Assert,
+            cardinality: ClaimCardinality::Single,
+            certainty: ClaimCertainty::Certain,
+            disposition: ClaimDisposition::New,
+            replaces_claim_ids: Vec::new(),
+            conflicts_with_claim_ids: Vec::new(),
+            event_time: None,
+            valid_from: None,
+            valid_to: None,
+            evidence: vec![assistant_evidence.clone()],
+        };
+        let output = |claim: ConsolidatedClaimOutput| StructuredConsolidationOutput {
+            entities: entities.clone(),
+            claims: vec![claim],
+            boundaries: Vec::new(),
+        };
+
+        let mut unrelated_claim = base_claim.clone();
+        unrelated_claim.evidence.push(ConsolidationClaimEvidence {
+            kind: ConsolidationEvidenceKind::UserConfirmation,
+            quote: full_quote(&unrelated),
+            subject_span: quote_nth(&unrelated, "Paris", 0),
+            relation_span: quote_nth(&unrelated, "is", 0),
+            object_span: quote_nth(&unrelated, "nice", 0),
+        });
+        assert!(matches!(
+            validate_structured_output(&batch, &empty_candidates(), &output(unrelated_claim)),
+            Err(ConsolidationApplyError::Rejected { .. })
+        ));
+
+        let mut wrong_claim = base_claim.clone();
+        wrong_claim.evidence = vec![ConsolidationClaimEvidence {
+            kind: ConsolidationEvidenceKind::Assertion,
+            quote: full_quote(&wrong_subject),
+            subject_span: quote_nth(&wrong_subject, "Bob", 0),
+            relation_span: quote_nth(&wrong_subject, "lives in", 0),
+            object_span: quote_nth(&wrong_subject, "Paris", 0),
+        }];
+        assert!(matches!(
+            validate_structured_output(&batch, &empty_candidates(), &output(wrong_claim)),
+            Err(ConsolidationApplyError::Rejected { .. })
+        ));
+
+        let mut swapped_claim = base_claim.clone();
+        swapped_claim.evidence = vec![ConsolidationClaimEvidence {
+            kind: ConsolidationEvidenceKind::Assertion,
+            quote: full_quote(&swapped),
+            subject_span: quote_nth(&swapped, "Alice", 0),
+            relation_span: quote_nth(&swapped, "lives in", 0),
+            object_span: quote_nth(&swapped, "Paris", 0),
+        }];
+        assert!(matches!(
+            validate_structured_output(&batch, &empty_candidates(), &output(swapped_claim)),
+            Err(ConsolidationApplyError::Rejected { .. })
+        ));
+
+        let mut negated_claim = base_claim.clone();
+        negated_claim.evidence = vec![ConsolidationClaimEvidence {
+            kind: ConsolidationEvidenceKind::Assertion,
+            quote: full_quote(&negated),
+            subject_span: quote_nth(&negated, "Alice", 0),
+            relation_span: quote_nth(&negated, "not", 0),
+            object_span: quote_nth(&negated, "Paris", 0),
+        }];
+        assert!(matches!(
+            validate_structured_output(&batch, &empty_candidates(), &output(negated_claim)),
+            Err(ConsolidationApplyError::Rejected { .. })
+        ));
+
+        let mut confirmed_claim = base_claim;
+        confirmed_claim.evidence.push(ConsolidationClaimEvidence {
+            kind: ConsolidationEvidenceKind::UserConfirmation,
+            quote: full_quote(&confirmation),
+            subject_span: quote_nth(&confirmation, "Alice", 0),
+            relation_span: quote_nth(&confirmation, "lives in", 0),
+            object_span: quote_nth(&confirmation, "Paris", 0),
+        });
+        assert!(
+            validate_structured_output(&batch, &empty_candidates(), &output(confirmed_claim))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn entity_identity_proofs_use_exact_nfkc_spans_without_prefix_matches() {
+        let candidate = |entity_id: &str,
+                         name: &str,
+                         aliases: Vec<MemoryAliasCandidate>|
+         -> MemoryEntityCandidate {
+            MemoryEntityCandidate {
+                entity_id: entity_id.into(),
+                kind: MemoryEntityKind::Person,
+                canonical_name: name.into(),
+                normalized_name: normalize_match(name),
+                disambiguation: EntityDisambiguation::Resolved,
+                created_session_id: "old-session".into(),
+                created_batch_key: "old-batch".into(),
+                created_event_id: "old-event".into(),
+                created_start: 0,
+                created_end: name.chars().count(),
+                created_hash: content_sha256(name),
+                created_at: "2025-01-01T00:00:00Z".into(),
+                updated_at: "2025-01-01T00:00:00Z".into(),
+                aliases,
+            }
+        };
+        let snapshot = |entity: MemoryEntityCandidate| {
+            let entities = vec![entity];
+            let claims = Vec::new();
+            ConsolidationCandidateSnapshot {
+                snapshot_sha256: candidate_snapshot_hash(&entities, &claims).unwrap(),
+                entities,
+                claims,
+            }
+        };
+        let batch_for = |event: ConsolidationEvent| ConsolidationInputBatch {
+            batch_key: "manual".into(),
+            session_id: "session".into(),
+            watermark_before: 0,
+            from_sequence: event.sequence,
+            through_sequence: event.sequence,
+            through_event_id: event.event_id.clone(),
+            through_event_sha256: event.content_sha256.clone(),
+            turn_count: 1,
+            char_count: event.content.chars().count(),
+            events: vec![event],
+        };
+        let event = |id: &str, content: &str| ConsolidationEvent {
+            event_id: id.into(),
+            turn_id: format!("turn-{id}"),
+            sequence: 1,
+            role: EventRole::User,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            content: content.into(),
+            content_sha256: content_sha256(content),
+        };
+        let explicit_output = |event: &ConsolidationEvent,
+                               name: &str,
+                               identity: ConsolidationQuote,
+                               candidate_id: &str|
+         -> ConsolidatedEntityOutput {
+            let proof = full_quote(event);
+            ConsolidatedEntityOutput {
+                local_id: "local_existing".into(),
+                name: name.into(),
+                kind: MemoryEntityKind::Person,
+                resolution: EntityResolution::Existing,
+                disambiguation: EntityDisambiguation::Resolved,
+                basis: EntityResolutionBasis::ExplicitAlias,
+                existing_entity_id: Some(candidate_id.into()),
+                name_evidence: quote_nth(event, name, 0),
+                existing_identity_evidence: Some(identity),
+                resolution_evidence: Some(proof.clone()),
+                aliases: vec![EntityAliasOutput {
+                    text: name.into(),
+                    kind: MemoryAliasKind::ExplicitAlias,
+                    stable_identifier_kind: None,
+                    evidence: quote_nth(event, name, 0),
+                    proof_evidence: proof,
+                }],
+            }
+        };
+
+        let ann_candidate = snapshot(candidate("ent_ann", "Ann", Vec::new()));
+        let joann = event("joann", "JoAnn aka Annie.");
+        let joann_output = StructuredConsolidationOutput {
+            entities: vec![explicit_output(
+                &joann,
+                "Annie",
+                quote_nth(&joann, "Ann", 0),
+                "ent_ann",
+            )],
+            claims: Vec::new(),
+            boundaries: Vec::new(),
+        };
+        assert!(matches!(
+            validate_structured_output(&batch_for(joann), &ann_candidate, &joann_output),
+            Err(ConsolidationApplyError::Rejected { .. })
+        ));
+
+        let fullwidth = event("fullwidth", "Ａｎｎ aka Annie.");
+        let fullwidth_output = StructuredConsolidationOutput {
+            entities: vec![explicit_output(
+                &fullwidth,
+                "Annie",
+                quote_nth(&fullwidth, "Ａｎｎ", 0),
+                "ent_ann",
+            )],
+            claims: Vec::new(),
+            boundaries: Vec::new(),
+        };
+        assert!(
+            validate_structured_output(&batch_for(fullwidth), &ann_candidate, &fullwidth_output)
+                .is_ok()
+        );
+
+        let cjk_candidate = snapshot(candidate("ent_wang", "王明", Vec::new()));
+        let cjk = event("cjk", "小明即王明。");
+        let cjk_output = StructuredConsolidationOutput {
+            entities: vec![explicit_output(
+                &cjk,
+                "小明",
+                quote_nth(&cjk, "王明", 0),
+                "ent_wang",
+            )],
+            claims: Vec::new(),
+            boundaries: Vec::new(),
+        };
+        assert!(validate_structured_output(&batch_for(cjk), &cjk_candidate, &cjk_output).is_ok());
+
+        let stable_alias = MemoryAliasCandidate {
+            alias_id: "alias-e123".into(),
+            text: "E123".into(),
+            normalized_text: "e123".into(),
+            kind: MemoryAliasKind::StableIdentifier,
+            stable_identifier_kind: Some("serial".into()),
+            session_id: "old-session".into(),
+            batch_key: "old-batch".into(),
+            event_id: "old-event".into(),
+            start_char: 0,
+            end_char: 4,
+            content_sha256: content_sha256("E123"),
+            created_at: "2025-01-01T00:00:00Z".into(),
+        };
+        let stable_candidate = snapshot(candidate("ent_device", "Device", vec![stable_alias]));
+        let prefix = event("prefix", "Unit serial E1234.");
+        let proof = full_quote(&prefix);
+        let identifier = quote_nth(&prefix, "E123", 0);
+        let stable_output = StructuredConsolidationOutput {
+            entities: vec![ConsolidatedEntityOutput {
+                local_id: "local_device".into(),
+                name: "Unit".into(),
+                kind: MemoryEntityKind::Person,
+                resolution: EntityResolution::Existing,
+                disambiguation: EntityDisambiguation::Resolved,
+                basis: EntityResolutionBasis::StableIdentifier,
+                existing_entity_id: Some("ent_device".into()),
+                name_evidence: quote_nth(&prefix, "Unit", 0),
+                existing_identity_evidence: Some(identifier.clone()),
+                resolution_evidence: Some(proof.clone()),
+                aliases: vec![EntityAliasOutput {
+                    text: "E123".into(),
+                    kind: MemoryAliasKind::StableIdentifier,
+                    stable_identifier_kind: Some("serial".into()),
+                    evidence: identifier,
+                    proof_evidence: proof,
+                }],
+            }],
+            claims: Vec::new(),
+            boundaries: Vec::new(),
+        };
+        assert!(matches!(
+            validate_structured_output(&batch_for(prefix), &stable_candidate, &stable_output),
+            Err(ConsolidationApplyError::Rejected { .. })
+        ));
+    }
+
+    #[test]
+    fn source_change_after_pending_check_is_stale_and_rolls_back_everything() {
+        use std::sync::Arc;
+
+        let root = tempfile::tempdir().unwrap();
+        let (store, mut session) = new_session(root.path());
+        push_complete_at(&mut session, "Alice arrived.", None, "2026-01-01T00:00:00Z");
+        let batch = next_batch(&store, &mut session);
+        let candidates = empty_candidates();
+        let output = StructuredConsolidationOutput {
+            entities: Vec::new(),
+            claims: Vec::new(),
+            boundaries: Vec::new(),
+        };
+        let attempt = applied_attempt(&batch, &output);
+        let source_path = store.root().join(format!("{}.json", session.id));
+        let original = fs::read(&source_path).unwrap();
+        let hook_path = source_path.clone();
+        store
+            .retrieval()
+            .set_consolidation_test_hook(Some(Arc::new(move |point| {
+                if point == crate::retrieval::ConsolidationHookPoint::AfterPendingBatchCheck {
+                    let mut changed = original.clone();
+                    changed.extend_from_slice(b" ");
+                    fs::write(&hook_path, changed).unwrap();
+                }
+            })));
+        let result = store
+            .retrieval()
+            .apply_consolidation_attempt(&batch, &candidates, &attempt);
+        assert!(matches!(result, Err(ConsolidationApplyError::Stale { .. })));
+        store.retrieval().set_consolidation_test_hook(None);
+        let connection = Connection::open(store.retrieval().index_path()).unwrap();
+        for table in [
+            "memory_entities",
+            "memory_claims",
+            "consolidation_batches",
+            "consolidation_watermarks",
+        ] {
+            assert_eq!(
+                connection
+                    .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap(),
+                0,
+                "unexpected write in {table}"
+            );
+        }
+    }
+
+    #[test]
+    fn session_save_waits_for_consolidation_root_read_lock() {
+        use std::sync::{Arc, Barrier, mpsc};
+        use std::time::Duration;
+
+        let root = tempfile::tempdir().unwrap();
+        let (store, mut session) = new_session(root.path());
+        push_complete_at(&mut session, "One.", None, "2026-01-01T00:00:00Z");
+        let batch = next_batch(&store, &mut session);
+        let candidates = empty_candidates();
+        let output = StructuredConsolidationOutput {
+            entities: Vec::new(),
+            claims: Vec::new(),
+            boundaries: Vec::new(),
+        };
+        let attempt = applied_attempt(&batch, &output);
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let hook_entered = Arc::clone(&entered);
+        let hook_release = Arc::clone(&release);
+        store
+            .retrieval()
+            .set_consolidation_test_hook(Some(Arc::new(move |point| {
+                if point == crate::retrieval::ConsolidationHookPoint::AfterTransactionSourceCheck {
+                    hook_entered.wait();
+                    hook_release.wait();
+                }
+            })));
+
+        let apply_store = store.retrieval().clone();
+        let apply_batch = batch.clone();
+        let apply_candidates = candidates.clone();
+        let apply_attempt = attempt.clone();
+        let apply_thread = std::thread::spawn(move || {
+            apply_store.apply_consolidation_attempt(&apply_batch, &apply_candidates, &apply_attempt)
+        });
+        entered.wait();
+
+        let second_store = SessionStore::new(root.path().join(".")).unwrap();
+        push_complete_at(&mut session, "Two.", None, "2026-01-02T00:00:00Z");
+        let (saved_tx, saved_rx) = mpsc::channel();
+        let save_thread = std::thread::spawn(move || {
+            let result = second_store.save(&mut session);
+            saved_tx.send(result.is_ok()).unwrap();
+        });
+        assert!(saved_rx.recv_timeout(Duration::from_millis(100)).is_err());
+        release.wait();
+        assert!(apply_thread.join().unwrap().is_ok());
+        assert!(saved_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+        save_thread.join().unwrap();
+        store.retrieval().set_consolidation_test_hook(None);
+    }
+
+    #[test]
+    fn full_integrity_rejects_hidden_orphan_memory_rows() {
+        let seed = || {
+            let root = tempfile::tempdir().unwrap();
+            let (store, mut session) = new_session(root.path());
+            push_complete_at(
+                &mut session,
+                "Alice aka Al lives in Paris and Alice likes tea. change topic.",
+                None,
+                "2026-01-01T00:00:00Z",
+            );
+            let batch = next_batch(&store, &mut session);
+            let event = &batch.events[0];
+            let proof = full_quote(event);
+            let mut alice = new_entity_output("local_alice", "Alice", quote_nth(event, "Alice", 0));
+            alice.aliases = vec![EntityAliasOutput {
+                text: "Al".into(),
+                kind: MemoryAliasKind::ExplicitAlias,
+                stable_identifier_kind: None,
+                evidence: quote_nth(event, "Al", 1),
+                proof_evidence: proof,
+            }];
+            let residence = ConsolidatedClaimOutput {
+                local_id: "local_residence".into(),
+                subject_ref: "local_alice".into(),
+                predicate_key: "residence.city".into(),
+                object: ConsolidatedClaimObject {
+                    kind: ConsolidationClaimObjectKind::Entity,
+                    text: None,
+                    entity_ref: Some("local_paris".into()),
+                    span: None,
+                },
+                polarity: ClaimPolarity::Assert,
+                cardinality: ClaimCardinality::Single,
+                certainty: ClaimCertainty::Certain,
+                disposition: ClaimDisposition::New,
+                replaces_claim_ids: Vec::new(),
+                conflicts_with_claim_ids: Vec::new(),
+                event_time: None,
+                valid_from: None,
+                valid_to: None,
+                evidence: vec![ConsolidationClaimEvidence {
+                    kind: ConsolidationEvidenceKind::Assertion,
+                    quote: quote_nth(event, "Alice aka Al lives in Paris", 0),
+                    subject_span: quote_nth(event, "Alice", 0),
+                    relation_span: quote_nth(event, "lives in", 0),
+                    object_span: quote_nth(event, "Paris", 0),
+                }],
+            };
+            let tea = text_claim_output(
+                "local_tea",
+                "local_alice",
+                "preference.drink",
+                "tea",
+                quote_nth(event, "Alice", 1),
+                quote_nth(event, "likes", 0),
+                quote_nth(event, "tea", 0),
+                quote_nth(event, "Alice likes tea", 0),
+            );
+            apply_output(
+                &store,
+                &batch,
+                &empty_candidates(),
+                &StructuredConsolidationOutput {
+                    entities: vec![
+                        alice,
+                        new_entity_output("local_paris", "Paris", quote_nth(event, "Paris", 0)),
+                    ],
+                    claims: vec![residence, tea],
+                    boundaries: vec![ConsolidationBoundaryOutput {
+                        before_event_id: event.event_id.clone(),
+                        reason: BoundarySuggestionReason::ExplicitTopicTransition,
+                        evidence: vec![quote_nth(event, "change topic", 0)],
+                    }],
+                },
+            )
+            .unwrap();
+            (root, store)
+        };
+
+        for mutation in [
+            "UPDATE memory_entities SET created_event_id = 'event_missing', updated_at = '1900-01-01T00:00:00Z' WHERE canonical_name = 'Alice'",
+            "UPDATE memory_entity_aliases SET entity_id = 'ent_missing'",
+            "UPDATE memory_claims SET subject_entity_id = 'ent_missing', updated_at = '1900-01-01T00:00:00Z' WHERE predicate_key = 'residence.city'",
+            "UPDATE memory_claims SET object_entity_id = 'ent_missing', updated_at = '1900-01-01T00:00:00Z' WHERE predicate_key = 'residence.city'",
+            "UPDATE memory_claim_evidence SET claim_id = 'claim_missing' WHERE claim_id = (SELECT claim_id FROM memory_claims WHERE predicate_key = 'residence.city')",
+            "UPDATE memory_claim_transitions SET claim_id = 'claim_missing' WHERE claim_id = (SELECT claim_id FROM memory_claims WHERE predicate_key = 'residence.city')",
+            "UPDATE memory_boundary_suggestions SET evidence_json = '[]'",
+        ] {
+            let (_root, store) = seed();
+            let connection = Connection::open(store.retrieval().index_path()).unwrap();
+            connection
+                .execute_batch("PRAGMA foreign_keys = OFF;")
+                .unwrap();
+            connection.execute_batch(mutation).unwrap();
+            drop(connection);
+            assert!(matches!(
+                store.retrieval().consolidation_candidates(1, 1),
+                Err(RetrievalError::CorruptIndex(_))
+            ));
+        }
     }
 }
