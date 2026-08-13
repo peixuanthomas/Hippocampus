@@ -9129,34 +9129,116 @@ mod tests {
     }
 
     #[test]
-    fn mention_reference_mapping_covers_self_new_existing_and_direct_targets() {
+    fn mention_reference_mapping_covers_self_and_new_targets() {
         let root = tempfile::tempdir().unwrap();
         let (store, mut session) = new_session(root.path());
-        push_complete_at(&mut session, "I am Alice.", None, "2026-01-01T00:00:00Z");
+        push_complete_at(
+            &mut session,
+            "I am I. He knows Bob.",
+            None,
+            "2026-01-01T00:00:00Z",
+        );
         let batch = next_batch(&store, &mut session);
         let event = &batch.events[0];
+        let mut seen = std::collections::BTreeSet::new();
         let mut self_entity = new_entity_output("local_self", "I", quote_nth(event, "I", 0));
         self_entity.resolution = EntityResolution::SelfEntity;
         self_entity.basis = EntityResolutionBasis::SelfPronoun;
-        apply_output(
+        let mut pending = new_entity_output("local_pending", "He", quote_nth(event, "He", 0));
+        pending.disambiguation = EntityDisambiguation::Pending;
+        pending.basis = EntityResolutionBasis::Ambiguous;
+        let bob_quote = quote_nth(event, "Bob", 0);
+        let bob_id = deterministic_id(
+            "ent",
+            &[
+                &batch.batch_key,
+                "person",
+                &bob_quote.event_id,
+                &bob_quote.start_char.to_string(),
+                &bob_quote.end_char.to_string(),
+                &bob_quote.content_sha256,
+            ],
+        );
+        let entity_claim = ConsolidatedClaimOutput {
+            local_id: "local_knows".into(),
+            subject_ref: "local_pending".into(),
+            predicate_key: "relation.knows".into(),
+            object: ConsolidatedClaimObject {
+                kind: ConsolidationClaimObjectKind::Entity,
+                text: None,
+                entity_ref: Some(bob_id.clone()),
+                span: None,
+            },
+            polarity: ClaimPolarity::Assert,
+            cardinality: ClaimCardinality::Single,
+            certainty: ClaimCertainty::Certain,
+            disposition: ClaimDisposition::New,
+            replaces_claim_ids: vec![],
+            conflicts_with_claim_ids: vec![],
+            event_time: None,
+            valid_from: None,
+            valid_to: None,
+            evidence: vec![ConsolidationClaimEvidence {
+                kind: ConsolidationEvidenceKind::Assertion,
+                quote: quote_nth(event, "He knows Bob.", 0),
+                subject_span: quote_nth(event, "He", 0),
+                relation_span: quote_nth(event, "knows", 0),
+                object_span: quote_nth(event, "Bob", 0),
+                speech_act_span: None,
+            }],
+        };
+        let report = apply_output(
             &store,
             &batch,
             &empty_candidates(),
             &StructuredConsolidationOutput {
-                entities: vec![self_entity],
-                claims: vec![],
+                entities: vec![
+                    self_entity,
+                    pending,
+                    new_entity_output("local_bob", "Bob", bob_quote),
+                ],
+                claims: vec![entity_claim],
                 boundaries: vec![],
             },
         )
         .unwrap();
+        assert_eq!(report.mentions_created, 5);
         let connection = Connection::open(store.retrieval().index_path()).unwrap();
+        let rows = connection.prepare("SELECT mention_kind,source_record_id,entity_id,entity_status FROM memory_entity_mentions ORDER BY mention_id").unwrap().query_map([], |row| Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?,row.get::<_, String>(2)?,row.get::<_, String>(3)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        assert!(rows.iter().any(|row| row.0 == "entity_name"
+            && row.1 == "local_self"
+            && row.2 == "ent_self"
+            && row.3 == "resolved"));
+        seen.insert("self_local");
+        assert!(rows.iter().any(|row| row.0 == "entity_name"
+            && row.1 == "local_pending"
+            && row.2.starts_with("ent_")
+            && row.3 == "pending"));
+        seen.insert("new_pending_local");
+        assert!(rows.iter().any(|row| row.0 == "entity_name"
+            && row.1 == "local_bob"
+            && row.2 == bob_id
+            && row.3 == "resolved"));
+        seen.insert("new_resolved_local");
+        assert!(
+            rows.iter()
+                .any(|row| row.0 == "claim_subject" && row.3 == "pending")
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.0 == "claim_object" && row.2 == bob_id && row.3 == "resolved")
+        );
+        seen.insert("direct_current_new_target");
         assert_eq!(
-            connection
-                .query_row("SELECT entity_id FROM memory_entity_mentions", [], |row| {
-                    row.get::<_, String>(0)
-                })
-                .unwrap(),
-            "ent_self"
+            seen,
+            [
+                "self_local",
+                "new_pending_local",
+                "new_resolved_local",
+                "direct_current_new_target"
+            ]
+            .into_iter()
+            .collect()
         );
     }
 
