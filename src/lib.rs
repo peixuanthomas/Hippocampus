@@ -48,8 +48,10 @@ pub use ollama::{
     validate_public_http_url, validate_public_http_url_resolved,
 };
 pub use retrieval::{
-    AnswerContext, AnswerContextItem, IndexedSession, RecallResult, RecalledEvidence, ResolvedSpan,
-    RetrievalError, RetrievalStore, StoredEvent, SyncReport,
+    AggregateEmbeddingDocument, AggregateEmbeddingSnapshot, AnswerContext, AnswerContextItem,
+    DirectMessageEmbedding, EmbeddingPublishReport, IndexedSession, LeafEmbeddingDocument,
+    LeafEmbeddingSnapshot, RecallResult, RecalledEvidence, ResolvedSpan, RetrievalError,
+    RetrievalStore, StoredEvent, SyncReport,
 };
 pub use store::{IndexSyncAfterSourceCommit, SessionStore};
 pub use vector::{

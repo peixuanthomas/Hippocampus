@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard,
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -73,6 +73,8 @@ pub enum RetrievalError {
     },
     #[error("派生索引内容校验失败：{0}")]
     CorruptIndex(String),
+    #[error("{kind} embedding catalog 已变化，请重新获取 snapshot")]
+    EmbeddingCatalogStale { kind: String },
     #[error("会话根目录锁已损坏，拒绝继续访问：{path}")]
     RootLockPoisoned { path: PathBuf },
 }
@@ -158,6 +160,59 @@ pub struct RecalledEvidence {
 pub struct RecallResult {
     pub trace: RetrievalTrace,
     pub evidence: Vec<RecalledEvidence>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmbeddingPublishReport {
+    pub documents: usize,
+    pub reused: usize,
+    pub changed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LeafEmbeddingDocument {
+    pub document_id: String,
+    pub session_id: String,
+    pub granularity: RetrievalDocumentGranularity,
+    pub source_sha256: String,
+    pub content: String,
+    pub source_event_id: String,
+    pub start_char: usize,
+    pub end_char: usize,
+    pub message_document_id: String,
+    pub reusable_vector: Option<Vec<f32>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LeafEmbeddingSnapshot {
+    pub catalog_sha256: String,
+    pub session_ids: Vec<String>,
+    pub documents: Vec<LeafEmbeddingDocument>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DirectMessageEmbedding {
+    pub message_document_id: String,
+    pub source_event_id: String,
+    pub source_sha256: String,
+    pub start_char: usize,
+    pub end_char: usize,
+    pub vector: Vec<f32>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AggregateEmbeddingDocument {
+    pub document_id: String,
+    pub session_id: String,
+    pub granularity: RetrievalDocumentGranularity,
+    pub source_sha256: String,
+    pub direct_messages: Vec<DirectMessageEmbedding>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AggregateEmbeddingSnapshot {
+    pub catalog_sha256: String,
+    pub documents: Vec<AggregateEmbeddingDocument>,
 }
 
 #[derive(Debug, Clone)]
@@ -632,6 +687,191 @@ impl RetrievalStore {
             .commit()
             .map_err(|error| self.database_error(error))?;
         Ok(())
+    }
+
+    pub fn leaf_embedding_snapshot(
+        &self,
+        spec: &VectorIndexSpec,
+    ) -> RetrievalResult<LeafEmbeddingSnapshot> {
+        validate_embedding_spec(spec)?;
+        let _guard = self.acquire_root_read()?;
+        let connection = self.open_connection()?;
+        load_leaf_embedding_snapshot(self, &connection, spec)
+    }
+
+    pub fn publish_leaf_embedding_catalog(
+        &self,
+        spec: &VectorIndexSpec,
+        snapshot: &LeafEmbeddingSnapshot,
+        writes: &[EmbeddingWrite],
+    ) -> RetrievalResult<EmbeddingPublishReport> {
+        validate_embedding_spec(spec)?;
+        let prepared = prepare_complete_catalog_writes(
+            spec,
+            snapshot.documents.iter().map(|document| {
+                (
+                    document.document_id.as_str(),
+                    document.source_sha256.as_str(),
+                )
+            }),
+            writes,
+        )?;
+        let _guard = self.acquire_root_write()?;
+        let mut connection = self.open_connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| self.database_error(error))?;
+        let current = load_leaf_embedding_snapshot(self, &transaction, spec)?;
+        if current.catalog_sha256 != snapshot.catalog_sha256
+            || current.session_ids != snapshot.session_ids
+            || current.documents != snapshot.documents
+        {
+            return Err(RetrievalError::EmbeddingCatalogStale {
+                kind: "leaf".into(),
+            });
+        }
+        let fingerprint = embedding_fingerprint(spec)?;
+        let embedded_at = Utc::now().to_rfc3339();
+        let mut changed_sessions = HashSet::new();
+        let mut reused = 0;
+        for (document, write) in current.documents.iter().zip(&prepared) {
+            let existing = raw_embedding(&transaction, &document.document_id)?;
+            if embedding_equals(
+                existing.as_ref(),
+                spec,
+                &fingerprint,
+                &document.source_sha256,
+                &write.vector_blob,
+            ) {
+                reused += 1;
+                continue;
+            }
+            transaction.execute(
+                "INSERT INTO memory_embeddings(document_id,model,dimensions,source_sha256,index_fingerprint,vector_blob,embedded_at)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7)
+                 ON CONFLICT(document_id) DO UPDATE SET model=excluded.model,dimensions=excluded.dimensions,
+                 source_sha256=excluded.source_sha256,index_fingerprint=excluded.index_fingerprint,
+                 vector_blob=excluded.vector_blob,embedded_at=excluded.embedded_at",
+                params![document.document_id, spec.model, usize_to_i64(spec.dimensions).map_err(|e| self.database_error(e))?, document.source_sha256, fingerprint, write.vector_blob, embedded_at],
+            ).map_err(|error| self.database_error(error))?;
+            changed_sessions.insert(document.session_id.clone());
+        }
+        for session_id in &changed_sessions {
+            transaction.execute(
+                "DELETE FROM memory_embeddings WHERE document_id IN
+                 (SELECT document_id FROM memory_documents WHERE session_id=?1 AND granularity IN ('episode','session'))",
+                [session_id],
+            ).map_err(|error| self.database_error(error))?;
+            transaction
+                .execute(
+                    "DELETE FROM memory_episode_materializations WHERE session_id=?1",
+                    [session_id],
+                )
+                .map_err(|error| self.database_error(error))?;
+        }
+        verify_published_catalog(
+            &transaction,
+            spec,
+            &fingerprint,
+            &prepared,
+            "'message','fragment'",
+        )?;
+        transaction
+            .commit()
+            .map_err(|error| self.database_error(error))?;
+        Ok(EmbeddingPublishReport {
+            documents: prepared.len(),
+            reused,
+            changed: !changed_sessions.is_empty(),
+        })
+    }
+
+    pub fn aggregate_embedding_snapshot(
+        &self,
+        spec: &VectorIndexSpec,
+    ) -> RetrievalResult<AggregateEmbeddingSnapshot> {
+        validate_embedding_spec(spec)?;
+        let _guard = self.acquire_root_read()?;
+        let connection = self.open_connection()?;
+        load_aggregate_embedding_snapshot(self, &connection, spec)
+    }
+
+    pub fn publish_aggregate_embedding_catalog(
+        &self,
+        spec: &VectorIndexSpec,
+        snapshot: &AggregateEmbeddingSnapshot,
+        writes: &[EmbeddingWrite],
+    ) -> RetrievalResult<EmbeddingPublishReport> {
+        validate_embedding_spec(spec)?;
+        let prepared = prepare_complete_catalog_writes(
+            spec,
+            snapshot.documents.iter().map(|document| {
+                (
+                    document.document_id.as_str(),
+                    document.source_sha256.as_str(),
+                )
+            }),
+            writes,
+        )?;
+        let _guard = self.acquire_root_write()?;
+        let mut connection = self.open_connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| self.database_error(error))?;
+        let current = load_aggregate_embedding_snapshot(self, &transaction, spec)?;
+        if current != *snapshot {
+            return Err(RetrievalError::EmbeddingCatalogStale {
+                kind: "aggregate".into(),
+            });
+        }
+        let fingerprint = embedding_fingerprint(spec)?;
+        let expected = canonical_aggregate_blobs_from_snapshot(&current, spec.dimensions)?;
+        for write in &prepared {
+            if expected.get(&write.document_id) != Some(&write.vector_blob) {
+                return Err(RetrievalError::CorruptIndex(format!(
+                    "aggregate document {} 的向量不是规范 equal_mean",
+                    write.document_id
+                )));
+            }
+        }
+        let embedded_at = Utc::now().to_rfc3339();
+        let mut reused = 0;
+        for write in &prepared {
+            let existing = raw_embedding(&transaction, &write.document_id)?;
+            if embedding_equals(
+                existing.as_ref(),
+                spec,
+                &fingerprint,
+                &write.source_sha256,
+                &write.vector_blob,
+            ) {
+                reused += 1;
+                continue;
+            }
+            transaction.execute(
+                "INSERT INTO memory_embeddings(document_id,model,dimensions,source_sha256,index_fingerprint,vector_blob,embedded_at)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7)
+                 ON CONFLICT(document_id) DO UPDATE SET model=excluded.model,dimensions=excluded.dimensions,
+                 source_sha256=excluded.source_sha256,index_fingerprint=excluded.index_fingerprint,
+                 vector_blob=excluded.vector_blob,embedded_at=excluded.embedded_at",
+                params![write.document_id, spec.model, usize_to_i64(spec.dimensions).map_err(|e| self.database_error(e))?, write.source_sha256, fingerprint, write.vector_blob, embedded_at],
+            ).map_err(|error| self.database_error(error))?;
+        }
+        verify_published_catalog(
+            &transaction,
+            spec,
+            &fingerprint,
+            &prepared,
+            "'episode','session'",
+        )?;
+        transaction
+            .commit()
+            .map_err(|error| self.database_error(error))?;
+        Ok(EmbeddingPublishReport {
+            documents: prepared.len(),
+            reused,
+            changed: reused != prepared.len(),
+        })
     }
 
     pub fn compatible_embeddings(
@@ -2607,6 +2847,667 @@ struct PreparedEmbedding {
     granularity: String,
     source_sha256: String,
     vector_blob: Vec<u8>,
+}
+
+const EMBEDDING_CATALOG_ALGORITHM_VERSION: u32 = 1;
+
+#[derive(Debug)]
+struct PreparedCatalogEmbedding {
+    document_id: String,
+    source_sha256: String,
+    vector_blob: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct RawEmbedding {
+    model: String,
+    dimensions: i64,
+    source_sha256: String,
+    fingerprint: String,
+    vector_blob: Vec<u8>,
+}
+
+fn validate_embedding_spec(spec: &VectorIndexSpec) -> RetrievalResult<()> {
+    spec.validate()
+        .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))
+}
+
+fn embedding_fingerprint(spec: &VectorIndexSpec) -> RetrievalResult<String> {
+    spec.fingerprint()
+        .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))
+}
+
+fn is_unit_vector(vector: &[f32]) -> bool {
+    let norm = vector.iter().try_fold(0.0_f64, |sum, value| {
+        value
+            .is_finite()
+            .then_some(sum + f64::from(*value) * f64::from(*value))
+    });
+    norm.is_some_and(|value| value.is_finite() && (value.sqrt() - 1.0).abs() <= 1e-5)
+}
+
+fn raw_embedding(
+    connection: &Connection,
+    document_id: &str,
+) -> RetrievalResult<Option<RawEmbedding>> {
+    connection
+        .query_row(
+            "SELECT model,dimensions,source_sha256,index_fingerprint,vector_blob
+         FROM memory_embeddings WHERE document_id=?1",
+            [document_id],
+            |row| {
+                Ok(RawEmbedding {
+                    model: row.get(0)?,
+                    dimensions: row.get(1)?,
+                    source_sha256: row.get(2)?,
+                    fingerprint: row.get(3)?,
+                    vector_blob: row.get(4)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| RetrievalError::CorruptIndex(format!("读取 embedding row 失败：{error}")))
+}
+
+fn embedding_equals(
+    existing: Option<&RawEmbedding>,
+    spec: &VectorIndexSpec,
+    fingerprint: &str,
+    source: &str,
+    blob: &[u8],
+) -> bool {
+    existing.is_some_and(|row| {
+        row.model == spec.model
+            && row.dimensions == i64::try_from(spec.dimensions).unwrap_or(-1)
+            && row.source_sha256 == source
+            && row.fingerprint == fingerprint
+            && row.vector_blob == blob
+    })
+}
+
+fn prepare_complete_catalog_writes<'a>(
+    spec: &VectorIndexSpec,
+    expected: impl Iterator<Item = (&'a str, &'a str)>,
+    writes: &[EmbeddingWrite],
+) -> RetrievalResult<Vec<PreparedCatalogEmbedding>> {
+    let expected = expected
+        .map(|(id, source)| (id.to_owned(), source.to_owned()))
+        .collect::<Vec<_>>();
+    let mut supplied = HashMap::with_capacity(writes.len());
+    for write in writes {
+        if supplied.insert(write.document_id.as_str(), write).is_some() {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "embedding catalog 包含重复文档 {}",
+                write.document_id
+            )));
+        }
+    }
+    if supplied.len() != expected.len()
+        || expected
+            .iter()
+            .any(|(id, _)| !supplied.contains_key(id.as_str()))
+    {
+        return Err(RetrievalError::CorruptIndex(
+            "embedding publication 必须精确覆盖完整 catalog".into(),
+        ));
+    }
+    expected
+        .into_iter()
+        .map(|(document_id, source_sha256)| {
+            let write = supplied[document_id.as_str()];
+            if write.expected_source_sha256 != source_sha256 {
+                return Err(RetrievalError::CorruptIndex(format!(
+                    "文档 {document_id} 的源哈希不匹配"
+                )));
+            }
+            if write.vector.len() != spec.dimensions {
+                return Err(RetrievalError::CorruptIndex(format!(
+                    "文档 {document_id} 的向量维度不匹配"
+                )));
+            }
+            let vector_blob = encode_f32_le(&write.vector)
+                .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+            Ok(PreparedCatalogEmbedding {
+                document_id,
+                source_sha256,
+                vector_blob,
+            })
+        })
+        .collect()
+}
+
+fn verify_published_catalog(
+    connection: &Connection,
+    spec: &VectorIndexSpec,
+    fingerprint: &str,
+    prepared: &[PreparedCatalogEmbedding],
+    granularities: &str,
+) -> RetrievalResult<()> {
+    for write in prepared {
+        let row = raw_embedding(connection, &write.document_id)?.ok_or_else(|| {
+            RetrievalError::CorruptIndex(format!("文档 {} 写后缺少 embedding", write.document_id))
+        })?;
+        if !embedding_equals(
+            Some(&row),
+            spec,
+            fingerprint,
+            &write.source_sha256,
+            &write.vector_blob,
+        ) {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "文档 {} 写后 embedding 不精确",
+                write.document_id
+            )));
+        }
+    }
+    let sql = format!(
+        "SELECT e.document_id FROM memory_embeddings e JOIN memory_documents d ON d.document_id=e.document_id WHERE d.granularity IN ({granularities}) AND e.model=?1 AND e.dimensions=?2 AND e.index_fingerprint=?3 AND e.source_sha256=d.source_sha256 ORDER BY e.document_id"
+    );
+    let actual = connection
+        .prepare(&sql)
+        .and_then(|mut statement| {
+            statement
+                .query_map(
+                    params![
+                        spec.model,
+                        i64::try_from(spec.dimensions).unwrap_or(-1),
+                        fingerprint
+                    ],
+                    |row| row.get::<_, String>(0),
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .map_err(|error| {
+            RetrievalError::CorruptIndex(format!("读取写后 compatible embedding 集合失败：{error}"))
+        })?;
+    let mut expected = prepared
+        .iter()
+        .map(|write| write.document_id.clone())
+        .collect::<Vec<_>>();
+    expected.sort();
+    if actual != expected {
+        return Err(RetrievalError::CorruptIndex(
+            "写后 compatible embedding 集合不精确".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn hash_field(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+}
+
+fn hash_string(hasher: &mut Sha256, value: &str) {
+    hash_field(hasher, value.as_bytes());
+}
+fn hash_usize(hasher: &mut Sha256, value: usize) {
+    hash_field(hasher, &(value as u64).to_be_bytes());
+}
+
+fn hash_session_catalog(
+    connection: &Connection,
+    hasher: &mut Sha256,
+) -> RetrievalResult<Vec<String>> {
+    let mut statement = connection.prepare("SELECT session_id,title,created_at,updated_at,source_file,source_sha256,source_schema_version FROM indexed_sessions ORDER BY session_id")
+        .map_err(|error| RetrievalError::CorruptIndex(format!("读取 session catalog 失败：{error}")))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, i64>(6)?,
+            ))
+        })
+        .map_err(|error| {
+            RetrievalError::CorruptIndex(format!("读取 session catalog 失败：{error}"))
+        })?;
+    let mut ids = Vec::new();
+    for row in rows {
+        let (id, title, created, updated, file, source, version) = row.map_err(|error| {
+            RetrievalError::CorruptIndex(format!("读取 session catalog 失败：{error}"))
+        })?;
+        for value in [&id, &title, &created, &updated, &file, &source] {
+            hash_string(hasher, value);
+        }
+        hash_field(hasher, &version.to_be_bytes());
+        ids.push(id);
+    }
+    Ok(ids)
+}
+
+fn hash_embedding_rows(
+    connection: &Connection,
+    hasher: &mut Sha256,
+    granularities: &str,
+) -> RetrievalResult<()> {
+    let sql = format!("SELECT e.document_id,e.model,e.dimensions,e.source_sha256,e.index_fingerprint,e.vector_blob,e.embedded_at
+        FROM memory_embeddings e JOIN memory_documents d ON d.document_id=e.document_id
+        WHERE d.granularity IN ({granularities}) ORDER BY e.document_id");
+    let mut statement = connection.prepare(&sql).map_err(|error| {
+        RetrievalError::CorruptIndex(format!("读取 embedding CAS state 失败：{error}"))
+    })?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Vec<u8>>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        })
+        .map_err(|error| {
+            RetrievalError::CorruptIndex(format!("读取 embedding CAS state 失败：{error}"))
+        })?;
+    for row in rows {
+        let (id, model, dim, source, fingerprint, blob, time) = row.map_err(|error| {
+            RetrievalError::CorruptIndex(format!("读取 embedding CAS state 失败：{error}"))
+        })?;
+        for value in [&id, &model, &source, &fingerprint] {
+            hash_string(hasher, value);
+        }
+        hash_field(hasher, &dim.to_be_bytes());
+        hash_field(hasher, &blob);
+        hash_string(hasher, &time);
+    }
+    Ok(())
+}
+
+fn load_leaf_embedding_snapshot(
+    store: &RetrievalStore,
+    connection: &Connection,
+    spec: &VectorIndexSpec,
+) -> RetrievalResult<LeafEmbeddingSnapshot> {
+    let fingerprint = embedding_fingerprint(spec)?;
+    let mut hasher = Sha256::new();
+    hash_string(&mut hasher, "hippocampus.embedding.catalog.leaf");
+    hash_field(
+        &mut hasher,
+        &EMBEDDING_CATALOG_ALGORITHM_VERSION.to_be_bytes(),
+    );
+    hash_string(&mut hasher, &fingerprint);
+    let session_ids = hash_session_catalog(connection, &mut hasher)?;
+    for session_id in &session_ids {
+        store.verify_indexed_session_source_projection(connection, session_id)?;
+    }
+    let mut expected = Vec::new();
+    let mut events = connection.prepare("SELECT event_id,session_id,sequence,role,content,content_sha256 FROM events ORDER BY session_id,sequence,event_id")
+        .map_err(|error| RetrievalError::CorruptIndex(format!("读取 leaf events 失败：{error}")))?;
+    let rows = events
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })
+        .map_err(|error| RetrievalError::CorruptIndex(format!("读取 leaf events 失败：{error}")))?;
+    for row in rows {
+        let (event_id, session_id, sequence, role, content, event_hash) = row.map_err(|error| {
+            RetrievalError::CorruptIndex(format!("读取 leaf events 失败：{error}"))
+        })?;
+        if role == "system" || content.trim().is_empty() {
+            continue;
+        }
+        if content_sha256(&content) != event_hash {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "事件 {event_id} 内容哈希损坏"
+            )));
+        }
+        let event = StoredEvent {
+            id: event_id.clone(),
+            session_id: session_id.clone(),
+            turn_id: None,
+            sequence: i64_to_usize(sequence)
+                .map_err(|e| RetrievalError::CorruptIndex(e.to_string()))?,
+            role: EventRole::User,
+            created_at: String::new(),
+            content: content.clone(),
+            content_sha256: event_hash,
+            reply_to_event_id: None,
+            token_count: None,
+            turn_status: None,
+            done_reason: None,
+            error: None,
+        };
+        let message_id = format!("{}:0:{}", event_id, content.chars().count());
+        for (granularity, span) in document_spans(&event) {
+            let part = slice_chars(&content, &span)?;
+            let source = content_sha256(&part);
+            let document_id = format!("{}:{}:{}", event_id, span.start_char, span.end_char);
+            expected.push((
+                document_id,
+                session_id.clone(),
+                granularity,
+                source,
+                part,
+                event_id.clone(),
+                span.start_char,
+                span.end_char,
+                message_id.clone(),
+                sequence,
+            ));
+        }
+    }
+    expected.sort_by(|a, b| a.0.cmp(&b.0));
+    let actual_ids = connection.prepare("SELECT document_id FROM retrieval_documents WHERE granularity IN ('message','fragment') ORDER BY document_id")
+        .and_then(|mut s| s.query_map([], |r| r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()).map_err(|e| RetrievalError::CorruptIndex(format!("读取 retrieval leaf catalog 失败：{e}")))?;
+    if actual_ids != expected.iter().map(|row| row.0.clone()).collect::<Vec<_>>() {
+        return Err(RetrievalError::CorruptIndex(
+            "retrieval leaf catalog 集合不规范".into(),
+        ));
+    }
+    let memory_ids = connection.prepare("SELECT document_id FROM memory_documents WHERE granularity IN ('message','fragment') ORDER BY document_id")
+        .and_then(|mut statement| statement.query_map([], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>())
+        .map_err(|error| RetrievalError::CorruptIndex(format!("读取 memory leaf catalog 失败：{error}")))?;
+    if memory_ids != actual_ids {
+        return Err(RetrievalError::CorruptIndex(
+            "memory leaf catalog 集合不规范".into(),
+        ));
+    }
+    let member_count: i64 = connection.query_row("SELECT count(*) FROM memory_document_members m JOIN memory_documents d ON d.document_id=m.document_id WHERE d.granularity IN ('message','fragment')", [], |row| row.get(0))
+        .map_err(|error| RetrievalError::CorruptIndex(format!("读取 leaf member 集合失败：{error}")))?;
+    if usize::try_from(member_count).ok() != Some(memory_ids.len()) {
+        return Err(RetrievalError::CorruptIndex(
+            "leaf member 集合/数量不规范".into(),
+        ));
+    }
+    let mut documents = Vec::with_capacity(expected.len());
+    for (id, session, granularity, source, content, event, start, end, message_id, sequence) in
+        expected
+    {
+        let granularity_str = match granularity {
+            RetrievalDocumentGranularity::Message => "message",
+            RetrievalDocumentGranularity::Fragment => "fragment",
+            _ => unreachable!(),
+        };
+        let count:i64=connection.query_row("SELECT count(*) FROM memory_documents d JOIN memory_document_members m ON m.document_id=d.document_id JOIN retrieval_documents r ON r.document_id=d.document_id JOIN source_spans s ON s.event_id=m.event_id AND s.start_char=m.start_char AND s.end_char=m.end_char WHERE d.document_id=?1 AND d.session_id=?2 AND d.granularity=?3 AND d.source_sha256=?4 AND d.start_sequence=?5 AND d.end_sequence=?5 AND d.member_count=1 AND m.ordinal=0 AND m.event_id=?6 AND m.start_char=?7 AND m.end_char=?8 AND m.content_sha256=?4 AND r.event_id=?6 AND r.start_char=?7 AND r.end_char=?8 AND r.granularity=?3 AND r.content_sha256=?4 AND r.exact_content=?9 AND s.content_sha256=?4", params![id,session,granularity_str,source,sequence,event,usize_to_i64(start).map_err(|e|store.database_error(e))?,usize_to_i64(end).map_err(|e|store.database_error(e))?,content], |r|r.get(0)).map_err(|e|store.database_error(e))?;
+        if count != 1 {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "leaf document {id} provenance 不规范"
+            )));
+        }
+        let reusable_vector = raw_embedding(connection, &id)?.and_then(|row| {
+            if embedding_equals(Some(&row), spec, &fingerprint, &source, &row.vector_blob) {
+                decode_f32_le(&row.vector_blob, spec.dimensions)
+                    .ok()
+                    .filter(|v| is_unit_vector(v))
+            } else {
+                None
+            }
+        });
+        for value in [
+            &id,
+            &session,
+            granularity_str,
+            &source,
+            &content,
+            &event,
+            &message_id,
+        ] {
+            hash_string(&mut hasher, value);
+        }
+        hash_usize(&mut hasher, start);
+        hash_usize(&mut hasher, end);
+        hash_field(&mut hasher, &sequence.to_be_bytes());
+        documents.push(LeafEmbeddingDocument {
+            document_id: id,
+            session_id: session,
+            granularity,
+            source_sha256: source,
+            content,
+            source_event_id: event,
+            start_char: start,
+            end_char: end,
+            message_document_id: message_id,
+            reusable_vector,
+        });
+    }
+    hash_embedding_rows(connection, &mut hasher, "'message','fragment'")?;
+    Ok(LeafEmbeddingSnapshot {
+        catalog_sha256: format!("{:x}", hasher.finalize()),
+        session_ids,
+        documents,
+    })
+}
+
+fn load_aggregate_embedding_snapshot(
+    store: &RetrievalStore,
+    connection: &Connection,
+    spec: &VectorIndexSpec,
+) -> RetrievalResult<AggregateEmbeddingSnapshot> {
+    let fingerprint = embedding_fingerprint(spec)?;
+    let mut hasher = Sha256::new();
+    hash_string(&mut hasher, "hippocampus.embedding.catalog.aggregate");
+    hash_field(
+        &mut hasher,
+        &EMBEDDING_CATALOG_ALGORITHM_VERSION.to_be_bytes(),
+    );
+    hash_string(&mut hasher, &fingerprint);
+    let session_ids = hash_session_catalog(connection, &mut hasher)?;
+    let mut documents = Vec::new();
+    for session_id in &session_ids {
+        store.verify_indexed_session_source_projection(connection, session_id)?;
+        let audit = validate_episode_materialization(
+            connection,
+            &store.root,
+            session_id,
+            spec,
+            &fingerprint,
+            true,
+        )?;
+        if audit.readiness != AggregateReadiness::Ready {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "会话 {session_id} 缺少当前 spec 的完整 aggregate materialization"
+            )));
+        }
+        let persisted = load_persisted_aggregate_documents(connection, session_id)?;
+        for document in persisted {
+            let granularity = match document.granularity.as_str() {
+                "episode" => RetrievalDocumentGranularity::Episode,
+                "session" => RetrievalDocumentGranularity::Session,
+                _ => return Err(RetrievalError::CorruptIndex("aggregate 粒度无效".into())),
+            };
+            let mut direct_messages = Vec::with_capacity(document.members.len());
+            for member in &document.members {
+                if member.span.start_char != 0 || member.span.event_id != member.event_id {
+                    return Err(RetrievalError::CorruptIndex(format!(
+                        "aggregate {} 包含非直接 message member",
+                        document.document_id
+                    )));
+                }
+                let expected_id = format!("{}:0:{}", member.event_id, member.span.end_char);
+                if member.document_id != expected_id {
+                    return Err(RetrievalError::CorruptIndex(format!(
+                        "aggregate {} 包含 fragment/间接 member",
+                        document.document_id
+                    )));
+                }
+                let row = raw_embedding(connection, &member.document_id)?.ok_or_else(|| {
+                    RetrievalError::CorruptIndex(format!(
+                        "direct message {} 缺少向量",
+                        member.document_id
+                    ))
+                })?;
+                if !embedding_equals(
+                    Some(&row),
+                    spec,
+                    &fingerprint,
+                    &member.content_sha256,
+                    &row.vector_blob,
+                ) {
+                    return Err(RetrievalError::CorruptIndex(format!(
+                        "direct message {} 向量不兼容",
+                        member.document_id
+                    )));
+                }
+                let vector = decode_f32_le(&row.vector_blob, spec.dimensions).map_err(|e| {
+                    RetrievalError::CorruptIndex(format!(
+                        "direct message {} 向量损坏：{e}",
+                        member.document_id
+                    ))
+                })?;
+                if !is_unit_vector(&vector) {
+                    return Err(RetrievalError::CorruptIndex(format!(
+                        "direct message {} 不是单位向量",
+                        member.document_id
+                    )));
+                }
+                direct_messages.push(DirectMessageEmbedding {
+                    message_document_id: member.document_id.clone(),
+                    source_event_id: member.event_id.clone(),
+                    source_sha256: member.content_sha256.clone(),
+                    start_char: member.span.start_char,
+                    end_char: member.span.end_char,
+                    vector,
+                });
+            }
+            for value in [
+                &document.document_id,
+                &document.session_id,
+                &document.granularity,
+                &document.source_sha256,
+            ] {
+                hash_string(&mut hasher, value);
+            }
+            hash_usize(&mut hasher, direct_messages.len());
+            for member in &direct_messages {
+                for value in [
+                    &member.message_document_id,
+                    &member.source_event_id,
+                    &member.source_sha256,
+                ] {
+                    hash_string(&mut hasher, value);
+                }
+                hash_usize(&mut hasher, member.start_char);
+                hash_usize(&mut hasher, member.end_char);
+                hash_field(
+                    &mut hasher,
+                    &encode_f32_le(&member.vector)
+                        .map_err(|e| RetrievalError::CorruptIndex(e.to_string()))?,
+                );
+            }
+            documents.push(AggregateEmbeddingDocument {
+                document_id: document.document_id,
+                session_id: document.session_id,
+                granularity,
+                source_sha256: document.source_sha256,
+                direct_messages,
+            });
+        }
+    }
+    documents.sort_by(|a, b| a.document_id.cmp(&b.document_id));
+    hash_aggregate_freshness(connection, &mut hasher)?;
+    hash_embedding_rows(connection, &mut hasher, "'message'")?;
+    hash_embedding_rows(connection, &mut hasher, "'episode','session'")?;
+    Ok(AggregateEmbeddingSnapshot {
+        catalog_sha256: format!("{:x}", hasher.finalize()),
+        documents,
+    })
+}
+
+fn hash_aggregate_freshness(connection: &Connection, hasher: &mut Sha256) -> RetrievalResult<()> {
+    let mut statement=connection.prepare("SELECT session_id,source_session_sha256,ledger_snapshot_sha256,vector_index_fingerprint,plan_input_sha256,algorithm_version,gap_minutes,topic_similarity_threshold,episode_count,boundary_count,materialized_at FROM memory_episode_materializations ORDER BY session_id")
+        .map_err(|e|RetrievalError::CorruptIndex(format!("读取 materialization CAS state 失败：{e}")))?;
+    let rows = statement
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, i64>(6)?,
+                r.get::<_, f64>(7)?,
+                r.get::<_, i64>(8)?,
+                r.get::<_, i64>(9)?,
+                r.get::<_, String>(10)?,
+            ))
+        })
+        .map_err(|e| {
+            RetrievalError::CorruptIndex(format!("读取 materialization CAS state 失败：{e}"))
+        })?;
+    for row in rows {
+        let (a, b, c, d, e, f, g, h, i, j, k) = row.map_err(|e| {
+            RetrievalError::CorruptIndex(format!("读取 materialization CAS state 失败：{e}"))
+        })?;
+        for v in [&a, &b, &c, &d, &e, &k] {
+            hash_string(hasher, v);
+        }
+        for v in [f, g, i, j] {
+            hash_field(hasher, &v.to_be_bytes());
+        }
+        hash_field(hasher, &h.to_bits().to_be_bytes());
+    }
+    let mut statement=connection.prepare("SELECT session_id,before_event_id,decision_json,input_sha256 FROM memory_episode_boundaries ORDER BY session_id,before_event_id")
+        .map_err(|e|RetrievalError::CorruptIndex(format!("读取 boundary CAS state 失败：{e}")))?;
+    let rows = statement
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|e| RetrievalError::CorruptIndex(format!("读取 boundary CAS state 失败：{e}")))?;
+    for row in rows {
+        let (a, b, c, d) = row.map_err(|e| {
+            RetrievalError::CorruptIndex(format!("读取 boundary CAS state 失败：{e}"))
+        })?;
+        for v in [&a, &b, &c, &d] {
+            hash_string(hasher, v);
+        }
+    }
+    Ok(())
+}
+
+fn canonical_aggregate_blobs_from_snapshot(
+    snapshot: &AggregateEmbeddingSnapshot,
+    dimensions: usize,
+) -> RetrievalResult<HashMap<String, Vec<u8>>> {
+    let mut blobs = HashMap::with_capacity(snapshot.documents.len());
+    for document in &snapshot.documents {
+        let vectors = document
+            .direct_messages
+            .iter()
+            .map(|m| (m.message_document_id.clone(), m.vector.clone()))
+            .collect::<HashMap<_, _>>();
+        let members = document
+            .direct_messages
+            .iter()
+            .enumerate()
+            .map(|(sequence, m)| EpisodeMember {
+                document_id: m.message_document_id.clone(),
+                event_id: m.source_event_id.clone(),
+                sequence: sequence as u64,
+                role: EventRole::User,
+                span: SourceSpan {
+                    event_id: m.source_event_id.clone(),
+                    start_char: m.start_char,
+                    end_char: m.end_char,
+                },
+                content_sha256: m.source_sha256.clone(),
+            })
+            .collect::<Vec<_>>();
+        let vector =
+            canonical_aggregate_vector(&members, &vectors, dimensions, &document.document_id)?;
+        let blob =
+            encode_f32_le(&vector).map_err(|e| RetrievalError::CorruptIndex(e.to_string()))?;
+        blobs.insert(document.document_id.clone(), blob);
+    }
+    Ok(blobs)
 }
 
 fn aggregate_corruption(message: impl Into<String>) -> RetrievalError {
@@ -4763,6 +5664,423 @@ mod tests {
     use crate::context::ContextAssembler;
     use crate::model::{ContextTrace, ModelRequestTrace, TokenUsage, Turn, TurnStatus, utc_now};
     use crate::store::SessionStore;
+
+    fn embedding_catalog_fixture(
+        message: &str,
+    ) -> (tempfile::TempDir, SessionStore, Session, VectorIndexSpec) {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let mut session = store
+            .create("model", "http://localhost", None, Default::default(), false)
+            .unwrap();
+        append_complete_turn(&mut session, message, "回答", "");
+        let path = store.save(&mut session).unwrap();
+        store.retrieval().sync_session(&session, &path).unwrap();
+        let spec = VectorIndexSpec::from_config(&aggregate_memory_config()).unwrap();
+        (root, store, session, spec)
+    }
+
+    fn embedding_catalog_unit_writes(
+        snapshot: &LeafEmbeddingSnapshot,
+        dimensions: usize,
+    ) -> Vec<EmbeddingWrite> {
+        snapshot
+            .documents
+            .iter()
+            .enumerate()
+            .map(|(index, document)| {
+                let mut vector = vec![0.0; dimensions];
+                vector[index % dimensions] = 1.0;
+                EmbeddingWrite {
+                    document_id: document.document_id.clone(),
+                    expected_source_sha256: document.source_sha256.clone(),
+                    vector,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn embedding_catalog_leaf_snapshot_is_owned_complete_unicode_canonical() {
+        let message = "界".repeat(441);
+        let (_root, store, session, spec) = embedding_catalog_fixture(&message);
+        let snapshot = store.retrieval().leaf_embedding_snapshot(&spec).unwrap();
+        assert_eq!(snapshot.session_ids, vec![session.id]);
+        let event = snapshot
+            .documents
+            .iter()
+            .find(|d| d.content == message)
+            .unwrap()
+            .source_event_id
+            .clone();
+        let docs = snapshot
+            .documents
+            .iter()
+            .filter(|d| d.source_event_id == event)
+            .collect::<Vec<_>>();
+        assert_eq!(docs.len(), 4);
+        assert!(
+            docs.iter()
+                .any(|d| d.granularity == RetrievalDocumentGranularity::Message
+                    && d.start_char == 0
+                    && d.end_char == 441
+                    && d.message_document_id == d.document_id)
+        );
+        assert_eq!(
+            docs.iter()
+                .filter(|d| d.granularity == RetrievalDocumentGranularity::Fragment)
+                .map(|d| (d.start_char, d.end_char))
+                .collect::<Vec<_>>(),
+            vec![(0, 240), (200, 440), (400, 441)]
+        );
+        drop(store);
+        assert_eq!(
+            snapshot
+                .documents
+                .iter()
+                .find(|d| d.source_event_id == event && d.start_char == 200)
+                .unwrap()
+                .content,
+            "界".repeat(240)
+        );
+        assert!(
+            snapshot
+                .documents
+                .windows(2)
+                .all(|w| w[0].document_id < w[1].document_id)
+        );
+    }
+
+    #[test]
+    fn embedding_catalog_leaf_complete_publish_noop_and_stale_cas() {
+        let (_root, store, session, spec) = embedding_catalog_fixture("hello catalog");
+        let snapshot = store.retrieval().leaf_embedding_snapshot(&spec).unwrap();
+        let writes = embedding_catalog_unit_writes(&snapshot, spec.dimensions);
+        assert!(
+            store
+                .retrieval()
+                .publish_leaf_embedding_catalog(&spec, &snapshot, &writes[..writes.len() - 1])
+                .is_err()
+        );
+        let report = store
+            .retrieval()
+            .publish_leaf_embedding_catalog(&spec, &snapshot, &writes)
+            .unwrap();
+        assert!(report.changed);
+        assert_eq!(report.documents, writes.len());
+        let fresh = store.retrieval().leaf_embedding_snapshot(&spec).unwrap();
+        let connection = Connection::open(store.retrieval().index_path()).unwrap();
+        let before = episode_sql_rows(
+            &connection,
+            "SELECT e.document_id,e.model,e.dimensions,e.source_sha256,e.index_fingerprint,e.vector_blob,e.embedded_at FROM memory_embeddings e JOIN memory_documents d ON d.document_id=e.document_id WHERE d.session_id=?1 ORDER BY e.document_id",
+            &session.id,
+        );
+        let noop = store
+            .retrieval()
+            .publish_leaf_embedding_catalog(&spec, &fresh, &writes)
+            .unwrap();
+        assert!(!noop.changed);
+        assert_eq!(noop.reused, writes.len());
+        let after = episode_sql_rows(
+            &connection,
+            "SELECT e.document_id,e.model,e.dimensions,e.source_sha256,e.index_fingerprint,e.vector_blob,e.embedded_at FROM memory_embeddings e JOIN memory_documents d ON d.document_id=e.document_id WHERE d.session_id=?1 ORDER BY e.document_id",
+            &session.id,
+        );
+        assert_eq!(before, after);
+        connection
+            .execute(
+                "UPDATE memory_embeddings SET embedded_at='tampered' WHERE document_id=?1",
+                [&writes[0].document_id],
+            )
+            .unwrap();
+        assert!(matches!(
+            store
+                .retrieval()
+                .publish_leaf_embedding_catalog(&spec, &fresh, &writes),
+            Err(RetrievalError::EmbeddingCatalogStale { .. })
+        ));
+    }
+
+    #[test]
+    fn embedding_catalog_aggregate_snapshot_and_atomic_complete_publish() {
+        let (_root, store, session, spec) = embedding_catalog_fixture("aggregate source");
+        let leaf = store.retrieval().leaf_embedding_snapshot(&spec).unwrap();
+        let leaf_writes = embedding_catalog_unit_writes(&leaf, spec.dimensions);
+        store
+            .retrieval()
+            .publish_leaf_embedding_catalog(&spec, &leaf, &leaf_writes)
+            .unwrap();
+        store
+            .retrieval()
+            .materialize_episode_documents(&session.id, &aggregate_memory_config())
+            .unwrap();
+        let snapshot = store
+            .retrieval()
+            .aggregate_embedding_snapshot(&spec)
+            .unwrap();
+        assert!(!snapshot.documents.is_empty());
+        assert!(
+            snapshot
+                .documents
+                .iter()
+                .all(|d| !d.direct_messages.is_empty())
+        );
+        let blobs = canonical_aggregate_blobs_from_snapshot(&snapshot, spec.dimensions).unwrap();
+        let writes = snapshot
+            .documents
+            .iter()
+            .map(|d| EmbeddingWrite {
+                document_id: d.document_id.clone(),
+                expected_source_sha256: d.source_sha256.clone(),
+                vector: decode_f32_le(&blobs[&d.document_id], spec.dimensions).unwrap(),
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            store
+                .retrieval()
+                .publish_aggregate_embedding_catalog(&spec, &snapshot, &writes[..writes.len() - 1])
+                .is_err()
+        );
+        let connection = Connection::open(store.retrieval().index_path()).unwrap();
+        let fail_id = writes.last().unwrap().document_id.replace('\'', "''");
+        connection.execute_batch(&format!("CREATE TRIGGER embedding_catalog_late_aggregate_failure BEFORE INSERT ON memory_embeddings WHEN NEW.document_id='{fail_id}' BEGIN SELECT RAISE(ABORT,'late aggregate failure'); END;")).unwrap();
+        assert!(
+            store
+                .retrieval()
+                .publish_aggregate_embedding_catalog(&spec, &snapshot, &writes)
+                .is_err()
+        );
+        assert_eq!(connection.query_row("SELECT count(*) FROM memory_embeddings e JOIN memory_documents d ON d.document_id=e.document_id WHERE d.granularity IN ('episode','session')",[],|row|row.get::<_,i64>(0)).unwrap(),0);
+        connection
+            .execute_batch("DROP TRIGGER embedding_catalog_late_aggregate_failure")
+            .unwrap();
+        let report = store
+            .retrieval()
+            .publish_aggregate_embedding_catalog(&spec, &snapshot, &writes)
+            .unwrap();
+        assert!(report.changed);
+        let fresh = store
+            .retrieval()
+            .aggregate_embedding_snapshot(&spec)
+            .unwrap();
+        let noop = store
+            .retrieval()
+            .publish_aggregate_embedding_catalog(&spec, &fresh, &writes)
+            .unwrap();
+        assert!(!noop.changed);
+    }
+
+    #[test]
+    fn embedding_catalog_leaf_invalid_inputs_and_late_failure_are_zero_write() {
+        let (_root, store, session, spec) = embedding_catalog_fixture(&"汉".repeat(300));
+        let source_path = store.root().join(format!("{}.json", session.id));
+        let source_before = fs::read(&source_path).unwrap();
+        let snapshot = store.retrieval().leaf_embedding_snapshot(&spec).unwrap();
+        let writes = embedding_catalog_unit_writes(&snapshot, spec.dimensions);
+        let connection = Connection::open(store.retrieval().index_path()).unwrap();
+        for invalid in [
+            vec![writes[0].clone(), writes[0].clone()],
+            {
+                let mut v = writes.clone();
+                v.push(EmbeddingWrite {
+                    document_id: "extra".into(),
+                    expected_source_sha256: "a".repeat(64),
+                    vector: vec![0.0; spec.dimensions],
+                });
+                v
+            },
+            {
+                let mut v = writes.clone();
+                v[0].expected_source_sha256 = "b".repeat(64);
+                v
+            },
+            {
+                let mut v = writes.clone();
+                v[0].vector = vec![0.0; spec.dimensions - 1];
+                v
+            },
+            {
+                let mut v = writes.clone();
+                v[0].vector[0] = f32::NAN;
+                v
+            },
+        ] {
+            assert!(
+                store
+                    .retrieval()
+                    .publish_leaf_embedding_catalog(&spec, &snapshot, &invalid)
+                    .is_err()
+            );
+            assert_eq!(
+                connection
+                    .query_row("SELECT count(*) FROM memory_embeddings", [], |r| r
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+        }
+        let fail_id = &writes.last().unwrap().document_id.replace('\'', "''");
+        connection.execute_batch(&format!("CREATE TRIGGER embedding_catalog_late_leaf_failure BEFORE INSERT ON memory_embeddings WHEN NEW.document_id='{fail_id}' BEGIN SELECT RAISE(ABORT,'late failure'); END;")).unwrap();
+        assert!(
+            store
+                .retrieval()
+                .publish_leaf_embedding_catalog(&spec, &snapshot, &writes)
+                .is_err()
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM memory_embeddings", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(fs::read(source_path).unwrap(), source_before);
+    }
+
+    #[test]
+    fn embedding_catalog_leaf_change_invalidates_only_own_session_aggregates() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let config = aggregate_memory_config();
+        let spec = VectorIndexSpec::from_config(&config).unwrap();
+        let mut sessions = Vec::new();
+        for title in ["one", "two"] {
+            let mut session = store
+                .create("model", "http://localhost", None, Default::default(), false)
+                .unwrap();
+            append_complete_turn(&mut session, title, "answer", "");
+            let path = store.save(&mut session).unwrap();
+            store.retrieval().sync_session(&session, &path).unwrap();
+            sessions.push(session);
+        }
+        let leaf = store.retrieval().leaf_embedding_snapshot(&spec).unwrap();
+        let writes = embedding_catalog_unit_writes(&leaf, spec.dimensions);
+        store
+            .retrieval()
+            .publish_leaf_embedding_catalog(&spec, &leaf, &writes)
+            .unwrap();
+        for session in &sessions {
+            store
+                .retrieval()
+                .materialize_episode_documents(&session.id, &config)
+                .unwrap();
+        }
+        let aggregate = store
+            .retrieval()
+            .aggregate_embedding_snapshot(&spec)
+            .unwrap();
+        let blobs = canonical_aggregate_blobs_from_snapshot(&aggregate, spec.dimensions).unwrap();
+        let aggregate_writes = aggregate
+            .documents
+            .iter()
+            .map(|d| EmbeddingWrite {
+                document_id: d.document_id.clone(),
+                expected_source_sha256: d.source_sha256.clone(),
+                vector: decode_f32_le(&blobs[&d.document_id], spec.dimensions).unwrap(),
+            })
+            .collect::<Vec<_>>();
+        store
+            .retrieval()
+            .publish_aggregate_embedding_catalog(&spec, &aggregate, &aggregate_writes)
+            .unwrap();
+        let fresh = store.retrieval().leaf_embedding_snapshot(&spec).unwrap();
+        let mut changed = writes.clone();
+        let target = fresh
+            .documents
+            .iter()
+            .position(|d| d.session_id == sessions[0].id)
+            .unwrap();
+        changed[target].vector.fill(0.0);
+        changed[target].vector[(target + 1) % spec.dimensions] = 1.0;
+        store
+            .retrieval()
+            .publish_leaf_embedding_catalog(&spec, &fresh, &changed)
+            .unwrap();
+        let connection = Connection::open(store.retrieval().index_path()).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM memory_episode_materializations WHERE session_id=?1",
+                    [&sessions[0].id],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM memory_episode_materializations WHERE session_id=?1",
+                    [&sessions[1].id],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn embedding_catalog_aggregate_requires_ready_unit_direct_messages_and_cas() {
+        let (_root, store, session, spec) = embedding_catalog_fixture("unit required");
+        assert!(matches!(
+            store.retrieval().aggregate_embedding_snapshot(&spec),
+            Err(RetrievalError::CorruptIndex(_))
+        ));
+        let leaf = store.retrieval().leaf_embedding_snapshot(&spec).unwrap();
+        let mut writes = embedding_catalog_unit_writes(&leaf, spec.dimensions);
+        writes[0].vector.fill(1.0);
+        store
+            .retrieval()
+            .publish_leaf_embedding_catalog(&spec, &leaf, &writes)
+            .unwrap();
+        store
+            .retrieval()
+            .materialize_episode_documents(&session.id, &aggregate_memory_config())
+            .unwrap();
+        assert!(matches!(
+            store.retrieval().aggregate_embedding_snapshot(&spec),
+            Err(RetrievalError::CorruptIndex(_))
+        ));
+        let fresh = store.retrieval().leaf_embedding_snapshot(&spec).unwrap();
+        writes = embedding_catalog_unit_writes(&fresh, spec.dimensions);
+        store
+            .retrieval()
+            .publish_leaf_embedding_catalog(&spec, &fresh, &writes)
+            .unwrap();
+        store
+            .retrieval()
+            .materialize_episode_documents(&session.id, &aggregate_memory_config())
+            .unwrap();
+        let aggregate = store
+            .retrieval()
+            .aggregate_embedding_snapshot(&spec)
+            .unwrap();
+        let connection = Connection::open(store.retrieval().index_path()).unwrap();
+        connection
+            .execute(
+                "UPDATE memory_embeddings SET embedded_at='tampered' WHERE document_id=?1",
+                [&writes[0].document_id],
+            )
+            .unwrap();
+        let blobs = canonical_aggregate_blobs_from_snapshot(&aggregate, spec.dimensions).unwrap();
+        let aggregate_writes = aggregate
+            .documents
+            .iter()
+            .map(|d| EmbeddingWrite {
+                document_id: d.document_id.clone(),
+                expected_source_sha256: d.source_sha256.clone(),
+                vector: decode_f32_le(&blobs[&d.document_id], spec.dimensions).unwrap(),
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            store.retrieval().publish_aggregate_embedding_catalog(
+                &spec,
+                &aggregate,
+                &aggregate_writes
+            ),
+            Err(RetrievalError::EmbeddingCatalogStale { .. })
+        ));
+    }
 
     #[test]
     fn mention_ddl_rejects_non_lowercase_ids_and_hashes() {
