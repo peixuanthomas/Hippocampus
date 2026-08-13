@@ -440,7 +440,9 @@ impl RetrievalStore {
             }
             prepared.push((&write.document_id, &write.expected_source_sha256, bytes));
         }
-        let fingerprint = spec.fingerprint();
+        let fingerprint = spec
+            .fingerprint()
+            .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
         let embedded_at = Utc::now().to_rfc3339();
         for (document_id, source_sha256, bytes) in prepared {
             transaction
@@ -479,7 +481,9 @@ impl RetrievalStore {
             .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
         let _guard = self.acquire_root_read()?;
         let connection = self.open_connection()?;
-        let fingerprint = spec.fingerprint();
+        let fingerprint = spec
+            .fingerprint()
+            .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
         let mut statement = connection
             .prepare(
                 "SELECT d.document_id, d.session_id, d.granularity, d.source_sha256,
@@ -560,7 +564,9 @@ impl RetrievalStore {
                 i64_to_usize(row.get(0)?)
             })
             .map_err(|error| self.database_error(error))?;
-        let fingerprint = spec.fingerprint();
+        let fingerprint = spec
+            .fingerprint()
+            .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
         let compatible = connection
             .query_row(
                 "SELECT count(*) FROM memory_documents d
@@ -2439,7 +2445,7 @@ CREATE TABLE IF NOT EXISTS memory_documents (
     document_id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL REFERENCES indexed_sessions(session_id) ON DELETE CASCADE,
     granularity TEXT NOT NULL CHECK(granularity IN ('message', 'fragment', 'episode', 'session')),
-    source_sha256 TEXT NOT NULL CHECK(length(source_sha256) > 0),
+    source_sha256 TEXT NOT NULL CHECK(length(source_sha256) = 64),
     start_sequence INTEGER NOT NULL CHECK(start_sequence >= 0),
     end_sequence INTEGER NOT NULL CHECK(end_sequence >= start_sequence),
     member_count INTEGER NOT NULL CHECK(member_count > 0)
@@ -2451,7 +2457,7 @@ CREATE TABLE IF NOT EXISTS memory_document_members (
     event_id TEXT NOT NULL,
     start_char INTEGER NOT NULL CHECK(start_char >= 0),
     end_char INTEGER NOT NULL CHECK(end_char >= start_char),
-    content_sha256 TEXT NOT NULL CHECK(length(content_sha256) > 0),
+    content_sha256 TEXT NOT NULL CHECK(length(content_sha256) = 64),
     PRIMARY KEY(document_id, ordinal),
     FOREIGN KEY(event_id, start_char, end_char)
         REFERENCES source_spans(event_id, start_char, end_char)
@@ -2461,8 +2467,8 @@ CREATE TABLE IF NOT EXISTS memory_embeddings (
     document_id TEXT PRIMARY KEY REFERENCES memory_documents(document_id) ON DELETE CASCADE,
     model TEXT NOT NULL CHECK(length(model) > 0),
     dimensions INTEGER NOT NULL CHECK(dimensions > 0),
-    source_sha256 TEXT NOT NULL CHECK(length(source_sha256) > 0),
-    index_fingerprint TEXT NOT NULL CHECK(length(index_fingerprint) > 0),
+    source_sha256 TEXT NOT NULL CHECK(length(source_sha256) = 64),
+    index_fingerprint TEXT NOT NULL CHECK(length(index_fingerprint) = 64),
     vector_blob BLOB NOT NULL CHECK(length(vector_blob) = dimensions * 4),
     embedded_at TEXT NOT NULL CHECK(length(embedded_at) > 0)
 );
@@ -3552,7 +3558,7 @@ CREATE INDEX memory_boundary_suggestions_session_event
         store.save(&mut session).unwrap();
         let spec = VectorIndexSpec {
             model: "qwen3-embedding:8b".into(),
-            dimensions: 3,
+            dimensions: 32,
             hnsw_m: 16,
             hnsw_ef_construction: 200,
             hnsw_ef_search: 64,
@@ -3578,10 +3584,13 @@ CREATE INDEX memory_boundary_suggestions_session_event
         assert_eq!(catalog_count, lexical_count);
         drop(connection);
 
+        let mut vector = vec![0.5; 32];
+        vector[0] = 1.0;
+        vector[1] = -0.0;
         let write = EmbeddingWrite {
             document_id: document_id.clone(),
             expected_source_sha256: source_sha256.clone(),
-            vector: vec![1.0, -0.0, 0.5],
+            vector,
         };
         store
             .retrieval()
@@ -3640,7 +3649,7 @@ CREATE INDEX memory_boundary_suggestions_session_event
             0
         );
         changed = spec.clone();
-        changed.dimensions = 4;
+        changed.dimensions = 64;
         assert_eq!(
             store
                 .retrieval()
@@ -3724,10 +3733,12 @@ CREATE INDEX memory_boundary_suggestions_session_event
 
         {
             let connection = Connection::open(store.retrieval().index_path()).unwrap();
+            let mut corrupt_blob = f32::NAN.to_le_bytes().to_vec();
+            corrupt_blob.resize(32 * std::mem::size_of::<f32>(), 0);
             connection
                 .execute(
-                    "UPDATE memory_embeddings SET vector_blob=X'0000C07F0000000000000000' WHERE document_id=?1",
-                    [&document_id],
+                    "UPDATE memory_embeddings SET vector_blob=?1 WHERE document_id=?2",
+                    params![corrupt_blob, document_id],
                 )
                 .unwrap();
         }

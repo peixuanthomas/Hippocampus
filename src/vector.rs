@@ -26,12 +26,14 @@ pub enum VectorError {
     EmptyModel,
     #[error("向量维度必须为非零值")]
     ZeroDimensions,
-    #[error("HNSW 参数无效：M={m}, ef_construction={ef_construction}, ef_search={ef_search}")]
-    InvalidHnsw {
-        m: usize,
-        ef_construction: usize,
-        ef_search: usize,
-    },
+    #[error("向量维度必须在 32..=4096 之间，实际为 {0}")]
+    DimensionsOutOfRange(usize),
+    #[error("HNSW M 必须在 2..=64 之间，实际为 {0}")]
+    HnswMOutOfRange(usize),
+    #[error("HNSW ef_construction 必须在 M..=4096 之间，实际为 {0}")]
+    HnswEfConstructionOutOfRange(usize),
+    #[error("HNSW ef_search 必须在 1..=4096 之间，实际为 {0}")]
+    HnswEfSearchOutOfRange(usize),
     #[error("向量不能为空")]
     EmptyVector,
     #[error("向量维度不匹配：期望 {expected}，实际 {actual}")]
@@ -67,12 +69,19 @@ impl VectorIndexSpec {
         if self.dimensions == 0 {
             return Err(VectorError::ZeroDimensions);
         }
-        if self.hnsw_m == 0 || self.hnsw_ef_construction < self.hnsw_m || self.hnsw_ef_search == 0 {
-            return Err(VectorError::InvalidHnsw {
-                m: self.hnsw_m,
-                ef_construction: self.hnsw_ef_construction,
-                ef_search: self.hnsw_ef_search,
-            });
+        if !(32..=4_096).contains(&self.dimensions) {
+            return Err(VectorError::DimensionsOutOfRange(self.dimensions));
+        }
+        if !(2..=64).contains(&self.hnsw_m) {
+            return Err(VectorError::HnswMOutOfRange(self.hnsw_m));
+        }
+        if !(self.hnsw_m..=4_096).contains(&self.hnsw_ef_construction) {
+            return Err(VectorError::HnswEfConstructionOutOfRange(
+                self.hnsw_ef_construction,
+            ));
+        }
+        if !(1..=4_096).contains(&self.hnsw_ef_search) {
+            return Err(VectorError::HnswEfSearchOutOfRange(self.hnsw_ef_search));
         }
         self.dimensions
             .checked_mul(std::mem::size_of::<f32>())
@@ -80,20 +89,28 @@ impl VectorIndexSpec {
         Ok(())
     }
 
-    pub fn fingerprint(&self) -> String {
+    pub fn fingerprint(&self) -> Result<String, VectorError> {
+        self.validate()?;
+        let dimensions =
+            u64::try_from(self.dimensions).map_err(|_| VectorError::DimensionOverflow)?;
+        let hnsw_m = u64::try_from(self.hnsw_m).map_err(|_| VectorError::DimensionOverflow)?;
+        let hnsw_ef_construction =
+            u64::try_from(self.hnsw_ef_construction).map_err(|_| VectorError::DimensionOverflow)?;
+        let hnsw_ef_search =
+            u64::try_from(self.hnsw_ef_search).map_err(|_| VectorError::DimensionOverflow)?;
         let mut hasher = Sha256::new();
         hasher.update(b"hippocampus-vector-index-v1\0");
         for value in [
             self.model.as_bytes(),
-            &(self.dimensions as u64).to_le_bytes(),
-            &(self.hnsw_m as u64).to_le_bytes(),
-            &(self.hnsw_ef_construction as u64).to_le_bytes(),
-            &(self.hnsw_ef_search as u64).to_le_bytes(),
+            &dimensions.to_le_bytes(),
+            &hnsw_m.to_le_bytes(),
+            &hnsw_ef_construction.to_le_bytes(),
+            &hnsw_ef_search.to_le_bytes(),
         ] {
             hasher.update((value.len() as u64).to_le_bytes());
             hasher.update(value);
         }
-        format!("{:x}", hasher.finalize())
+        Ok(format!("{:x}", hasher.finalize()))
     }
 }
 
@@ -222,22 +239,69 @@ mod tests {
             hnsw_ef_construction: 200,
             hnsw_ef_search: 64,
         };
-        let fingerprint = base.fingerprint();
+        let fingerprint = base.fingerprint().unwrap();
+        assert_eq!(
+            fingerprint,
+            "c591bf40346074f1407af6274f5be8e6889b73f549bd0c9a20a288d870fe16de"
+        );
         let mut changed = base.clone();
         changed.model = "other".into();
-        assert_ne!(fingerprint, changed.fingerprint());
+        assert_ne!(fingerprint, changed.fingerprint().unwrap());
         changed = base.clone();
         changed.dimensions = 512;
-        assert_ne!(fingerprint, changed.fingerprint());
+        assert_ne!(fingerprint, changed.fingerprint().unwrap());
         changed = base.clone();
         changed.hnsw_m = 24;
-        assert_ne!(fingerprint, changed.fingerprint());
+        assert_ne!(fingerprint, changed.fingerprint().unwrap());
         changed = base.clone();
         changed.hnsw_ef_construction = 300;
-        assert_ne!(fingerprint, changed.fingerprint());
+        assert_ne!(fingerprint, changed.fingerprint().unwrap());
         changed = base.clone();
         changed.hnsw_ef_search = 96;
-        assert_ne!(fingerprint, changed.fingerprint());
-        assert_eq!(fingerprint, base.fingerprint());
+        assert_ne!(fingerprint, changed.fingerprint().unwrap());
+        assert_eq!(fingerprint, base.fingerprint().unwrap());
+    }
+
+    #[test]
+    fn spec_validation_matches_memory_config_bounds() {
+        let base = VectorIndexSpec {
+            model: "qwen3-embedding:8b".into(),
+            dimensions: 1024,
+            hnsw_m: 16,
+            hnsw_ef_construction: 200,
+            hnsw_ef_search: 64,
+        };
+        for (spec, expected) in [
+            (
+                VectorIndexSpec {
+                    dimensions: 31,
+                    ..base.clone()
+                },
+                VectorError::DimensionsOutOfRange(31),
+            ),
+            (
+                VectorIndexSpec {
+                    hnsw_m: 1,
+                    ..base.clone()
+                },
+                VectorError::HnswMOutOfRange(1),
+            ),
+            (
+                VectorIndexSpec {
+                    hnsw_ef_construction: 15,
+                    ..base.clone()
+                },
+                VectorError::HnswEfConstructionOutOfRange(15),
+            ),
+            (
+                VectorIndexSpec {
+                    hnsw_ef_search: 4_097,
+                    ..base.clone()
+                },
+                VectorError::HnswEfSearchOutOfRange(4_097),
+            ),
+        ] {
+            assert_eq!(spec.validate(), Err(expected));
+        }
     }
 }
