@@ -1696,12 +1696,26 @@ fn backfill_memory_documents(transaction: &Transaction<'_>) -> rusqlite::Result<
          SELECT d.document_id, e.session_id, d.granularity, d.content_sha256,
                 e.sequence, e.sequence, 1
          FROM retrieval_documents d JOIN events e ON e.event_id=d.event_id
-         WHERE d.granularity IN ('message', 'fragment');
+         WHERE d.granularity IN ('message', 'fragment')
+         ORDER BY d.document_id
+         ON CONFLICT(document_id) DO UPDATE SET
+         session_id=excluded.session_id, granularity=excluded.granularity,
+         source_sha256=excluded.source_sha256, start_sequence=excluded.start_sequence,
+         end_sequence=excluded.end_sequence, member_count=excluded.member_count;
+         DELETE FROM memory_document_members
+         WHERE document_id IN (
+             SELECT document_id FROM retrieval_documents
+             WHERE granularity IN ('message', 'fragment')
+         );
          INSERT INTO memory_document_members
          (document_id, ordinal, event_id, start_char, end_char, content_sha256)
          SELECT d.document_id, 0, d.event_id, d.start_char, d.end_char, d.content_sha256
          FROM retrieval_documents d
-         WHERE d.granularity IN ('message', 'fragment');",
+         WHERE d.granularity IN ('message', 'fragment')
+         ORDER BY d.document_id
+         ON CONFLICT(document_id, ordinal) DO UPDATE SET
+         event_id=excluded.event_id, start_char=excluded.start_char,
+         end_char=excluded.end_char, content_sha256=excluded.content_sha256;",
     )
 }
 
@@ -2472,6 +2486,21 @@ CREATE TABLE IF NOT EXISTS memory_embeddings (
     vector_blob BLOB NOT NULL CHECK(length(vector_blob) = dimensions * 4),
     embedded_at TEXT NOT NULL CHECK(length(embedded_at) > 0)
 );
+
+-- A provenance source is immutable but rebuild and corruption recovery may
+-- delete it.  Remove the entire derived document before the source span goes
+-- away, so an aggregate can never retain a partial member list or embedding.
+CREATE TRIGGER IF NOT EXISTS memory_documents_before_source_span_delete
+BEFORE DELETE ON source_spans
+BEGIN
+    DELETE FROM memory_documents
+    WHERE document_id IN (
+        SELECT document_id FROM memory_document_members
+        WHERE event_id = OLD.event_id
+          AND start_char = OLD.start_char
+          AND end_char = OLD.end_char
+    );
+END;
 
 CREATE INDEX IF NOT EXISTS memory_documents_session_granularity
     ON memory_documents(session_id, granularity, document_id);
@@ -3543,6 +3572,209 @@ CREATE INDEX memory_boundary_suggestions_session_event
     }
 
     #[test]
+    fn v4_vector_backfill_is_idempotent_and_preserves_compatible_embeddings() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let mut session = store
+            .create("model", "http://localhost", None, Default::default(), false)
+            .unwrap();
+        append_complete_turn(&mut session, "保留向量的原文", "回复", "");
+        store.save(&mut session).unwrap();
+        let spec = VectorIndexSpec {
+            model: "qwen3-embedding:8b".into(),
+            dimensions: 32,
+            hnsw_m: 16,
+            hnsw_ef_construction: 200,
+            hnsw_ef_search: 64,
+        };
+        let (document_id, source_sha256): (String, String) = store
+            .retrieval()
+            .open_connection()
+            .unwrap()
+            .query_row(
+                "SELECT document_id, source_sha256 FROM memory_documents ORDER BY document_id LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let write = EmbeddingWrite {
+            document_id: document_id.clone(),
+            expected_source_sha256: source_sha256,
+            vector: vec![0.25; 32],
+        };
+        store
+            .retrieval()
+            .upsert_embeddings(&spec, std::slice::from_ref(&write))
+            .unwrap();
+
+        for _ in 0..2 {
+            let connection = Connection::open(store.retrieval().index_path()).unwrap();
+            connection
+                .pragma_update(None, "user_version", 4_i64)
+                .unwrap();
+            drop(connection);
+
+            let migrated = RetrievalStore::new(root.path()).unwrap();
+            assert_eq!(migrated.compatible_embeddings(&spec).unwrap().len(), 1);
+            let connection = migrated.open_connection().unwrap();
+            assert_eq!(
+                connection
+                    .query_row("SELECT count(*) FROM memory_documents", [], |row| row
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                connection
+                    .query_row("SELECT count(*) FROM retrieval_documents", [], |row| row
+                        .get::<_, i64>(0))
+                    .unwrap()
+            );
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT count(*) FROM memory_documents d
+                         LEFT JOIN memory_document_members m ON m.document_id=d.document_id
+                         GROUP BY d.document_id HAVING count(m.ordinal) != d.member_count",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()
+                    .unwrap(),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn source_provenance_deletion_cleans_catalog_and_embeddings() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let mut session = store
+            .create("model", "http://localhost", None, Default::default(), false)
+            .unwrap();
+        append_complete_turn(&mut session, &"用".repeat(241), "助手原文", "");
+        store.save(&mut session).unwrap();
+        let spec = VectorIndexSpec {
+            model: "qwen3-embedding:8b".into(),
+            dimensions: 32,
+            hnsw_m: 16,
+            hnsw_ef_construction: 200,
+            hnsw_ef_search: 64,
+        };
+        let connection = store.retrieval().open_connection().unwrap();
+        let mut statement = connection
+            .prepare(
+                "SELECT d.document_id, d.source_sha256, m.event_id, m.start_char, m.end_char, e.role,
+                        d.granularity
+                 FROM memory_documents d
+                 JOIN memory_document_members m ON m.document_id=d.document_id
+                 JOIN events e ON e.event_id=m.event_id
+                 ORDER BY e.sequence, d.document_id",
+            )
+            .unwrap();
+        let entries = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        drop(statement);
+        drop(connection);
+        let user = entries
+            .iter()
+            .find(|entry| entry.5 == "user" && entry.6 == "fragment")
+            .unwrap();
+        let assistant = entries.iter().find(|entry| entry.5 == "assistant").unwrap();
+        let writes = [
+            EmbeddingWrite {
+                document_id: user.0.clone(),
+                expected_source_sha256: user.1.clone(),
+                vector: vec![0.1; 32],
+            },
+            EmbeddingWrite {
+                document_id: assistant.0.clone(),
+                expected_source_sha256: assistant.1.clone(),
+                vector: vec![0.2; 32],
+            },
+        ];
+        store.retrieval().upsert_embeddings(&spec, &writes).unwrap();
+
+        let connection = Connection::open(store.retrieval().index_path()).unwrap();
+        connection
+            .execute_batch("PRAGMA foreign_keys = ON;")
+            .unwrap();
+        connection
+            .execute(
+                "DELETE FROM source_spans WHERE event_id=?1 AND start_char=?2 AND end_char=?3",
+                params![user.2, user.3, user.4],
+            )
+            .unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM memory_documents WHERE document_id=?1",
+                    [&user.0],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM memory_embeddings WHERE document_id=?1",
+                    [&user.0],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        connection
+            .execute("DELETE FROM events WHERE event_id=?1", [&assistant.2])
+            .unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM memory_documents WHERE document_id=?1",
+                    [&assistant.0],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM memory_embeddings WHERE document_id=?1",
+                    [&assistant.0],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM memory_documents d
+                     LEFT JOIN memory_document_members m ON m.document_id=d.document_id
+                     GROUP BY d.document_id HAVING count(m.ordinal) != d.member_count",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
     fn vector_storage_sync_rebuild_and_embedding_guards() {
         let root = tempfile::tempdir().unwrap();
         let store = SessionStore::new(root.path()).unwrap();
@@ -3594,7 +3826,7 @@ CREATE INDEX memory_boundary_suggestions_session_event
         };
         store
             .retrieval()
-            .upsert_embeddings(&spec, &[write.clone()])
+            .upsert_embeddings(&spec, std::slice::from_ref(&write))
             .unwrap();
         assert_eq!(
             store
