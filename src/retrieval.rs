@@ -1920,6 +1920,9 @@ impl RetrievalStore {
                 .map_err(|source| self.database_error(source))?;
             prepare_memory_state_schema(&transaction, existing_memory_version)
                 .map_err(|e| self.database_error(e))?;
+            transaction
+                .pragma_update(None, "user_version", INDEX_SCHEMA_VERSION)
+                .map_err(|e| self.database_error(e))?;
             transaction.commit().map_err(|e| self.database_error(e))?;
         }
         Ok(connection)
@@ -5159,6 +5162,388 @@ CREATE INDEX memory_boundary_suggestions_session_event
             .unwrap();
         assert_eq!(embedding_after, embedding_before);
         assert_eq!(fs::read(path).unwrap(), source_bytes);
+    }
+
+    #[test]
+    fn memory_state_v4_migration_clears_aggregates_retains_leaf_raw_legacy_ledger_and_replays() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let mut session = store
+            .create("model", "http://localhost", None, Default::default(), false)
+            .unwrap();
+        append_complete_turn(&mut session, &"字".repeat(241), "complete answer", "");
+        let source_path = store.save(&mut session).unwrap();
+        let source_before = fs::read(&source_path).unwrap();
+        let batch = store
+            .retrieval()
+            .next_consolidation_batch(&session.id)
+            .unwrap()
+            .unwrap();
+        let config = MemoryConfig {
+            enabled: true,
+            embedding_dimensions: 32,
+            ..MemoryConfig::default()
+        };
+        let spec = VectorIndexSpec::from_config(&config).unwrap();
+        let leaf_writes = {
+            let connection = Connection::open(store.retrieval().index_path()).unwrap();
+            connection
+                .prepare(
+                    "SELECT document_id,source_sha256 FROM memory_documents
+                     WHERE session_id=?1 AND granularity IN ('message','fragment')
+                     ORDER BY document_id",
+                )
+                .unwrap()
+                .query_map([&session.id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .unwrap()
+                .enumerate()
+                .map(|(index, row)| {
+                    let (document_id, expected_source_sha256) = row.unwrap();
+                    EmbeddingWrite {
+                        document_id,
+                        expected_source_sha256,
+                        vector: vec![index as f32 + 1.0; spec.dimensions],
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(leaf_writes.iter().any(|write| {
+            write.document_id.contains(":0:240") || write.document_id.contains(":200:241")
+        }));
+        store
+            .retrieval()
+            .upsert_embeddings(&spec, &leaf_writes)
+            .unwrap();
+        let plan = store
+            .retrieval()
+            .materialize_episode_documents(&session.id, &config)
+            .unwrap();
+        let aggregate_writes = aggregate_writes(&store, &plan, &spec, 10.0);
+        assert!(aggregate_writes.len() >= 2);
+        store
+            .retrieval()
+            .upsert_embeddings(&spec, &aggregate_writes)
+            .unwrap();
+
+        let connection = Connection::open(store.retrieval().index_path()).unwrap();
+        let boundary_event_id: String = connection
+            .query_row(
+                "SELECT event_id FROM events WHERE session_id=?1 AND role='user'",
+                [&session.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT OR REPLACE INTO memory_episode_boundaries(session_id,before_event_id,decision_json,input_sha256)
+                 VALUES(?1,?2,'{\"fixture\":true}',?3)",
+                params![session.id, boundary_event_id, "a".repeat(64)],
+            )
+            .unwrap();
+        let aggregate_before = episode_materialization_sql_state(&connection, &session.id);
+        assert!(!aggregate_before.catalog.is_empty());
+        assert!(!aggregate_before.members.is_empty());
+        assert!(!aggregate_before.boundaries.is_empty());
+        assert!(!aggregate_before.materialization.is_empty());
+        assert!(!aggregate_before.embeddings.is_empty());
+        let leaf_before = (
+            episode_sql_rows(
+                &connection,
+                "SELECT d.document_id,d.granularity,d.source_sha256,d.start_sequence,d.end_sequence,
+                        d.member_count,m.ordinal,m.event_id,m.start_char,m.end_char,m.content_sha256
+                 FROM memory_documents d JOIN memory_document_members m ON m.document_id=d.document_id
+                 WHERE d.session_id=?1 AND d.granularity IN ('message','fragment')
+                 ORDER BY d.document_id,m.ordinal",
+                &session.id,
+            ),
+            episode_sql_rows(
+                &connection,
+                "SELECT r.document_id,r.event_id,r.start_char,r.end_char,r.granularity,r.content_sha256,
+                        r.exact_content,r.lexical_content,r.ngram_content
+                 FROM retrieval_documents r JOIN events e ON e.event_id=r.event_id
+                 WHERE e.session_id=?1 ORDER BY r.document_id",
+                &session.id,
+            ),
+            episode_sql_rows(
+                &connection,
+                "SELECT s.event_id,s.start_char,s.end_char,s.content_sha256
+                 FROM source_spans s JOIN events e ON e.event_id=s.event_id
+                 WHERE e.session_id=?1 ORDER BY s.event_id,s.start_char,s.end_char",
+                &session.id,
+            ),
+            episode_sql_rows(
+                &connection,
+                "SELECT e.document_id,e.model,e.dimensions,e.source_sha256,e.index_fingerprint,
+                        e.vector_blob,e.embedded_at
+                 FROM memory_embeddings e JOIN memory_documents d ON d.document_id=e.document_id
+                 WHERE d.session_id=?1 AND d.granularity IN ('message','fragment')
+                 ORDER BY e.document_id",
+                &session.id,
+            ),
+        );
+        assert!(!leaf_before.0.is_empty());
+        assert!(!leaf_before.1.is_empty());
+        assert!(!leaf_before.2.is_empty());
+        assert_eq!(leaf_before.3.len(), leaf_writes.len());
+        let raw_events_before = episode_sql_rows(
+            &connection,
+            "SELECT event_id,session_id,turn_id,sequence,role,created_at,content,content_sha256,
+                    reply_to_event_id,token_count,turn_status,done_reason,error
+             FROM events WHERE session_id=?1 ORDER BY sequence,event_id",
+            &session.id,
+        );
+        let event_ids = serde_json::to_string(
+            &batch
+                .events
+                .iter()
+                .map(|event| event.event_id.clone())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let event_hashes = serde_json::to_string(
+            &batch
+                .events
+                .iter()
+                .map(|event| event.content_sha256.clone())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let legacy_request_json = "{\"legacy\":true}";
+        let legacy_response_json = "{\"legacy_response\":true}";
+        connection
+            .execute_batch(
+                "DROP TRIGGER consolidation_batches_immutable_update;
+                 DROP TRIGGER consolidation_batches_immutable_delete;
+                 ALTER TABLE consolidation_batches DROP COLUMN projection_schema_version;",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO consolidation_batches
+                 (attempt_id,batch_key,session_id,from_sequence,through_sequence,trigger,model,
+                  request_json,request_sha256,input_event_ids,input_event_hashes,response_json,
+                  response_sha256,status,input_tokens,output_tokens,latency_ms,started_at,
+                  completed_at,validation_json,error_json)
+                 VALUES('legacy-v3-applied',?1,?2,?3,?4,'legacy','legacy-model',?5,?6,?7,?8,
+                        ?9,?10,'applied',7,3,1,?11,?12,'{\"legacy\":true}',NULL)",
+                params![
+                    batch.batch_key,
+                    batch.session_id,
+                    batch.from_sequence as i64,
+                    batch.through_sequence as i64,
+                    legacy_request_json,
+                    content_sha256(legacy_request_json),
+                    event_ids,
+                    event_hashes,
+                    legacy_response_json,
+                    content_sha256(legacy_response_json),
+                    batch.events.last().unwrap().created_at,
+                    (DateTime::parse_from_rfc3339(&batch.events.last().unwrap().created_at)
+                        .unwrap()
+                        + chrono::Duration::seconds(1))
+                    .to_rfc3339(),
+                ],
+            )
+            .unwrap();
+        let legacy_before = episode_sql_rows(
+            &connection,
+            "SELECT attempt_id,batch_key,session_id,from_sequence,through_sequence,trigger,model,
+                    request_json,request_sha256,input_event_ids,input_event_hashes,response_json,
+                    response_sha256,status,input_tokens,output_tokens,latency_ms,started_at,
+                    completed_at,validation_json,error_json
+             FROM consolidation_batches WHERE session_id=?1 ORDER BY attempt_id",
+            &session.id,
+        );
+        assert_eq!(legacy_before.len(), 1);
+        connection
+            .execute(
+                "UPDATE memory_schema_meta SET value=3 WHERE key='state_schema_version'",
+                [],
+            )
+            .unwrap();
+        connection
+            .pragma_update(None, "user_version", 6_i64)
+            .unwrap();
+        drop(connection);
+
+        let reopened = RetrievalStore::new(root.path()).unwrap();
+        reopened.open_connection().unwrap();
+        let connection = Connection::open(reopened.index_path()).unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            7
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT value FROM memory_schema_meta WHERE key='state_schema_version'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            4
+        );
+        let aggregate_after = episode_materialization_sql_state(&connection, &session.id);
+        assert!(aggregate_after.catalog.is_empty());
+        assert!(aggregate_after.members.is_empty());
+        assert!(aggregate_after.boundaries.is_empty());
+        assert!(aggregate_after.materialization.is_empty());
+        assert!(aggregate_after.embeddings.is_empty());
+        let leaf_after = (
+            episode_sql_rows(
+                &connection,
+                "SELECT d.document_id,d.granularity,d.source_sha256,d.start_sequence,d.end_sequence,
+                        d.member_count,m.ordinal,m.event_id,m.start_char,m.end_char,m.content_sha256
+                 FROM memory_documents d JOIN memory_document_members m ON m.document_id=d.document_id
+                 WHERE d.session_id=?1 AND d.granularity IN ('message','fragment')
+                 ORDER BY d.document_id,m.ordinal",
+                &session.id,
+            ),
+            episode_sql_rows(
+                &connection,
+                "SELECT r.document_id,r.event_id,r.start_char,r.end_char,r.granularity,r.content_sha256,
+                        r.exact_content,r.lexical_content,r.ngram_content
+                 FROM retrieval_documents r JOIN events e ON e.event_id=r.event_id
+                 WHERE e.session_id=?1 ORDER BY r.document_id",
+                &session.id,
+            ),
+            episode_sql_rows(
+                &connection,
+                "SELECT s.event_id,s.start_char,s.end_char,s.content_sha256
+                 FROM source_spans s JOIN events e ON e.event_id=s.event_id
+                 WHERE e.session_id=?1 ORDER BY s.event_id,s.start_char,s.end_char",
+                &session.id,
+            ),
+            episode_sql_rows(
+                &connection,
+                "SELECT e.document_id,e.model,e.dimensions,e.source_sha256,e.index_fingerprint,
+                        e.vector_blob,e.embedded_at
+                 FROM memory_embeddings e JOIN memory_documents d ON d.document_id=e.document_id
+                 WHERE d.session_id=?1 AND d.granularity IN ('message','fragment')
+                 ORDER BY e.document_id",
+                &session.id,
+            ),
+        );
+        assert_eq!(leaf_after, leaf_before);
+        assert_eq!(
+            episode_sql_rows(
+                &connection,
+                "SELECT event_id,session_id,turn_id,sequence,role,created_at,content,content_sha256,
+                        reply_to_event_id,token_count,turn_status,done_reason,error
+                 FROM events WHERE session_id=?1 ORDER BY sequence,event_id",
+                &session.id,
+            ),
+            raw_events_before
+        );
+        let legacy_after = episode_sql_rows(
+            &connection,
+            "SELECT attempt_id,batch_key,session_id,from_sequence,through_sequence,trigger,model,
+                    request_json,request_sha256,input_event_ids,input_event_hashes,response_json,
+                    response_sha256,status,input_tokens,output_tokens,latency_ms,started_at,
+                    completed_at,validation_json,error_json
+             FROM consolidation_batches WHERE session_id=?1 AND attempt_id='legacy-v3-applied'",
+            &session.id,
+        );
+        assert_eq!(legacy_after, legacy_before);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM consolidation_batches
+                     WHERE attempt_id='legacy-v3-applied' AND projection_schema_version IS NULL",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        drop(connection);
+        assert_eq!(fs::read(&source_path).unwrap(), source_before);
+        assert_eq!(
+            reopened.next_consolidation_batch(&session.id).unwrap(),
+            Some(batch.clone())
+        );
+
+        let candidates = reopened.consolidation_candidates(16, 16).unwrap();
+        let output = StructuredConsolidationOutput {
+            entities: vec![],
+            claims: vec![],
+            boundaries: vec![],
+        };
+        let request_json = serde_json::to_string(
+            &canonical_consolidation_request(
+                "current-model".into(),
+                &batch,
+                &candidates,
+                4096,
+                1024,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let response_json = serde_json::to_string(&output).unwrap();
+        let started_at = batch.events.last().unwrap().created_at.clone();
+        let attempt = ConsolidationAttemptRecord {
+            attempt_id: "current-v4-replay".into(),
+            batch_key: batch.batch_key.clone(),
+            session_id: batch.session_id.clone(),
+            from_sequence: batch.from_sequence,
+            through_sequence: batch.through_sequence,
+            trigger: "test".into(),
+            model: "current-model".into(),
+            request_sha256: content_sha256(&request_json),
+            request_json,
+            input_event_ids: batch
+                .events
+                .iter()
+                .map(|event| event.event_id.clone())
+                .collect(),
+            input_event_hashes: batch
+                .events
+                .iter()
+                .map(|event| event.content_sha256.clone())
+                .collect(),
+            response_sha256: Some(content_sha256(&response_json)),
+            response_json: Some(response_json),
+            status: ConsolidationAttemptStatus::Applied,
+            input_tokens: Some(1),
+            output_tokens: Some(1),
+            latency_ms: 1,
+            started_at: started_at.clone(),
+            completed_at: (DateTime::parse_from_rfc3339(&started_at).unwrap()
+                + chrono::Duration::seconds(1))
+            .to_rfc3339(),
+            validation_json: Some("{\"valid\":true}".into()),
+            error_json: None,
+        };
+        let report = reopened
+            .apply_consolidation_attempt(&batch, &candidates, &attempt)
+            .unwrap();
+        assert_eq!(report.mentions_created, 0);
+        let connection = Connection::open(reopened.index_path()).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM consolidation_batches WHERE batch_key=?1 AND status='applied' AND projection_schema_version=4",
+                    [&batch.batch_key],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM consolidation_batches WHERE attempt_id='legacy-v3-applied' AND projection_schema_version IS NULL",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
