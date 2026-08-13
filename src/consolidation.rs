@@ -3103,6 +3103,77 @@ fn validate_boundary_ids_and_batches(connection: &Connection) -> RetrievalResult
                 "边界 {id} 的确定性 ID 不匹配"
             )));
         }
+        let (ids_json, hashes_json, from_sequence, through_sequence): (String, String, i64, i64) = connection
+            .query_row(
+                "SELECT input_event_ids,input_event_hashes,from_sequence,through_sequence FROM consolidation_batches WHERE session_id=?1 AND batch_key=?2 AND completed_at=?3 AND status='applied'",
+                params![session, batch, created_at],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .map_err(candidate_database_error)?;
+        let ids: Vec<String> = serde_json::from_str(&ids_json).map_err(|_| {
+            RetrievalError::CorruptIndex(format!("边界 {id} 的 applied batch 事件 ID 损坏"))
+        })?;
+        let hashes: Vec<String> = serde_json::from_str(&hashes_json).map_err(|_| {
+            RetrievalError::CorruptIndex(format!("边界 {id} 的 applied batch 事件哈希损坏"))
+        })?;
+        if ids.is_empty()
+            || ids.len() != hashes.len()
+            || ids.iter().collect::<HashSet<_>>().len() != ids.len()
+            || ids.iter().any(|value| value.trim().is_empty())
+            || hashes.iter().any(|value| !is_lower_sha256(value))
+            || from_sequence < 0
+            || through_sequence < from_sequence
+        {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "边界 {id} 的 applied batch 成员损坏"
+            )));
+        }
+        let mut batch_events = HashSet::new();
+        let mut sequences = Vec::with_capacity(ids.len());
+        for (event_id, expected_hash) in ids.iter().zip(hashes) {
+            let (event_session, sequence, content, content_sha256): (String, i64, String, String) = connection
+                .query_row(
+                    "SELECT session_id,sequence,content,content_sha256 FROM events WHERE event_id=?1",
+                    [event_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .map_err(candidate_database_error)?;
+            if event_session != session
+                || sequence < from_sequence
+                || sequence > through_sequence
+                || sha256_bytes(content.as_bytes()) != content_sha256
+                || content_sha256 != expected_hash
+            {
+                return Err(RetrievalError::CorruptIndex(format!(
+                    "边界 {id} 的 applied batch 原文不匹配"
+                )));
+            }
+            sequences.push(sequence);
+            batch_events.insert(event_id.clone());
+        }
+        if sequences.first() != Some(&from_sequence)
+            || sequences.last() != Some(&through_sequence)
+            || sequences.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "边界 {id} 的 applied batch 序号不一致"
+            )));
+        }
+        if !batch_events.contains(&before_event) {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "边界 {id} 指向 applied batch 外事件"
+            )));
+        }
+        let evidence: Vec<ConsolidationQuote> = serde_json::from_str(&evidence_json)
+            .map_err(|_| RetrievalError::CorruptIndex(format!("边界 {id} 的证据损坏")))?;
+        if evidence
+            .iter()
+            .any(|quote| !batch_events.contains(&quote.event_id))
+        {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "边界 {id} 证据位于 applied batch 外"
+            )));
+        }
     }
     Ok(())
 }
@@ -8903,13 +8974,6 @@ mod tests {
     }
 
     #[test]
-    fn episode_materialization_invalidation_contract_is_atomic() {
-        // The production apply path performs metadata and aggregate-vector
-        // deletion in its transaction immediately after the watermark update.
-        assert_eq!(ConsolidationAttemptStatus::Applied.as_str(), "applied");
-    }
-
-    #[test]
     fn rebuild_preserves_ledger_and_watermark_then_revalidates_source() {
         let root = tempfile::tempdir().unwrap();
         let (store, mut session) = new_session(root.path());
@@ -11717,7 +11781,7 @@ mod tests {
     }
 
     #[test]
-    fn boundary_suggestions_deduplicate_and_candidate_hashes_detect_tampering_after_rebuild() {
+    fn episode_boundary_applied_batch_deduplicates_and_detects_tampering_after_rebuild() {
         let root = tempfile::tempdir().unwrap();
         let (store, mut session) = new_session(root.path());
         push_complete_at(
@@ -12699,7 +12763,7 @@ mod tests {
     }
 
     #[test]
-    fn full_integrity_rejects_hidden_orphan_memory_rows() {
+    fn integrity_audit_rejects_hidden_orphan_memory_rows() {
         let seed = || {
             let root = tempfile::tempdir().unwrap();
             let (store, mut session) = new_session(root.path());
