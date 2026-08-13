@@ -9305,6 +9305,8 @@ mod tests {
         let memory = episode_memory_config();
         let spec = VectorIndexSpec::from_config(&memory).unwrap();
         let initial = materialize_episodes(&store, &session.id).unwrap();
+        let mut canonical_unit_basis = vec![0.0; 32];
+        canonical_unit_basis[0] = 1.0;
         let connection = Connection::open(store.retrieval().index_path()).unwrap();
         let leaf_writes = connection
             .prepare(
@@ -9316,7 +9318,7 @@ mod tests {
                 Ok(EmbeddingWrite {
                     document_id: row.get(0)?,
                     expected_source_sha256: row.get(1)?,
-                    vector: vec![1.0; 32],
+                    vector: canonical_unit_basis.clone(),
                 })
             })
             .unwrap()
@@ -9359,7 +9361,7 @@ mod tests {
                 Ok(EmbeddingWrite {
                     document_id: row.get(0)?,
                     expected_source_sha256: row.get(1)?,
-                    vector: vec![0.5; 32],
+                    vector: canonical_unit_basis.clone(),
                 })
             })
             .unwrap()
