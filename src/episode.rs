@@ -217,7 +217,7 @@ fn make_document(
     } else {
         session_document_id(session_id)
     };
-    let source_sha256 = members_hash(granularity, session_id, &members);
+    let source_sha256 = aggregate_members_hash(granularity, session_id, &members);
     Ok(EpisodeDocument {
         document_id,
         session_id: session_id.to_owned(),
@@ -449,7 +449,11 @@ fn dedupe_suggestions(values: &[EpisodeBoundarySuggestion]) -> BTreeMap<String, 
     result
 }
 
-fn members_hash(granularity: &str, session_id: &str, members: &[EpisodeMember]) -> String {
+pub(crate) fn aggregate_members_hash(
+    granularity: &str,
+    session_id: &str,
+    members: &[EpisodeMember],
+) -> String {
     let mut hasher = Sha256::new();
     hash_part(&mut hasher, b"hippocampus-aggregate-source-v1");
     hash_part(&mut hasher, granularity.as_bytes());

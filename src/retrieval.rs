@@ -14,7 +14,8 @@ use crate::config::MemoryConfig;
 use crate::consolidation::validate_full_derived_integrity;
 use crate::episode::{
     EpisodeBoundarySuggestion, EpisodeDocument, EpisodeInputMessage, EpisodeMaterializationReport,
-    EpisodeMember, EpisodePlanInput, ledger_snapshot_hash, plan_episodes, session_document_id,
+    EpisodeMember, EpisodePlanInput, aggregate_members_hash, ledger_snapshot_hash, plan_episodes,
+    session_document_id,
 };
 use crate::knowledge::{KnowledgeStore, KnowledgeTrace};
 use crate::model::{
@@ -2170,44 +2171,6 @@ fn verify_aggregate_document(
         ));
     }
     Ok(())
-}
-
-fn aggregate_members_hash(
-    granularity: &str,
-    session_id: &str,
-    members: &[EpisodeMember],
-) -> String {
-    let mut hasher = Sha256::new();
-    for value in [
-        b"hippocampus-aggregate-source-v1".as_slice(),
-        granularity.as_bytes(),
-        session_id.as_bytes(),
-        &(members.len() as u64).to_le_bytes(),
-    ] {
-        hash_length_prefixed(&mut hasher, value);
-    }
-    for member in members {
-        for value in [
-            member.document_id.as_bytes(),
-            member.event_id.as_bytes(),
-            &member.sequence.to_le_bytes(),
-            member.role.as_str().as_bytes(),
-            &u64::try_from(member.span.start_char)
-                .unwrap_or(u64::MAX)
-                .to_le_bytes(),
-            &u64::try_from(member.span.end_char)
-                .unwrap_or(u64::MAX)
-                .to_le_bytes(),
-            member.content_sha256.as_bytes(),
-        ] {
-            hash_length_prefixed(&mut hasher, value);
-        }
-    }
-    format!("{:x}", hasher.finalize())
-}
-fn hash_length_prefixed(hasher: &mut Sha256, value: &[u8]) {
-    hasher.update((value.len() as u64).to_le_bytes());
-    hasher.update(value);
 }
 
 fn backfill_memory_documents(transaction: &Transaction<'_>) -> rusqlite::Result<()> {
