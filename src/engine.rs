@@ -373,6 +373,8 @@ impl<B: ChatBackend> ChatEngine<B> {
 
             let response_json = response.content;
             let response_sha256 = content_sha256(&response_json);
+            let response_input_tokens = response.usage.input_tokens;
+            let response_output_tokens = response.usage.output_tokens;
             let decoded = serde_json::from_str::<StructuredConsolidationOutput>(&response_json);
             if let Ok(output) = &decoded {
                 report.entities_attempted += output.entities.len();
@@ -383,10 +385,10 @@ impl<B: ChatBackend> ChatEngine<B> {
                 let message = "caller cancelled consolidation";
                 let attempt = base_attempt(
                     ConsolidationAttemptStatus::Cancelled,
-                    None,
-                    None,
-                    None,
-                    None,
+                    Some(response_json),
+                    Some(response_sha256),
+                    response_input_tokens,
+                    response_output_tokens,
                     None,
                     Some(consolidation_failure_json("cancellation", message)),
                 );
@@ -402,8 +404,8 @@ impl<B: ChatBackend> ChatEngine<B> {
                 ConsolidationAttemptStatus::Applied,
                 Some(response_json.clone()),
                 Some(response_sha256),
-                response.usage.input_tokens,
-                response.usage.output_tokens,
+                response_input_tokens,
+                response_output_tokens,
                 Some(json!({"valid": true, "batch_key": batch.batch_key, "watermark_after": batch.through_sequence}).to_string()),
                 None,
             );
@@ -2119,10 +2121,20 @@ mod tests {
 
     use async_trait::async_trait;
     use rusqlite::Connection;
+    use tokio::sync::Notify;
 
     use super::*;
     use crate::model::{BudgetConfig, ChatMessage, ToolCallFunction};
     use crate::ollama::{ModelInfo, WebSearchResult};
+
+    #[derive(Clone, Default)]
+    struct StructuredTestControl {
+        block_call: Option<usize>,
+        cancel_on_call: Option<usize>,
+        call_started: Option<Arc<Notify>>,
+        release_response: Option<Arc<Notify>>,
+        cancellation: Option<CancellationToken>,
+    }
 
     #[derive(Clone)]
     struct FakeClient {
@@ -2141,6 +2153,7 @@ mod tests {
             Arc<Mutex<VecDeque<Result<crate::ollama::StructuredChatResponse, OllamaError>>>>,
         structured_requests: Arc<Mutex<Vec<StructuredChatRequest>>>,
         structured_delay: Arc<Mutex<Option<Duration>>>,
+        structured_control: Arc<Mutex<StructuredTestControl>>,
     }
 
     impl FakeClient {
@@ -2170,6 +2183,7 @@ mod tests {
                 structured_responses: Arc::new(Mutex::new(VecDeque::new())),
                 structured_requests: Arc::new(Mutex::new(Vec::new())),
                 structured_delay: Arc::new(Mutex::new(None)),
+                structured_control: Arc::new(Mutex::new(StructuredTestControl::default())),
             }
         }
 
@@ -2252,9 +2266,24 @@ mod tests {
             request: StructuredChatRequest,
         ) -> Result<crate::ollama::StructuredChatResponse, OllamaError> {
             self.structured_requests.lock().unwrap().push(request);
+            let control = self.structured_control.lock().unwrap().clone();
+            let call_number = self.structured_requests.lock().unwrap().len();
             let delay = *self.structured_delay.lock().unwrap();
             if let Some(delay) = delay {
                 tokio::time::sleep(delay).await;
+            }
+            if control.block_call == Some(call_number) {
+                if let Some(notify) = control.call_started {
+                    notify.notify_one();
+                }
+                if let Some(notify) = control.release_response {
+                    notify.notified().await;
+                }
+            }
+            if control.cancel_on_call == Some(call_number)
+                && let Some(cancellation) = control.cancellation
+            {
+                cancellation.cancel();
             }
             self.structured_responses
                 .lock()
@@ -2667,28 +2696,47 @@ mod tests {
 
     #[tokio::test]
     async fn consolidation_cancellation_timeout_and_partial_progress() {
+        fn valid_response() -> crate::ollama::StructuredChatResponse {
+            crate::ollama::StructuredChatResponse {
+                content: "{\"entities\":[],\"claims\":[],\"boundaries\":[]}".into(),
+                usage: TokenUsage::new(Some(8), Some(4)),
+                done_reason: Some("stop".into()),
+            }
+        }
+        fn seeded(store: &SessionStore, turns: usize) -> Session {
+            let mut session = store
+                .create("model", "http://localhost", None, budget(), true)
+                .unwrap();
+            for index in 0..turns {
+                let mut turn = Turn::pending(format!("fact {index}"));
+                turn.status = TurnStatus::Complete;
+                turn.assistant_content = format!("answer {index}");
+                turn.usage = TokenUsage::new(Some(3), Some(2));
+                turn.done_reason = Some("stop".into());
+                session.turns.push(turn);
+            }
+            store.save(&mut session).unwrap();
+            session
+        }
+        fn engine(store: SessionStore, client: FakeClient) -> ChatEngine<FakeClient> {
+            let mut config = AppConfig::default();
+            config.memory.enabled = true;
+            config.memory.consolidation_timeout_secs = 1;
+            ChatEngine::with_config(store, client, config)
+        }
+
+        // A: pre-cancel has no backend call or audit.
         let root = tempfile::tempdir().unwrap();
         let store = SessionStore::new(root.path()).unwrap();
-        let mut session = store
-            .create("model", "http://localhost", None, budget(), true)
-            .unwrap();
-        let mut turn = Turn::pending("fact".into());
-        turn.status = TurnStatus::Complete;
-        turn.assistant_content = "answer".into();
-        session.turns.push(turn);
-        store.save(&mut session).unwrap();
+        let session = seeded(&store, 1);
         let client = FakeClient::new(100);
-        let mut config = AppConfig::default();
-        config.memory.enabled = true;
-        config.memory.consolidation_timeout_secs = 1;
-        let engine = ChatEngine::with_config(store.clone(), client.clone(), config);
         let cancelled = CancellationToken::new();
         cancelled.cancel();
-        let report = engine
+        let report = engine(store.clone(), client.clone())
             .consolidate_session(&session, ConsolidationTrigger::Manual, cancelled)
             .await;
         assert_eq!(report.status, ConsolidationRunStatus::Cancelled);
-        assert_eq!(client.structured_requests.lock().unwrap().len(), 0);
+        assert!(client.structured_requests.lock().unwrap().is_empty());
         assert!(
             store
                 .retrieval()
@@ -2697,8 +2745,53 @@ mod tests {
                 .is_empty()
         );
 
+        // B: cancellation during an already-started call produces one response-less audit.
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let session = seeded(&store, 1);
+        let client = FakeClient::new(100);
+        let call_started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        *client.structured_control.lock().unwrap() = StructuredTestControl {
+            block_call: Some(1),
+            call_started: Some(call_started.clone()),
+            release_response: Some(release),
+            ..StructuredTestControl::default()
+        };
+        let cancellation = CancellationToken::new();
+        let task_engine = engine(store.clone(), client.clone());
+        let task_session = session.clone();
+        let task_cancellation = cancellation.clone();
+        let task = tokio::spawn(async move {
+            task_engine
+                .consolidate_session(
+                    &task_session,
+                    ConsolidationTrigger::Manual,
+                    task_cancellation,
+                )
+                .await
+        });
+        call_started.notified().await;
+        cancellation.cancel();
+        let report = task.await.unwrap();
+        assert_eq!(report.status, ConsolidationRunStatus::Cancelled);
+        assert_eq!(report.watermark_after, 0);
+        let attempts = store
+            .retrieval()
+            .consolidation_attempts(&session.id)
+            .unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].status, ConsolidationAttemptStatus::Cancelled);
+        assert!(attempts[0].response_json.is_none());
+        assert!(attempts[0].input_tokens.is_none() && attempts[0].output_tokens.is_none());
+
+        // C: timeout is a model error with no response and leaves the batch retryable.
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let session = seeded(&store, 1);
+        let client = FakeClient::new(100);
         *client.structured_delay.lock().unwrap() = Some(Duration::from_secs(2));
-        let report = engine
+        let report = engine(store.clone(), client.clone())
             .consolidate_session(
                 &session,
                 ConsolidationTrigger::Manual,
@@ -2714,6 +2807,147 @@ mod tests {
         assert_eq!(timeout[0].status, ConsolidationAttemptStatus::ModelError);
         assert!(timeout[0].response_json.is_none());
         assert_eq!(report.watermark_after, 0);
+
+        // D: the first of two bounded batches persists, and the rejected second batch stays retryable.
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let session = seeded(&store, 17);
+        let first = store
+            .retrieval()
+            .next_consolidation_batch(&session.id)
+            .unwrap()
+            .unwrap();
+        let client = FakeClient::new(100);
+        *client.structured_responses.lock().unwrap() = VecDeque::from([
+            Ok(valid_response()),
+            Ok(crate::ollama::StructuredChatResponse {
+                content: "malformed".into(),
+                usage: TokenUsage::new(Some(9), Some(5)),
+                done_reason: None,
+            }),
+        ]);
+        let report = engine(store.clone(), client.clone())
+            .consolidate_session(
+                &session,
+                ConsolidationTrigger::Manual,
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(report.status, ConsolidationRunStatus::Partial);
+        assert_eq!(report.batches_attempted, 2);
+        assert_eq!(report.batches_applied, 1);
+        assert_eq!(report.events_applied, first.events.len());
+        assert!(report.events_attempted > report.events_applied);
+        assert_eq!(report.watermark_after, first.through_sequence);
+        let attempts = store
+            .retrieval()
+            .consolidation_attempts(&session.id)
+            .unwrap();
+        assert_eq!(
+            attempts
+                .iter()
+                .map(|attempt| attempt.status)
+                .collect::<Vec<_>>(),
+            vec![
+                ConsolidationAttemptStatus::Applied,
+                ConsolidationAttemptStatus::Rejected
+            ]
+        );
+        assert_eq!(attempts[0].through_sequence, first.through_sequence);
+        assert!(attempts[1].through_sequence > first.through_sequence);
+
+        // E: cancellation after the second call starts keeps exactly the first batch.
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let session = seeded(&store, 17);
+        let first = store
+            .retrieval()
+            .next_consolidation_batch(&session.id)
+            .unwrap()
+            .unwrap();
+        let client = FakeClient::new(100);
+        *client.structured_responses.lock().unwrap() = VecDeque::from([Ok(valid_response())]);
+        let call_started = Arc::new(Notify::new());
+        *client.structured_control.lock().unwrap() = StructuredTestControl {
+            block_call: Some(2),
+            call_started: Some(call_started.clone()),
+            release_response: Some(Arc::new(Notify::new())),
+            ..StructuredTestControl::default()
+        };
+        let cancellation = CancellationToken::new();
+        let task_engine = engine(store.clone(), client.clone());
+        let task_session = session.clone();
+        let task_cancellation = cancellation.clone();
+        let task = tokio::spawn(async move {
+            task_engine
+                .consolidate_session(
+                    &task_session,
+                    ConsolidationTrigger::Manual,
+                    task_cancellation,
+                )
+                .await
+        });
+        call_started.notified().await;
+        cancellation.cancel();
+        let report = task.await.unwrap();
+        assert_eq!(report.status, ConsolidationRunStatus::Cancelled);
+        assert_eq!(report.batches_attempted, 2);
+        assert_eq!(report.batches_applied, 1);
+        assert_eq!(report.watermark_after, first.through_sequence);
+        let attempts = store
+            .retrieval()
+            .consolidation_attempts(&session.id)
+            .unwrap();
+        assert_eq!(
+            attempts
+                .iter()
+                .map(|attempt| attempt.status)
+                .collect::<Vec<_>>(),
+            vec![
+                ConsolidationAttemptStatus::Applied,
+                ConsolidationAttemptStatus::Cancelled
+            ]
+        );
+        assert!(attempts[1].response_json.is_none());
+        assert!(attempts[1].input_tokens.is_none() && attempts[1].output_tokens.is_none());
+
+        // F: cancellation observed after a response returns retains that exact response and usage.
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let session = seeded(&store, 1);
+        let client = FakeClient::new(100);
+        let cancellation = CancellationToken::new();
+        let raw = "{\"entities\":[],\"claims\":[],\"boundaries\":[]}";
+        client.structured_responses.lock().unwrap().push_back(Ok(
+            crate::ollama::StructuredChatResponse {
+                content: raw.into(),
+                usage: TokenUsage::new(Some(12), None),
+                done_reason: None,
+            },
+        ));
+        *client.structured_control.lock().unwrap() = StructuredTestControl {
+            cancel_on_call: Some(1),
+            cancellation: Some(cancellation.clone()),
+            ..StructuredTestControl::default()
+        };
+        let report = engine(store.clone(), client)
+            .consolidate_session(&session, ConsolidationTrigger::Manual, cancellation)
+            .await;
+        assert_eq!(report.status, ConsolidationRunStatus::Cancelled);
+        assert_eq!(report.watermark_after, 0);
+        let attempts = store
+            .retrieval()
+            .consolidation_attempts(&session.id)
+            .unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].status, ConsolidationAttemptStatus::Cancelled);
+        assert_eq!(attempts[0].response_json.as_deref(), Some(raw));
+        assert_eq!(
+            attempts[0].response_sha256.as_deref(),
+            Some(content_sha256(raw).as_str())
+        );
+        assert_eq!(attempts[0].input_tokens, Some(12));
+        assert_eq!(attempts[0].output_tokens, None);
     }
 
     #[tokio::test]
