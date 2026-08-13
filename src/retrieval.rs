@@ -179,10 +179,32 @@ pub(crate) enum ConsolidationHookPoint {
 #[cfg(test)]
 pub(crate) type ConsolidationHook = Arc<dyn Fn(ConsolidationHookPoint) + Send + Sync>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum AggregateAuditPhase {
+    PreWrite,
+    FinalWrite,
+    Read,
+    MaterializeFinal,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AggregateAuditHookPoint {
+    DerivedIntegrity,
+    Materialization {
+        session_id: String,
+        phase: AggregateAuditPhase,
+    },
+}
+
+#[cfg(test)]
+type AggregateAuditHook = Arc<dyn Fn(AggregateAuditHookPoint) + Send + Sync>;
+
 #[cfg(test)]
 #[derive(Clone, Default)]
 struct RetrievalTestHooks {
     consolidation: Arc<Mutex<Option<ConsolidationHook>>>,
+    aggregate_audit: Arc<Mutex<Option<AggregateAuditHook>>>,
 }
 
 #[cfg(test)]
@@ -481,22 +503,30 @@ impl RetrievalStore {
                 "同一会话不能在 leaf 更新时发布 aggregate 向量".into(),
             ));
         }
+        let prewrite_readiness = self.aggregate_readiness_by_session(
+            &transaction,
+            &aggregate_sessions,
+            spec,
+            &fingerprint,
+            true,
+            AggregateAuditPhase::PreWrite,
+        )?;
         for prepared_write in &prepared {
-            if matches!(prepared_write.granularity.as_str(), "episode" | "session")
-                && validate_aggregate_embedding_ready(
+            if matches!(prepared_write.granularity.as_str(), "episode" | "session") {
+                if prewrite_readiness.get(&prepared_write.session_id)
+                    != Some(&AggregateReadiness::Ready)
+                {
+                    return Err(RetrievalError::CorruptIndex(format!(
+                        "文档 {} 的 aggregate 输入不完整或不兼容",
+                        prepared_write.document_id
+                    )));
+                }
+                validate_aggregate_document_source(
                     &transaction,
-                    &self.root,
                     &prepared_write.document_id,
                     &prepared_write.session_id,
                     &prepared_write.source_sha256,
-                    spec,
-                    &fingerprint,
-                )? != AggregateReadiness::Ready
-            {
-                return Err(RetrievalError::CorruptIndex(format!(
-                    "文档 {} 的 aggregate 输入不完整或不兼容",
-                    prepared_write.document_id
-                )));
+                )?;
             }
         }
         let embedded_at = Utc::now().to_rfc3339();
@@ -529,22 +559,6 @@ impl RetrievalStore {
                 &fingerprint,
                 &embedded_at,
             )?;
-            if matches!(prepared_write.granularity.as_str(), "episode" | "session")
-                && validate_aggregate_embedding_ready(
-                    &transaction,
-                    &self.root,
-                    &prepared_write.document_id,
-                    &prepared_write.session_id,
-                    &prepared_write.source_sha256,
-                    spec,
-                    &fingerprint,
-                )? != AggregateReadiness::Ready
-            {
-                return Err(RetrievalError::CorruptIndex(format!(
-                    "文档 {} 的 aggregate 输入在写入后不完整或不兼容",
-                    prepared_write.document_id
-                )));
-            }
         }
         for session_id in leaf_sessions {
             transaction.execute(
@@ -566,21 +580,34 @@ impl RetrievalStore {
                 &fingerprint,
                 &embedded_at,
             )?;
-            if matches!(prepared_write.granularity.as_str(), "episode" | "session")
-                && validate_aggregate_embedding_ready(
-                    &transaction,
-                    &self.root,
-                    &prepared_write.document_id,
-                    &prepared_write.session_id,
-                    &prepared_write.source_sha256,
-                    spec,
-                    &fingerprint,
-                )? != AggregateReadiness::Ready
-            {
-                return Err(RetrievalError::CorruptIndex(format!(
-                    "文档 {} 的 aggregate 输入在批量写入后不完整或不兼容",
-                    prepared_write.document_id
-                )));
+        }
+        if !aggregate_sessions.is_empty() {
+            self.validate_aggregate_derived_integrity(&transaction)?;
+            let final_readiness = self.aggregate_readiness_by_session(
+                &transaction,
+                &aggregate_sessions,
+                spec,
+                &fingerprint,
+                true,
+                AggregateAuditPhase::FinalWrite,
+            )?;
+            for prepared_write in &prepared {
+                if matches!(prepared_write.granularity.as_str(), "episode" | "session") {
+                    if final_readiness.get(&prepared_write.session_id)
+                        != Some(&AggregateReadiness::Ready)
+                    {
+                        return Err(RetrievalError::CorruptIndex(format!(
+                            "文档 {} 的 aggregate 输入在批量写入后不完整或不兼容",
+                            prepared_write.document_id
+                        )));
+                    }
+                    validate_aggregate_document_source(
+                        &transaction,
+                        &prepared_write.document_id,
+                        &prepared_write.session_id,
+                        &prepared_write.source_sha256,
+                    )?;
+                }
             }
         }
         transaction
@@ -667,6 +694,24 @@ impl RetrievalStore {
             .map_err(|error| self.database_error(error))?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|error| self.database_error(error))?;
+        let aggregate_sessions = rows
+            .iter()
+            .filter(|row| matches!(row.2.as_str(), "episode" | "session"))
+            .map(|row| row.1.clone())
+            .collect::<HashSet<_>>();
+        let aggregate_readiness = if aggregate_sessions.is_empty() {
+            HashMap::new()
+        } else {
+            self.validate_aggregate_derived_integrity(connection)?;
+            self.aggregate_readiness_by_session(
+                connection,
+                &aggregate_sessions,
+                spec,
+                fingerprint,
+                true,
+                AggregateAuditPhase::Read,
+            )?
+        };
         let mut compatible = Vec::with_capacity(rows.len());
         for (
             document_id,
@@ -683,17 +728,19 @@ impl RetrievalStore {
         {
             let parsed_granularity = parse_memory_granularity(&granularity)?;
             if matches!(granularity.as_str(), "episode" | "session") {
-                match validate_aggregate_embedding_ready(
-                    connection,
-                    &self.root,
-                    &document_id,
-                    &session_id,
-                    &source_sha256,
-                    spec,
-                    fingerprint,
-                )? {
-                    AggregateReadiness::Ready => {}
-                    AggregateReadiness::Stale => continue,
+                match aggregate_readiness.get(&session_id) {
+                    Some(AggregateReadiness::Ready) => validate_aggregate_document_source(
+                        connection,
+                        &document_id,
+                        &session_id,
+                        &source_sha256,
+                    )?,
+                    Some(AggregateReadiness::Stale) => continue,
+                    None => {
+                        return Err(aggregate_corruption(format!(
+                            "会话 {session_id} 缺少缓存的 aggregate readiness"
+                        )));
+                    }
                 }
             }
             if embedding_source_sha256 != source_sha256 {
@@ -740,7 +787,6 @@ impl RetrievalStore {
             .map_err(|error| self.database_error(error))?;
         let session = self.get_session_from_connection(&transaction, session_id)?;
         self.verify_fresh(&session)?;
-        validate_full_derived_integrity(&transaction)?;
         let (messages, watermark, suggestions, ledger_snapshot_sha256) =
             load_episode_snapshot(&transaction, session_id, &spec, &fingerprint)?;
         let plan = plan_episodes(&EpisodePlanInput {
@@ -759,13 +805,14 @@ impl RetrievalStore {
             &fingerprint,
             config,
         )?;
-        if validate_episode_materialization(
+        self.validate_aggregate_derived_integrity(&transaction)?;
+        if self.validate_episode_materialization_phase(
             &transaction,
-            &self.root,
             session_id,
             &spec,
             &fingerprint,
             false,
+            AggregateAuditPhase::MaterializeFinal,
         )? != AggregateReadiness::Ready
         {
             return Err(RetrievalError::CorruptIndex(format!(
@@ -814,6 +861,87 @@ impl RetrievalStore {
         if let Some(hook) = hook {
             hook(point);
         }
+    }
+
+    #[cfg(test)]
+    fn set_aggregate_audit_test_hook(&self, hook: Option<AggregateAuditHook>) {
+        *self
+            .test_hooks
+            .aggregate_audit
+            .lock()
+            .expect("test hook mutex must not be poisoned") = hook;
+    }
+
+    #[cfg(test)]
+    fn run_aggregate_audit_test_hook(&self, point: AggregateAuditHookPoint) {
+        let hook = self
+            .test_hooks
+            .aggregate_audit
+            .lock()
+            .expect("test hook mutex must not be poisoned")
+            .clone();
+        if let Some(hook) = hook {
+            hook(point);
+        }
+    }
+
+    fn validate_aggregate_derived_integrity(&self, connection: &Connection) -> RetrievalResult<()> {
+        #[cfg(test)]
+        self.run_aggregate_audit_test_hook(AggregateAuditHookPoint::DerivedIntegrity);
+        validate_full_derived_integrity(connection)
+    }
+
+    fn validate_episode_materialization_phase(
+        &self,
+        connection: &Connection,
+        session_id: &str,
+        spec: &VectorIndexSpec,
+        fingerprint: &str,
+        require_complete_message_embeddings: bool,
+        phase: AggregateAuditPhase,
+    ) -> RetrievalResult<AggregateReadiness> {
+        #[cfg(test)]
+        self.run_aggregate_audit_test_hook(AggregateAuditHookPoint::Materialization {
+            session_id: session_id.to_owned(),
+            phase,
+        });
+        #[cfg(not(test))]
+        let _ = phase;
+        validate_episode_materialization(
+            connection,
+            &self.root,
+            session_id,
+            spec,
+            fingerprint,
+            require_complete_message_embeddings,
+        )
+    }
+
+    fn aggregate_readiness_by_session(
+        &self,
+        connection: &Connection,
+        sessions: &HashSet<String>,
+        spec: &VectorIndexSpec,
+        fingerprint: &str,
+        require_complete_message_embeddings: bool,
+        phase: AggregateAuditPhase,
+    ) -> RetrievalResult<HashMap<String, AggregateReadiness>> {
+        let mut ordered_sessions = sessions.iter().collect::<Vec<_>>();
+        ordered_sessions.sort();
+        ordered_sessions
+            .into_iter()
+            .map(|session_id| {
+                self.validate_episode_materialization_phase(
+                    connection,
+                    session_id,
+                    spec,
+                    fingerprint,
+                    require_complete_message_embeddings,
+                    phase,
+                )
+                .map(|readiness| (session_id.clone(), readiness))
+            })
+            .collect()
     }
 
     pub fn get_session(&self, session_id: &str) -> RetrievalResult<IndexedSession> {
@@ -2311,7 +2439,6 @@ fn validate_episode_materialization(
     fingerprint: &str,
     require_complete_message_embeddings: bool,
 ) -> RetrievalResult<AggregateReadiness> {
-    validate_full_derived_integrity(connection)?;
     let materialization = connection
         .query_row(
             "SELECT m.source_session_sha256, m.ledger_snapshot_sha256,
@@ -2488,34 +2615,41 @@ fn validate_episode_materialization(
     Ok(AggregateReadiness::Ready)
 }
 
-fn validate_aggregate_embedding_ready(
+fn validate_aggregate_document_source(
     connection: &Connection,
-    root: &Path,
     document_id: &str,
     expected_session: &str,
     expected_source: &str,
-    spec: &VectorIndexSpec,
-    fingerprint: &str,
-) -> RetrievalResult<AggregateReadiness> {
-    let readiness = validate_episode_materialization(
-        connection,
-        root,
-        expected_session,
-        spec,
-        fingerprint,
-        true,
-    )?;
-    if readiness == AggregateReadiness::Stale {
-        return Ok(readiness);
-    }
-    let target = load_persisted_aggregate_document(connection, document_id, expected_session)
-        .map_err(|_| aggregate_corruption(format!("缺少 aggregate document {document_id}")))?;
-    if target.source_sha256 != expected_source {
+) -> RetrievalResult<()> {
+    let stored = connection
+        .query_row(
+            "SELECT session_id, granularity, source_sha256
+             FROM memory_documents WHERE document_id=?1",
+            [document_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| {
+            aggregate_corruption(format!(
+                "读取 aggregate document {document_id} 失败：{error}"
+            ))
+        })?
+        .ok_or_else(|| aggregate_corruption(format!("缺少 aggregate document {document_id}")))?;
+    if stored.0 != expected_session
+        || !matches!(stored.1.as_str(), "episode" | "session")
+        || stored.2 != expected_source
+    {
         return Err(aggregate_corruption(format!(
             "aggregate document {document_id} 与预期来源不匹配"
         )));
     }
-    Ok(AggregateReadiness::Ready)
+    Ok(())
 }
 
 fn validate_aggregate_raw_source(
@@ -4673,6 +4807,115 @@ CREATE INDEX memory_boundary_suggestions_session_event
             compatible.len()
         );
         assert_eq!(fs::read(path).unwrap(), source_before);
+    }
+
+    #[test]
+    fn episode_aggregate_readiness_audit_scales_with_unique_sessions() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let mut first = store
+            .create("model", "http://localhost", None, Default::default(), false)
+            .unwrap();
+        append_complete_turn(&mut first, "first user", "first assistant", "");
+        let first_path = store.save(&mut first).unwrap();
+        store.retrieval().sync_session(&first, &first_path).unwrap();
+        let mut second = store
+            .create("model", "http://localhost", None, Default::default(), false)
+            .unwrap();
+        append_complete_turn(&mut second, "second user", "second assistant", "");
+        let second_path = store.save(&mut second).unwrap();
+        store
+            .retrieval()
+            .sync_session(&second, &second_path)
+            .unwrap();
+
+        let config = aggregate_memory_config();
+        let (spec, first_report) = materialize_with_canonical_embeddings(&store, &first, &config);
+        let (_, second_report) = materialize_with_canonical_embeddings(&store, &second, &config);
+        let mut writes = aggregate_writes(&store, &first_report, &spec, 101.0);
+        writes.extend(aggregate_writes(&store, &second_report, &spec, 201.0));
+        assert_eq!(writes.len(), 4, "two documents per aggregate session");
+
+        let expected_sessions = [first.id.clone(), second.id.clone()]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let hook_observations = Arc::clone(&observations);
+        store
+            .retrieval()
+            .set_aggregate_audit_test_hook(Some(Arc::new(move |point| {
+                hook_observations.lock().unwrap().push(point);
+            })));
+
+        store.retrieval().upsert_embeddings(&spec, &writes).unwrap();
+        let write_observations = observations.lock().unwrap().clone();
+        assert_eq!(
+            write_observations
+                .iter()
+                .filter(|point| matches!(point, AggregateAuditHookPoint::DerivedIntegrity))
+                .count(),
+            1,
+            "the full projection audit runs once for the write transaction"
+        );
+        for phase in [
+            AggregateAuditPhase::PreWrite,
+            AggregateAuditPhase::FinalWrite,
+        ] {
+            let sessions = write_observations
+                .iter()
+                .filter_map(|point| match point {
+                    AggregateAuditHookPoint::Materialization {
+                        session_id,
+                        phase: observed,
+                    } if *observed == phase => Some(session_id.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(sessions.len(), expected_sessions.len());
+            assert_eq!(
+                sessions
+                    .into_iter()
+                    .collect::<std::collections::BTreeSet<_>>(),
+                expected_sessions,
+                "one cached readiness computation per session in {phase:?}"
+            );
+        }
+
+        observations.lock().unwrap().clear();
+        let compatible = store.retrieval().compatible_embeddings(&spec).unwrap();
+        assert!(writes.iter().all(|write| {
+            compatible
+                .iter()
+                .any(|embedding| embedding.document_id == write.document_id)
+        }));
+        let read_observations = observations.lock().unwrap().clone();
+        assert_eq!(
+            read_observations
+                .iter()
+                .filter(|point| matches!(point, AggregateAuditHookPoint::DerivedIntegrity))
+                .count(),
+            1,
+            "the full projection audit runs once for the read operation"
+        );
+        let read_sessions = read_observations
+            .iter()
+            .filter_map(|point| match point {
+                AggregateAuditHookPoint::Materialization {
+                    session_id,
+                    phase: AggregateAuditPhase::Read,
+                } => Some(session_id.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(read_sessions.len(), expected_sessions.len());
+        assert_eq!(
+            read_sessions
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected_sessions,
+            "readiness recomputation follows unique sessions, not four aggregate documents"
+        );
+        store.retrieval().set_aggregate_audit_test_hook(None);
     }
 
     #[test]
