@@ -6485,6 +6485,10 @@ fn is_confirmation_separator(character: char) -> bool {
         )
 }
 
+fn has_interrogative_token_boundary(tail: &str) -> bool {
+    tail.chars().next().is_some_and(is_confirmation_separator)
+}
+
 fn after_optional_confirmation_cue(value: &str) -> [&str; 2] {
     let leading = value.trim_start_matches(is_confirmation_separator);
     let after_optional_cue = [
@@ -6523,7 +6527,7 @@ fn starts_with_plain_interrogative(value: &str) -> bool {
             .any(|auxiliary| {
                 candidate
                     .strip_prefix(auxiliary)
-                    .is_some_and(|tail| tail.chars().next().is_some_and(char::is_whitespace))
+                    .is_some_and(has_interrogative_token_boundary)
             })
         })
 }
@@ -6554,7 +6558,7 @@ fn starts_with_contracted_interrogative(value: &str) -> bool {
             .any(|auxiliary| {
                 candidate
                     .strip_prefix(auxiliary)
-                    .is_some_and(|tail| tail.chars().next().is_some_and(char::is_whitespace))
+                    .is_some_and(has_interrogative_token_boundary)
             })
         })
 }
@@ -6568,11 +6572,9 @@ fn starts_with_wh_interrogative(value: &str) -> bool {
             ]
             .iter()
             .any(|word| {
-                candidate.strip_prefix(word).is_some_and(|tail| {
-                    tail.chars().next().is_some_and(|ch| {
-                        ch.is_whitespace() || matches!(ch, ',' | '，' | ':' | '：' | ';' | '；')
-                    })
-                })
+                candidate
+                    .strip_prefix(word)
+                    .is_some_and(has_interrogative_token_boundary)
             })
         })
 }
@@ -9520,6 +9522,24 @@ mod tests {
                 "Yes, {interrogative} Alice lives in Paris"
             )));
         }
+        for separator in [
+            " ", ",", "，", ":", "：", ";", "；", "(", ")", "（", "）", "[", "]", "【", "】", "-",
+            "–", "—",
+        ] {
+            for interrogative in ["does", "doesn't", "where"] {
+                assert!(evidence_has_invalid_context(&format!(
+                    "Yes, {interrogative}{separator}Alice live in Paris"
+                )));
+            }
+        }
+        for concatenated in [
+            "doesAlice live in Paris",
+            "doesn'tAlice live in Paris",
+            "whereabouts Alice lives in Paris",
+            "wholesale Alice lives in Paris",
+        ] {
+            assert!(!evidence_has_invalid_context(concatenated));
+        }
         assert!(evidence_has_invalid_context(
             "Yes—could Alice be living in Paris"
         ));
@@ -9545,6 +9565,9 @@ mod tests {
             ("Yes, `Alice lives in Paris`", "lives in"),
             ("Yes, who says Alice lives in Paris", "lives in"),
             ("Yes, does Alice live in Paris", "live in"),
+            ("Yes, does—Alice live in Paris", "live in"),
+            ("Yes, doesn't—Alice live in Paris", "live in"),
+            ("Yes, where—does Alice live in Paris", "live in"),
             ("Yes—could Alice be living in Paris", "be living in"),
         ] {
             let root = tempfile::tempdir().unwrap();
@@ -9672,6 +9695,7 @@ mod tests {
             ("Yes, ‘Alice lives in Paris’", "lives in", 2),
             ("Yes, who says Alice lives in Paris", "lives in", 2),
             ("Yes, does Alice live in Paris", "live in", 0),
+            ("Yes, does—Alice live in Paris", "live in", 0),
             ("Yes—could Alice be living in Paris", "be living in", 0),
         ] {
             let root = tempfile::tempdir().unwrap();
