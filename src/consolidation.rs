@@ -9979,45 +9979,202 @@ mod tests {
 
     #[test]
     fn mention_episode_soft_vote_uses_stored_resolved_history_only() {
+        let expected = [
+            "entity_set_vote",
+            "model_vote",
+            "two_vote_boundary",
+            "current_status_isolated",
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+        let mut seen = std::collections::BTreeSet::new();
         let root = tempfile::tempdir().unwrap();
         let (store, mut session) = new_session(root.path());
-        push_complete_at(&mut session, "Alice", None, "2026-01-01T00:00:00Z");
+        push_complete_at(
+            &mut session,
+            "Alice opens the project.",
+            Some("Acknowledged."),
+            "2026-01-01T00:00:00Z",
+        );
+        push_complete_at(
+            &mut session,
+            "Bob reviews the budget.",
+            Some("Acknowledged."),
+            "2026-01-01T00:01:00Z",
+        );
         let batch = next_batch(&store, &mut session);
+        let alice = batch
+            .events
+            .iter()
+            .find(|event| event.content == "Alice opens the project.")
+            .unwrap();
+        let bob = batch
+            .events
+            .iter()
+            .find(|event| event.content == "Bob reviews the budget.")
+            .unwrap();
         let output = StructuredConsolidationOutput {
-            entities: vec![new_entity_output(
-                "local_alice",
-                "Alice",
-                full_quote(&batch.events[0]),
-            )],
+            entities: vec![
+                new_entity_output("local_alice", "Alice", quote_nth(alice, "Alice", 0)),
+                new_entity_output("local_bob", "Bob", quote_nth(bob, "Bob", 0)),
+            ],
             claims: vec![],
-            boundaries: vec![],
+            boundaries: vec![ConsolidationBoundaryOutput {
+                before_event_id: bob.event_id.clone(),
+                reason: BoundarySuggestionReason::ModelTopicShift,
+                evidence: vec![full_quote(bob)],
+            }],
         };
         apply_output(&store, &batch, &empty_candidates(), &output).unwrap();
         let config = episode_memory_config();
-        store
+        let plan_input = store
             .retrieval()
-            .materialize_episode_documents(&session.id, &config)
+            .episode_plan_input_for_test(&session.id, &config)
             .unwrap();
+        let report = crate::episode::plan_episodes(&plan_input).unwrap();
+        let target = report
+            .boundary_decisions
+            .iter()
+            .find(|decision| decision.before_event_id == bob.event_id)
+            .unwrap();
+        assert_eq!(target.soft_true_votes, 2);
+        assert!(target.is_boundary);
+        assert_eq!(
+            target
+                .soft_signals
+                .iter()
+                .find(|signal| signal.name == "entity_jaccard_distance")
+                .unwrap()
+                .state,
+            EpisodeSignalState::True
+        );
+        seen.insert("entity_set_vote");
+        assert_eq!(
+            target
+                .soft_signals
+                .iter()
+                .find(|signal| signal.name == "model_topic_shift")
+                .unwrap()
+                .state,
+            EpisodeSignalState::True
+        );
+        seen.insert("model_vote");
+        let mut only_entity = plan_input.clone();
+        only_entity.suggestions.clear();
+        assert!(
+            !crate::episode::plan_episodes(&only_entity)
+                .unwrap()
+                .boundary_decisions
+                .iter()
+                .find(|decision| decision.before_event_id == bob.event_id)
+                .unwrap()
+                .is_boundary
+        );
+        let mut only_model = plan_input.clone();
+        only_model
+            .messages
+            .iter_mut()
+            .find(|message| message.member.event_id == bob.event_id)
+            .unwrap()
+            .resolved_entity_ids
+            .clear();
+        assert!(
+            !crate::episode::plan_episodes(&only_model)
+                .unwrap()
+                .boundary_decisions
+                .iter()
+                .find(|decision| decision.before_event_id == bob.event_id)
+                .unwrap()
+                .is_boundary
+        );
+        let materialized = materialize_episodes(&store, &session.id).unwrap();
+        assert_eq!(materialized, report);
+        assert_eq!(materialized.episode_documents.len(), 2);
         let connection = Connection::open(store.retrieval().index_path()).unwrap();
-        connection
-            .execute("UPDATE memory_entities SET disambiguation='pending'", [])
+        let persisted: crate::episode::EpisodeBoundaryDecision = connection
+            .query_row(
+                "SELECT decision_json FROM memory_episode_boundaries WHERE session_id=?1 AND before_event_id=?2",
+                params![session.id, bob.event_id],
+                |row| serde_json::from_str(&row.get::<_, String>(0)?).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                }),
+            )
+            .unwrap();
+        assert_eq!(persisted, *target);
+        let bob_entity_id: String = connection
+            .query_row(
+                "SELECT entity_id FROM memory_entity_mentions WHERE event_id=?1 AND entity_status='resolved'",
+                [&bob.event_id],
+                |row| row.get(0),
+            )
             .unwrap();
         drop(connection);
-        store
+        seen.insert("two_vote_boundary");
+
+        let entity_sets_before = store
             .retrieval()
-            .materialize_episode_documents(&session.id, &config)
+            .episode_entity_sets_for_test(&session.id, &config)
             .unwrap();
+        assert!(
+            entity_sets_before
+                .iter()
+                .find(|(event_id, _)| event_id == &alice.event_id)
+                .is_some_and(|(_, entities)| !entities.contains(&bob_entity_id))
+        );
+        assert!(
+            entity_sets_before
+                .iter()
+                .find(|(event_id, _)| event_id == &bob.event_id)
+                .is_some_and(|(_, entities)| entities.contains(&bob_entity_id))
+        );
         let connection = Connection::open(store.retrieval().index_path()).unwrap();
+        connection
+            .execute(
+                "UPDATE memory_entities SET disambiguation='pending' WHERE entity_id=?1",
+                [&bob_entity_id],
+            )
+            .unwrap();
+        drop(connection);
+        let rematerialized = materialize_episodes(&store, &session.id).unwrap();
+        let entity_sets_after = store
+            .retrieval()
+            .episode_entity_sets_for_test(&session.id, &config)
+            .unwrap();
+        assert_eq!(entity_sets_after, entity_sets_before);
         assert_eq!(
-            connection
+            rematerialized.plan_input_sha256,
+            materialized.plan_input_sha256
+        );
+        assert_eq!(
+            rematerialized.boundary_decisions,
+            materialized.boundary_decisions
+        );
+        let connection = Connection::open(store.retrieval().index_path()).unwrap();
+        let current_status: String = connection
+            .query_row(
+                "SELECT disambiguation FROM memory_entities WHERE entity_id=?1",
+                [&bob_entity_id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert_eq!(current_status, "pending");
+        assert_eq!(
+            Connection::open(store.retrieval().index_path())
+                .unwrap()
                 .query_row(
-                    "SELECT entity_status FROM memory_entity_mentions",
-                    [],
-                    |row| row.get::<_, String>(0)
+                    "SELECT entity_status FROM memory_entity_mentions WHERE entity_id=?1",
+                    [&bob_entity_id],
+                    |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
             "resolved"
         );
+        seen.insert("current_status_isolated");
+        assert_eq!(seen, expected);
     }
 
     #[test]

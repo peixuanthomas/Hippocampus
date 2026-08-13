@@ -906,6 +906,34 @@ impl RetrievalStore {
     }
 
     #[cfg(test)]
+    pub(crate) fn episode_plan_input_for_test(
+        &self,
+        session_id: &str,
+        config: &MemoryConfig,
+    ) -> RetrievalResult<EpisodePlanInput> {
+        config
+            .validate()
+            .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+        let spec = VectorIndexSpec::from_config(config)
+            .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+        let fingerprint = spec
+            .fingerprint()
+            .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+        let connection = self.open_connection()?;
+        let session = self.get_session_from_connection(&connection, session_id)?;
+        let (messages, watermark, suggestions, _) =
+            load_episode_snapshot(&connection, session_id, &spec, &fingerprint)?;
+        Ok(EpisodePlanInput {
+            session_id: session_id.to_owned(),
+            source_session_sha256: session.source_sha256,
+            gap_minutes: config.episode_gap_minutes,
+            consolidation_watermark: watermark,
+            messages,
+            suggestions,
+        })
+    }
+
+    #[cfg(test)]
     pub(crate) fn set_consolidation_test_hook(&self, hook: Option<ConsolidationHook>) {
         *self
             .test_hooks
