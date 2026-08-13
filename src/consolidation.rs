@@ -8908,7 +8908,7 @@ mod tests {
             entities: vec![new_entity_output(
                 "local_alice",
                 "Alice",
-                full_quote(&batch.events[0]),
+                quote_nth(&batch.events[0], "Alice", 0),
             )],
             claims: vec![],
             boundaries: vec![],
@@ -8994,44 +8994,138 @@ mod tests {
     fn mention_projection_combines_exact_occurrences_and_excludes_auxiliary_spans() {
         let root = tempfile::tempdir().unwrap();
         let (store, mut session) = new_session(root.path());
+        push_complete_at(&mut session, "王明", None, "2026-01-01T00:00:00Z");
+        let first = next_batch(&store, &mut session);
+        apply_output(
+            &store,
+            &first,
+            &empty_candidates(),
+            &StructuredConsolidationOutput {
+                entities: vec![new_entity_output(
+                    "local_wang",
+                    "王明",
+                    quote_nth(&first.events[0], "王明", 0),
+                )],
+                claims: vec![],
+                boundaries: vec![],
+            },
+        )
+        .unwrap();
+        let candidates = store.retrieval().consolidation_candidates(8, 8).unwrap();
+        let alice = candidates.entities[0].entity_id.clone();
         push_complete_at(
             &mut session,
-            "Alice likes tea.",
+            "小明即王明。小明认识李雷。小明喜欢茶。",
             None,
-            "2026-01-01T00:00:00Z",
+            "2026-01-02T00:00:00Z",
         );
         let batch = next_batch(&store, &mut session);
         let event = &batch.events[0];
+        assert_eq!(event.content, "小明即王明。小明认识李雷。小明喜欢茶。");
+        let alias = quote_nth(event, "小明", 0);
+        let proof = quote_nth(event, "小明即王明。", 0);
+        let existing = ConsolidatedEntityOutput {
+            local_id: "local_alias".into(),
+            name: "小明".into(),
+            kind: MemoryEntityKind::Person,
+            resolution: EntityResolution::Existing,
+            disambiguation: EntityDisambiguation::Resolved,
+            basis: EntityResolutionBasis::ExplicitAlias,
+            existing_entity_id: Some(alice.clone()),
+            name_evidence: alias.clone(),
+            existing_identity_evidence: Some(quote_nth(event, "王明", 0)),
+            resolution_evidence: Some(proof.clone()),
+            aliases: vec![EntityAliasOutput {
+                text: "小明".into(),
+                kind: MemoryAliasKind::ExplicitAlias,
+                stable_identifier_kind: None,
+                evidence: alias.clone(),
+                proof_evidence: proof.clone(),
+            }],
+        };
+        let bob = new_entity_output("local_bob", "李雷", quote_nth(event, "李雷", 0));
+        let entity_claim = ConsolidatedClaimOutput {
+            local_id: "local_knows".into(),
+            subject_ref: "local_alias".into(),
+            predicate_key: "relation.knows".into(),
+            object: ConsolidatedClaimObject {
+                kind: ConsolidationClaimObjectKind::Entity,
+                text: None,
+                entity_ref: Some("local_bob".into()),
+                span: None,
+            },
+            polarity: ClaimPolarity::Assert,
+            cardinality: ClaimCardinality::Single,
+            certainty: ClaimCertainty::Certain,
+            disposition: ClaimDisposition::New,
+            replaces_claim_ids: vec![],
+            conflicts_with_claim_ids: vec![],
+            event_time: None,
+            valid_from: None,
+            valid_to: None,
+            evidence: vec![ConsolidationClaimEvidence {
+                kind: ConsolidationEvidenceKind::Assertion,
+                quote: quote_nth(event, "小明认识李雷。", 0),
+                subject_span: quote_nth(event, "小明", 1),
+                relation_span: quote_nth(event, "认识", 0),
+                object_span: quote_nth(event, "李雷", 0),
+                speech_act_span: None,
+            }],
+        };
+        let text_claim = text_claim_output(
+            "local_tea",
+            "local_alias",
+            "preference.drink",
+            "茶",
+            quote_nth(event, "小明", 2),
+            quote_nth(event, "喜欢", 0),
+            quote_nth(event, "茶", 0),
+            quote_nth(event, "小明喜欢茶。", 0),
+        );
         let output = StructuredConsolidationOutput {
-            entities: vec![new_entity_output(
-                "local_alice",
-                "Alice",
-                quote_nth(event, "Alice", 0),
-            )],
-            claims: vec![text_claim_output(
-                "local_tea",
-                "local_alice",
-                "preference.drink",
-                "tea",
-                quote_nth(event, "Alice", 0),
-                quote_nth(event, "likes", 0),
-                quote_nth(event, "tea", 0),
-                full_quote(event),
-            )],
+            entities: vec![existing, bob],
+            claims: vec![entity_claim, text_claim],
             boundaries: vec![],
         };
-        let report = apply_output(&store, &batch, &empty_candidates(), &output).unwrap();
-        assert_eq!(report.mentions_created, 2);
+        let report = apply_output(&store, &batch, &candidates, &output).unwrap();
+        assert_eq!(report.mentions_created, 6);
         let connection = Connection::open(store.retrieval().index_path()).unwrap();
-        let kinds = connection
-            .prepare("SELECT mention_kind FROM memory_entity_mentions ORDER BY mention_kind")
+        let rows = connection
+            .prepare("SELECT mention_kind,source_record_id,entity_id,entity_status,event_id,sequence,role,start_char,end_char,content_sha256,created_at FROM memory_entity_mentions WHERE batch_key=?1 ORDER BY mention_kind,source_record_id")
             .unwrap()
-            .query_map([], |row| row.get::<_, String>(0))
+            .query_map([&batch.batch_key], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, i64>(5)?, row.get::<_, String>(6)?, row.get::<_, i64>(7)?, row.get::<_, i64>(8)?, row.get::<_, String>(9)?, row.get::<_, String>(10)?)))
             .unwrap()
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
-        assert_eq!(kinds, vec!["claim_subject", "entity_name"]);
-        assert_eq!(connection.query_row("SELECT count(*) FROM memory_entity_mentions WHERE start_char=(SELECT instr(content,'likes')-1 FROM events LIMIT 1)", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+        assert_eq!(rows.len(), 6);
+        assert!(rows.iter().all(|row| row.3 == "resolved"
+            && row.4 == event.event_id
+            && row.5 == event.sequence as i64
+            && row.6 == "user"
+            && row.10 == applied_attempt(&batch, &candidates, &output).completed_at));
+        assert!(
+            rows.iter()
+                .any(|row| row.0 == "entity_name" && row.1 == "local_alias" && row.2 == alice)
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.0 == "alias" && row.1.starts_with("alias_") && row.2 == alice)
+        );
+        assert_eq!(
+            rows.iter().filter(|row| row.0 == "claim_subject").count(),
+            2
+        );
+        assert_eq!(rows.iter().filter(|row| row.0 == "claim_object").count(), 1);
+        for span in [
+            proof,
+            quote_nth(event, "王明", 0),
+            quote_nth(event, "认识", 0),
+            quote_nth(event, "茶", 0),
+        ] {
+            assert!(!rows.iter().any(|row| row.7 == span.start_char as i64
+                && row.8 == span.end_char as i64
+                && matches!(row.0.as_str(), "alias" | "claim_subject" | "claim_object")));
+        }
     }
 
     #[test]
