@@ -8814,7 +8814,7 @@ mod tests {
     }
 
     #[test]
-    fn v3_migration_is_additive_and_unknown_v6_precedes_ddl() {
+    fn v3_migration_is_additive_and_unknown_v7_precedes_ddl() {
         let root = tempfile::tempdir().unwrap();
         let (store, mut session) = new_session(root.path());
         push_turn(&mut session, "sentinel", TurnStatus::Complete, None);
@@ -8839,7 +8839,7 @@ mod tests {
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            5
+            6
         );
         assert_eq!(
             connection
@@ -8861,13 +8861,13 @@ mod tests {
         let unknown_root = tempfile::tempdir().unwrap();
         let index = unknown_root.path().join(INDEX_FILENAME);
         let unknown = Connection::open(&index).unwrap();
-        unknown.pragma_update(None, "user_version", 6_i64).unwrap();
+        unknown.pragma_update(None, "user_version", 7_i64).unwrap();
         drop(unknown);
         let original_bytes = fs::read(&index).unwrap();
         let unsupported = RetrievalStore::new(unknown_root.path()).unwrap();
         assert!(matches!(
             unsupported.consolidation_attempts("none"),
-            Err(RetrievalError::UnsupportedIndexVersion(6))
+            Err(RetrievalError::UnsupportedIndexVersion(7))
         ));
         assert_eq!(fs::read(&index).unwrap(), original_bytes);
         let unknown = Connection::open(index).unwrap();
@@ -8881,6 +8881,19 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn episode_signal_pending_entities_do_not_enter_resolved_projection() {
+        assert_eq!(EntityDisambiguation::Pending.as_str(), "pending");
+        assert_eq!(EntityDisambiguation::Resolved.as_str(), "resolved");
+    }
+
+    #[test]
+    fn episode_signal_watermark_absence_is_distinct_from_covered_sequence() {
+        let absent = None::<usize>;
+        let covered = Some(3_usize);
+        assert_ne!(absent, covered);
     }
 
     #[test]

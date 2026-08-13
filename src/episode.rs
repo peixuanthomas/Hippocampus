@@ -129,6 +129,10 @@ pub fn plan_episodes(input: &EpisodePlanInput) -> Result<EpisodeMaterializationR
             || message.member.span.end_char == 0
             || !is_sha256(&message.member.content_sha256)
             || !matches!(message.member.role, EventRole::User | EventRole::Assistant)
+            || message
+                .embedding
+                .as_ref()
+                .is_some_and(|values| values.iter().any(|value| !value.is_finite()))
     }) {
         return Err("episode plan contains a non-message or invalid direct member".into());
     }
@@ -281,7 +285,17 @@ fn decide_boundary(
         .iter()
         .any(|signal| signal.state == EpisodeSignalState::True)
         || votes >= SOFT_BOUNDARY_VOTE_THRESHOLD;
-    let input_sha256 = decision_hash(&current.member.event_id, &gap, &hard_signals, &soft_signals);
+    let input_sha256 = decision_hash(
+        input,
+        current,
+        previous_eligible,
+        previous_user,
+        suggestions,
+        gap,
+        &hard_signals,
+        &soft_signals,
+        votes,
+    );
     EpisodeBoundaryDecision {
         before_event_id: current.member.event_id.clone(),
         is_boundary: boundary,
@@ -322,9 +336,7 @@ fn gap_signal(
             EpisodeSignalState::Abstain,
         );
     }
-    let threshold = i64::try_from(gap_minutes)
-        .unwrap_or(i64::MAX)
-        .saturating_mul(60);
+    let threshold = i64::try_from(gap_minutes).unwrap_or(i64::MAX / 60) * 60;
     if seconds > threshold {
         (
             EpisodeGapState::GreaterThanThreshold,
@@ -468,74 +480,238 @@ fn plan_hash(
     messages: &[EpisodeInputMessage],
     suggestions: &BTreeMap<String, BTreeSet<String>>,
 ) -> String {
-    let mut hasher = Sha256::new();
-    hash_part(&mut hasher, b"hippocampus-episode-plan-input-v1");
-    hash_part(&mut hasher, input.session_id.as_bytes());
-    hash_part(&mut hasher, input.source_session_sha256.as_bytes());
-    hash_part(&mut hasher, &input.gap_minutes.to_le_bytes());
-    match input.consolidation_watermark {
-        Some(value) => {
-            hash_part(&mut hasher, b"watermark");
-            hash_part(&mut hasher, &value.to_le_bytes());
-        }
-        None => hash_part(&mut hasher, b"no-watermark"),
-    }
-    for message in messages {
-        hash_part(&mut hasher, message.member.document_id.as_bytes());
-        hash_part(&mut hasher, message.member.event_id.as_bytes());
-        hash_part(&mut hasher, &message.member.sequence.to_le_bytes());
-        hash_part(&mut hasher, message.member.role.as_str().as_bytes());
-        hash_part(
-            &mut hasher,
-            &u64::try_from(message.member.span.start_char)
-                .unwrap_or(u64::MAX)
-                .to_le_bytes(),
-        );
-        hash_part(
-            &mut hasher,
-            &u64::try_from(message.member.span.end_char)
-                .unwrap_or(u64::MAX)
-                .to_le_bytes(),
-        );
-        hash_part(&mut hasher, message.member.content_sha256.as_bytes());
-        hash_part(&mut hasher, message.created_at.as_bytes());
-        for entity in &message.resolved_entity_ids {
-            hash_part(&mut hasher, entity.as_bytes());
-        }
-        match &message.embedding {
-            Some(values) => {
-                hash_part(&mut hasher, b"embedding");
-                for value in values {
-                    hash_part(&mut hasher, &value.to_bits().to_le_bytes());
-                }
-            }
-            None => hash_part(&mut hasher, b"no-embedding"),
-        }
-    }
-    for (event, reasons) in suggestions {
-        hash_part(&mut hasher, event.as_bytes());
-        for reason in reasons {
-            hash_part(&mut hasher, reason.as_bytes());
-        }
-    }
-    format!("{:x}", hasher.finalize())
+    canonical_input_hash(
+        b"hippocampus-episode-plan-input-v2",
+        &input.session_id,
+        Some(&input.source_session_sha256),
+        input.gap_minutes,
+        input.consolidation_watermark,
+        messages,
+        suggestions,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decision_hash(
-    event: &str,
-    gap: &EpisodeGapState,
+    input: &EpisodePlanInput,
+    current: &EpisodeInputMessage,
+    previous_eligible: Option<&EpisodeInputMessage>,
+    previous_user: Option<&EpisodeInputMessage>,
+    suggestions: Option<&BTreeSet<String>>,
+    gap: EpisodeGapState,
     hard: &[EpisodeSignal],
     soft: &[EpisodeSignal],
+    votes: usize,
 ) -> String {
-    let mut hasher = Sha256::new();
-    hash_part(&mut hasher, b"hippocampus-episode-decision-v1");
-    hash_part(&mut hasher, event.as_bytes());
-    hash_part(&mut hasher, format!("{gap:?}").as_bytes());
-    for signal in hard.iter().chain(soft) {
-        hash_part(&mut hasher, signal.name.as_bytes());
-        hash_part(&mut hasher, format!("{:?}", signal.state).as_bytes());
+    let mut encoder = CanonicalEncoder::new(b"hippocampus-episode-boundary-decision-v2");
+    encoder.text("session_id", &input.session_id);
+    encoder.u64("gap_minutes", input.gap_minutes);
+    encoder.option_u64("watermark", input.consolidation_watermark);
+    encoder.message("current", current);
+    encoder.option_message("previous_eligible", previous_eligible);
+    encoder.option_message("previous_user", previous_user);
+    encoder.string_set("suggestion_reasons", suggestions);
+    encoder.byte("output_gap", gap_tag(gap));
+    encoder.signals("hard", hard);
+    encoder.signals("soft", soft);
+    encoder.u64(
+        "soft_true_votes",
+        u64::try_from(votes).expect("usize fits u64"),
+    );
+    encoder.finish()
+}
+
+pub(crate) fn ledger_snapshot_hash(
+    session_id: &str,
+    watermark: Option<u64>,
+    messages: &[EpisodeInputMessage],
+    suggestions: &[EpisodeBoundarySuggestion],
+) -> String {
+    let mut ordered = messages.to_vec();
+    ordered.sort_by(|left, right| {
+        left.member
+            .sequence
+            .cmp(&right.member.sequence)
+            .then_with(|| left.member.event_id.cmp(&right.member.event_id))
+    });
+    let suggestions = dedupe_suggestions(suggestions);
+    canonical_input_hash(
+        b"hippocampus-episode-ledger-snapshot-v2",
+        session_id,
+        None,
+        0,
+        watermark,
+        &ordered,
+        &suggestions,
+    )
+}
+
+fn canonical_input_hash(
+    domain: &[u8],
+    session_id: &str,
+    source_hash: Option<&str>,
+    gap_minutes: u64,
+    watermark: Option<u64>,
+    messages: &[EpisodeInputMessage],
+    suggestions: &BTreeMap<String, BTreeSet<String>>,
+) -> String {
+    let mut encoder = CanonicalEncoder::new(domain);
+    encoder.text("session_id", session_id);
+    encoder.option_text("source_session_sha256", source_hash);
+    encoder.u64("gap_minutes", gap_minutes);
+    encoder.option_u64("watermark", watermark);
+    encoder.messages("messages", messages);
+    encoder.suggestions("suggestions", suggestions);
+    encoder.finish()
+}
+
+struct CanonicalEncoder(Sha256);
+impl CanonicalEncoder {
+    fn new(domain: &[u8]) -> Self {
+        let mut hash = Sha256::new();
+        hash_part(&mut hash, domain);
+        Self(hash)
     }
-    format!("{:x}", hasher.finalize())
+    fn field(&mut self, tag: &str, value: &[u8]) {
+        hash_part(&mut self.0, tag.as_bytes());
+        hash_part(&mut self.0, value);
+    }
+    fn byte(&mut self, tag: &str, value: u8) {
+        self.field(tag, &[value]);
+    }
+    fn u64(&mut self, tag: &str, value: u64) {
+        self.field(tag, &value.to_le_bytes());
+    }
+    fn text(&mut self, tag: &str, value: &str) {
+        self.field(tag, value.as_bytes());
+    }
+    fn option_u64(&mut self, tag: &str, value: Option<u64>) {
+        self.byte(&format!("{tag}_present"), u8::from(value.is_some()));
+        if let Some(value) = value {
+            self.u64(tag, value);
+        }
+    }
+    fn option_text(&mut self, tag: &str, value: Option<&str>) {
+        self.byte(&format!("{tag}_present"), u8::from(value.is_some()));
+        if let Some(value) = value {
+            self.text(tag, value);
+        }
+    }
+    fn member(&mut self, tag: &str, member: &EpisodeMember) {
+        self.text(&format!("{tag}.document_id"), &member.document_id);
+        self.text(&format!("{tag}.event_id"), &member.event_id);
+        self.u64(&format!("{tag}.sequence"), member.sequence);
+        self.byte(&format!("{tag}.role"), role_tag(member.role));
+        self.text(&format!("{tag}.span.event_id"), &member.span.event_id);
+        self.u64(
+            &format!("{tag}.span.start"),
+            u64::try_from(member.span.start_char).expect("usize fits u64"),
+        );
+        self.u64(
+            &format!("{tag}.span.end"),
+            u64::try_from(member.span.end_char).expect("usize fits u64"),
+        );
+        self.text(&format!("{tag}.content_sha256"), &member.content_sha256);
+    }
+    fn message(&mut self, tag: &str, message: &EpisodeInputMessage) {
+        self.member(tag, &message.member);
+        self.text(&format!("{tag}.created_at"), &message.created_at);
+        self.u64(
+            &format!("{tag}.entities.count"),
+            u64::try_from(message.resolved_entity_ids.len()).expect("usize fits u64"),
+        );
+        for entity in &message.resolved_entity_ids {
+            self.text(&format!("{tag}.entity"), entity);
+        }
+        self.byte(
+            &format!("{tag}.embedding.present"),
+            u8::from(message.embedding.is_some()),
+        );
+        if let Some(values) = &message.embedding {
+            self.u64(
+                &format!("{tag}.embedding.count"),
+                u64::try_from(values.len()).expect("usize fits u64"),
+            );
+            for value in values {
+                self.field(
+                    &format!("{tag}.embedding.value"),
+                    &value.to_bits().to_le_bytes(),
+                );
+            }
+        }
+    }
+    fn option_message(&mut self, tag: &str, message: Option<&EpisodeInputMessage>) {
+        self.byte(&format!("{tag}.present"), u8::from(message.is_some()));
+        if let Some(message) = message {
+            self.message(tag, message);
+        }
+    }
+    fn messages(&mut self, tag: &str, messages: &[EpisodeInputMessage]) {
+        self.u64(
+            &format!("{tag}.count"),
+            u64::try_from(messages.len()).expect("usize fits u64"),
+        );
+        for message in messages {
+            self.message(&format!("{tag}.item"), message);
+        }
+    }
+    fn string_set(&mut self, tag: &str, values: Option<&BTreeSet<String>>) {
+        let values = values.cloned().unwrap_or_default();
+        self.u64(
+            &format!("{tag}.count"),
+            u64::try_from(values.len()).expect("usize fits u64"),
+        );
+        for value in values {
+            self.text(&format!("{tag}.item"), &value);
+        }
+    }
+    fn suggestions(&mut self, tag: &str, suggestions: &BTreeMap<String, BTreeSet<String>>) {
+        self.u64(
+            &format!("{tag}.count"),
+            u64::try_from(suggestions.len()).expect("usize fits u64"),
+        );
+        for (event, reasons) in suggestions {
+            self.text(&format!("{tag}.event"), event);
+            self.string_set(&format!("{tag}.reasons"), Some(reasons));
+        }
+    }
+    fn signals(&mut self, tag: &str, signals: &[EpisodeSignal]) {
+        self.u64(
+            &format!("{tag}.count"),
+            u64::try_from(signals.len()).expect("usize fits u64"),
+        );
+        for signal in signals {
+            self.text(&format!("{tag}.name"), &signal.name);
+            self.byte(&format!("{tag}.state"), signal_tag(signal.state));
+        }
+    }
+    fn finish(self) -> String {
+        format!("{:x}", self.0.finalize())
+    }
+}
+fn role_tag(role: EventRole) -> u8 {
+    match role {
+        EventRole::System => 0,
+        EventRole::User => 1,
+        EventRole::Assistant => 2,
+    }
+}
+fn gap_tag(gap: EpisodeGapState) -> u8 {
+    match gap {
+        EpisodeGapState::FirstMessage => 0,
+        EpisodeGapState::GreaterThanThreshold => 1,
+        EpisodeGapState::EqualToThreshold => 2,
+        EpisodeGapState::BelowThreshold => 3,
+        EpisodeGapState::InvalidOrOutOfOrder => 4,
+        EpisodeGapState::MissingTimestamp => 5,
+    }
+}
+fn signal_tag(state: EpisodeSignalState) -> u8 {
+    match state {
+        EpisodeSignalState::True => 1,
+        EpisodeSignalState::False => 2,
+        EpisodeSignalState::Abstain => 3,
+    }
 }
 
 fn hash_fields(domain: &[u8], fields: &[&[u8]]) -> String {
@@ -622,6 +798,36 @@ mod tests {
         assert_ne!(
             short.episode_documents[0].source_sha256,
             long.episode_documents[0].source_sha256
+        );
+    }
+
+    #[test]
+    fn decision_and_ledger_hashes_cover_raw_inputs_canonically() {
+        let first = message(1, EventRole::User, "2026-01-01T00:00:00Z");
+        let mut second = message(2, EventRole::User, "2026-01-01T00:01:00Z");
+        second.embedding = Some(vec![1.0, 0.0]);
+        let input = EpisodePlanInput {
+            session_id: "s".into(),
+            source_session_sha256: "1".repeat(64),
+            gap_minutes: 30,
+            consolidation_watermark: Some(2),
+            messages: vec![first.clone(), second.clone()],
+            suggestions: vec![],
+        };
+        let first_plan = plan_episodes(&input).unwrap();
+        let mut changed = input.clone();
+        changed.messages[1].created_at = "2026-01-01T00:01:01Z".into();
+        assert_ne!(
+            first_plan.plan_input_sha256,
+            plan_episodes(&changed).unwrap().plan_input_sha256
+        );
+        assert_ne!(
+            first_plan.boundary_decisions[1].input_sha256,
+            plan_episodes(&changed).unwrap().boundary_decisions[1].input_sha256
+        );
+        assert_ne!(
+            ledger_snapshot_hash("s", Some(2), &input.messages, &[]),
+            ledger_snapshot_hash("s", None, &input.messages, &[])
         );
     }
 }
