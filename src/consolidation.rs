@@ -5752,13 +5752,13 @@ fn claim_contradicts(
 ) -> bool {
     let same_object =
         existing.object_kind == new_object_kind && existing.normalized_object == new_object;
-    if existing.cardinality == ClaimCardinality::Single
-        || new_cardinality == ClaimCardinality::Single
-    {
-        !same_object || existing.polarity != new_polarity
-    } else {
-        same_object && existing.polarity != new_polarity
-    }
+    claim_semantics_contradict(
+        same_object,
+        existing.polarity,
+        existing.cardinality,
+        new_polarity,
+        new_cardinality,
+    )
 }
 
 fn stored_claims_contradict(
@@ -5785,12 +5785,29 @@ fn stored_claims_contradict(
 fn planned_claims_contradict(left: &ValidatedClaim, right: &ValidatedClaim) -> bool {
     let same_object =
         left.object_kind == right.object_kind && left.normalized_object == right.normalized_object;
-    if left.cardinality == ClaimCardinality::Single || right.cardinality == ClaimCardinality::Single
-    {
-        !same_object || left.polarity != right.polarity
-    } else {
-        same_object && left.polarity != right.polarity
+    claim_semantics_contradict(
+        same_object,
+        left.polarity,
+        left.cardinality,
+        right.polarity,
+        right.cardinality,
+    )
+}
+
+fn claim_semantics_contradict(
+    same_object: bool,
+    left_polarity: ClaimPolarity,
+    left_cardinality: ClaimCardinality,
+    right_polarity: ClaimPolarity,
+    right_cardinality: ClaimCardinality,
+) -> bool {
+    if same_object {
+        return left_polarity != right_polarity;
     }
+    left_polarity == ClaimPolarity::Assert
+        && right_polarity == ClaimPolarity::Assert
+        && (left_cardinality == ClaimCardinality::Single
+            || right_cardinality == ClaimCardinality::Single)
 }
 
 fn intervals_overlap(
@@ -6415,7 +6432,8 @@ fn evidence_has_invalid_context(value: &str) -> bool {
                 .strip_prefix(word)
                 .is_some_and(|tail| tail.starts_with(' '))
         })
-        || starts_with_contracted_interrogative(trimmed);
+        || starts_with_contracted_interrogative(trimmed)
+        || starts_with_wh_interrogative(trimmed);
     let conditional = ["如果", "若是", "假如", "要是", "除非"]
         .iter()
         .any(|marker| normalized.contains(marker))
@@ -6447,13 +6465,17 @@ fn evidence_has_invalid_context(value: &str) -> bool {
         ]
         .iter()
         .any(|marker| contains_ascii_word(&normalized, marker));
-    let quoted_envelope = value
-        .chars()
-        .any(|ch| matches!(ch, '"' | '“' | '”' | '「' | '」' | '『' | '』' | '`'));
-    question || conditional || attribution || quoted_envelope
+    let quoted_envelope = value.chars().any(|ch| {
+        matches!(
+            ch,
+            '"' | '“' | '”' | '‘' | '’' | '「' | '」' | '『' | '』' | '`'
+        )
+    });
+    let hedged = contains_confirmation_hedge(&normalized);
+    question || conditional || attribution || quoted_envelope || hedged
 }
 
-fn starts_with_contracted_interrogative(value: &str) -> bool {
+fn after_optional_confirmation_cue(value: &str) -> [&str; 2] {
     let leading = value.trim_start_matches(|ch: char| {
         ch.is_whitespace()
             || matches!(
@@ -6501,10 +6523,14 @@ fn starts_with_contracted_interrogative(value: &str) -> bool {
                     })
                 })
         })
-    });
-    [leading]
+    })
+    .unwrap_or(leading);
+    [leading, after_optional_cue]
+}
+
+fn starts_with_contracted_interrogative(value: &str) -> bool {
+    after_optional_confirmation_cue(value)
         .into_iter()
-        .chain(after_optional_cue)
         .any(|candidate| {
             [
                 "doesn't",
@@ -6531,6 +6557,36 @@ fn starts_with_contracted_interrogative(value: &str) -> bool {
                     .is_some_and(|tail| tail.chars().next().is_some_and(char::is_whitespace))
             })
         })
+}
+
+fn starts_with_wh_interrogative(value: &str) -> bool {
+    after_optional_confirmation_cue(value)
+        .into_iter()
+        .any(|candidate| {
+            [
+                "who", "what", "when", "where", "why", "how", "which", "whose", "whom",
+            ]
+            .iter()
+            .any(|word| {
+                candidate.strip_prefix(word).is_some_and(|tail| {
+                    tail.chars().next().is_some_and(|ch| {
+                        ch.is_whitespace() || matches!(ch, ',' | '，' | ':' | '：' | ';' | '；')
+                    })
+                })
+            })
+        })
+}
+
+fn contains_confirmation_hedge(value: &str) -> bool {
+    ["似乎", "可能", "也许", "大概", "我觉得", "我猜"]
+        .iter()
+        .any(|phrase| value.contains(phrase))
+        || ["maybe", "perhaps", "probably", "possibly"]
+            .iter()
+            .any(|word| contains_ascii_word(value, word))
+        || ["i think", "i guess"]
+            .iter()
+            .any(|phrase| contains_ascii_phrase(value, phrase))
 }
 
 fn contains_cjk_a_not_a_question(value: &str) -> bool {
@@ -6562,6 +6618,21 @@ fn is_cjk(character: char) -> bool {
 }
 
 fn contains_ascii_word(value: &str, needle: &str) -> bool {
+    value.match_indices(needle).any(|(start, matched)| {
+        let end = start + matched.len();
+        let left_is_word = value[..start]
+            .chars()
+            .next_back()
+            .is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_');
+        let right_is_word = value[end..]
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_');
+        !left_is_word && !right_is_word
+    })
+}
+
+fn contains_ascii_phrase(value: &str, needle: &str) -> bool {
     value.match_indices(needle).any(|(start, matched)| {
         let end = start + matched.len();
         let left_is_word = value[..start]
@@ -9333,6 +9404,223 @@ mod tests {
     }
 
     #[test]
+    fn explicit_confirmation_rejects_hedged_quoted_and_wh_led_apply_evidence() {
+        for hedge in [
+            "maybe",
+            "perhaps",
+            "probably",
+            "possibly",
+            "I think",
+            "I guess",
+            "似乎",
+            "可能",
+            "也许",
+            "大概",
+            "我觉得",
+            "我猜",
+        ] {
+            assert!(evidence_has_invalid_context(&format!(
+                "Yes, {hedge} Alice lives in Paris"
+            )));
+        }
+        for interrogative in [
+            "who", "what", "when", "where", "why", "how", "which", "whose", "whom",
+        ] {
+            assert!(evidence_has_invalid_context(&format!(
+                "Yes, {interrogative} Alice lives in Paris"
+            )));
+        }
+        for content in [
+            "Yes, maybe Alice lives in Paris",
+            "Yes, ‘Alice lives in Paris’",
+            "Yes, who says Alice lives in Paris",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let (store, mut session) = new_session(root.path());
+            push_complete_at(&mut session, content, None, "2026-01-01T00:00:00Z");
+            let batch = next_batch(&store, &mut session);
+            let event = &batch.events[0];
+            let mut claim = text_claim_output(
+                "local_residence",
+                "local_alice",
+                "residence.city",
+                "Paris",
+                quote_nth(event, "Alice", 0),
+                quote_nth(event, "lives in", 0),
+                quote_nth(event, "Paris", 0),
+                full_quote(event),
+            );
+            claim.evidence[0].kind = ConsolidationEvidenceKind::UserConfirmation;
+            claim.evidence[0].speech_act_span = Some(quote_nth(event, "Yes", 0));
+            assert!(matches!(
+                apply_output(
+                    &store,
+                    &batch,
+                    &empty_candidates(),
+                    &StructuredConsolidationOutput {
+                        entities: vec![new_entity_output(
+                            "local_alice",
+                            "Alice",
+                            quote_nth(event, "Alice", 0),
+                        )],
+                        claims: vec![claim],
+                        boundaries: Vec::new(),
+                    },
+                ),
+                Err(ConsolidationApplyError::Rejected { .. })
+            ));
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let (store, mut session) = new_session(root.path());
+        push_complete_at(
+            &mut session,
+            "Yes, Alice lives in Paris",
+            None,
+            "2026-01-01T00:00:00Z",
+        );
+        let batch = next_batch(&store, &mut session);
+        let event = &batch.events[0];
+        let mut claim = text_claim_output(
+            "local_residence",
+            "local_alice",
+            "residence.city",
+            "Paris",
+            quote_nth(event, "Alice", 0),
+            quote_nth(event, "lives in", 0),
+            quote_nth(event, "Paris", 0),
+            full_quote(event),
+        );
+        claim.evidence[0].kind = ConsolidationEvidenceKind::UserConfirmation;
+        claim.evidence[0].speech_act_span = Some(quote_nth(event, "Yes", 0));
+        assert!(
+            apply_output(
+                &store,
+                &batch,
+                &empty_candidates(),
+                &StructuredConsolidationOutput {
+                    entities: vec![new_entity_output(
+                        "local_alice",
+                        "Alice",
+                        quote_nth(event, "Alice", 0),
+                    )],
+                    claims: vec![claim],
+                    boundaries: Vec::new(),
+                },
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn stored_confirmation_rejects_coherently_rehashed_invalid_context() {
+        for invalid in [
+            "Yes, maybe Alice lives in Paris",
+            "Yes, ‘Alice lives in Paris’",
+            "Yes, who says Alice lives in Paris",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let (store, mut session) = new_session(root.path());
+            let valid = "Yes, Alice lives in Paris";
+            let content = format!("{valid}. {valid}. {invalid}");
+            push_complete_at(&mut session, &content, None, "2026-01-01T00:00:00Z");
+            let batch = next_batch(&store, &mut session);
+            let event = &batch.events[0];
+            let mut claim = text_claim_output(
+                "local_residence",
+                "local_alice",
+                "residence.city",
+                "Paris",
+                quote_nth(event, "Alice", 0),
+                quote_nth(event, "lives in", 0),
+                quote_nth(event, "Paris", 0),
+                quote_nth(event, valid, 0),
+            );
+            claim.evidence[0].kind = ConsolidationEvidenceKind::UserConfirmation;
+            claim.evidence[0].speech_act_span = Some(quote_nth(event, "Yes", 0));
+            claim.evidence.push(ConsolidationClaimEvidence {
+                kind: ConsolidationEvidenceKind::UserConfirmation,
+                quote: quote_nth(event, valid, 1),
+                subject_span: quote_nth(event, "Alice", 1),
+                relation_span: quote_nth(event, "lives in", 1),
+                object_span: quote_nth(event, "Paris", 1),
+                speech_act_span: Some(quote_nth(event, "Yes", 1)),
+            });
+            apply_output(
+                &store,
+                &batch,
+                &empty_candidates(),
+                &StructuredConsolidationOutput {
+                    entities: vec![new_entity_output(
+                        "local_alice",
+                        "Alice",
+                        quote_nth(event, "Alice", 0),
+                    )],
+                    claims: vec![claim],
+                    boundaries: Vec::new(),
+                },
+            )
+            .unwrap();
+
+            let old_outer = quote_nth(event, valid, 1);
+            let new_outer = quote_nth(event, invalid, 0);
+            let new_subject = quote_nth(event, "Alice", 2);
+            let new_relation = quote_nth(event, "lives in", 2);
+            let new_object = quote_nth(event, "Paris", 2);
+            let new_speech = quote_nth(event, "Yes", 2);
+            let connection = Connection::open(store.retrieval().index_path()).unwrap();
+            connection
+                .execute(
+                    "UPDATE memory_claim_evidence
+                     SET start_char=?1, end_char=?2, content_sha256=?3,
+                         subject_start_char=?4, subject_end_char=?5, subject_sha256=?6,
+                         relation_start_char=?7, relation_end_char=?8, relation_sha256=?9,
+                         object_start_char=?10, object_end_char=?11, object_sha256=?12,
+                         speech_act_start_char=?13, speech_act_end_char=?14,
+                         speech_act_sha256=?15
+                     WHERE start_char=?16",
+                    params![
+                        new_outer.start_char as i64,
+                        new_outer.end_char as i64,
+                        new_outer.content_sha256,
+                        new_subject.start_char as i64,
+                        new_subject.end_char as i64,
+                        new_subject.content_sha256,
+                        new_relation.start_char as i64,
+                        new_relation.end_char as i64,
+                        new_relation.content_sha256,
+                        new_object.start_char as i64,
+                        new_object.end_char as i64,
+                        new_object.content_sha256,
+                        new_speech.start_char as i64,
+                        new_speech.end_char as i64,
+                        new_speech.content_sha256,
+                        old_outer.start_char as i64,
+                    ],
+                )
+                .unwrap();
+            let stored = load_all_claim_candidates(&connection).unwrap().remove(0);
+            let evidence = stored
+                .evidence
+                .iter()
+                .find(|evidence| evidence.start_char == new_outer.start_char)
+                .unwrap();
+            let expected_id = deterministic_evidence_id(&stored.claim_id, evidence);
+            connection
+                .execute(
+                    "UPDATE memory_claim_evidence SET evidence_id=?1 WHERE start_char=?2",
+                    params![expected_id, new_outer.start_char as i64],
+                )
+                .unwrap();
+            drop(connection);
+            assert!(matches!(
+                store.retrieval().consolidation_candidates(512, 512),
+                Err(RetrievalError::CorruptIndex(_))
+            ));
+        }
+    }
+
+    #[test]
     fn unicode_scalar_quotes_accept_exact_spans_and_reject_byte_offsets_rewrites_and_hashes() {
         let event = ConsolidationEvent {
             event_id: "evt_unicode".into(),
@@ -10064,6 +10352,185 @@ mod tests {
         assert_eq!(saved.claims[0].valid_from, "2026-02-01T00:00:00Z");
         assert_eq!(saved.claims[0].asserted_at, "2026-02-01T12:00:00Z");
         assert_eq!(saved.claims[0].reference_time, saved.claims[0].asserted_at);
+    }
+
+    #[test]
+    fn contradiction_matrix_is_shared_by_planned_stored_and_candidate_claims() {
+        let candidate = |object: &str,
+                         polarity: ClaimPolarity,
+                         cardinality: ClaimCardinality,
+                         valid_from: &str,
+                         valid_to: Option<&str>| {
+            MemoryClaimCandidate {
+                claim_id: format!("claim-{object}-{}", polarity.as_str()),
+                session_id: "session".into(),
+                subject_entity_id: "alice".into(),
+                predicate_key: "profile.value".into(),
+                normalized_relation: "value".into(),
+                object_kind: ConsolidationClaimObjectKind::Text,
+                object_text: Some(object.into()),
+                object_entity_id: None,
+                normalized_object: object.into(),
+                polarity,
+                cardinality,
+                certainty: ClaimCertainty::Certain,
+                state: MemoryClaimState::Active,
+                asserted_at: valid_from.into(),
+                event_time: None,
+                valid_from: valid_from.into(),
+                valid_to: valid_to.map(str::to_owned),
+                reference_time: valid_from.into(),
+                created_batch_key: "batch".into(),
+                updated_batch_key: "batch".into(),
+                created_at: valid_from.into(),
+                updated_at: valid_from.into(),
+                evidence: Vec::new(),
+            }
+        };
+        let planned =
+            |object: &str, polarity: ClaimPolarity, cardinality: ClaimCardinality| ValidatedClaim {
+                action: ValidatedClaimAction::Create {
+                    claim_id: format!("planned-{object}-{}", polarity.as_str()),
+                    state: MemoryClaimState::Active,
+                    conflicts: Vec::new(),
+                    supersedes: Vec::new(),
+                    supersede_reason: None,
+                },
+                subject_entity_id: "alice".into(),
+                predicate_key: "profile.value".into(),
+                normalized_relation: "value".into(),
+                object_kind: ConsolidationClaimObjectKind::Text,
+                object_text: Some(object.into()),
+                object_entity_id: None,
+                normalized_object: object.into(),
+                polarity,
+                cardinality,
+                certainty: ClaimCertainty::Certain,
+                asserted_at: "2026-01-01T00:00:00Z".into(),
+                event_time: None,
+                valid_from: "2026-01-01T00:00:00Z".into(),
+                valid_to: None,
+                reference_time: "2026-01-01T00:00:00Z".into(),
+                evidence: Vec::new(),
+            };
+        for (
+            left_object,
+            left_polarity,
+            left_cardinality,
+            right_object,
+            right_polarity,
+            right_cardinality,
+            expected,
+        ) in [
+            (
+                "paris",
+                ClaimPolarity::Deny,
+                ClaimCardinality::Single,
+                "london",
+                ClaimPolarity::Deny,
+                ClaimCardinality::Single,
+                false,
+            ),
+            (
+                "paris",
+                ClaimPolarity::Deny,
+                ClaimCardinality::Single,
+                "london",
+                ClaimPolarity::Assert,
+                ClaimCardinality::Single,
+                false,
+            ),
+            (
+                "paris",
+                ClaimPolarity::Assert,
+                ClaimCardinality::Single,
+                "london",
+                ClaimPolarity::Assert,
+                ClaimCardinality::Multi,
+                true,
+            ),
+            (
+                "paris",
+                ClaimPolarity::Assert,
+                ClaimCardinality::Multi,
+                "paris",
+                ClaimPolarity::Deny,
+                ClaimCardinality::Multi,
+                true,
+            ),
+            (
+                "tea",
+                ClaimPolarity::Assert,
+                ClaimCardinality::Multi,
+                "coffee",
+                ClaimPolarity::Assert,
+                ClaimCardinality::Multi,
+                false,
+            ),
+        ] {
+            assert_eq!(
+                claim_semantics_contradict(
+                    left_object == right_object,
+                    left_polarity,
+                    left_cardinality,
+                    right_polarity,
+                    right_cardinality,
+                ),
+                expected
+            );
+            let left = candidate(
+                left_object,
+                left_polarity,
+                left_cardinality,
+                "2026-01-01T00:00:00Z",
+                None,
+            );
+            let right = candidate(
+                right_object,
+                right_polarity,
+                right_cardinality,
+                "2026-01-01T00:00:00Z",
+                None,
+            );
+            assert_eq!(
+                claim_contradicts(
+                    &left,
+                    right.object_kind,
+                    &right.normalized_object,
+                    right.polarity,
+                    right.cardinality,
+                ),
+                expected
+            );
+            assert_eq!(stored_claims_contradict(&left, &right), expected);
+            assert_eq!(stored_claims_contradict(&right, &left), expected);
+            assert_eq!(
+                planned_claims_contradict(
+                    &planned(left_object, left_polarity, left_cardinality),
+                    &planned(right_object, right_polarity, right_cardinality),
+                ),
+                expected
+            );
+        }
+
+        let historical_assertion = candidate(
+            "paris",
+            ClaimPolarity::Assert,
+            ClaimCardinality::Single,
+            "2026-01-01T00:00:00Z",
+            Some("2026-01-02T00:00:00Z"),
+        );
+        let later_denial = candidate(
+            "paris",
+            ClaimPolarity::Deny,
+            ClaimCardinality::Single,
+            "2026-01-03T00:00:00Z",
+            None,
+        );
+        assert!(!stored_claims_contradict(
+            &historical_assertion,
+            &later_denial
+        ));
     }
 
     #[test]

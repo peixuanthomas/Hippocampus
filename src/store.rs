@@ -33,13 +33,8 @@ pub struct SessionStore {
 impl SessionStore {
     pub fn new(root: impl AsRef<Path>) -> Result<Self> {
         let expanded = expand_tilde(root.as_ref());
-        let path = expanded.as_path();
-        let root = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            std::env::current_dir()?.join(path)
-        };
-        let retrieval = RetrievalStore::new(&root)?;
+        let retrieval = RetrievalStore::new(expanded.as_path())?;
+        let root = retrieval.root().to_path_buf();
         let knowledge = KnowledgeStore::new(&root)?;
         Ok(Self {
             root,
@@ -337,6 +332,133 @@ fn sync_directory(_path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::model::{ContextTrace, ProvenanceQuality, TokenUsage, Turn, TurnStatus, utc_now};
+
+    #[cfg(unix)]
+    #[test]
+    fn session_store_pins_symlink_root_across_retarget_and_shares_original_lock() {
+        use std::os::unix::fs::symlink;
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        let parent = tempfile::tempdir().unwrap();
+        let target_a = parent.path().join("a");
+        let target_b = parent.path().join("b");
+        fs::create_dir_all(&target_a).unwrap();
+        fs::create_dir_all(&target_b).unwrap();
+        let canonical_a = fs::canonicalize(&target_a).unwrap();
+        let canonical_b = fs::canonicalize(&target_b).unwrap();
+        let link = parent.path().join("sessions");
+        symlink(&target_a, &link).unwrap();
+
+        let through_link = SessionStore::new(&link).unwrap();
+        let direct_a = SessionStore::new(&target_a).unwrap();
+        assert_eq!(through_link.root(), canonical_a);
+        assert_eq!(through_link.retrieval().root(), canonical_a);
+        assert_eq!(
+            through_link.retrieval().index_path(),
+            canonical_a.join(crate::retrieval::INDEX_FILENAME)
+        );
+        assert_eq!(
+            through_link.knowledge().root().parent(),
+            Some(canonical_a.as_path())
+        );
+
+        let guard = through_link.retrieval().acquire_root_write().unwrap();
+        let competing = direct_a.retrieval().clone();
+        let (sent, received) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let _guard = competing.acquire_root_write().unwrap();
+            sent.send(()).unwrap();
+        });
+        assert!(received.recv_timeout(Duration::from_millis(100)).is_err());
+        drop(guard);
+        received.recv_timeout(Duration::from_secs(2)).unwrap();
+        worker.join().unwrap();
+
+        fs::remove_file(&link).unwrap();
+        symlink(&target_b, &link).unwrap();
+        let first = through_link
+            .create(
+                "model",
+                "http://localhost",
+                None,
+                BudgetConfig::default(),
+                false,
+            )
+            .unwrap();
+        assert!(canonical_a.join(format!("{}.json", first.id)).is_file());
+        assert!(!canonical_b.join(format!("{}.json", first.id)).exists());
+        assert!(canonical_a.join(crate::retrieval::INDEX_FILENAME).is_file());
+        assert!(!canonical_b.join(crate::retrieval::INDEX_FILENAME).exists());
+        assert_eq!(through_link.load(&first.id).unwrap().id, first.id);
+
+        let direct_b = SessionStore::new(&target_b).unwrap();
+        let guard = through_link.retrieval().acquire_root_write().unwrap();
+        let competing_a = direct_a.retrieval().clone();
+        let independent_b = direct_b.retrieval().clone();
+        let (a_sent, a_received) = mpsc::channel();
+        let (b_sent, b_received) = mpsc::channel();
+        let a_worker = thread::spawn(move || {
+            let _guard = competing_a.acquire_root_write().unwrap();
+            a_sent.send(()).unwrap();
+        });
+        let b_worker = thread::spawn(move || {
+            let _guard = independent_b.acquire_root_write().unwrap();
+            b_sent.send(()).unwrap();
+        });
+        b_received.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(a_received.recv_timeout(Duration::from_millis(100)).is_err());
+        drop(guard);
+        a_received.recv_timeout(Duration::from_secs(2)).unwrap();
+        a_worker.join().unwrap();
+        b_worker.join().unwrap();
+
+        let second = direct_b
+            .create(
+                "model",
+                "http://localhost",
+                None,
+                BudgetConfig::default(),
+                false,
+            )
+            .unwrap();
+        assert_eq!(direct_b.root(), canonical_b);
+        assert!(canonical_b.join(format!("{}.json", second.id)).is_file());
+        assert!(!canonical_a.join(format!("{}.json", second.id)).exists());
+        assert!(canonical_b.join(crate::retrieval::INDEX_FILENAME).is_file());
+        assert_eq!(through_link.list_sessions().unwrap().len(), 1);
+        assert_eq!(direct_b.list_sessions().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn session_store_creates_pinned_missing_root_and_rejects_regular_file() {
+        let parent = tempfile::tempdir().unwrap();
+        let missing = parent.path().join("missing").join("sessions");
+        let expected = fs::canonicalize(parent.path())
+            .unwrap()
+            .join("missing")
+            .join("sessions");
+        let store = SessionStore::new(&missing).unwrap();
+        assert_eq!(store.root(), expected);
+        assert!(!store.root().exists());
+        let session = store
+            .create(
+                "model",
+                "http://localhost",
+                None,
+                BudgetConfig::default(),
+                false,
+            )
+            .unwrap();
+        assert!(expected.join(format!("{}.json", session.id)).is_file());
+        assert!(expected.join(crate::retrieval::INDEX_FILENAME).is_file());
+
+        let file = parent.path().join("not-a-directory");
+        fs::write(&file, b"sentinel").unwrap();
+        assert!(SessionStore::new(&file).is_err());
+        assert_eq!(fs::read(&file).unwrap(), b"sentinel");
+    }
 
     #[test]
     fn round_trip_legacy_schema_and_atomic_file() {

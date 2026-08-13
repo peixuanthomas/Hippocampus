@@ -182,18 +182,19 @@ impl std::fmt::Debug for RetrievalTestHooks {
 
 static ROOT_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<RwLock<()>>>>> = OnceLock::new();
 
-fn shared_root_lock(root: &Path) -> RetrievalResult<Arc<RwLock<()>>> {
-    let key = canonical_root_key(root);
+fn shared_root_lock(key: &Path) -> RetrievalResult<Arc<RwLock<()>>> {
     let registry = ROOT_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut registry = registry
         .lock()
-        .map_err(|_| RetrievalError::RootLockPoisoned { path: key.clone() })?;
+        .map_err(|_| RetrievalError::RootLockPoisoned {
+            path: key.to_path_buf(),
+        })?;
     registry.retain(|_, lock| lock.strong_count() > 0);
-    if let Some(lock) = registry.get(&key).and_then(Weak::upgrade) {
+    if let Some(lock) = registry.get(key).and_then(Weak::upgrade) {
         return Ok(lock);
     }
     let lock = Arc::new(RwLock::new(()));
-    registry.insert(key, Arc::downgrade(&lock));
+    registry.insert(key.to_path_buf(), Arc::downgrade(&lock));
     Ok(lock)
 }
 
@@ -257,6 +258,16 @@ impl RetrievalStore {
                 })?
                 .join(path)
         };
+        let root = canonical_root_key(&root);
+        if root.exists() && !root.is_dir() {
+            return Err(RetrievalError::Io {
+                path: root.clone(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::NotADirectory,
+                    "session root is not a directory",
+                ),
+            });
+        }
         let root_lock = shared_root_lock(&root)?;
         Ok(Self {
             index_path: root.join(INDEX_FILENAME),
@@ -3389,9 +3400,13 @@ CREATE INDEX memory_boundary_suggestions_session_event
         let parent = tempfile::tempdir().unwrap();
         let through_missing = parent.path().join("missing").join("..").join("root");
         let direct = parent.path().join("root");
+        let expected = fs::canonicalize(parent.path()).unwrap().join("root");
         assert!(!direct.exists());
         let first = RetrievalStore::new(&through_missing).unwrap();
         let second = RetrievalStore::new(&direct).unwrap();
+        assert_eq!(first.root(), expected);
+        assert_eq!(second.root(), expected);
+        assert_eq!(first.index_path(), expected.join(INDEX_FILENAME));
         assert!(Arc::ptr_eq(&first.root_lock, &second.root_lock));
 
         let guard = first.acquire_root_write().unwrap();
@@ -3422,10 +3437,14 @@ CREATE INDEX memory_boundary_suggestions_session_event
 
         let through_symlink_parent = link.join("..").join("shared");
         let direct = target_parent.join("shared");
+        let expected = fs::canonicalize(&target_parent).unwrap().join("shared");
         assert!(!through_symlink_parent.exists());
         assert!(!direct.exists());
         let first = RetrievalStore::new(&through_symlink_parent).unwrap();
         let second = RetrievalStore::new(&direct).unwrap();
+        assert_eq!(first.root(), expected);
+        assert_eq!(second.root(), expected);
+        assert_eq!(first.index_path(), expected.join(INDEX_FILENAME));
         assert!(Arc::ptr_eq(&first.root_lock, &second.root_lock));
 
         let guard = first.acquire_root_write().unwrap();
@@ -3438,6 +3457,64 @@ CREATE INDEX memory_boundary_suggestions_session_event
         drop(guard);
         received.recv_timeout(Duration::from_secs(2)).unwrap();
         worker.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_symlink_retarget_keeps_existing_store_pinned_to_original_target() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let target_a = parent.path().join("a");
+        let target_b = parent.path().join("b");
+        fs::create_dir_all(&target_a).unwrap();
+        fs::create_dir_all(&target_b).unwrap();
+        let canonical_a = fs::canonicalize(&target_a).unwrap();
+        let canonical_b = fs::canonicalize(&target_b).unwrap();
+        let link = parent.path().join("sessions");
+        symlink(&target_a, &link).unwrap();
+
+        let through_link = RetrievalStore::new(&link).unwrap();
+        let direct_a = RetrievalStore::new(&target_a).unwrap();
+        assert_eq!(through_link.root(), canonical_a);
+        assert_eq!(through_link.index_path(), canonical_a.join(INDEX_FILENAME));
+        assert!(Arc::ptr_eq(&through_link.root_lock, &direct_a.root_lock));
+
+        fs::remove_file(&link).unwrap();
+        symlink(&target_b, &link).unwrap();
+        let direct_b = RetrievalStore::new(&target_b).unwrap();
+        let fresh_link = RetrievalStore::new(&link).unwrap();
+        assert_eq!(through_link.root(), canonical_a);
+        assert_eq!(direct_b.root(), canonical_b);
+        assert_eq!(fresh_link.root(), canonical_b);
+        assert_eq!(direct_b.index_path(), canonical_b.join(INDEX_FILENAME));
+        assert!(!Arc::ptr_eq(&through_link.root_lock, &direct_b.root_lock));
+        assert!(Arc::ptr_eq(&fresh_link.root_lock, &direct_b.root_lock));
+    }
+
+    #[test]
+    fn retrieval_root_pins_missing_paths_and_rejects_regular_files() {
+        let parent = tempfile::tempdir().unwrap();
+        let missing = parent.path().join("missing").join("sessions");
+        let expected = fs::canonicalize(parent.path())
+            .unwrap()
+            .join("missing")
+            .join("sessions");
+        let store = RetrievalStore::new(&missing).unwrap();
+        assert_eq!(store.root(), expected);
+        assert!(!store.root().exists());
+        store.open_connection().unwrap();
+        assert!(store.root().is_dir());
+        assert!(store.index_path().is_file());
+
+        let file = parent.path().join("not-a-directory");
+        fs::write(&file, b"sentinel").unwrap();
+        assert!(matches!(
+            RetrievalStore::new(&file),
+            Err(RetrievalError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotADirectory
+        ));
+        assert_eq!(fs::read(&file).unwrap(), b"sentinel");
     }
 
     #[test]
