@@ -504,7 +504,9 @@ async fn run_memory_consolidate(
     config: &AppConfig,
 ) -> Result<()> {
     let sessions = if all {
-        store.list_sessions()?
+        let mut sessions = store.list_sessions()?;
+        order_sessions_for_bulk_consolidation(&mut sessions);
+        sessions
     } else {
         vec![
             store.load(
@@ -551,6 +553,15 @@ async fn run_memory_consolidate(
         }
     }
     Ok(())
+}
+
+fn order_sessions_for_bulk_consolidation(sessions: &mut [Session]) {
+    sessions.sort_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| left.id.cmp(&right.id))
+    });
 }
 
 fn consolidation_trigger_for_tui_exit(
@@ -1095,6 +1106,40 @@ mod tests {
             Cli::try_parse_from(["hippocampus", "memory", "consolidate", "session-a", "--all",])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn memory_consolidate_all_order_is_deterministic() {
+        fn session(id: &str, updated_at: &str) -> Session {
+            let mut session = Session::new(
+                id.into(),
+                "model".into(),
+                "http://localhost:11434".into(),
+                "system".into(),
+                BudgetConfig::default(),
+                true,
+            )
+            .unwrap();
+            session.updated_at = updated_at.into();
+            session
+        }
+
+        let mut sessions = vec![
+            session("tie-b", "2026-08-12T12:00:00Z"),
+            session("newest", "2026-08-13T12:00:00Z"),
+            session("tie-a", "2026-08-12T12:00:00Z"),
+        ];
+
+        order_sessions_for_bulk_consolidation(&mut sessions);
+
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["newest", "tie-a", "tie-b"]
+        );
+        assert_eq!(sessions[1].updated_at, sessions[2].updated_at);
     }
 
     #[test]
