@@ -759,6 +759,19 @@ impl RetrievalStore {
             &fingerprint,
             config,
         )?;
+        if validate_episode_materialization(
+            &transaction,
+            &self.root,
+            session_id,
+            &spec,
+            &fingerprint,
+            false,
+        )? != AggregateReadiness::Ready
+        {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "会话 {session_id} 的 episode materialization 写后审计未就绪"
+            )));
+        }
         transaction
             .commit()
             .map_err(|error| self.database_error(error))?;
@@ -1892,14 +1905,7 @@ fn load_episode_snapshot(
     spec: &VectorIndexSpec,
     fingerprint: &str,
 ) -> RetrievalResult<EpisodeSnapshot> {
-    let watermark = transaction
-        .query_row(
-            "SELECT through_sequence FROM consolidation_watermarks WHERE session_id=?1",
-            [session_id],
-            |row| i64_to_u64(row.get(0)?),
-        )
-        .optional()
-        .map_err(|error| RetrievalError::CorruptIndex(format!("读取巩固水位失败：{error}")))?;
+    let watermark = load_validated_consolidation_watermark(transaction, session_id)?;
     let mut entities = HashMap::<String, std::collections::BTreeSet<String>>::new();
     // Only resolved entities participate.  All rows below have already passed
     // the consolidation ledger integrity audit in the same transaction.
@@ -2297,15 +2303,15 @@ fn aggregate_corruption(message: impl Into<String>) -> RetrievalError {
     RetrievalError::CorruptIndex(message.into())
 }
 
-fn validate_aggregate_embedding_ready(
+fn validate_episode_materialization(
     connection: &Connection,
     root: &Path,
-    document_id: &str,
     expected_session: &str,
-    expected_source: &str,
     spec: &VectorIndexSpec,
     fingerprint: &str,
+    require_complete_message_embeddings: bool,
 ) -> RetrievalResult<AggregateReadiness> {
+    validate_full_derived_integrity(connection)?;
     let materialization = connection
         .query_row(
             "SELECT m.source_session_sha256, m.ledger_snapshot_sha256,
@@ -2398,9 +2404,10 @@ fn validate_aggregate_embedding_ready(
             "会话 {expected_session} 的 materialized_at 损坏：{error}"
         ))
     })?;
-    if !is_safe_source_file(&source_file) {
+    let expected_source_file = format!("{expected_session}.json");
+    if !is_safe_source_file(&source_file) || source_file != expected_source_file {
         return Err(aggregate_corruption(format!(
-            "会话 {expected_session} 的源文件名不安全"
+            "会话 {expected_session} 的源文件名没有绑定规范会话文件"
         )));
     }
 
@@ -2421,16 +2428,6 @@ fn validate_aggregate_embedding_ready(
             "会话 {expected_session} 的 aggregate document count 不匹配"
         )));
     }
-    let target = persisted_documents
-        .iter()
-        .find(|document| document.document_id == document_id)
-        .ok_or_else(|| aggregate_corruption(format!("缺少 aggregate document {document_id}")))?;
-    if target.session_id != expected_session || target.source_sha256 != expected_source {
-        return Err(aggregate_corruption(format!(
-            "aggregate document {document_id} 与预期来源不匹配"
-        )));
-    }
-
     let persisted_boundaries = load_persisted_episode_boundaries(connection, expected_session)?;
     if persisted_boundaries.len() != boundary_count {
         return Err(aggregate_corruption(format!(
@@ -2438,9 +2435,9 @@ fn validate_aggregate_embedding_ready(
         )));
     }
 
-    let raw_source_stale = fs::read(root.join(&source_file))
-        .map(|bytes| bytes_sha256(&bytes) != indexed_source)
-        .unwrap_or(true);
+    let raw_source_stale =
+        validate_aggregate_raw_source(root, expected_session, &source_file, &indexed_source)?
+            == AggregateReadiness::Stale;
     if materialized_source != indexed_source || materialized_fingerprint != fingerprint {
         return Ok(AggregateReadiness::Stale);
     }
@@ -2457,7 +2454,7 @@ fn validate_aggregate_embedding_ready(
         suggestions,
     })
     .map_err(|error| aggregate_corruption(format!("重算 episode plan 失败：{error}")))?;
-    if !complete_message_coverage {
+    if require_complete_message_embeddings && !complete_message_coverage {
         return Ok(AggregateReadiness::Stale);
     }
     if current_ledger_snapshot != stored_ledger_snapshot
@@ -2489,6 +2486,247 @@ fn validate_aggregate_embedding_ready(
         return Ok(AggregateReadiness::Stale);
     }
     Ok(AggregateReadiness::Ready)
+}
+
+fn validate_aggregate_embedding_ready(
+    connection: &Connection,
+    root: &Path,
+    document_id: &str,
+    expected_session: &str,
+    expected_source: &str,
+    spec: &VectorIndexSpec,
+    fingerprint: &str,
+) -> RetrievalResult<AggregateReadiness> {
+    let readiness = validate_episode_materialization(
+        connection,
+        root,
+        expected_session,
+        spec,
+        fingerprint,
+        true,
+    )?;
+    if readiness == AggregateReadiness::Stale {
+        return Ok(readiness);
+    }
+    let target = load_persisted_aggregate_document(connection, document_id, expected_session)
+        .map_err(|_| aggregate_corruption(format!("缺少 aggregate document {document_id}")))?;
+    if target.source_sha256 != expected_source {
+        return Err(aggregate_corruption(format!(
+            "aggregate document {document_id} 与预期来源不匹配"
+        )));
+    }
+    Ok(AggregateReadiness::Ready)
+}
+
+fn validate_aggregate_raw_source(
+    root: &Path,
+    expected_session: &str,
+    source_file: &str,
+    indexed_source_sha256: &str,
+) -> RetrievalResult<AggregateReadiness> {
+    let path = root.join(source_file);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(_) => return Ok(AggregateReadiness::Stale),
+    };
+    if bytes_sha256(&bytes) != indexed_source_sha256 {
+        return Ok(AggregateReadiness::Stale);
+    }
+    let mut session: Session = serde_json::from_slice(&bytes).map_err(|error| {
+        aggregate_corruption(format!(
+            "会话 {expected_session} 的规范原文件 JSON 损坏：{error}"
+        ))
+    })?;
+    session.normalize_legacy_provenance();
+    session.validate().map_err(|error| {
+        aggregate_corruption(format!(
+            "会话 {expected_session} 的规范原文件语义损坏：{error}"
+        ))
+    })?;
+    if session.id != expected_session
+        || path.file_stem().and_then(|value| value.to_str()) != Some(session.id.as_str())
+    {
+        return Err(aggregate_corruption(format!(
+            "会话 {expected_session} 的规范原文件内嵌会话 ID 不匹配"
+        )));
+    }
+    session.refresh_cumulative_usage();
+    Ok(AggregateReadiness::Ready)
+}
+
+fn load_validated_consolidation_watermark(
+    connection: &Connection,
+    session_id: &str,
+) -> RetrievalResult<Option<u64>> {
+    let stored = connection
+        .query_row(
+            "SELECT through_sequence, through_event_id, through_event_sha256, updated_at
+             FROM consolidation_watermarks WHERE session_id=?1",
+            [session_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| aggregate_corruption(format!("读取巩固水位失败：{error}")))?;
+    let Some((through_sequence, through_event_id, through_event_sha256, updated_at)) = stored
+    else {
+        let applied_batches = connection
+            .query_row(
+                "SELECT count(*) FROM consolidation_batches
+                 WHERE session_id=?1 AND status='applied'",
+                [session_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| aggregate_corruption(format!("读取 applied 巩固批次失败：{error}")))?;
+        if applied_batches != 0 {
+            return Err(aggregate_corruption(format!(
+                "会话 {session_id} 已有 applied 巩固批次但缺少水位"
+            )));
+        }
+        return Ok(None);
+    };
+    let through_sequence = i64_to_u64(through_sequence)
+        .map_err(|error| aggregate_corruption(format!("巩固水位序号损坏：{error}")))?;
+    if through_sequence == 0 {
+        return Err(aggregate_corruption(format!(
+            "会话 {session_id} 的零巩固水位必须由缺失记录表示"
+        )));
+    }
+    let through_event_id = through_event_id
+        .ok_or_else(|| aggregate_corruption(format!("会话 {session_id} 的巩固水位缺少事件 ID")))?;
+    let through_event_sha256 = through_event_sha256
+        .ok_or_else(|| aggregate_corruption(format!("会话 {session_id} 的巩固水位缺少事件哈希")))?;
+    let updated_at = updated_at
+        .ok_or_else(|| aggregate_corruption(format!("会话 {session_id} 的巩固水位缺少更新时间")))?;
+    if !is_sha256_hex(&through_event_sha256) {
+        return Err(aggregate_corruption(format!(
+            "会话 {session_id} 的巩固水位事件哈希损坏"
+        )));
+    }
+    DateTime::parse_from_rfc3339(&updated_at).map_err(|error| {
+        aggregate_corruption(format!("会话 {session_id} 的巩固水位更新时间损坏：{error}"))
+    })?;
+
+    let source = connection
+        .query_row(
+            "SELECT event_id, turn_id, role, content, content_sha256
+             FROM events WHERE session_id=?1 AND sequence=?2",
+            params![
+                session_id,
+                i64::try_from(through_sequence).map_err(|_| {
+                    aggregate_corruption(format!(
+                        "会话 {session_id} 的巩固水位序号超出 SQLite INTEGER"
+                    ))
+                })?
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| aggregate_corruption(format!("读取巩固水位事件失败：{error}")))?
+        .ok_or_else(|| {
+            aggregate_corruption(format!("会话 {session_id} 的巩固水位序号找不到原始事件"))
+        })?;
+    if source.0 != through_event_id
+        || !matches!(source.2.as_str(), "user" | "assistant")
+        || content_sha256(&source.3) != source.4
+        || source.4 != through_event_sha256
+    {
+        return Err(aggregate_corruption(format!(
+            "会话 {session_id} 的巩固水位事件来源不匹配"
+        )));
+    }
+    let next_turn_id = connection
+        .query_row(
+            "SELECT turn_id FROM events WHERE session_id=?1 AND sequence>?2
+             ORDER BY sequence LIMIT 1",
+            params![
+                session_id,
+                i64::try_from(through_sequence).map_err(|_| {
+                    aggregate_corruption(format!(
+                        "会话 {session_id} 的巩固水位序号超出 SQLite INTEGER"
+                    ))
+                })?
+            ],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(|error| aggregate_corruption(format!("读取巩固水位后继事件失败：{error}")))?
+        .flatten();
+    if next_turn_id.is_some() && next_turn_id == source.1 {
+        return Err(aggregate_corruption(format!(
+            "会话 {session_id} 的巩固水位落在轮次内部"
+        )));
+    }
+
+    let applied = connection
+        .prepare(
+            "SELECT through_sequence, input_event_ids, input_event_hashes, completed_at
+             FROM consolidation_batches WHERE session_id=?1 AND status='applied'
+             ORDER BY through_sequence DESC, attempt_id",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map([session_id], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()
+        })
+        .map_err(|error| aggregate_corruption(format!("读取 applied 巩固批次失败：{error}")))?;
+    let through_sequence_sql = i64::try_from(through_sequence).map_err(|_| {
+        aggregate_corruption(format!(
+            "会话 {session_id} 的巩固水位序号超出 SQLite INTEGER"
+        ))
+    })?;
+    let matching_latest = applied
+        .iter()
+        .filter(|row| row.0 == through_sequence_sql)
+        .collect::<Vec<_>>();
+    if applied.first().map(|row| row.0) != Some(through_sequence_sql) || matching_latest.len() != 1
+    {
+        return Err(aggregate_corruption(format!(
+            "会话 {session_id} 的巩固水位未唯一绑定最新 applied 批次"
+        )));
+    }
+    let latest = matching_latest[0];
+    let event_ids: Vec<String> = serde_json::from_str(&latest.1).map_err(|error| {
+        aggregate_corruption(format!(
+            "会话 {session_id} 的 applied 事件 ID 损坏：{error}"
+        ))
+    })?;
+    let event_hashes: Vec<String> = serde_json::from_str(&latest.2).map_err(|error| {
+        aggregate_corruption(format!(
+            "会话 {session_id} 的 applied 事件哈希损坏：{error}"
+        ))
+    })?;
+    if event_ids.last() != Some(&through_event_id)
+        || event_hashes.last() != Some(&through_event_sha256)
+        || event_ids.len() != event_hashes.len()
+        || latest.3 != updated_at
+    {
+        return Err(aggregate_corruption(format!(
+            "会话 {session_id} 的巩固水位字段与最新 applied 批次不匹配"
+        )));
+    }
+    Ok(Some(through_sequence))
 }
 
 fn is_sha256_hex(value: &str) -> bool {
@@ -3898,6 +4136,15 @@ CREATE INDEX IF NOT EXISTS memory_boundary_suggestions_session_event
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::consolidation::{
+        BoundarySuggestionReason, ClaimCardinality, ClaimCertainty, ClaimDisposition,
+        ClaimPolarity, ConsolidatedClaimObject, ConsolidatedClaimOutput, ConsolidatedEntityOutput,
+        ConsolidationAttemptRecord, ConsolidationAttemptStatus, ConsolidationBoundaryOutput,
+        ConsolidationClaimEvidence, ConsolidationClaimObjectKind, ConsolidationEvent,
+        ConsolidationEvidenceKind, ConsolidationQuote, EntityAliasOutput, EntityDisambiguation,
+        EntityResolution, EntityResolutionBasis, MemoryAliasKind, MemoryEntityKind,
+        StructuredConsolidationOutput,
+    };
     use crate::context::ContextAssembler;
     use crate::model::{ContextTrace, ModelRequestTrace, TokenUsage, Turn, TurnStatus, utc_now};
     use crate::store::SessionStore;
@@ -4725,6 +4972,63 @@ CREATE INDEX memory_boundary_suggestions_session_event
         assert_eq!(fs::read(path).unwrap(), source_before);
     }
 
+    #[test]
+    fn episode_aggregate_materialization_later_write_rolls_back_entire_transaction() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let mut session = store
+            .create("model", "http://localhost", None, Default::default(), false)
+            .unwrap();
+        append_complete_turn(&mut session, "u1", "a1", "");
+        append_complete_turn(&mut session, "u2", "a2", "");
+        let path = store.save(&mut session).unwrap();
+        let source_before = fs::read(&path).unwrap();
+        store.retrieval().sync_session(&session, &path).unwrap();
+        let config = aggregate_memory_config();
+        let (spec, report) = materialize_with_canonical_embeddings(&store, &session, &config);
+        let aggregate_writes = aggregate_writes(&store, &report, &spec, 71.0);
+        store
+            .retrieval()
+            .upsert_embeddings(&spec, &aggregate_writes)
+            .unwrap();
+        let connection = Connection::open(store.retrieval().index_path()).unwrap();
+        let before = episode_materialization_sql_state(&connection, &session.id);
+        let earlier_episode = &report.episode_documents[0].document_id;
+        connection
+            .execute_batch(&format!(
+                "CREATE TRIGGER materialization_later_write_corrupts_earlier
+                 AFTER UPDATE ON memory_episode_materializations
+                 WHEN NEW.session_id = '{}'
+                 BEGIN
+                     UPDATE memory_documents SET source_sha256='{}'
+                     WHERE document_id='{}';
+                 END;",
+                session.id.replace('\'', "''"),
+                "0".repeat(64),
+                earlier_episode.replace('\'', "''"),
+            ))
+            .unwrap();
+
+        assert!(matches!(
+            store
+                .retrieval()
+                .materialize_episode_documents(&session.id, &config),
+            Err(RetrievalError::CorruptIndex(_))
+        ));
+        connection
+            .execute_batch("DROP TRIGGER materialization_later_write_corrupts_earlier;")
+            .unwrap();
+        let after = episode_materialization_sql_state(&connection, &session.id);
+        assert_eq!(after, before);
+        assert_eq!(fs::read(path).unwrap(), source_before);
+        let compatible = store.retrieval().compatible_embeddings(&spec).unwrap();
+        assert!(aggregate_writes.iter().all(|write| {
+            compatible
+                .iter()
+                .any(|embedding| embedding.document_id == write.document_id)
+        }));
+    }
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum AggregateAuditTamper {
         LedgerSnapshot,
@@ -4847,6 +5151,320 @@ CREATE INDEX memory_boundary_suggestions_session_event
                 assert_eq!(fs::read(&path).unwrap(), source_before, "{tamper:?}");
             }
         }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum ProjectionAuditTamper {
+        WatermarkEventId,
+        WatermarkEventHash,
+        WatermarkUpdatedAt,
+        BoundaryEvidence,
+        BoundaryProvenance,
+        EntityProjection,
+        AliasProjection,
+        ClaimProjection,
+        ClaimEvidenceProjection,
+        ClaimTransitionProjection,
+    }
+
+    #[test]
+    fn episode_aggregate_projection_audit_rejects_corruption() {
+        let cases = [
+            ProjectionAuditTamper::WatermarkEventId,
+            ProjectionAuditTamper::WatermarkEventHash,
+            ProjectionAuditTamper::WatermarkUpdatedAt,
+            ProjectionAuditTamper::BoundaryEvidence,
+            ProjectionAuditTamper::BoundaryProvenance,
+            ProjectionAuditTamper::EntityProjection,
+            ProjectionAuditTamper::AliasProjection,
+            ProjectionAuditTamper::ClaimProjection,
+            ProjectionAuditTamper::ClaimEvidenceProjection,
+            ProjectionAuditTamper::ClaimTransitionProjection,
+        ];
+        for tamper in cases {
+            let root = tempfile::tempdir().unwrap();
+            let store = SessionStore::new(root.path()).unwrap();
+            let mut session = store
+                .create("model", "http://localhost", None, Default::default(), false)
+                .unwrap();
+            append_complete_turn(&mut session, "Alice aka Al likes tea.", "Acknowledged.", "");
+            append_complete_turn(&mut session, "change topic now.", "Changed.", "");
+            let path = store.save(&mut session).unwrap();
+            let source_before = fs::read(&path).unwrap();
+            store.retrieval().sync_session(&session, &path).unwrap();
+            seed_episode_projection(&store, &session.id);
+
+            let config = aggregate_memory_config();
+            let (spec, report) = materialize_with_canonical_embeddings(&store, &session, &config);
+            let aggregate_writes = aggregate_writes(&store, &report, &spec, 51.0);
+            store
+                .retrieval()
+                .upsert_embeddings(&spec, &aggregate_writes)
+                .unwrap();
+            let target_write = aggregate_writes.last().unwrap().clone();
+            let target_before = stored_embedding_unchecked(
+                &Connection::open(store.retrieval().index_path()).unwrap(),
+                &target_write.document_id,
+            );
+
+            let connection = Connection::open(store.retrieval().index_path()).unwrap();
+            apply_projection_audit_tamper(&connection, &session.id, tamper);
+            let mut replacement = target_write.clone();
+            replacement.vector = vec![83.0; spec.dimensions];
+            assert!(
+                matches!(
+                    store.retrieval().upsert_embeddings(&spec, &[replacement]),
+                    Err(RetrievalError::CorruptIndex(_))
+                ),
+                "publication classification for {tamper:?}"
+            );
+            assert_eq!(
+                stored_embedding_unchecked(&connection, &target_write.document_id),
+                target_before,
+                "publication rollback for {tamper:?}"
+            );
+            assert!(
+                matches!(
+                    store.retrieval().compatible_embeddings(&spec),
+                    Err(RetrievalError::CorruptIndex(_))
+                ),
+                "exposure classification for {tamper:?}"
+            );
+            assert!(
+                matches!(
+                    store.retrieval().embedding_coverage(&spec),
+                    Err(RetrievalError::CorruptIndex(_))
+                ),
+                "coverage classification for {tamper:?}"
+            );
+            assert_eq!(fs::read(&path).unwrap(), source_before, "{tamper:?}");
+        }
+    }
+
+    fn apply_projection_audit_tamper(
+        connection: &Connection,
+        session_id: &str,
+        tamper: ProjectionAuditTamper,
+    ) {
+        let fake_hash = "0".repeat(64);
+        match tamper {
+            ProjectionAuditTamper::WatermarkEventId => {
+                connection
+                    .execute(
+                        "UPDATE consolidation_watermarks
+                         SET through_event_id=(SELECT event_id FROM events
+                             WHERE session_id=?1 AND role='user' ORDER BY sequence LIMIT 1)
+                         WHERE session_id=?1",
+                        [session_id],
+                    )
+                    .unwrap();
+            }
+            ProjectionAuditTamper::WatermarkEventHash => {
+                connection
+                    .execute(
+                        "UPDATE consolidation_watermarks SET through_event_sha256=?1
+                         WHERE session_id=?2",
+                        params![fake_hash, session_id],
+                    )
+                    .unwrap();
+            }
+            ProjectionAuditTamper::WatermarkUpdatedAt => {
+                connection
+                    .execute(
+                        "UPDATE consolidation_watermarks
+                         SET updated_at='2000-01-01T00:00:00Z' WHERE session_id=?1",
+                        [session_id],
+                    )
+                    .unwrap();
+            }
+            ProjectionAuditTamper::BoundaryEvidence => {
+                connection
+                    .execute(
+                        "UPDATE memory_boundary_suggestions SET evidence_json='[]'
+                         WHERE session_id=?1",
+                        [session_id],
+                    )
+                    .unwrap();
+            }
+            ProjectionAuditTamper::BoundaryProvenance => {
+                connection
+                    .execute(
+                        "UPDATE memory_boundary_suggestions SET batch_key='missing-batch'
+                         WHERE session_id=?1",
+                        [session_id],
+                    )
+                    .unwrap();
+            }
+            ProjectionAuditTamper::EntityProjection => {
+                connection
+                    .execute(
+                        "UPDATE memory_entities
+                         SET canonical_name='Mallory', normalized_name='mallory'
+                         WHERE created_session_id=?1 AND canonical_name='Alice'",
+                        [session_id],
+                    )
+                    .unwrap();
+            }
+            ProjectionAuditTamper::AliasProjection => {
+                connection
+                    .execute(
+                        "UPDATE memory_entity_aliases
+                         SET alias_text='Eve', normalized_alias='eve' WHERE session_id=?1",
+                        [session_id],
+                    )
+                    .unwrap();
+            }
+            ProjectionAuditTamper::ClaimProjection => {
+                connection
+                    .execute(
+                        "UPDATE memory_claims
+                         SET predicate_key='tampered.preference',
+                             normalized_relation='tampered preference'
+                         WHERE session_id=?1",
+                        [session_id],
+                    )
+                    .unwrap();
+            }
+            ProjectionAuditTamper::ClaimEvidenceProjection => {
+                connection
+                    .execute(
+                        "UPDATE memory_claim_evidence SET relation_sha256=?1
+                         WHERE session_id=?2",
+                        params![fake_hash, session_id],
+                    )
+                    .unwrap();
+            }
+            ProjectionAuditTamper::ClaimTransitionProjection => {
+                connection
+                    .execute(
+                        "UPDATE memory_claim_transitions SET to_state='uncertain'
+                         WHERE session_id=?1",
+                        [session_id],
+                    )
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn episode_aggregate_source_binding_rejects_alternate_same_byte_file() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let mut session = store
+            .create("model", "http://localhost", None, Default::default(), false)
+            .unwrap();
+        append_complete_turn(&mut session, "u", "a", "");
+        let path = store.save(&mut session).unwrap();
+        let source_before = fs::read(&path).unwrap();
+        store.retrieval().sync_session(&session, &path).unwrap();
+        let config = aggregate_memory_config();
+        let (spec, report) = materialize_with_canonical_embeddings(&store, &session, &config);
+        let aggregate_writes = aggregate_writes(&store, &report, &spec, 61.0);
+        store
+            .retrieval()
+            .upsert_embeddings(&spec, &aggregate_writes)
+            .unwrap();
+        let target_write = aggregate_writes.last().unwrap().clone();
+        let target_before = stored_embedding_unchecked(
+            &Connection::open(store.retrieval().index_path()).unwrap(),
+            &target_write.document_id,
+        );
+
+        let alternate = root.path().join("alternate.json");
+        fs::write(&alternate, &source_before).unwrap();
+        let connection = Connection::open(store.retrieval().index_path()).unwrap();
+        connection
+            .execute(
+                "UPDATE indexed_sessions SET source_file='alternate.json' WHERE session_id=?1",
+                [&session.id],
+            )
+            .unwrap();
+
+        let mut replacement = target_write.clone();
+        replacement.vector = vec![89.0; spec.dimensions];
+        assert!(matches!(
+            store.retrieval().upsert_embeddings(&spec, &[replacement]),
+            Err(RetrievalError::CorruptIndex(_))
+        ));
+        assert_eq!(
+            stored_embedding_unchecked(&connection, &target_write.document_id),
+            target_before
+        );
+        assert!(matches!(
+            store.retrieval().compatible_embeddings(&spec),
+            Err(RetrievalError::CorruptIndex(_))
+        ));
+        assert!(matches!(
+            store.retrieval().embedding_coverage(&spec),
+            Err(RetrievalError::CorruptIndex(_))
+        ));
+        assert_eq!(fs::read(&path).unwrap(), source_before);
+        assert_eq!(fs::read(alternate).unwrap(), source_before);
+    }
+
+    #[test]
+    fn episode_aggregate_source_semantics_rejects_hash_coherent_wrong_session() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let mut session = store
+            .create("model", "http://localhost", None, Default::default(), false)
+            .unwrap();
+        append_complete_turn(&mut session, "u", "a", "");
+        let path = store.save(&mut session).unwrap();
+        let source_before = fs::read(&path).unwrap();
+        store.retrieval().sync_session(&session, &path).unwrap();
+        let config = aggregate_memory_config();
+        let (spec, report) = materialize_with_canonical_embeddings(&store, &session, &config);
+        let aggregate_writes = aggregate_writes(&store, &report, &spec, 63.0);
+        store
+            .retrieval()
+            .upsert_embeddings(&spec, &aggregate_writes)
+            .unwrap();
+        let target_write = aggregate_writes.last().unwrap().clone();
+        let target_before = stored_embedding_unchecked(
+            &Connection::open(store.retrieval().index_path()).unwrap(),
+            &target_write.document_id,
+        );
+
+        let mut wrong_session = session.clone();
+        wrong_session.id = "wrong-embedded-session".into();
+        let wrong_bytes = serde_json::to_vec_pretty(&wrong_session).unwrap();
+        let wrong_hash = bytes_sha256(&wrong_bytes);
+        fs::write(&path, wrong_bytes).unwrap();
+        let connection = Connection::open(store.retrieval().index_path()).unwrap();
+        connection
+            .execute(
+                "UPDATE indexed_sessions SET source_sha256=?1 WHERE session_id=?2",
+                params![wrong_hash, session.id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE memory_episode_materializations SET source_session_sha256=?1
+                 WHERE session_id=?2",
+                params![wrong_hash, session.id],
+            )
+            .unwrap();
+
+        let mut replacement = target_write.clone();
+        replacement.vector = vec![97.0; spec.dimensions];
+        assert!(matches!(
+            store.retrieval().upsert_embeddings(&spec, &[replacement]),
+            Err(RetrievalError::CorruptIndex(_))
+        ));
+        assert_eq!(
+            stored_embedding_unchecked(&connection, &target_write.document_id),
+            target_before
+        );
+        assert!(matches!(
+            store.retrieval().compatible_embeddings(&spec),
+            Err(RetrievalError::CorruptIndex(_))
+        ));
+        assert!(matches!(
+            store.retrieval().embedding_coverage(&spec),
+            Err(RetrievalError::CorruptIndex(_))
+        ));
+        fs::write(&path, source_before).unwrap();
     }
 
     fn apply_aggregate_audit_tamper(
@@ -4990,6 +5608,261 @@ CREATE INDEX memory_boundary_suggestions_session_event
                 },
             )
             .unwrap()
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum EpisodeSqlCell {
+        Null,
+        Integer(i64),
+        Real(u64),
+        Text(String),
+        Blob(Vec<u8>),
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct EpisodeMaterializationSqlState {
+        catalog: Vec<Vec<EpisodeSqlCell>>,
+        members: Vec<Vec<EpisodeSqlCell>>,
+        boundaries: Vec<Vec<EpisodeSqlCell>>,
+        materialization: Vec<Vec<EpisodeSqlCell>>,
+        embeddings: Vec<Vec<EpisodeSqlCell>>,
+    }
+
+    fn episode_sql_rows(
+        connection: &Connection,
+        query: &str,
+        session_id: &str,
+    ) -> Vec<Vec<EpisodeSqlCell>> {
+        let mut statement = connection.prepare(query).unwrap();
+        let column_count = statement.column_count();
+        statement
+            .query_map([session_id], |row| {
+                (0..column_count)
+                    .map(|index| {
+                        Ok(match row.get_ref(index)? {
+                            rusqlite::types::ValueRef::Null => EpisodeSqlCell::Null,
+                            rusqlite::types::ValueRef::Integer(value) => {
+                                EpisodeSqlCell::Integer(value)
+                            }
+                            rusqlite::types::ValueRef::Real(value) => {
+                                EpisodeSqlCell::Real(value.to_bits())
+                            }
+                            rusqlite::types::ValueRef::Text(value) => {
+                                EpisodeSqlCell::Text(String::from_utf8_lossy(value).into_owned())
+                            }
+                            rusqlite::types::ValueRef::Blob(value) => {
+                                EpisodeSqlCell::Blob(value.to_vec())
+                            }
+                        })
+                    })
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    fn episode_materialization_sql_state(
+        connection: &Connection,
+        session_id: &str,
+    ) -> EpisodeMaterializationSqlState {
+        EpisodeMaterializationSqlState {
+            catalog: episode_sql_rows(
+                connection,
+                "SELECT document_id,session_id,granularity,source_sha256,start_sequence,
+                        end_sequence,member_count
+                 FROM memory_documents WHERE session_id=?1
+                   AND granularity IN ('episode','session') ORDER BY document_id",
+                session_id,
+            ),
+            members: episode_sql_rows(
+                connection,
+                "SELECT m.document_id,m.ordinal,m.event_id,m.start_char,m.end_char,
+                        m.content_sha256
+                 FROM memory_document_members m
+                 JOIN memory_documents d ON d.document_id=m.document_id
+                 WHERE d.session_id=?1 AND d.granularity IN ('episode','session')
+                 ORDER BY m.document_id,m.ordinal",
+                session_id,
+            ),
+            boundaries: episode_sql_rows(
+                connection,
+                "SELECT session_id,before_event_id,decision_json,input_sha256
+                 FROM memory_episode_boundaries WHERE session_id=?1 ORDER BY before_event_id",
+                session_id,
+            ),
+            materialization: episode_sql_rows(
+                connection,
+                "SELECT session_id,source_session_sha256,ledger_snapshot_sha256,
+                        vector_index_fingerprint,plan_input_sha256,algorithm_version,gap_minutes,
+                        topic_similarity_threshold,episode_count,boundary_count,materialized_at
+                 FROM memory_episode_materializations WHERE session_id=?1",
+                session_id,
+            ),
+            embeddings: episode_sql_rows(
+                connection,
+                "SELECT e.document_id,e.model,e.dimensions,e.source_sha256,
+                        e.index_fingerprint,e.vector_blob,e.embedded_at
+                 FROM memory_embeddings e
+                 JOIN memory_documents d ON d.document_id=e.document_id
+                 WHERE d.session_id=?1 AND d.granularity IN ('episode','session')
+                 ORDER BY e.document_id",
+                session_id,
+            ),
+        }
+    }
+
+    fn consolidation_quote_nth(
+        event: &ConsolidationEvent,
+        needle: &str,
+        occurrence: usize,
+    ) -> ConsolidationQuote {
+        let mut offset = 0_usize;
+        let mut found = None;
+        for _ in 0..=occurrence {
+            let relative = event.content[offset..].find(needle).unwrap();
+            let start_byte = offset + relative;
+            found = Some(start_byte);
+            offset = start_byte + needle.len();
+        }
+        let start_byte = found.unwrap();
+        let start_char = event.content[..start_byte].chars().count();
+        ConsolidationQuote {
+            event_id: event.event_id.clone(),
+            start_char,
+            end_char: start_char + needle.chars().count(),
+            content_sha256: content_sha256(needle),
+        }
+    }
+
+    fn full_consolidation_quote(event: &ConsolidationEvent) -> ConsolidationQuote {
+        ConsolidationQuote {
+            event_id: event.event_id.clone(),
+            start_char: 0,
+            end_char: event.content.chars().count(),
+            content_sha256: content_sha256(&event.content),
+        }
+    }
+
+    fn seed_episode_projection(store: &SessionStore, session_id: &str) {
+        let batch = store
+            .retrieval()
+            .next_consolidation_batch(session_id)
+            .unwrap()
+            .unwrap();
+        let first_user = batch
+            .events
+            .iter()
+            .find(|event| event.content == "Alice aka Al likes tea.")
+            .unwrap();
+        let boundary_user = batch
+            .events
+            .iter()
+            .find(|event| event.content == "change topic now.")
+            .unwrap();
+        let mut entity = ConsolidatedEntityOutput {
+            local_id: "local_alice".into(),
+            name: "Alice".into(),
+            kind: MemoryEntityKind::Person,
+            resolution: EntityResolution::New,
+            disambiguation: EntityDisambiguation::Resolved,
+            basis: EntityResolutionBasis::FirstMention,
+            existing_entity_id: None,
+            name_evidence: consolidation_quote_nth(first_user, "Alice", 0),
+            existing_identity_evidence: None,
+            resolution_evidence: None,
+            aliases: Vec::new(),
+        };
+        entity.aliases.push(EntityAliasOutput {
+            text: "Al".into(),
+            kind: MemoryAliasKind::ExplicitAlias,
+            stable_identifier_kind: None,
+            evidence: consolidation_quote_nth(first_user, "Al", 1),
+            proof_evidence: full_consolidation_quote(first_user),
+        });
+        let subject = consolidation_quote_nth(first_user, "Alice", 0);
+        let relation = consolidation_quote_nth(first_user, "likes", 0);
+        let object = consolidation_quote_nth(first_user, "tea", 0);
+        let output = StructuredConsolidationOutput {
+            entities: vec![entity],
+            claims: vec![ConsolidatedClaimOutput {
+                local_id: "local_preference".into(),
+                subject_ref: "local_alice".into(),
+                predicate_key: "preference.drink".into(),
+                object: ConsolidatedClaimObject {
+                    kind: ConsolidationClaimObjectKind::Text,
+                    text: Some("tea".into()),
+                    entity_ref: None,
+                    span: Some(object.clone()),
+                },
+                polarity: ClaimPolarity::Assert,
+                cardinality: ClaimCardinality::Single,
+                certainty: ClaimCertainty::Certain,
+                disposition: ClaimDisposition::New,
+                replaces_claim_ids: Vec::new(),
+                conflicts_with_claim_ids: Vec::new(),
+                event_time: None,
+                valid_from: None,
+                valid_to: None,
+                evidence: vec![ConsolidationClaimEvidence {
+                    kind: ConsolidationEvidenceKind::Assertion,
+                    quote: full_consolidation_quote(first_user),
+                    subject_span: subject,
+                    relation_span: relation,
+                    object_span: object,
+                    speech_act_span: None,
+                }],
+            }],
+            boundaries: vec![ConsolidationBoundaryOutput {
+                before_event_id: boundary_user.event_id.clone(),
+                reason: BoundarySuggestionReason::ExplicitTopicTransition,
+                evidence: vec![consolidation_quote_nth(boundary_user, "change topic", 0)],
+            }],
+        };
+        let candidates = store.retrieval().consolidation_candidates(1, 1).unwrap();
+        assert!(candidates.entities.is_empty());
+        assert!(candidates.claims.is_empty());
+        let request_json = serde_json::json!({ "batch_key": batch.batch_key }).to_string();
+        let response_json = serde_json::to_string(&output).unwrap();
+        let started_at = batch.events.last().unwrap().created_at.clone();
+        let completed_at = (DateTime::parse_from_rfc3339(&started_at).unwrap()
+            + chrono::Duration::seconds(1))
+        .to_rfc3339();
+        let attempt = ConsolidationAttemptRecord {
+            attempt_id: format!("projection-attempt-{session_id}"),
+            batch_key: batch.batch_key.clone(),
+            session_id: batch.session_id.clone(),
+            from_sequence: batch.from_sequence,
+            through_sequence: batch.through_sequence,
+            trigger: "test".into(),
+            model: "fixture-model".into(),
+            request_sha256: content_sha256(&request_json),
+            request_json,
+            input_event_ids: batch
+                .events
+                .iter()
+                .map(|event| event.event_id.clone())
+                .collect(),
+            input_event_hashes: batch
+                .events
+                .iter()
+                .map(|event| event.content_sha256.clone())
+                .collect(),
+            response_sha256: Some(content_sha256(&response_json)),
+            response_json: Some(response_json),
+            status: ConsolidationAttemptStatus::Applied,
+            input_tokens: Some(1),
+            output_tokens: Some(1),
+            latency_ms: 1,
+            started_at,
+            completed_at,
+            validation_json: Some("{\"valid\":true}".into()),
+            error_json: None,
+        };
+        store
+            .retrieval()
+            .apply_consolidation_attempt(&batch, &candidates, &attempt)
+            .unwrap();
     }
 
     fn aggregate_memory_config() -> MemoryConfig {
