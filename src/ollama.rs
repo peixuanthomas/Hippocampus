@@ -547,18 +547,11 @@ fn parse_structured_chat_response(payload: &Value) -> Result<StructuredChatRespo
         .and_then(Value::as_str)
         .filter(|content| !content.trim().is_empty())
         .ok_or_else(|| OllamaError::Protocol("Ollama 结构化响应缺少非空内容".into()))?;
-    serde_json::from_str::<Value>(content)
-        .map_err(|_| OllamaError::Protocol("Ollama 结构化响应内容不是有效 JSON".into()))?;
     let input = payload.get("prompt_eval_count").and_then(Value::as_u64);
     let output = payload.get("eval_count").and_then(Value::as_u64);
-    let (Some(input), Some(output)) = (input, output) else {
-        return Err(OllamaError::Protocol(
-            "Ollama 结构化响应缺少 token 计数".into(),
-        ));
-    };
     Ok(StructuredChatResponse {
         content: content.to_owned(),
-        usage: TokenUsage::new(Some(input), Some(output)),
+        usage: TokenUsage::new(input, output),
         done_reason: payload
             .get("done_reason")
             .and_then(Value::as_str)
@@ -1428,19 +1421,23 @@ mod tests {
         let request = structured_request();
         for payload in [
             json!({"message":{"content":""},"prompt_eval_count":1,"eval_count":1}),
-            json!({"message":{"content":"{}"},"eval_count":1}),
-            json!({"message":{"content":"{}"},"prompt_eval_count":1}),
+            json!({"message":{"content":"   "},"prompt_eval_count":1,"eval_count":1}),
+            json!({"message":{"content":null},"prompt_eval_count":1,"eval_count":1}),
         ] {
             assert!(parse_structured_chat_response(&payload).is_err());
         }
+        let raw = parse_structured_chat_response(&json!({
+            "message": {"content": "not json"},
+            "prompt_eval_count": 1
+        }))
+        .unwrap();
+        assert_eq!(raw.content, "not json");
+        assert_eq!(raw.usage, TokenUsage::new(Some(1), None));
         assert_eq!(
-            parse_structured_chat_response(&json!({
-                "message": {"content": "not json"},
-                "prompt_eval_count": 1,
-                "eval_count": 1
-            }))
-            .unwrap_err(),
-            OllamaError::Protocol("Ollama 结构化响应内容不是有效 JSON".into())
+            parse_structured_chat_response(&json!({"message":{"content":"{}"}}))
+                .unwrap()
+                .usage,
+            TokenUsage::new(None, None)
         );
 
         let mut invalid = request.clone();

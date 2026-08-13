@@ -18,6 +18,56 @@ pub const CONSOLIDATION_MAX_CHARS: usize = 24_000;
 
 const CONSOLIDATION_BATCH_KEY_VERSION: &str = "hippocampus-consolidation-batch-v2";
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsolidationTrigger {
+    TuiExit,
+    TuiIdleCtrlC,
+    Manual,
+}
+
+impl ConsolidationTrigger {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TuiExit => "tui_exit",
+            Self::TuiIdleCtrlC => "tui_idle_ctrl_c",
+            Self::Manual => "manual",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsolidationRunStatus {
+    Disabled,
+    UpToDate,
+    Completed,
+    Partial,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConsolidationRunReport {
+    pub session_id: String,
+    pub trigger: ConsolidationTrigger,
+    pub model: String,
+    pub status: ConsolidationRunStatus,
+    pub batches_attempted: usize,
+    pub batches_applied: usize,
+    pub events_attempted: usize,
+    pub events_applied: usize,
+    pub entities_attempted: usize,
+    pub entities_applied: usize,
+    pub claims_attempted: usize,
+    pub claims_applied: usize,
+    pub boundaries_attempted: usize,
+    pub boundaries_applied: usize,
+    pub watermark_before: usize,
+    pub watermark_after: usize,
+    pub warnings: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConsolidationEvent {
     pub event_id: String,
@@ -7969,6 +8019,46 @@ mod tests {
     use rusqlite::{Connection, params};
 
     use super::*;
+
+    #[test]
+    fn consolidation_run_types_serialize_stably() {
+        assert_eq!(
+            serde_json::to_string(&ConsolidationTrigger::TuiExit).unwrap(),
+            "\"tui_exit\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ConsolidationTrigger::TuiIdleCtrlC).unwrap(),
+            "\"tui_idle_ctrl_c\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ConsolidationTrigger::Manual).unwrap(),
+            "\"manual\""
+        );
+        let report = ConsolidationRunReport {
+            session_id: "session".into(),
+            trigger: ConsolidationTrigger::Manual,
+            model: "model".into(),
+            status: ConsolidationRunStatus::Completed,
+            batches_attempted: 1,
+            batches_applied: 1,
+            events_attempted: 2,
+            events_applied: 2,
+            entities_attempted: 3,
+            entities_applied: 3,
+            claims_attempted: 4,
+            claims_applied: 4,
+            boundaries_attempted: 5,
+            boundaries_applied: 5,
+            watermark_before: 0,
+            watermark_after: 2,
+            warnings: vec!["warning".into()],
+        };
+        let encoded = serde_json::to_string(&report).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ConsolidationRunReport>(&encoded).unwrap(),
+            report
+        );
+    }
     use crate::model::{EventRole, Session, Turn, TurnStatus, content_sha256, utc_now};
     use crate::retrieval::INDEX_FILENAME;
     use crate::store::SessionStore;

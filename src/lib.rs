@@ -20,10 +20,11 @@ pub use consolidation::{
     ConsolidationApplyReport, ConsolidationApplyResult, ConsolidationAttemptRecord,
     ConsolidationAttemptStatus, ConsolidationBoundaryOutput, ConsolidationCandidateSnapshot,
     ConsolidationClaimEvidence, ConsolidationClaimObjectKind, ConsolidationEvent,
-    ConsolidationEvidenceKind, ConsolidationInputBatch, ConsolidationQuote, ConsolidationWatermark,
-    EntityAliasOutput, EntityDisambiguation, EntityResolution, EntityResolutionBasis,
-    MemoryAliasCandidate, MemoryAliasKind, MemoryClaimCandidate, MemoryClaimEvidenceCandidate,
-    MemoryClaimState, MemoryEntityCandidate, MemoryEntityKind, StructuredConsolidationOutput,
+    ConsolidationEvidenceKind, ConsolidationInputBatch, ConsolidationQuote, ConsolidationRunReport,
+    ConsolidationRunStatus, ConsolidationTrigger, ConsolidationWatermark, EntityAliasOutput,
+    EntityDisambiguation, EntityResolution, EntityResolutionBasis, MemoryAliasCandidate,
+    MemoryAliasKind, MemoryClaimCandidate, MemoryClaimEvidenceCandidate, MemoryClaimState,
+    MemoryEntityCandidate, MemoryEntityKind, StructuredConsolidationOutput,
     structured_consolidation_schema,
 };
 pub use context::ContextAssembler;
