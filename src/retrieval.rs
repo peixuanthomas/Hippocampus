@@ -17,9 +17,13 @@ use crate::model::{
     SelectedEvidence, Session, SourceSpan, Turn, TurnStatus, WebTrace, content_sha256,
     context_sha256, event_id,
 };
+use crate::vector::{
+    EmbeddingCoverage, EmbeddingWrite, StoredEmbedding, VectorIndexSpec, decode_f32_le,
+    encode_f32_le,
+};
 
 pub const INDEX_FILENAME: &str = ".hippocampus-index.sqlite3";
-const INDEX_SCHEMA_VERSION: i64 = 4;
+const INDEX_SCHEMA_VERSION: i64 = 5;
 const MEMORY_STATE_SCHEMA_VERSION: i64 = 3;
 
 #[derive(Debug, Error)]
@@ -351,7 +355,8 @@ impl RetrievalStore {
             .map_err(|source| self.database_error(source))?;
         transaction
             .execute_batch(
-                "DELETE FROM retrieval_documents_fts;
+                "DELETE FROM memory_documents;
+                 DELETE FROM retrieval_documents_fts;
                  DELETE FROM retrieval_documents;
                  DELETE FROM retrieval_runs;
                  DELETE FROM answer_context_items;
@@ -376,6 +381,205 @@ impl RetrievalStore {
             .commit()
             .map_err(|source| self.database_error(source))?;
         Ok(total)
+    }
+
+    /// Atomically replace the persisted embeddings for a batch of immutable
+    /// derived documents.  The expected source hash prevents a vector
+    /// produced for an older source span from being committed after resync.
+    pub fn upsert_embeddings(
+        &self,
+        spec: &VectorIndexSpec,
+        writes: &[EmbeddingWrite],
+    ) -> RetrievalResult<()> {
+        spec.validate()
+            .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+        let _guard = self.acquire_root_write()?;
+        let mut connection = self.open_connection()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| self.database_error(error))?;
+        let mut document_ids = HashSet::with_capacity(writes.len());
+        let mut prepared = Vec::with_capacity(writes.len());
+        for write in writes {
+            if !document_ids.insert(write.document_id.as_str()) {
+                return Err(RetrievalError::CorruptIndex(format!(
+                    "批量写入包含重复文档 {}",
+                    write.document_id
+                )));
+            }
+            if write.expected_source_sha256.trim().is_empty() {
+                return Err(RetrievalError::CorruptIndex(format!(
+                    "文档 {} 缺少源哈希",
+                    write.document_id
+                )));
+            }
+            if write.vector.len() != spec.dimensions {
+                return Err(RetrievalError::CorruptIndex(format!(
+                    "文档 {} 的向量维度不匹配",
+                    write.document_id
+                )));
+            }
+            let bytes = encode_f32_le(&write.vector)
+                .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+            let current_hash = transaction
+                .query_row(
+                    "SELECT source_sha256 FROM memory_documents WHERE document_id=?1",
+                    [&write.document_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|error| self.database_error(error))?
+                .ok_or_else(|| {
+                    RetrievalError::CorruptIndex(format!("未知派生文档 {}", write.document_id))
+                })?;
+            if current_hash != write.expected_source_sha256 {
+                return Err(RetrievalError::CorruptIndex(format!(
+                    "文档 {} 的源哈希已变化",
+                    write.document_id
+                )));
+            }
+            prepared.push((&write.document_id, &write.expected_source_sha256, bytes));
+        }
+        let fingerprint = spec.fingerprint();
+        let embedded_at = Utc::now().to_rfc3339();
+        for (document_id, source_sha256, bytes) in prepared {
+            transaction
+                .execute(
+                    "INSERT INTO memory_embeddings
+                     (document_id, model, dimensions, source_sha256, index_fingerprint, vector_blob, embedded_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                     ON CONFLICT(document_id) DO UPDATE SET
+                     model=excluded.model, dimensions=excluded.dimensions,
+                     source_sha256=excluded.source_sha256,
+                     index_fingerprint=excluded.index_fingerprint,
+                     vector_blob=excluded.vector_blob, embedded_at=excluded.embedded_at",
+                    params![
+                        document_id,
+                        spec.model,
+                        usize_to_i64(spec.dimensions).map_err(|error| self.database_error(error))?,
+                        source_sha256,
+                        fingerprint,
+                        bytes,
+                        embedded_at,
+                    ],
+                )
+                .map_err(|error| self.database_error(error))?;
+        }
+        transaction
+            .commit()
+            .map_err(|error| self.database_error(error))?;
+        Ok(())
+    }
+
+    pub fn compatible_embeddings(
+        &self,
+        spec: &VectorIndexSpec,
+    ) -> RetrievalResult<Vec<StoredEmbedding>> {
+        spec.validate()
+            .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+        let _guard = self.acquire_root_read()?;
+        let connection = self.open_connection()?;
+        let fingerprint = spec.fingerprint();
+        let mut statement = connection
+            .prepare(
+                "SELECT d.document_id, d.session_id, d.granularity, d.source_sha256,
+                        e.model, e.dimensions, e.index_fingerprint, e.vector_blob, e.embedded_at
+                 FROM memory_documents d JOIN memory_embeddings e ON e.document_id=d.document_id
+                 WHERE e.model=?1 AND e.dimensions=?2 AND e.source_sha256=d.source_sha256
+                   AND e.index_fingerprint=?3
+                 ORDER BY d.document_id ASC",
+            )
+            .map_err(|error| self.database_error(error))?;
+        let rows = statement
+            .query_map(
+                params![
+                    spec.model,
+                    usize_to_i64(spec.dimensions).map_err(|error| self.database_error(error))?,
+                    fingerprint,
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        i64_to_usize(row.get(5)?)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, Vec<u8>>(7)?,
+                        row.get::<_, String>(8)?,
+                    ))
+                },
+            )
+            .map_err(|error| self.database_error(error))?;
+        let rows = rows
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| self.database_error(error))?;
+        rows.into_iter()
+            .map(
+                |(
+                    document_id,
+                    session_id,
+                    granularity,
+                    source_sha256,
+                    model,
+                    dimensions,
+                    index_fingerprint,
+                    bytes,
+                    embedded_at,
+                )| {
+                    let granularity = parse_memory_granularity(&granularity)?;
+                    let vector = decode_f32_le(&bytes, dimensions).map_err(|error| {
+                        RetrievalError::CorruptIndex(format!(
+                            "文档 {document_id} 的兼容向量损坏：{error}"
+                        ))
+                    })?;
+                    Ok(StoredEmbedding {
+                        document_id,
+                        session_id,
+                        granularity,
+                        source_sha256,
+                        model,
+                        dimensions,
+                        index_fingerprint,
+                        vector,
+                        embedded_at,
+                    })
+                },
+            )
+            .collect()
+    }
+
+    pub fn embedding_coverage(&self, spec: &VectorIndexSpec) -> RetrievalResult<EmbeddingCoverage> {
+        spec.validate()
+            .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+        let _guard = self.acquire_root_read()?;
+        let connection = self.open_connection()?;
+        let total = connection
+            .query_row("SELECT count(*) FROM memory_documents", [], |row| {
+                i64_to_usize(row.get(0)?)
+            })
+            .map_err(|error| self.database_error(error))?;
+        let fingerprint = spec.fingerprint();
+        let compatible = connection
+            .query_row(
+                "SELECT count(*) FROM memory_documents d
+                 JOIN memory_embeddings e ON e.document_id=d.document_id
+                 WHERE e.model=?1 AND e.dimensions=?2 AND e.source_sha256=d.source_sha256
+                   AND e.index_fingerprint=?3",
+                params![
+                    spec.model,
+                    usize_to_i64(spec.dimensions).map_err(|error| self.database_error(error))?,
+                    fingerprint,
+                ],
+                |row| i64_to_usize(row.get(0)?),
+            )
+            .map_err(|error| self.database_error(error))?;
+        Ok(EmbeddingCoverage {
+            total,
+            compatible,
+            stale: total.saturating_sub(compatible),
+        })
     }
 
     pub(crate) fn acquire_root_read(&self) -> RetrievalResult<RwLockReadGuard<'_, ()>> {
@@ -972,6 +1176,8 @@ impl RetrievalStore {
                         .map_err(|error| self.database_error(error))?;
                     insert_document(transaction, event, &span, granularity, &text)
                         .map_err(|error| self.database_error(error))?;
+                    insert_memory_document(transaction, event, &span, granularity, &text)
+                        .map_err(|error| self.database_error(error))?;
                     document_count += 1;
                 }
             }
@@ -1205,7 +1411,7 @@ impl RetrievalStore {
         let version = connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .map_err(|source| self.database_error(source))?;
-        if !matches!(version, 0 | 1 | 2 | 3 | INDEX_SCHEMA_VERSION) {
+        if !matches!(version, 0 | 1 | 2 | 3 | 4 | INDEX_SCHEMA_VERSION) {
             return Err(RetrievalError::UnsupportedIndexVersion(version));
         }
         let existing_memory_version = read_existing_memory_state_version(&connection)
@@ -1245,7 +1451,8 @@ impl RetrievalStore {
             if version == 1 {
                 transaction
                     .execute_batch(
-                        "DELETE FROM retrieval_documents_fts; DELETE FROM retrieval_documents;",
+                        "DELETE FROM memory_documents;
+                         DELETE FROM retrieval_documents_fts; DELETE FROM retrieval_documents;",
                     )
                     .map_err(|e| self.database_error(e))?;
                 let mut statement = transaction.prepare("SELECT event_id, session_id, turn_id, sequence, role, created_at, content, content_sha256, reply_to_event_id, token_count, turn_status, done_reason, error FROM events").map_err(|e| self.database_error(e))?;
@@ -1264,15 +1471,20 @@ impl RetrievalStore {
                                 .map_err(|e| self.database_error(e))?;
                             insert_document(&transaction, event, &span, granularity, &text)
                                 .map_err(|e| self.database_error(e))?;
+                            insert_memory_document(&transaction, event, &span, granularity, &text)
+                                .map_err(|e| self.database_error(e))?;
                         }
                     }
                 }
+            }
+            if version == 2 {
+                backfill_memory_documents(&transaction).map_err(|e| self.database_error(e))?;
             }
             transaction
                 .pragma_update(None, "user_version", INDEX_SCHEMA_VERSION)
                 .map_err(|e| self.database_error(e))?;
             transaction.commit().map_err(|e| self.database_error(e))?;
-        } else if matches!(version, 0 | 3) {
+        } else if matches!(version, 0 | 3 | 4) {
             let transaction = connection
                 .transaction()
                 .map_err(|e| self.database_error(e))?;
@@ -1281,6 +1493,9 @@ impl RetrievalStore {
                 .map_err(|e| self.database_error(e))?;
             prepare_memory_state_schema(&transaction, existing_memory_version)
                 .map_err(|e| self.database_error(e))?;
+            if matches!(version, 3 | 4) {
+                backfill_memory_documents(&transaction).map_err(|e| self.database_error(e))?;
+            }
             transaction
                 .pragma_update(None, "user_version", INDEX_SCHEMA_VERSION)
                 .map_err(|e| self.database_error(e))?;
@@ -1409,6 +1624,91 @@ fn insert_document(
     let rowid = transaction.last_insert_rowid();
     transaction.execute("INSERT INTO retrieval_documents_fts(rowid, lexical_content, ngram_content) VALUES(?1,?2,?3)", params![rowid, lexical_field(content), ngram_field(content)])?;
     Ok(())
+}
+
+fn insert_memory_document(
+    transaction: &Transaction<'_>,
+    event: &StoredEvent,
+    span: &SourceSpan,
+    granularity: RetrievalDocumentGranularity,
+    content: &str,
+) -> rusqlite::Result<()> {
+    let granularity = match granularity {
+        RetrievalDocumentGranularity::Message => "message",
+        RetrievalDocumentGranularity::Fragment => "fragment",
+        RetrievalDocumentGranularity::Episode | RetrievalDocumentGranularity::Session => {
+            return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "lexical document must be message or fragment",
+                ),
+            )));
+        }
+    };
+    let document_id = format!("{}:{}:{}", event.id, span.start_char, span.end_char);
+    let source_sha256 = content_sha256(content);
+    transaction.execute(
+        "INSERT INTO memory_documents
+         (document_id, session_id, granularity, source_sha256, start_sequence, end_sequence, member_count)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)
+         ON CONFLICT(document_id) DO UPDATE SET
+         session_id=excluded.session_id, granularity=excluded.granularity,
+         source_sha256=excluded.source_sha256, start_sequence=excluded.start_sequence,
+         end_sequence=excluded.end_sequence, member_count=excluded.member_count",
+        params![
+            document_id,
+            event.session_id,
+            granularity,
+            source_sha256,
+            usize_to_i64(event.sequence)?,
+            usize_to_i64(event.sequence)?,
+        ],
+    )?;
+    transaction.execute(
+        "DELETE FROM memory_document_members WHERE document_id=?1",
+        [&document_id],
+    )?;
+    transaction.execute(
+        "INSERT INTO memory_document_members
+         (document_id, ordinal, event_id, start_char, end_char, content_sha256)
+         VALUES (?1, 0, ?2, ?3, ?4, ?5)",
+        params![
+            document_id,
+            event.id,
+            usize_to_i64(span.start_char)?,
+            usize_to_i64(span.end_char)?,
+            source_sha256,
+        ],
+    )?;
+    Ok(())
+}
+
+fn backfill_memory_documents(transaction: &Transaction<'_>) -> rusqlite::Result<()> {
+    transaction.execute_batch(
+        "INSERT INTO memory_documents
+         (document_id, session_id, granularity, source_sha256, start_sequence, end_sequence, member_count)
+         SELECT d.document_id, e.session_id, d.granularity, d.content_sha256,
+                e.sequence, e.sequence, 1
+         FROM retrieval_documents d JOIN events e ON e.event_id=d.event_id
+         WHERE d.granularity IN ('message', 'fragment');
+         INSERT INTO memory_document_members
+         (document_id, ordinal, event_id, start_char, end_char, content_sha256)
+         SELECT d.document_id, 0, d.event_id, d.start_char, d.end_char, d.content_sha256
+         FROM retrieval_documents d
+         WHERE d.granularity IN ('message', 'fragment');",
+    )
+}
+
+fn parse_memory_granularity(value: &str) -> RetrievalResult<RetrievalDocumentGranularity> {
+    match value {
+        "message" => Ok(RetrievalDocumentGranularity::Message),
+        "fragment" => Ok(RetrievalDocumentGranularity::Fragment),
+        "episode" => Ok(RetrievalDocumentGranularity::Episode),
+        "session" => Ok(RetrievalDocumentGranularity::Session),
+        _ => Err(RetrievalError::CorruptIndex(format!(
+            "未知记忆文档粒度 {value}"
+        ))),
+    }
 }
 
 fn jieba() -> &'static jieba_rs::Jieba {
@@ -2131,6 +2431,44 @@ CREATE TABLE IF NOT EXISTS retrieval_documents (
 CREATE VIRTUAL TABLE IF NOT EXISTS retrieval_documents_fts USING fts5(
     lexical_content, ngram_content, tokenize='unicode61'
 );
+
+-- The memory catalog is derived only.  It intentionally remains separate
+-- from FTS because episode/session documents have provenance members but no
+-- generated text to index.
+CREATE TABLE IF NOT EXISTS memory_documents (
+    document_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES indexed_sessions(session_id) ON DELETE CASCADE,
+    granularity TEXT NOT NULL CHECK(granularity IN ('message', 'fragment', 'episode', 'session')),
+    source_sha256 TEXT NOT NULL CHECK(length(source_sha256) > 0),
+    start_sequence INTEGER NOT NULL CHECK(start_sequence >= 0),
+    end_sequence INTEGER NOT NULL CHECK(end_sequence >= start_sequence),
+    member_count INTEGER NOT NULL CHECK(member_count > 0)
+);
+
+CREATE TABLE IF NOT EXISTS memory_document_members (
+    document_id TEXT NOT NULL REFERENCES memory_documents(document_id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+    event_id TEXT NOT NULL,
+    start_char INTEGER NOT NULL CHECK(start_char >= 0),
+    end_char INTEGER NOT NULL CHECK(end_char >= start_char),
+    content_sha256 TEXT NOT NULL CHECK(length(content_sha256) > 0),
+    PRIMARY KEY(document_id, ordinal),
+    FOREIGN KEY(event_id, start_char, end_char)
+        REFERENCES source_spans(event_id, start_char, end_char)
+);
+
+CREATE TABLE IF NOT EXISTS memory_embeddings (
+    document_id TEXT PRIMARY KEY REFERENCES memory_documents(document_id) ON DELETE CASCADE,
+    model TEXT NOT NULL CHECK(length(model) > 0),
+    dimensions INTEGER NOT NULL CHECK(dimensions > 0),
+    source_sha256 TEXT NOT NULL CHECK(length(source_sha256) > 0),
+    index_fingerprint TEXT NOT NULL CHECK(length(index_fingerprint) > 0),
+    vector_blob BLOB NOT NULL CHECK(length(vector_blob) = dimensions * 4),
+    embedded_at TEXT NOT NULL CHECK(length(embedded_at) > 0)
+);
+
+CREATE INDEX IF NOT EXISTS memory_documents_session_granularity
+    ON memory_documents(session_id, granularity, document_id);
 
 CREATE INDEX IF NOT EXISTS events_session_sequence
     ON events(session_id, sequence);
@@ -2982,7 +3320,7 @@ CREATE INDEX memory_boundary_suggestions_session_event
                  );
                  INSERT INTO consolidation_batches VALUES
                      ('future-attempt', 'future-applied', '{\"future\":true}');
-                 PRAGMA user_version=5;",
+                 PRAGMA user_version=6;",
             )
             .unwrap();
         drop(connection);
@@ -2991,7 +3329,7 @@ CREATE INDEX memory_boundary_suggestions_session_event
         let store = RetrievalStore::new(root.path()).unwrap();
         assert!(matches!(
             store.rebuild(),
-            Err(RetrievalError::UnsupportedIndexVersion(5))
+            Err(RetrievalError::UnsupportedIndexVersion(6))
         ));
         assert!(index.is_file());
         assert_eq!(fs::read(&index).unwrap(), original_bytes);
@@ -3001,7 +3339,7 @@ CREATE INDEX memory_boundary_suggestions_session_event
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            5
+            6
         );
         assert_eq!(
             connection
@@ -3060,6 +3398,361 @@ CREATE INDEX memory_boundary_suggestions_session_event
                 "future-applied".to_owned(),
                 "{\"future\":true}".to_owned(),
             )
+        );
+    }
+
+    #[test]
+    fn migrates_real_v4_vector_storage_transactionally() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let mut session = store
+            .create(
+                "model",
+                "http://localhost",
+                Some("system"),
+                Default::default(),
+                false,
+            )
+            .unwrap();
+        let answer_id = append_complete_turn(
+            &mut session,
+            &format!("{}杭州唐波", "甲".repeat(241)),
+            "原始回复",
+            "",
+        );
+        store.save(&mut session).unwrap();
+        let expected_context = store.retrieval().answer_context(&answer_id).unwrap();
+        {
+            let connection = Connection::open(store.retrieval().index_path()).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO consolidation_watermarks
+                     (session_id, through_sequence, through_event_id, through_event_sha256, updated_at)
+                     VALUES (?1, 1, 'event', 'hash', '2026-01-01T00:00:00Z')",
+                    [&session.id],
+                )
+                .unwrap();
+            connection
+                .execute_batch(
+                    "DROP TABLE memory_embeddings;
+                     DROP TABLE memory_document_members;
+                     DROP TABLE memory_documents;
+                     PRAGMA user_version=4;",
+                )
+                .unwrap();
+        }
+
+        let migrated = RetrievalStore::new(root.path()).unwrap();
+        let connection = migrated.open_connection().unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            INDEX_SCHEMA_VERSION
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM memory_documents", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            connection
+                .query_row("SELECT count(*) FROM retrieval_documents", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap()
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM memory_document_members", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            connection
+                .query_row("SELECT count(*) FROM retrieval_documents", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap()
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT member_count, start_sequence=end_sequence, source_sha256=content_sha256
+                     FROM memory_documents m
+                     JOIN retrieval_documents d ON d.document_id=m.document_id
+                     ORDER BY m.document_id LIMIT 1",
+                    [],
+                    |row| Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?
+                    )),
+                )
+                .unwrap(),
+            (1, 1, 1)
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT mm.ordinal, mm.event_id=d.event_id,
+                            mm.start_char=d.start_char, mm.end_char=d.end_char,
+                            mm.content_sha256=d.content_sha256
+                     FROM memory_document_members mm
+                     JOIN retrieval_documents d ON d.document_id=mm.document_id
+                     ORDER BY mm.document_id LIMIT 1",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, i64>(4)?,
+                        ))
+                    },
+                )
+                .unwrap(),
+            (0, 1, 1, 1, 1)
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT through_sequence FROM consolidation_watermarks WHERE session_id=?1",
+                    [&session.id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        let recall = migrated
+            .keyword_recall("唐波", "current", &[], RetrievalConfig::default())
+            .unwrap();
+        assert!(
+            recall
+                .evidence
+                .iter()
+                .any(|item| item.content.contains("杭州唐波"))
+        );
+        assert_eq!(
+            migrated.answer_context(&answer_id).unwrap().context_sha256,
+            expected_context.context_sha256
+        );
+    }
+
+    #[test]
+    fn vector_storage_sync_rebuild_and_embedding_guards() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let mut session = store
+            .create("model", "http://localhost", None, Default::default(), false)
+            .unwrap();
+        append_complete_turn(
+            &mut session,
+            &format!("{}证据", "字".repeat(241)),
+            "回复",
+            "",
+        );
+        store.save(&mut session).unwrap();
+        let spec = VectorIndexSpec {
+            model: "qwen3-embedding:8b".into(),
+            dimensions: 3,
+            hnsw_m: 16,
+            hnsw_ef_construction: 200,
+            hnsw_ef_search: 64,
+        };
+        let connection = store.retrieval().open_connection().unwrap();
+        let (document_id, source_sha256): (String, String) = connection
+            .query_row(
+                "SELECT document_id, source_sha256 FROM memory_documents ORDER BY document_id LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let lexical_count = connection
+            .query_row("SELECT count(*) FROM retrieval_documents", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        let catalog_count = connection
+            .query_row("SELECT count(*) FROM memory_documents", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        assert_eq!(catalog_count, lexical_count);
+        drop(connection);
+
+        let write = EmbeddingWrite {
+            document_id: document_id.clone(),
+            expected_source_sha256: source_sha256.clone(),
+            vector: vec![1.0, -0.0, 0.5],
+        };
+        store
+            .retrieval()
+            .upsert_embeddings(&spec, &[write.clone()])
+            .unwrap();
+        assert_eq!(
+            store
+                .retrieval()
+                .embedding_coverage(&spec)
+                .unwrap()
+                .compatible,
+            1
+        );
+        let loaded = store.retrieval().compatible_embeddings(&spec).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].vector[1].to_bits(), (-0.0_f32).to_bits());
+        store.save(&mut session).unwrap();
+        assert_eq!(
+            store
+                .retrieval()
+                .embedding_coverage(&spec)
+                .unwrap()
+                .compatible,
+            1
+        );
+        assert_eq!(
+            store
+                .retrieval()
+                .compatible_embeddings(&spec)
+                .unwrap()
+                .len(),
+            1
+        );
+        append_complete_turn(&mut session, "追加问题", "追加回复", "");
+        store.save(&mut session).unwrap();
+        let after_append = store.retrieval().embedding_coverage(&spec).unwrap();
+        assert_eq!(after_append.compatible, 1);
+        assert!(after_append.total > after_append.compatible);
+        assert_eq!(
+            store
+                .retrieval()
+                .compatible_embeddings(&spec)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let mut changed = spec.clone();
+        changed.model = "different".into();
+        assert_eq!(
+            store
+                .retrieval()
+                .embedding_coverage(&changed)
+                .unwrap()
+                .compatible,
+            0
+        );
+        changed = spec.clone();
+        changed.dimensions = 4;
+        assert_eq!(
+            store
+                .retrieval()
+                .embedding_coverage(&changed)
+                .unwrap()
+                .compatible,
+            0
+        );
+        changed = spec.clone();
+        changed.hnsw_m = 24;
+        assert_eq!(
+            store
+                .retrieval()
+                .embedding_coverage(&changed)
+                .unwrap()
+                .compatible,
+            0
+        );
+        changed = spec.clone();
+        changed.hnsw_ef_construction = 300;
+        assert_eq!(
+            store
+                .retrieval()
+                .embedding_coverage(&changed)
+                .unwrap()
+                .compatible,
+            0
+        );
+        changed = spec.clone();
+        changed.hnsw_ef_search = 96;
+        assert_eq!(
+            store
+                .retrieval()
+                .embedding_coverage(&changed)
+                .unwrap()
+                .compatible,
+            0
+        );
+
+        for invalid in [
+            vec![EmbeddingWrite {
+                expected_source_sha256: "wrong".into(),
+                ..write.clone()
+            }],
+            vec![EmbeddingWrite {
+                document_id: "unknown".into(),
+                ..write.clone()
+            }],
+            vec![
+                write.clone(),
+                EmbeddingWrite {
+                    document_id: "unknown".into(),
+                    ..write.clone()
+                },
+            ],
+            vec![EmbeddingWrite {
+                vector: vec![1.0],
+                ..write.clone()
+            }],
+            vec![EmbeddingWrite {
+                vector: vec![f32::NAN, 0.0, 0.0],
+                ..write.clone()
+            }],
+            vec![write.clone(), write.clone()],
+        ] {
+            assert!(
+                store
+                    .retrieval()
+                    .upsert_embeddings(&spec, &invalid)
+                    .is_err()
+            );
+            assert_eq!(
+                store
+                    .retrieval()
+                    .compatible_embeddings(&spec)
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+
+        {
+            let connection = Connection::open(store.retrieval().index_path()).unwrap();
+            connection
+                .execute(
+                    "UPDATE memory_embeddings SET vector_blob=X'0000C07F0000000000000000' WHERE document_id=?1",
+                    [&document_id],
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            store.retrieval().compatible_embeddings(&spec),
+            Err(RetrievalError::CorruptIndex(_))
+        ));
+        store.retrieval().rebuild().unwrap();
+        let connection = store.retrieval().open_connection().unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM memory_embeddings", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM memory_documents", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            connection
+                .query_row("SELECT count(*) FROM retrieval_documents", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap()
         );
     }
 

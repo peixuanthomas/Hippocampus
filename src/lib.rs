@@ -8,6 +8,7 @@ pub mod ollama;
 pub mod retrieval;
 pub mod store;
 pub mod tui;
+pub mod vector;
 pub mod web;
 
 pub use config::{
@@ -44,3 +45,7 @@ pub use retrieval::{
     RetrievalError, RetrievalStore, StoredEvent, SyncReport,
 };
 pub use store::{IndexSyncAfterSourceCommit, SessionStore};
+pub use vector::{
+    EmbeddingCoverage, EmbeddingWrite, StoredEmbedding, VectorError, VectorIndexSpec,
+    decode_f32_le, encode_f32_le,
+};
