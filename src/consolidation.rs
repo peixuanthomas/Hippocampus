@@ -1741,22 +1741,24 @@ fn validate_full_derived_integrity(connection: &Connection) -> RetrievalResult<(
 
     let mut statement = connection
         .prepare(
-            "SELECT transition_id, from_state, to_state, reason, related_claim_id,
+            "SELECT transition_id, ordinal, from_state, to_state, reason, related_claim_id,
                     session_id, batch_key, created_at
-             FROM memory_claim_transitions ORDER BY transition_id",
+             FROM memory_claim_transitions ORDER BY claim_id, ordinal",
         )
         .map_err(candidate_database_error)?;
     let mut rows = statement.query([]).map_err(candidate_database_error)?;
     while let Some(row) = rows.next().map_err(candidate_database_error)? {
         let id: String = row.get(0).map_err(candidate_database_error)?;
-        let from: Option<String> = row.get(1).map_err(candidate_database_error)?;
-        let to: String = row.get(2).map_err(candidate_database_error)?;
-        let reason: String = row.get(3).map_err(candidate_database_error)?;
-        let related: Option<String> = row.get(4).map_err(candidate_database_error)?;
-        let session: String = row.get(5).map_err(candidate_database_error)?;
-        let batch_key: String = row.get(6).map_err(candidate_database_error)?;
-        let created: String = row.get(7).map_err(candidate_database_error)?;
+        let ordinal: i64 = row.get(1).map_err(candidate_database_error)?;
+        let from: Option<String> = row.get(2).map_err(candidate_database_error)?;
+        let to: String = row.get(3).map_err(candidate_database_error)?;
+        let reason: String = row.get(4).map_err(candidate_database_error)?;
+        let related: Option<String> = row.get(5).map_err(candidate_database_error)?;
+        let session: String = row.get(6).map_err(candidate_database_error)?;
+        let batch_key: String = row.get(7).map_err(candidate_database_error)?;
+        let created: String = row.get(8).map_err(candidate_database_error)?;
         if id.trim().is_empty()
+            || ordinal < 0
             || session.trim().is_empty()
             || batch_key.trim().is_empty()
             || !matches!(
@@ -1777,7 +1779,16 @@ fn validate_full_derived_integrity(connection: &Connection) -> RetrievalResult<(
             parse_claim_state(value)?;
         }
         parse_claim_state(&to)?;
-        if matches!(reason.as_str(), "conflicted" | "corrected" | "replaced") != related.is_some() {
+        let related_is_valid = match reason.as_str() {
+            "created" => {
+                (to == "conflicted" && related.is_some())
+                    || (to != "conflicted" && related.is_none())
+            }
+            "conflicted" | "corrected" | "replaced" => related.is_some(),
+            "confirmed" | "certainty_upgraded" => related.is_none(),
+            _ => false,
+        };
+        if !related_is_valid {
             return Err(RetrievalError::CorruptIndex(format!(
                 "声明迁移 {id} 的关联声明不符合原因"
             )));
@@ -2093,8 +2104,8 @@ fn validate_memory_v2_semantics_and_history(connection: &Connection) -> Retrieva
                     alias.alias_id
                 )));
             }
-            validate_stored_alias_proof(connection, entity, alias)?;
         }
+        validate_stored_alias_provenance(connection, entity)?;
     }
 
     for claim in &claims {
@@ -2505,9 +2516,8 @@ fn resolved_entity_view(entity: &MemoryEntityCandidate) -> ResolvedEntityView {
 
 fn validate_stored_alias_proof(
     connection: &Connection,
-    entity: &MemoryEntityCandidate,
     alias: &MemoryAliasCandidate,
-) -> RetrievalResult<()> {
+) -> RetrievalResult<String> {
     let proof = load_event_quote(
         connection,
         &alias.proof_event_id,
@@ -2537,17 +2547,6 @@ fn validate_stored_alias_proof(
             && inner.quote.start_char >= proof.quote.start_char
             && inner.quote.end_char <= proof.quote.end_char
     };
-    let mut names = vec![entity.normalized_name.clone()];
-    names.extend(
-        entity
-            .aliases
-            .iter()
-            .filter(|candidate| candidate.alias_id != alias.alias_id)
-            .map(|candidate| candidate.normalized_text.clone()),
-    );
-    let identity_matches = names.contains(&normalize_match(&identity.text))
-        || alias.kind == MemoryAliasKind::StableIdentifier
-            && normalize_match(&identity.text) == alias.normalized_text;
     validate_stored_ascii_token_boundary(
         connection,
         &alias.session_id,
@@ -2572,13 +2571,45 @@ fn validate_stored_alias_proof(
         || evidence.text != alias.text
         || !nested(&evidence)
         || !nested(&identity)
-        || !identity_matches
         || !proof_semantics_valid
     {
         return Err(RetrievalError::CorruptIndex(format!(
             "别名 {} 的证明、标记或实体归属不匹配",
             alias.alias_id
         )));
+    }
+    Ok(normalize_match(&identity.text))
+}
+
+fn validate_stored_alias_provenance(
+    connection: &Connection,
+    entity: &MemoryEntityCandidate,
+) -> RetrievalResult<()> {
+    let mut pending = entity
+        .aliases
+        .iter()
+        .map(|alias| Ok((alias, validate_stored_alias_proof(connection, alias)?)))
+        .collect::<RetrievalResult<Vec<_>>>()?;
+    let mut grounded = HashSet::from([entity.normalized_name.clone()]);
+
+    while !pending.is_empty() {
+        let accepted = pending
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (_, identity))| grounded.contains(identity).then_some(index))
+            .collect::<Vec<_>>();
+        if accepted.is_empty() {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "实体 {} 的别名证明未从规范名称形成有向溯源链",
+                entity.entity_id
+            )));
+        }
+        let mut newly_grounded = Vec::with_capacity(accepted.len());
+        for index in accepted.into_iter().rev() {
+            let (alias, _) = pending.swap_remove(index);
+            newly_grounded.push(alias.normalized_text.clone());
+        }
+        grounded.extend(newly_grounded);
     }
     Ok(())
 }
@@ -2641,6 +2672,7 @@ fn applied_batch_session(connection: &Connection, batch_key: &str) -> RetrievalR
 struct StoredTransition {
     id: String,
     claim_id: String,
+    ordinal: usize,
     from: Option<MemoryClaimState>,
     to: MemoryClaimState,
     reason: String,
@@ -2648,7 +2680,7 @@ struct StoredTransition {
     session: String,
     batch: String,
     created_at: String,
-    created_instant: DateTime<FixedOffset>,
+    through_sequence: usize,
 }
 
 fn validate_transition_history(
@@ -2657,25 +2689,26 @@ fn validate_transition_history(
 ) -> RetrievalResult<()> {
     let mut statement = connection
         .prepare(
-            "SELECT transition_id, claim_id, from_state, to_state, reason, related_claim_id,
+            "SELECT transition_id, claim_id, ordinal, from_state, to_state, reason, related_claim_id,
                     session_id, batch_key, created_at
-             FROM memory_claim_transitions ORDER BY claim_id, transition_id",
+             FROM memory_claim_transitions ORDER BY claim_id, ordinal",
         )
         .map_err(candidate_database_error)?;
     let rows = statement
         .query_map([], |row| {
-            let from = row.get::<_, Option<String>>(2)?;
-            let to = row.get::<_, String>(3)?;
+            let from = row.get::<_, Option<String>>(3)?;
+            let to = row.get::<_, String>(4)?;
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
                 from,
                 to,
-                row.get::<_, String>(4)?,
-                row.get::<_, Option<String>>(5)?,
-                row.get::<_, String>(6)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
                 row.get::<_, String>(7)?,
                 row.get::<_, String>(8)?,
+                row.get::<_, String>(9)?,
             ))
         })
         .map_err(candidate_database_error)?
@@ -2683,14 +2716,22 @@ fn validate_transition_history(
         .map_err(candidate_database_error)?;
     drop(statement);
     let mut grouped = HashMap::<String, Vec<StoredTransition>>::new();
-    for (id, claim_id, from, to, reason, related, session, batch, created_at) in rows {
-        let created_instant = parse_stored_time(&created_at, "transition.created_at")?;
+    for (id, claim_id, ordinal, from, to, reason, related, session, batch, created_at) in rows {
+        let ordinal = nonnegative_usize(ordinal, "transition.ordinal")?;
+        let (through_sequence, completed_at) =
+            load_unique_applied_batch_audit(connection, &session, &batch)?;
+        if created_at != completed_at {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "迁移 {id} 的 created_at 不等于唯一 applied 尝试的 completed_at"
+            )));
+        }
         grouped
             .entry(claim_id.clone())
             .or_default()
             .push(StoredTransition {
                 id,
                 claim_id,
+                ordinal,
                 from: from.as_deref().map(parse_claim_state).transpose()?,
                 to: parse_claim_state(&to)?,
                 reason,
@@ -2698,46 +2739,55 @@ fn validate_transition_history(
                 session,
                 batch,
                 created_at,
-                created_instant,
+                through_sequence,
             });
     }
+    let mut conflict_links = HashSet::<(String, String)>::new();
+    let mut conflicted_in_batch = HashSet::<(String, String, String)>::new();
+    let mut created_conflicts = Vec::<(String, String, String, String)>::new();
     for (claim_id, claim) in claims {
-        let mut chain = grouped
+        let chain = grouped
             .remove(*claim_id)
             .ok_or_else(|| RetrievalError::CorruptIndex(format!("声明 {claim_id} 缺少状态迁移")))?;
-        chain.sort_by(|left, right| {
-            left.created_instant
-                .cmp(&right.created_instant)
-                .then_with(|| (left.reason != "created").cmp(&(right.reason != "created")))
-                .then_with(|| left.id.cmp(&right.id))
-        });
-        let claim_created = parse_stored_time(&claim.created_at, "claim.created_at")?;
-        let claim_updated = parse_stored_time(&claim.updated_at, "claim.updated_at")?;
         if chain.first().is_none_or(|transition| {
-            transition.created_instant != claim_created
+            transition.ordinal != 0
+                || transition.created_at != claim.created_at
                 || transition.batch != claim.created_batch_key
                 || transition.session != claim.session_id
         }) || chain.last().is_none_or(|transition| {
-            transition.created_instant != claim_updated
-                || transition.batch != claim.updated_batch_key
+            transition.created_at != claim.updated_at || transition.batch != claim.updated_batch_key
         }) {
             return Err(RetrievalError::CorruptIndex(format!(
                 "声明 {claim_id} 的首尾迁移与声明创建/更新时间不一致"
             )));
         }
         let mut previous = None;
+        let mut last_session_batches = HashMap::<&str, (&str, usize)>::new();
         for (index, transition) in chain.iter().enumerate() {
-            validate_applied_batch_ref(
-                connection,
-                &transition.session,
-                &transition.batch,
-                &transition.created_at,
-                "transition.batch_key",
-            )?;
+            if transition.ordinal != index {
+                return Err(RetrievalError::CorruptIndex(format!(
+                    "声明 {claim_id} 的迁移 ordinal 不连续"
+                )));
+            }
+            if let Some((last_batch, last_sequence)) =
+                last_session_batches.get(transition.session.as_str())
+                && *last_batch != transition.batch
+                && transition.through_sequence <= *last_sequence
+            {
+                return Err(RetrievalError::CorruptIndex(format!(
+                    "声明 {claim_id} 在会话 {} 内的迁移批次序号未严格递增",
+                    transition.session
+                )));
+            }
+            last_session_batches.insert(
+                transition.session.as_str(),
+                (transition.batch.as_str(), transition.through_sequence),
+            );
             let expected = deterministic_id(
                 "transition",
                 &[
                     &transition.claim_id,
+                    &transition.ordinal.to_string(),
                     transition.from.map(MemoryClaimState::as_str).unwrap_or(""),
                     transition.to.as_str(),
                     &transition.reason,
@@ -2746,8 +2796,9 @@ fn validate_transition_history(
                 ],
             );
             if transition.id != expected
-                || (index == 0 && (transition.from.is_some() || transition.reason != "created"))
-                || (index > 0 && transition.from != previous)
+                || transition.from != previous
+                || (index == 0 && transition.reason != "created")
+                || (index > 0 && transition.reason == "created")
             {
                 return Err(RetrievalError::CorruptIndex(format!(
                     "声明 {claim_id} 的迁移链或确定性 ID 损坏（index={index}, id_match={}, from={:?}, previous={previous:?}, reason={}）",
@@ -2760,23 +2811,33 @@ fn validate_transition_history(
             let legal = match transition.reason.as_str() {
                 "created" => {
                     index == 0
+                        && transition.from.is_none()
                         && transition.to != MemoryClaimState::Superseded
+                        && (transition.to == MemoryClaimState::Conflicted) == has_related
                         && (transition.to == MemoryClaimState::Conflicted
                             || transition.to == MemoryClaimState::Active
                                 && claim.certainty == ClaimCertainty::Certain
                             || transition.to == MemoryClaimState::Uncertain)
                 }
                 "confirmed" => {
-                    transition.from == Some(transition.to) && transition.related.is_none()
+                    transition.from == Some(transition.to)
+                        && transition.to.is_live()
+                        && transition.related.is_none()
                 }
                 "certainty_upgraded" => {
                     transition.from == Some(MemoryClaimState::Uncertain)
                         && transition.to == MemoryClaimState::Active
                         && transition.related.is_none()
                 }
-                "conflicted" => transition.to == MemoryClaimState::Conflicted && has_related,
+                "conflicted" => {
+                    transition.from.is_some_and(MemoryClaimState::is_live)
+                        && transition.to == MemoryClaimState::Conflicted
+                        && has_related
+                }
                 "corrected" | "replaced" => {
-                    transition.to == MemoryClaimState::Superseded && has_related
+                    transition.from.is_some_and(MemoryClaimState::is_live)
+                        && transition.to == MemoryClaimState::Superseded
+                        && has_related
                 }
                 _ => false,
             };
@@ -2789,31 +2850,52 @@ fn validate_transition_history(
                 let related = claims.get(related_id).ok_or_else(|| {
                     RetrievalError::CorruptIndex(format!("迁移 {} 的关联声明缺失", transition.id))
                 })?;
-                if related.subject_entity_id != claim.subject_entity_id
-                    || related.predicate_key != claim.predicate_key
-                    || related.created_batch_key != transition.batch
-                    || !stored_claims_contradict(claim, related)
-                {
+                if !stored_claims_contradict(claim, related) {
                     return Err(RetrievalError::CorruptIndex(format!(
-                        "迁移 {} 的关联声明语义或批次不匹配",
+                        "迁移 {} 的关联声明不是实际矛盾声明",
                         transition.id
                     )));
                 }
-                if matches!(transition.reason.as_str(), "corrected" | "replaced")
-                    && claim.valid_to.as_deref() != Some(related.valid_from.as_str())
-                {
-                    return Err(RetrievalError::CorruptIndex(format!(
-                        "迁移 {} 的 superseded 截止时间不等于替代声明起始时间",
-                        transition.id
-                    )));
+                match transition.reason.as_str() {
+                    "created" | "conflicted" => {
+                        let claim_created_here = claim.created_batch_key == transition.batch
+                            && claim.session_id == transition.session;
+                        let related_created_here = related.created_batch_key == transition.batch
+                            && related.session_id == transition.session;
+                        if !claim_created_here && !related_created_here {
+                            return Err(RetrievalError::CorruptIndex(format!(
+                                "迁移 {} 的冲突双方均非本批次新声明",
+                                transition.id
+                            )));
+                        }
+                        let pair = ordered_claim_pair(claim_id, related_id);
+                        conflict_links.insert(pair);
+                        conflicted_in_batch.insert((
+                            claim_id.to_string(),
+                            transition.session.clone(),
+                            transition.batch.clone(),
+                        ));
+                        if transition.reason == "created" {
+                            created_conflicts.push((
+                                claim_id.to_string(),
+                                related_id.to_owned(),
+                                transition.session.clone(),
+                                transition.batch.clone(),
+                            ));
+                        }
+                    }
+                    "corrected" | "replaced"
+                        if related.created_batch_key != transition.batch
+                            || related.session_id != transition.session
+                            || claim.valid_to.as_deref() != Some(related.valid_from.as_str()) =>
+                    {
+                        return Err(RetrievalError::CorruptIndex(format!(
+                            "迁移 {} 的替代声明批次或有效期边界不匹配",
+                            transition.id
+                        )));
+                    }
+                    _ => {}
                 }
-            }
-            if transition.reason == "created"
-                && (transition.to != MemoryClaimState::Conflicted && transition.related.is_some())
-            {
-                return Err(RetrievalError::CorruptIndex(format!(
-                    "声明 {claim_id} 的 created 迁移关联声明不合法"
-                )));
             }
             previous = Some(transition.to);
         }
@@ -2825,6 +2907,96 @@ fn validate_transition_history(
     }
     if !grouped.is_empty() {
         return Err(RetrievalError::CorruptIndex("存在孤立声明迁移链".into()));
+    }
+    for (claim_id, related_id, session, batch) in created_conflicts {
+        if !conflicted_in_batch.contains(&(related_id.clone(), session, batch)) {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "声明 {claim_id} 的初始冲突缺少关联声明 {related_id} 的同批冲突历史"
+            )));
+        }
+    }
+    validate_current_conflict_topology(claims, &conflict_links)?;
+    Ok(())
+}
+
+fn load_unique_applied_batch_audit(
+    connection: &Connection,
+    session_id: &str,
+    batch_key: &str,
+) -> RetrievalResult<(usize, String)> {
+    let rows = connection
+        .prepare(
+            "SELECT through_sequence, completed_at FROM consolidation_batches
+             WHERE session_id = ?1 AND batch_key = ?2 AND status = 'applied'
+             ORDER BY attempt_id",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map(params![session_id, batch_key], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(candidate_database_error)?;
+    if rows.len() != 1 {
+        return Err(RetrievalError::CorruptIndex(format!(
+            "迁移批次 ({session_id},{batch_key}) 未唯一绑定 applied 尝试"
+        )));
+    }
+    let (through_sequence, completed_at) = rows.into_iter().next().expect("one row checked");
+    parse_stored_time(&completed_at, "consolidation_batch.completed_at")?;
+    Ok((
+        nonnegative_usize(through_sequence, "consolidation_batch.through_sequence")?,
+        completed_at,
+    ))
+}
+
+fn ordered_claim_pair(left: &str, right: &str) -> (String, String) {
+    if left <= right {
+        (left.to_owned(), right.to_owned())
+    } else {
+        (right.to_owned(), left.to_owned())
+    }
+}
+
+fn validate_current_conflict_topology(
+    claims: &HashMap<&str, &MemoryClaimCandidate>,
+    conflict_links: &HashSet<(String, String)>,
+) -> RetrievalResult<()> {
+    let values = claims.values().copied().collect::<Vec<_>>();
+    let mut incident = HashSet::<&str>::new();
+    for left in 0..values.len() {
+        for right in (left + 1)..values.len() {
+            let left_claim = values[left];
+            let right_claim = values[right];
+            if left_claim.state.is_live()
+                && right_claim.state.is_live()
+                && stored_claims_contradict(left_claim, right_claim)
+            {
+                if left_claim.state != MemoryClaimState::Conflicted
+                    || right_claim.state != MemoryClaimState::Conflicted
+                    || !conflict_links.contains(&ordered_claim_pair(
+                        &left_claim.claim_id,
+                        &right_claim.claim_id,
+                    ))
+                {
+                    return Err(RetrievalError::CorruptIndex(format!(
+                        "当前矛盾声明 {} 与 {} 的状态或迁移拓扑不完整",
+                        left_claim.claim_id, right_claim.claim_id
+                    )));
+                }
+                incident.insert(&left_claim.claim_id);
+                incident.insert(&right_claim.claim_id);
+            }
+        }
+    }
+    if let Some(claim) = values.iter().find(|claim| {
+        claim.state == MemoryClaimState::Conflicted && !incident.contains(claim.claim_id.as_str())
+    }) {
+        return Err(RetrievalError::CorruptIndex(format!(
+            "当前冲突声明 {} 没有实际矛盾的当前 counterpart",
+            claim.claim_id
+        )));
     }
     Ok(())
 }
@@ -2959,10 +3131,10 @@ fn global_memory_state_hash(connection: &Connection) -> RetrievalResult<String> 
         ),
         (
             "transitions",
-            "SELECT transition_id, claim_id, from_state, to_state, reason, related_claim_id,
+            "SELECT transition_id, claim_id, ordinal, from_state, to_state, reason, related_claim_id,
                     session_id, batch_key, created_at
-             FROM memory_claim_transitions ORDER BY transition_id",
-            9_usize,
+             FROM memory_claim_transitions ORDER BY claim_id, ordinal",
+            10_usize,
         ),
         (
             "boundaries",
@@ -6011,7 +6183,10 @@ fn validate_evidence_semantics(
         .expect("nested object ends inside outer evidence");
     let semantic_envelope = slice_unicode(&quote.text, semantic_start, semantic_end)
         .expect("nested triple envelope uses valid character offsets");
-    let invalid_context = evidence_has_invalid_context(&quote.text);
+    let normalized_semantic = normalize_cue(semantic_envelope);
+    let invalid_context = evidence_has_invalid_context(&quote.text)
+        || normalized_semantic.contains("是否")
+        || contains_cjk_a_not_a_question(semantic_envelope);
 
     let reject_context = || {
         rejected(
@@ -6087,13 +6262,12 @@ fn validate_evidence_semantics(
             if invalid_context {
                 return Err(reject_context());
             }
-            if !is_exact_negative_cue(&marker.text)
-                || marker.quote.end_char > subject.quote.start_char
+            if !is_exact_negative_cue(&marker.text) || marker.quote.end_char > object.quote.end_char
             {
                 return Err(rejected(
                     "confirmation_marker",
                     format!("{path}.speech_act_span"),
-                    "否定确认必须在三元组前使用受支持的精确否定提示",
+                    "否定确认必须在完整三元组范围内使用受支持的精确否定提示",
                 ));
             }
         }
@@ -6227,22 +6401,6 @@ fn evidence_has_invalid_context(value: &str) -> bool {
     let normalized = normalize_cue(value);
     let trimmed = normalized.trim();
     let question = trimmed.chars().any(|ch| matches!(ch, '?' | '？'))
-        || [
-            "是否",
-            "是不是",
-            "有没有",
-            "会不会",
-            "能不能",
-            "可不可以",
-            "要不要",
-            "对不对",
-            "喜不喜欢",
-            "住不住",
-            "在不在",
-            "叫不叫",
-        ]
-        .iter()
-        .any(|marker| normalized.contains(marker))
         || trimmed
             .trim_end_matches(['。', '.', '!', '！', '?', '？'])
             .chars()
@@ -6256,7 +6414,8 @@ fn evidence_has_invalid_context(value: &str) -> bool {
             trimmed
                 .strip_prefix(word)
                 .is_some_and(|tail| tail.starts_with(' '))
-        });
+        })
+        || starts_with_contracted_interrogative(trimmed);
     let conditional = ["如果", "若是", "假如", "要是", "除非"]
         .iter()
         .any(|marker| normalized.contains(marker))
@@ -6292,6 +6451,114 @@ fn evidence_has_invalid_context(value: &str) -> bool {
         .chars()
         .any(|ch| matches!(ch, '"' | '“' | '”' | '「' | '」' | '『' | '』' | '`'));
     question || conditional || attribution || quoted_envelope
+}
+
+fn starts_with_contracted_interrogative(value: &str) -> bool {
+    let leading = value.trim_start_matches(|ch: char| {
+        ch.is_whitespace()
+            || matches!(
+                ch,
+                ',' | '，'
+                    | ':'
+                    | '：'
+                    | ';'
+                    | '；'
+                    | '('
+                    | ')'
+                    | '（'
+                    | '）'
+                    | '['
+                    | ']'
+                    | '【'
+                    | '】'
+            )
+    });
+    let after_optional_cue = [
+        "that's right",
+        "affirmative",
+        "correct",
+        "indeed",
+        "yes",
+        "wrong",
+        "no",
+        "没错",
+        "确实",
+        "确认",
+        "是",
+        "对",
+    ]
+    .iter()
+    .find_map(|cue| {
+        leading.strip_prefix(cue).and_then(|tail| {
+            tail.chars()
+                .next()
+                .is_some_and(|ch| {
+                    ch.is_whitespace() || matches!(ch, ',' | '，' | ':' | '：' | ';' | '；')
+                })
+                .then(|| {
+                    tail.trim_start_matches(|ch: char| {
+                        ch.is_whitespace() || matches!(ch, ',' | '，' | ':' | '：' | ';' | '；')
+                    })
+                })
+        })
+    });
+    [leading]
+        .into_iter()
+        .chain(after_optional_cue)
+        .any(|candidate| {
+            [
+                "doesn't",
+                "don't",
+                "didn't",
+                "isn't",
+                "aren't",
+                "wasn't",
+                "weren't",
+                "can't",
+                "cannot",
+                "won't",
+                "wouldn't",
+                "shouldn't",
+                "couldn't",
+                "haven't",
+                "hasn't",
+                "hadn't",
+            ]
+            .iter()
+            .any(|auxiliary| {
+                candidate
+                    .strip_prefix(auxiliary)
+                    .is_some_and(|tail| tail.chars().next().is_some_and(char::is_whitespace))
+            })
+        })
+}
+
+fn contains_cjk_a_not_a_question(value: &str) -> bool {
+    let chars = value.chars().collect::<Vec<_>>();
+    for (index, marker) in chars.iter().copied().enumerate() {
+        if !matches!(marker, '不' | '没') {
+            continue;
+        }
+        for width in 1..=4 {
+            if index >= width
+                && index + width < chars.len()
+                && chars[index - width..index] == chars[index + 1..=index + width]
+                && chars[index - width..index]
+                    .iter()
+                    .all(|character| is_cjk(*character))
+            {
+                return true;
+            }
+        }
+    }
+    normalize_match(value).contains("有没")
+}
+
+fn is_cjk(character: char) -> bool {
+    matches!(
+        character as u32,
+        0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF
+    )
 }
 
 fn contains_ascii_word(value: &str, needle: &str) -> bool {
@@ -6803,7 +7070,11 @@ fn apply_validated_plan(
                     None,
                     *state,
                     "created",
-                    None,
+                    if *state == MemoryClaimState::Conflicted {
+                        conflicts.first().map(String::as_str)
+                    } else {
+                        None
+                    },
                     batch,
                     &attempt.completed_at,
                 )?;
@@ -6829,18 +7100,28 @@ fn apply_validated_plan(
                         if changed != 1 {
                             return Err(rusqlite::Error::QueryReturnedNoRows);
                         }
-                        insert_transition(
-                            transaction,
-                            old_claim_id,
-                            Some(old_state),
-                            MemoryClaimState::Conflicted,
-                            "conflicted",
-                            Some(claim_id),
-                            batch,
-                            &attempt.completed_at,
-                        )?;
                         report.claims_conflicted += 1;
+                    } else {
+                        let changed = transaction.execute(
+                            "UPDATE memory_claims
+                             SET updated_batch_key = ?1, updated_at = ?2
+                             WHERE claim_id = ?3 AND state = 'conflicted'",
+                            params![batch.batch_key, attempt.completed_at, old_claim_id],
+                        )?;
+                        if changed != 1 {
+                            return Err(rusqlite::Error::QueryReturnedNoRows);
+                        }
                     }
+                    insert_transition(
+                        transaction,
+                        old_claim_id,
+                        Some(old_state),
+                        MemoryClaimState::Conflicted,
+                        "conflicted",
+                        Some(claim_id),
+                        batch,
+                        &attempt.completed_at,
+                    )?;
                 }
                 if let Some(reason) = supersede_reason {
                     for old_claim_id in supersedes {
@@ -7027,10 +7308,23 @@ fn insert_transition(
     batch: &ConsolidationInputBatch,
     created_at: &str,
 ) -> rusqlite::Result<()> {
+    let ordinal = transaction.query_row(
+        "SELECT COALESCE(MAX(ordinal), -1) + 1
+         FROM memory_claim_transitions WHERE claim_id = ?1",
+        [claim_id],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let ordinal_usize = nonnegative_usize(ordinal, "transition.ordinal").map_err(|error| {
+        rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            error.to_string(),
+        )))
+    })?;
     let transition_id = deterministic_id(
         "transition",
         &[
             claim_id,
+            &ordinal_usize.to_string(),
             from_state.map(MemoryClaimState::as_str).unwrap_or(""),
             to_state.as_str(),
             reason,
@@ -7040,12 +7334,13 @@ fn insert_transition(
     );
     transaction.execute(
         "INSERT INTO memory_claim_transitions
-         (transition_id, claim_id, from_state, to_state, reason, related_claim_id,
+         (transition_id, claim_id, ordinal, from_state, to_state, reason, related_claim_id,
           session_id, batch_key, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             transition_id,
             claim_id,
+            ordinal,
             from_state.map(MemoryClaimState::as_str),
             to_state.as_str(),
             reason,
@@ -8680,6 +8975,57 @@ mod tests {
                 .is_err()
             );
         }
+        for contracted in [
+            "don't",
+            "doesn't",
+            "didn't",
+            "isn't",
+            "aren't",
+            "wasn't",
+            "weren't",
+            "can't",
+            "cannot",
+            "won't",
+            "wouldn't",
+            "shouldn't",
+            "couldn't",
+            "haven't",
+            "hasn't",
+            "hadn't",
+        ] {
+            assert!(
+                evidence_has_invalid_context(&format!("{contracted} Alice live in Paris")),
+                "contracted question was accepted: {contracted}"
+            );
+        }
+        assert!(evidence_has_invalid_context(
+            "No: doesn’t Alice live in Paris"
+        ));
+        assert!(!evidence_has_invalid_context("Doesn'tAlice live in Paris"));
+        assert!(
+            check(
+                "Doesn't Alice live in Paris",
+                ("Alice", 0),
+                ("live in", 0),
+                ("Paris", 0),
+                ConsolidationEvidenceKind::UserConfirmation,
+                ClaimPolarity::Deny,
+                Some(("Doesn't", 0)),
+            )
+            .is_err()
+        );
+        assert!(
+            check(
+                "Alice doesn't live in Paris",
+                ("Alice", 0),
+                ("live in", 0),
+                ("Paris", 0),
+                ConsolidationEvidenceKind::UserConfirmation,
+                ClaimPolarity::Deny,
+                Some(("doesn't", 0)),
+            )
+            .is_ok()
+        );
         assert!(
             check(
                 "Alice lives in 不丹。",
@@ -8745,6 +9091,12 @@ mod tests {
             ("Alice住Paris么", "住", "Paris"),
             ("Alice住Paris呢", "住", "Paris"),
             ("Alice住Paris嘛", "住", "Paris"),
+            ("Alice爱不爱茶", "爱", "茶"),
+            ("Alice去不去Paris", "去", "Paris"),
+            ("Alice喝不喝茶", "喝", "茶"),
+            ("Alice喜欢不喜欢茶", "喜欢", "茶"),
+            ("Alice有没(有)茶", "有没(有)", "茶"),
+            ("Alice是不是学生", "是不是", "学生"),
         ] {
             let speech = question.contains("不是").then_some(("不是", 0));
             assert!(
@@ -8765,6 +9117,32 @@ mod tests {
                 "question accepted: {question}"
             );
         }
+        for phrase in [
+            "爱不爱",
+            "去不去",
+            "喝不喝",
+            "喜欢不喜欢",
+            "有没(有)",
+            "是不是",
+        ] {
+            assert!(
+                contains_cjk_a_not_a_question(phrase),
+                "A-not-A form was not detected: {phrase}"
+            );
+        }
+        assert!(!contains_cjk_a_not_a_question("不丹"));
+        assert!(
+            check(
+                "Bob爱不爱茶。Alice住Paris",
+                ("Alice", 0),
+                ("住", 0),
+                ("Paris", 0),
+                ConsolidationEvidenceKind::Assertion,
+                ClaimPolarity::Assert,
+                None,
+            )
+            .is_ok()
+        );
         assert!(
             check(
                 "Alice doesn't live in Paris.",
@@ -8919,6 +9297,39 @@ mod tests {
             ),
             Err(ConsolidationApplyError::Rejected { .. })
         ));
+        assert!(matches!(
+            validate(
+                "Alice爱不爱茶",
+                ("爱", 0),
+                "茶",
+                ConsolidationEvidenceKind::Assertion,
+                ClaimPolarity::Assert,
+                None,
+            ),
+            Err(ConsolidationApplyError::Rejected { .. })
+        ));
+        assert!(matches!(
+            validate(
+                "Doesn't Alice live in Paris",
+                ("live in", 0),
+                "Paris",
+                ConsolidationEvidenceKind::UserConfirmation,
+                ClaimPolarity::Deny,
+                Some(("Doesn't", 0)),
+            ),
+            Err(ConsolidationApplyError::Rejected { .. })
+        ));
+        assert!(
+            validate(
+                "Alice doesn't live in Paris",
+                ("live in", 0),
+                "Paris",
+                ConsolidationEvidenceKind::UserConfirmation,
+                ClaimPolarity::Deny,
+                Some(("doesn't", 0)),
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -10184,19 +10595,20 @@ mod tests {
             .claim_id
             .clone();
         let connection = Connection::open(store.retrieval().index_path()).unwrap();
-        let (old_transition_id, from_state, to_state, reason, batch_key) = connection
+        let (old_transition_id, ordinal, from_state, to_state, reason, batch_key) = connection
             .query_row(
-                "SELECT transition_id, from_state, to_state, reason, batch_key
+                "SELECT transition_id, ordinal, from_state, to_state, reason, batch_key
                  FROM memory_claim_transitions
                  WHERE claim_id = ?1 AND reason = 'conflicted'",
                 [&tea_id],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
                         row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
                     ))
                 },
             )
@@ -10205,6 +10617,7 @@ mod tests {
             "transition",
             &[
                 &tea_id,
+                &ordinal.to_string(),
                 &from_state,
                 &to_state,
                 &reason,
@@ -10217,6 +10630,220 @@ mod tests {
                 "UPDATE memory_claim_transitions
                  SET transition_id = ?1, related_claim_id = ?2 WHERE transition_id = ?3",
                 params![tampered_id, coffee_id, old_transition_id],
+            )
+            .unwrap();
+        drop(connection);
+        assert!(matches!(
+            store.retrieval().consolidation_candidates(512, 512),
+            Err(RetrievalError::CorruptIndex(_))
+        ));
+    }
+
+    #[test]
+    fn transition_history_rejects_noncontiguous_and_duplicate_ordinals() {
+        let seed = || {
+            let root = tempfile::tempdir().unwrap();
+            let (store, mut session) = new_session(root.path());
+            push_complete_at(
+                &mut session,
+                "Alice likes tea.",
+                None,
+                "2026-01-01T00:00:00Z",
+            );
+            let batch = next_batch(&store, &mut session);
+            let event = &batch.events[0];
+            let claim = text_claim_output(
+                "local_tea",
+                "local_alice",
+                "preference.drink",
+                "tea",
+                quote_nth(event, "Alice", 0),
+                quote_nth(event, "likes", 0),
+                quote_nth(event, "tea", 0),
+                full_quote(event),
+            );
+            apply_output(
+                &store,
+                &batch,
+                &empty_candidates(),
+                &StructuredConsolidationOutput {
+                    entities: vec![new_entity_output(
+                        "local_alice",
+                        "Alice",
+                        quote_nth(event, "Alice", 0),
+                    )],
+                    claims: vec![claim],
+                    boundaries: Vec::new(),
+                },
+            )
+            .unwrap();
+            (root, store)
+        };
+
+        let (_gap_root, gap_store) = seed();
+        let connection = Connection::open(gap_store.retrieval().index_path()).unwrap();
+        connection
+            .execute("UPDATE memory_claim_transitions SET ordinal=1", [])
+            .unwrap();
+        drop(connection);
+        assert!(matches!(
+            gap_store.retrieval().consolidation_candidates(512, 512),
+            Err(RetrievalError::CorruptIndex(_))
+        ));
+
+        let (_duplicate_root, duplicate_store) = seed();
+        let connection = Connection::open(duplicate_store.retrieval().index_path()).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys=OFF;
+                 ALTER TABLE memory_claim_transitions RENAME TO memory_claim_transitions_v3;
+                 CREATE TABLE memory_claim_transitions (
+                    transition_id TEXT PRIMARY KEY,
+                    claim_id TEXT NOT NULL,
+                    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+                    from_state TEXT,
+                    to_state TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    related_claim_id TEXT,
+                    session_id TEXT NOT NULL,
+                    batch_key TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                 );
+                 INSERT INTO memory_claim_transitions SELECT * FROM memory_claim_transitions_v3;
+                 INSERT INTO memory_claim_transitions
+                 SELECT transition_id || '_duplicate', claim_id, ordinal, from_state, to_state,
+                        reason, related_claim_id, session_id, batch_key, created_at
+                 FROM memory_claim_transitions_v3;
+                 DROP TABLE memory_claim_transitions_v3;",
+            )
+            .unwrap();
+        drop(connection);
+        assert!(matches!(
+            duplicate_store
+                .retrieval()
+                .consolidation_candidates(512, 512),
+            Err(RetrievalError::CorruptIndex(_))
+        ));
+    }
+
+    #[test]
+    fn transition_history_rejects_duplicate_applied_attempt_for_one_batch() {
+        let root = tempfile::tempdir().unwrap();
+        let (store, mut session) = new_session(root.path());
+        push_complete_at(
+            &mut session,
+            "Alice likes tea.",
+            None,
+            "2026-01-01T00:00:00Z",
+        );
+        let batch = next_batch(&store, &mut session);
+        let event = &batch.events[0];
+        let claim = text_claim_output(
+            "local_tea",
+            "local_alice",
+            "preference.drink",
+            "tea",
+            quote_nth(event, "Alice", 0),
+            quote_nth(event, "likes", 0),
+            quote_nth(event, "tea", 0),
+            full_quote(event),
+        );
+        apply_output(
+            &store,
+            &batch,
+            &empty_candidates(),
+            &StructuredConsolidationOutput {
+                entities: vec![new_entity_output(
+                    "local_alice",
+                    "Alice",
+                    quote_nth(event, "Alice", 0),
+                )],
+                claims: vec![claim],
+                boundaries: Vec::new(),
+            },
+        )
+        .unwrap();
+        let connection = Connection::open(store.retrieval().index_path()).unwrap();
+        connection
+            .execute(
+                "INSERT INTO consolidation_batches
+                 SELECT attempt_id || '_duplicate', batch_key, session_id, from_sequence,
+                        through_sequence, trigger, model, request_json, request_sha256,
+                        input_event_ids, input_event_hashes, response_json, response_sha256,
+                        status, input_tokens, output_tokens, latency_ms, started_at, completed_at,
+                        validation_json, error_json
+                 FROM consolidation_batches WHERE status='applied'",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        assert!(matches!(
+            store.retrieval().consolidation_candidates(512, 512),
+            Err(RetrievalError::CorruptIndex(_))
+        ));
+    }
+
+    #[test]
+    fn conflict_integrity_rejects_a_coherently_rehashed_standalone_conflicted_claim() {
+        let root = tempfile::tempdir().unwrap();
+        let (store, mut session) = new_session(root.path());
+        push_complete_at(
+            &mut session,
+            "Alice likes tea.",
+            None,
+            "2026-01-01T00:00:00Z",
+        );
+        let batch = next_batch(&store, &mut session);
+        let event = &batch.events[0];
+        let claim = text_claim_output(
+            "local_tea",
+            "local_alice",
+            "preference.drink",
+            "tea",
+            quote_nth(event, "Alice", 0),
+            quote_nth(event, "likes", 0),
+            quote_nth(event, "tea", 0),
+            full_quote(event),
+        );
+        apply_output(
+            &store,
+            &batch,
+            &empty_candidates(),
+            &StructuredConsolidationOutput {
+                entities: vec![new_entity_output(
+                    "local_alice",
+                    "Alice",
+                    quote_nth(event, "Alice", 0),
+                )],
+                claims: vec![claim],
+                boundaries: Vec::new(),
+            },
+        )
+        .unwrap();
+        let connection = Connection::open(store.retrieval().index_path()).unwrap();
+        let (claim_id, batch_key) = connection
+            .query_row(
+                "SELECT claim_id, created_batch_key FROM memory_claims LIMIT 1",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap();
+        let transition_id = deterministic_id(
+            "transition",
+            &[&claim_id, "0", "", "conflicted", &claim_id, &batch_key],
+        );
+        connection
+            .execute(
+                "UPDATE memory_claims SET state='conflicted' WHERE claim_id=?1",
+                [&claim_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE memory_claim_transitions
+                 SET transition_id=?1, to_state='conflicted', related_claim_id=?2
+                 WHERE claim_id=?2",
+                params![transition_id, claim_id],
             )
             .unwrap();
         drop(connection);
@@ -11047,6 +11674,159 @@ mod tests {
         );
         assert!(matches!(
             stable_store.retrieval().consolidation_candidates(512, 512),
+            Err(RetrievalError::CorruptIndex(_))
+        ));
+    }
+
+    #[test]
+    fn stored_alias_provenance_rejects_rehashed_cross_support_cycles() {
+        let root = tempfile::tempdir().unwrap();
+        let (store, mut session) = new_session(root.path());
+        push_complete_at(
+            &mut session,
+            "Device aka Ann. Device serial E123. Ann aka E123.",
+            None,
+            "2026-01-01T00:00:00Z",
+        );
+        let batch = next_batch(&store, &mut session);
+        let event = &batch.events[0];
+        let mut entity = new_entity_output("local_device", "Device", quote_nth(event, "Device", 0));
+        entity.aliases = vec![EntityAliasOutput {
+            text: "Ann".into(),
+            kind: MemoryAliasKind::ExplicitAlias,
+            stable_identifier_kind: None,
+            evidence: quote_nth(event, "Ann", 0),
+            proof_evidence: quote_nth(event, "Device aka Ann", 0),
+        }];
+        apply_output(
+            &store,
+            &batch,
+            &empty_candidates(),
+            &StructuredConsolidationOutput {
+                entities: vec![entity],
+                claims: Vec::new(),
+                boundaries: Vec::new(),
+            },
+        )
+        .unwrap();
+        let valid = store
+            .retrieval()
+            .consolidation_candidates(512, 512)
+            .unwrap();
+        let entity_id = valid.entities[0].entity_id.clone();
+        let ann = quote_nth(event, "Ann", 1);
+        let e123 = quote_nth(event, "E123", 1);
+        let proof = quote_nth(event, "Ann aka E123", 0);
+        let alias_id = |kind: MemoryAliasKind,
+                        stable_kind: Option<&str>,
+                        normalized: &str,
+                        evidence: &ConsolidationQuote,
+                        identity: &ConsolidationQuote| {
+            deterministic_id(
+                "alias",
+                &[
+                    &entity_id,
+                    kind.as_str(),
+                    stable_kind.unwrap_or(""),
+                    normalized,
+                    &evidence.event_id,
+                    &evidence.start_char.to_string(),
+                    &evidence.end_char.to_string(),
+                    &evidence.content_sha256,
+                    &proof.event_id,
+                    &proof.start_char.to_string(),
+                    &proof.end_char.to_string(),
+                    &proof.content_sha256,
+                    &identity.event_id,
+                    &identity.start_char.to_string(),
+                    &identity.end_char.to_string(),
+                    &identity.content_sha256,
+                ],
+            )
+        };
+        let connection = Connection::open(store.retrieval().index_path()).unwrap();
+        let template = &valid.entities[0].aliases[0];
+        connection
+            .execute(
+                "INSERT INTO memory_entity_aliases
+                 (alias_id, entity_id, alias_text, normalized_alias, alias_kind,
+                  stable_identifier_kind, session_id, batch_key, event_id, start_char,
+                  end_char, content_sha256, proof_event_id, proof_start_char, proof_end_char,
+                  proof_sha256, identity_event_id, identity_start_char, identity_end_char,
+                  identity_sha256, created_at)
+                 VALUES (?1,?2,'E123','e123','stable_identifier','serial',?3,?4,?5,?6,?7,
+                         ?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+                params![
+                    alias_id(
+                        MemoryAliasKind::StableIdentifier,
+                        Some("serial"),
+                        "e123",
+                        &e123,
+                        &ann,
+                    ),
+                    entity_id,
+                    template.session_id,
+                    template.batch_key,
+                    e123.event_id,
+                    e123.start_char as i64,
+                    e123.end_char as i64,
+                    e123.content_sha256,
+                    proof.event_id,
+                    proof.start_char as i64,
+                    proof.end_char as i64,
+                    proof.content_sha256,
+                    ann.event_id,
+                    ann.start_char as i64,
+                    ann.end_char as i64,
+                    ann.content_sha256,
+                    template.created_at,
+                ],
+            )
+            .unwrap();
+        for (normalized, kind, stable_kind, evidence, identity) in [
+            ("ann", MemoryAliasKind::ExplicitAlias, None, &ann, &e123),
+            (
+                "e123",
+                MemoryAliasKind::StableIdentifier,
+                Some("serial"),
+                &e123,
+                &ann,
+            ),
+        ] {
+            if normalized == "e123" {
+                continue;
+            }
+            connection
+                .execute(
+                    "UPDATE memory_entity_aliases
+                     SET alias_id=?1, event_id=?2, start_char=?3, end_char=?4,
+                         content_sha256=?5, proof_event_id=?6, proof_start_char=?7,
+                         proof_end_char=?8, proof_sha256=?9, identity_event_id=?10,
+                         identity_start_char=?11, identity_end_char=?12, identity_sha256=?13
+                     WHERE entity_id=?14 AND normalized_alias=?15",
+                    params![
+                        alias_id(kind, stable_kind, normalized, evidence, identity),
+                        evidence.event_id,
+                        evidence.start_char as i64,
+                        evidence.end_char as i64,
+                        evidence.content_sha256,
+                        proof.event_id,
+                        proof.start_char as i64,
+                        proof.end_char as i64,
+                        proof.content_sha256,
+                        identity.event_id,
+                        identity.start_char as i64,
+                        identity.end_char as i64,
+                        identity.content_sha256,
+                        entity_id,
+                        normalized,
+                    ],
+                )
+                .unwrap();
+        }
+        drop(connection);
+        assert!(matches!(
+            store.retrieval().consolidation_candidates(512, 512),
             Err(RetrievalError::CorruptIndex(_))
         ));
     }

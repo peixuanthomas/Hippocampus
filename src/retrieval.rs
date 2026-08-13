@@ -20,7 +20,7 @@ use crate::model::{
 
 pub const INDEX_FILENAME: &str = ".hippocampus-index.sqlite3";
 const INDEX_SCHEMA_VERSION: i64 = 4;
-const MEMORY_STATE_SCHEMA_VERSION: i64 = 2;
+const MEMORY_STATE_SCHEMA_VERSION: i64 = 3;
 
 #[derive(Debug, Error)]
 pub enum RetrievalError {
@@ -1182,7 +1182,7 @@ impl RetrievalStore {
         }
         let existing_memory_version = read_existing_memory_state_version(&connection)
             .map_err(|source| self.database_error(source))?;
-        if existing_memory_version.is_some_and(|value| !matches!(value, 1 | 2)) {
+        if existing_memory_version.is_some_and(|value| !matches!(value, 1..=3)) {
             return Err(RetrievalError::UnsupportedMemoryStateVersion(
                 existing_memory_version.expect("checked as some"),
             ));
@@ -1908,9 +1908,9 @@ fn prepare_memory_state_schema(
     existing_version: Option<i64>,
 ) -> rusqlite::Result<()> {
     if existing_version != Some(MEMORY_STATE_SCHEMA_VERSION) {
-        // Memory v1 rows use different deterministic-ID and evidence contracts. They cannot be
-        // upgraded row by row without trusting the old derived state, so discard only the
-        // replayable derived projection and retain raw events plus the immutable attempt ledger.
+        // Pre-v3 rows use different deterministic-ID, evidence, or transition-order contracts.
+        // They cannot be upgraded row by row without trusting the old derived state, so discard
+        // only the replayable projection and retain raw events plus the immutable attempt ledger.
         connection.execute_batch(
             "DELETE FROM memory_claim_evidence;
              DELETE FROM memory_claim_transitions;
@@ -2283,6 +2283,7 @@ CREATE INDEX IF NOT EXISTS memory_claim_evidence_event
 CREATE TABLE IF NOT EXISTS memory_claim_transitions (
     transition_id TEXT PRIMARY KEY,
     claim_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
     from_state TEXT CHECK(from_state IS NULL OR from_state IN ('active','superseded','conflicted','uncertain')),
     to_state TEXT NOT NULL CHECK(to_state IN ('active','superseded','conflicted','uncertain')),
     reason TEXT NOT NULL CHECK(reason IN ('created','confirmed','certainty_upgraded','conflicted','corrected','replaced')),
@@ -2291,10 +2292,11 @@ CREATE TABLE IF NOT EXISTS memory_claim_transitions (
     batch_key TEXT NOT NULL CHECK(length(batch_key) > 0),
     created_at TEXT NOT NULL,
     FOREIGN KEY(claim_id) REFERENCES memory_claims(claim_id),
-    FOREIGN KEY(related_claim_id) REFERENCES memory_claims(claim_id)
+    FOREIGN KEY(related_claim_id) REFERENCES memory_claims(claim_id),
+    UNIQUE(claim_id, ordinal)
 );
 CREATE INDEX IF NOT EXISTS memory_claim_transitions_claim
-    ON memory_claim_transitions(claim_id, created_at, transition_id);
+    ON memory_claim_transitions(claim_id, ordinal);
 
 CREATE TABLE IF NOT EXISTS memory_boundary_suggestions (
     boundary_id TEXT PRIMARY KEY,
@@ -2449,6 +2451,35 @@ CREATE INDEX memory_boundary_suggestions_session_event
             )
             .unwrap();
         connection.execute_batch(OLD_MEMORY_V1_SCHEMA).unwrap();
+    }
+
+    fn replace_transition_table_with_memory_v2_schema(connection: &Connection) {
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys=OFF;
+                 DROP INDEX memory_claim_transitions_claim;
+                 DROP TABLE memory_claim_transitions;
+                 CREATE TABLE memory_claim_transitions (
+                    transition_id TEXT PRIMARY KEY,
+                    claim_id TEXT NOT NULL,
+                    from_state TEXT CHECK(from_state IS NULL OR from_state IN
+                        ('active','superseded','conflicted','uncertain')),
+                    to_state TEXT NOT NULL CHECK(to_state IN
+                        ('active','superseded','conflicted','uncertain')),
+                    reason TEXT NOT NULL CHECK(reason IN
+                        ('created','confirmed','certainty_upgraded','conflicted','corrected','replaced')),
+                    related_claim_id TEXT,
+                    session_id TEXT NOT NULL CHECK(length(session_id) > 0),
+                    batch_key TEXT NOT NULL CHECK(length(batch_key) > 0),
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(claim_id) REFERENCES memory_claims(claim_id),
+                    FOREIGN KEY(related_claim_id) REFERENCES memory_claims(claim_id)
+                 );
+                 CREATE INDEX memory_claim_transitions_claim
+                    ON memory_claim_transitions(claim_id, created_at, transition_id);
+                 UPDATE memory_schema_meta SET value=2 WHERE key='state_schema_version';",
+            )
+            .unwrap();
     }
 
     fn append_complete_turn(
@@ -3481,7 +3512,7 @@ CREATE INDEX memory_boundary_suggestions_session_event
                     |row| row.get::<_, i64>(0),
                 )
                 .unwrap(),
-            2
+            3
         );
         assert_eq!(
             (
@@ -3548,7 +3579,7 @@ CREATE INDEX memory_boundary_suggestions_session_event
     }
 
     #[test]
-    fn empty_real_memory_v1_schema_upgrades_to_v2_without_rows() {
+    fn empty_real_memory_v1_schema_upgrades_to_v3_without_rows() {
         let root = tempfile::tempdir().unwrap();
         let store = RetrievalStore::new(root.path()).unwrap();
         store.open_connection().unwrap();
@@ -3566,12 +3597,120 @@ CREATE INDEX memory_boundary_suggestions_session_event
                     |row| row.get::<_, i64>(0),
                 )
                 .unwrap(),
-            2
+            3
         );
         assert!(table_has_column(&connection, "memory_claims", "normalized_relation").unwrap());
         assert!(
             table_has_column(&connection, "memory_claim_evidence", "speech_act_sha256").unwrap()
         );
+        assert!(table_has_column(&connection, "memory_claim_transitions", "ordinal").unwrap());
+    }
+
+    #[test]
+    fn memory_state_v2_upgrades_to_v3_and_preserves_raw_events_and_ledger() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let mut session = store
+            .create("model", "http://localhost", None, Default::default(), false)
+            .unwrap();
+        append_complete_turn(&mut session, "v2 fact", "answer", "");
+        store.save(&mut session).unwrap();
+        let index_path = store.retrieval().index_path().to_owned();
+        let (event_count, event_id, event_hash) = {
+            let connection = Connection::open(&index_path).unwrap();
+            let count = connection
+                .query_row("SELECT count(*) FROM events", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap();
+            let source = connection
+                .query_row(
+                    "SELECT event_id, content_sha256 FROM events WHERE role='user' LIMIT 1",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .unwrap();
+            (count, source.0, source.1)
+        };
+        {
+            let connection = Connection::open(&index_path).unwrap();
+            replace_transition_table_with_memory_v2_schema(&connection);
+            connection
+                .execute_batch(&format!(
+                    "INSERT INTO consolidation_batches
+                     (attempt_id,batch_key,session_id,from_sequence,through_sequence,trigger,model,
+                      request_json,request_sha256,input_event_ids,input_event_hashes,response_json,
+                      response_sha256,status,input_tokens,output_tokens,latency_ms,started_at,
+                      completed_at,validation_json,error_json)
+                     VALUES ('v2-attempt','v2-batch','v2-session',1,1,'test','model','{{}}',
+                      '{zero}','[]','[]','{{}}','{zero}','applied',NULL,NULL,0,
+                      '2025-01-01T00:00:00Z','2025-01-01T00:00:01Z','{{}}',NULL);
+                     INSERT INTO memory_entities
+                     (entity_id,kind,canonical_name,normalized_name,disambiguation,
+                      created_session_id,created_batch_key,created_event_id,created_start,
+                      created_end,created_hash,created_at,updated_at)
+                     VALUES ('v2-entity','person','old','old','resolved','v2-session','v2-batch',
+                      '{event_id}',0,1,'{event_hash}',
+                      '2025-01-01T00:00:01Z','2025-01-01T00:00:01Z');
+                     INSERT INTO consolidation_watermarks
+                     (session_id,through_sequence,through_event_id,through_event_sha256,updated_at)
+                     VALUES ('v2-session',1,'{event_id}','{event_hash}',
+                      '2025-01-01T00:00:01Z');",
+                    zero = "0".repeat(64),
+                ))
+                .unwrap();
+        }
+
+        let reopened = RetrievalStore::new(root.path()).unwrap();
+        reopened.open_connection().unwrap();
+        let connection = Connection::open(reopened.index_path()).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT value FROM memory_schema_meta WHERE key='state_schema_version'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            3
+        );
+        assert!(table_has_column(&connection, "memory_claim_transitions", "ordinal").unwrap());
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM events", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            event_count
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM consolidation_batches WHERE attempt_id='v2-attempt'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        for table in [
+            "memory_claim_evidence",
+            "memory_claim_transitions",
+            "memory_boundary_suggestions",
+            "memory_claims",
+            "memory_entity_aliases",
+            "memory_entities",
+            "consolidation_watermarks",
+        ] {
+            assert_eq!(
+                connection
+                    .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap(),
+                0,
+                "{table} was not reset"
+            );
+        }
     }
 
     #[test]
