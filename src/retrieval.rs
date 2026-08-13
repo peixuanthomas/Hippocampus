@@ -407,6 +407,7 @@ impl RetrievalStore {
         let mut document_ids = HashSet::with_capacity(writes.len());
         let mut prepared = Vec::with_capacity(writes.len());
         let mut leaf_sessions = HashSet::new();
+        let mut aggregate_sessions = HashSet::new();
         for write in writes {
             if !document_ids.insert(write.document_id.as_str()) {
                 return Err(RetrievalError::CorruptIndex(format!(
@@ -447,12 +448,39 @@ impl RetrievalStore {
             }
             if matches!(granularity.as_str(), "message" | "fragment") {
                 leaf_sessions.insert(session_id);
+            } else {
+                aggregate_sessions.insert(session_id);
             }
             prepared.push((&write.document_id, &write.expected_source_sha256, bytes));
         }
         let fingerprint = spec
             .fingerprint()
             .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+        if leaf_sessions
+            .iter()
+            .any(|session| aggregate_sessions.contains(session))
+        {
+            return Err(RetrievalError::CorruptIndex(
+                "同一会话不能在 leaf 更新时发布 aggregate 向量".into(),
+            ));
+        }
+        for session_id in &aggregate_sessions {
+            let current = transaction
+                .query_row(
+                    "SELECT m.source_session_sha256=s.source_sha256 AND m.vector_index_fingerprint=?2
+                     FROM memory_episode_materializations m JOIN indexed_sessions s ON s.session_id=m.session_id
+                     WHERE m.session_id=?1",
+                    params![session_id, fingerprint],
+                    |row| row.get::<_, bool>(0),
+                )
+                .optional()
+                .map_err(|error| self.database_error(error))?;
+            if current != Some(true) {
+                return Err(RetrievalError::CorruptIndex(format!(
+                    "会话 {session_id} 的 aggregate materialization 不新鲜"
+                )));
+            }
+        }
         let embedded_at = Utc::now().to_rfc3339();
         for (document_id, source_sha256, bytes) in prepared {
             transaction
@@ -478,6 +506,10 @@ impl RetrievalStore {
                 .map_err(|error| self.database_error(error))?;
         }
         for session_id in leaf_sessions {
+            transaction.execute(
+                "DELETE FROM memory_embeddings WHERE document_id IN (SELECT document_id FROM memory_documents WHERE session_id=?1 AND granularity IN ('episode','session'))",
+                [&session_id],
+            ).map_err(|error| self.database_error(error))?;
             transaction
                 .execute(
                     "DELETE FROM memory_episode_materializations WHERE session_id=?1",
@@ -1991,6 +2023,10 @@ fn persist_episode_plan(
     fingerprint: &str,
     config: &MemoryConfig,
 ) -> RetrievalResult<()> {
+    transaction.execute(
+        "DELETE FROM memory_embeddings WHERE document_id IN (SELECT document_id FROM memory_documents WHERE session_id=?1 AND granularity IN ('episode','session'))",
+        [&plan.session_id],
+    ).map_err(|error| RetrievalError::CorruptIndex(format!("清理旧 aggregate 向量失败：{error}")))?;
     let mut documents = plan.episode_documents.clone();
     if !documents.is_empty() {
         let members = documents
@@ -3550,6 +3586,74 @@ CREATE INDEX memory_boundary_suggestions_session_event
                 .unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn episode_aggregate_leaf_and_aggregate_batch_is_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let mut session = store
+            .create("model", "http://localhost", None, Default::default(), false)
+            .unwrap();
+        append_complete_turn(&mut session, "u", "a", "");
+        let path = store.save(&mut session).unwrap();
+        store.retrieval().sync_session(&session, &path).unwrap();
+        let mut config = MemoryConfig::default();
+        config.enabled = true;
+        let plan = store
+            .retrieval()
+            .materialize_episode_documents(&session.id, &config)
+            .unwrap();
+        let spec = VectorIndexSpec::from_config(&config).unwrap();
+        let leaf = store
+            .retrieval()
+            .replay_session(&session.id)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.role == EventRole::User)
+            .unwrap();
+        let leaf_id = format!("{}:0:{}", leaf.id, leaf.content.chars().count());
+        let leaf_hash = content_sha256(&leaf.content);
+        let aggregate = &plan.episode_documents[0];
+        assert!(
+            store
+                .retrieval()
+                .upsert_embeddings(
+                    &spec,
+                    &[
+                        EmbeddingWrite {
+                            document_id: leaf_id,
+                            expected_source_sha256: leaf_hash,
+                            vector: vec![1.0; spec.dimensions]
+                        },
+                        EmbeddingWrite {
+                            document_id: aggregate.document_id.clone(),
+                            expected_source_sha256: aggregate.source_sha256.clone(),
+                            vector: vec![1.0; spec.dimensions]
+                        }
+                    ]
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn episode_boundary_materialization_audits_direct_user_events() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let mut session = store
+            .create("model", "http://localhost", None, Default::default(), false)
+            .unwrap();
+        append_complete_turn(&mut session, "u", "a", "");
+        let path = store.save(&mut session).unwrap();
+        store.retrieval().sync_session(&session, &path).unwrap();
+        let mut config = MemoryConfig::default();
+        config.enabled = true;
+        let report = store
+            .retrieval()
+            .materialize_episode_documents(&session.id, &config)
+            .unwrap();
+        assert_eq!(report.boundary_decisions.len(), 1);
     }
 
     fn append_complete_turn(

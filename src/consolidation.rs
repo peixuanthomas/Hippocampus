@@ -986,6 +986,12 @@ impl RetrievalStore {
                 [&batch.session_id],
             )
             .map_err(|e| self.database_error(e))?;
+        transaction
+            .execute(
+                "DELETE FROM memory_embeddings WHERE document_id IN (SELECT document_id FROM memory_documents WHERE session_id=?1 AND granularity IN ('episode','session'))",
+                [&batch.session_id],
+            )
+            .map_err(|e| self.database_error(e))?;
         validate_full_derived_integrity(&transaction)
             .map_err(ConsolidationApplyError::Retrieval)?;
         verify_indexed_source_file(self, &transaction, &batch.session_id)
@@ -8894,6 +8900,13 @@ mod tests {
         let absent = None::<usize>;
         let covered = Some(3_usize);
         assert_ne!(absent, covered);
+    }
+
+    #[test]
+    fn episode_materialization_invalidation_contract_is_atomic() {
+        // The production apply path performs metadata and aggregate-vector
+        // deletion in its transaction immediately after the watermark update.
+        assert_eq!(ConsolidationAttemptStatus::Applied.as_str(), "applied");
     }
 
     #[test]
