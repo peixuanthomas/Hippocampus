@@ -883,6 +883,29 @@ impl RetrievalStore {
     }
 
     #[cfg(test)]
+    pub(crate) fn episode_entity_sets_for_test(
+        &self,
+        session_id: &str,
+        config: &MemoryConfig,
+    ) -> RetrievalResult<Vec<(String, std::collections::BTreeSet<String>)>> {
+        config
+            .validate()
+            .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+        let spec = VectorIndexSpec::from_config(config)
+            .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+        let fingerprint = spec
+            .fingerprint()
+            .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+        let connection = self.open_connection()?;
+        let (messages, _, _, _) =
+            load_episode_snapshot(&connection, session_id, &spec, &fingerprint)?;
+        Ok(messages
+            .into_iter()
+            .map(|message| (message.member.event_id, message.resolved_entity_ids))
+            .collect())
+    }
+
+    #[cfg(test)]
     pub(crate) fn set_consolidation_test_hook(&self, hook: Option<ConsolidationHook>) {
         *self
             .test_hooks

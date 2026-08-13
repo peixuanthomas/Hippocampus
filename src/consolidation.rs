@@ -10020,6 +10020,218 @@ mod tests {
         );
     }
 
+    #[test]
+    fn mention_projection_preserves_pending_history_after_later_resolution() {
+        let expected = [
+            "initial_pending",
+            "later_resolved",
+            "no_retroactive_promotion",
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+        let mut seen = std::collections::BTreeSet::new();
+        let root = tempfile::tempdir().unwrap();
+        let (store, mut session) = new_session(root.path());
+        push_complete_at(
+            &mut session,
+            "甲叫小王，乙也叫小王。小王认识李雷。",
+            None,
+            "2026-01-01T00:00:00Z",
+        );
+        let first_batch = next_batch(&store, &mut session);
+        let first_event = &first_batch.events[0];
+        let mut pending =
+            new_entity_output("local_pending", "小王", quote_nth(first_event, "小王", 0));
+        pending.disambiguation = EntityDisambiguation::Pending;
+        pending.basis = EntityResolutionBasis::Ambiguous;
+        let mut second_pending = new_entity_output(
+            "local_other_pending",
+            "小王",
+            quote_nth(first_event, "小王", 1),
+        );
+        second_pending.disambiguation = EntityDisambiguation::Pending;
+        second_pending.basis = EntityResolutionBasis::Ambiguous;
+        let first_output = StructuredConsolidationOutput {
+            entities: vec![
+                pending,
+                second_pending,
+                new_entity_output("local_li", "李雷", quote_nth(first_event, "李雷", 0)),
+            ],
+            claims: vec![ConsolidatedClaimOutput {
+                local_id: "local_knows".into(),
+                subject_ref: "local_pending".into(),
+                predicate_key: "relation.knows".into(),
+                object: ConsolidatedClaimObject {
+                    kind: ConsolidationClaimObjectKind::Entity,
+                    text: None,
+                    entity_ref: Some("local_li".into()),
+                    span: None,
+                },
+                polarity: ClaimPolarity::Assert,
+                cardinality: ClaimCardinality::Single,
+                certainty: ClaimCertainty::Certain,
+                disposition: ClaimDisposition::New,
+                replaces_claim_ids: vec![],
+                conflicts_with_claim_ids: vec![],
+                event_time: None,
+                valid_from: None,
+                valid_to: None,
+                evidence: vec![ConsolidationClaimEvidence {
+                    kind: ConsolidationEvidenceKind::Assertion,
+                    quote: quote_nth(first_event, "小王认识李雷。", 0),
+                    subject_span: quote_nth(first_event, "小王", 2),
+                    relation_span: quote_nth(first_event, "认识", 0),
+                    object_span: quote_nth(first_event, "李雷", 0),
+                    speech_act_span: None,
+                }],
+            }],
+            boundaries: vec![],
+        };
+        apply_output(&store, &first_batch, &empty_candidates(), &first_output).unwrap();
+        let candidates = store.retrieval().consolidation_candidates(16, 16).unwrap();
+        let li_id = candidates
+            .entities
+            .iter()
+            .find(|entity| entity.canonical_name == "李雷")
+            .unwrap()
+            .entity_id
+            .clone();
+        let connection = Connection::open(store.retrieval().index_path()).unwrap();
+        let old_tuple = connection
+            .query_row(
+                "SELECT mention_id,session_id,batch_key,mention_kind,source_record_id,entity_id,entity_status,event_id,CAST(sequence AS TEXT),role,CAST(start_char AS TEXT),CAST(end_char AS TEXT),content_sha256,created_at FROM memory_entity_mentions WHERE batch_key=?1 AND mention_kind='entity_name' AND source_record_id='local_pending'",
+                [&first_batch.batch_key],
+                |row| (0..14).map(|index| row.get::<_, String>(index)).collect::<rusqlite::Result<Vec<_>>>(),
+            )
+            .unwrap();
+        let old_mention_id = old_tuple[0].clone();
+        let pending_id = old_tuple[5].clone();
+        assert_eq!(old_tuple[6], "pending");
+        drop(connection);
+        let first_report = materialize_episodes(&store, &session.id).unwrap();
+        assert_ne!(first_report.plan_input_sha256, "");
+        let first_entity_sets = store
+            .retrieval()
+            .episode_entity_sets_for_test(&session.id, &episode_memory_config())
+            .unwrap();
+        assert!(
+            first_entity_sets
+                .iter()
+                .find(|(event_id, _)| event_id == &first_event.event_id)
+                .is_some_and(|(_, entities)| !entities.contains(&pending_id))
+        );
+        seen.insert("initial_pending");
+
+        push_complete_at(
+            &mut session,
+            "小新即小王。小新喜欢李雷。",
+            None,
+            "2026-01-02T00:00:00Z",
+        );
+        let second_batch = next_batch(&store, &mut session);
+        let second_event = &second_batch.events[0];
+        let resolved_existing = ConsolidatedEntityOutput {
+            local_id: "local_resolved".into(),
+            name: "小新".into(),
+            kind: MemoryEntityKind::Person,
+            resolution: EntityResolution::Existing,
+            disambiguation: EntityDisambiguation::Resolved,
+            basis: EntityResolutionBasis::ExplicitAlias,
+            existing_entity_id: Some(pending_id.clone()),
+            name_evidence: quote_nth(second_event, "小新", 0),
+            existing_identity_evidence: Some(quote_nth(second_event, "小王", 0)),
+            resolution_evidence: Some(quote_nth(second_event, "小新即小王。", 0)),
+            aliases: vec![EntityAliasOutput {
+                text: "小新".into(),
+                kind: MemoryAliasKind::ExplicitAlias,
+                stable_identifier_kind: None,
+                evidence: quote_nth(second_event, "小新", 0),
+                proof_evidence: quote_nth(second_event, "小新即小王。", 0),
+            }],
+        };
+        let second_output = StructuredConsolidationOutput {
+            entities: vec![resolved_existing],
+            claims: vec![ConsolidatedClaimOutput {
+                local_id: "local_knows_again".into(),
+                subject_ref: "local_resolved".into(),
+                predicate_key: "relation.likes".into(),
+                object: ConsolidatedClaimObject {
+                    kind: ConsolidationClaimObjectKind::Entity,
+                    text: None,
+                    entity_ref: Some(li_id.clone()),
+                    span: None,
+                },
+                polarity: ClaimPolarity::Assert,
+                cardinality: ClaimCardinality::Single,
+                certainty: ClaimCertainty::Certain,
+                disposition: ClaimDisposition::New,
+                replaces_claim_ids: vec![],
+                conflicts_with_claim_ids: vec![],
+                event_time: None,
+                valid_from: None,
+                valid_to: None,
+                evidence: vec![ConsolidationClaimEvidence {
+                    kind: ConsolidationEvidenceKind::Assertion,
+                    quote: quote_nth(second_event, "小新喜欢李雷。", 0),
+                    subject_span: quote_nth(second_event, "小新", 1),
+                    relation_span: quote_nth(second_event, "喜欢", 0),
+                    object_span: quote_nth(second_event, "李雷", 0),
+                    speech_act_span: None,
+                }],
+            }],
+            boundaries: vec![],
+        };
+        let second_report =
+            apply_output(&store, &second_batch, &candidates, &second_output).unwrap();
+        assert_eq!(second_report.mentions_created, 4);
+        let connection = Connection::open(store.retrieval().index_path()).unwrap();
+        let current_old_tuple = connection
+            .query_row(
+                "SELECT mention_id,session_id,batch_key,mention_kind,source_record_id,entity_id,entity_status,event_id,CAST(sequence AS TEXT),role,CAST(start_char AS TEXT),CAST(end_char AS TEXT),content_sha256,created_at FROM memory_entity_mentions WHERE mention_id=?1 AND batch_key=?2",
+                params![old_mention_id, first_batch.batch_key],
+                |row| (0..14).map(|index| row.get::<_, String>(index)).collect::<rusqlite::Result<Vec<_>>>(),
+            )
+            .unwrap();
+        assert_eq!(current_old_tuple, old_tuple);
+        assert_eq!(current_old_tuple[6], "pending");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM memory_entity_mentions WHERE batch_key=?1 AND entity_id=?2 AND entity_status='resolved'",
+                    params![second_batch.batch_key, pending_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            3
+        );
+        drop(connection);
+        seen.insert("later_resolved");
+
+        let second_materialization = materialize_episodes(&store, &session.id).unwrap();
+        assert_ne!(
+            second_materialization.plan_input_sha256,
+            first_report.plan_input_sha256
+        );
+        let entity_sets = store
+            .retrieval()
+            .episode_entity_sets_for_test(&session.id, &episode_memory_config())
+            .unwrap();
+        let first_entities = &entity_sets
+            .iter()
+            .find(|(event_id, _)| event_id == &first_event.event_id)
+            .unwrap()
+            .1;
+        let second_entities = &entity_sets
+            .iter()
+            .find(|(event_id, _)| event_id == &second_event.event_id)
+            .unwrap()
+            .1;
+        assert!(!first_entities.contains(&pending_id));
+        assert!(second_entities.contains(&pending_id));
+        seen.insert("no_retroactive_promotion");
+        assert_eq!(seen, expected);
+    }
+
     fn episode_memory_config() -> MemoryConfig {
         MemoryConfig {
             enabled: true,
