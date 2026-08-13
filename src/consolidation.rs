@@ -8845,7 +8845,30 @@ mod tests {
 
     #[test]
     fn canonical_applied_request_rejects_every_contract_mutation() {
-        for mutation in ["model", "messages", "budget", "payload", "whitespace"] {
+        let expected = [
+            "wrong_model",
+            "fewer_messages",
+            "extra_messages",
+            "swapped_order",
+            "wrong_system_role",
+            "wrong_user_role",
+            "wrong_prompt",
+            "wrong_schema",
+            "zero_num_ctx",
+            "zero_num_predict",
+            "batch_payload",
+            "candidate_payload",
+            "payload_unknown_field",
+            "request_unknown_field",
+            "leading_whitespace",
+            "trailing_whitespace",
+            "noncanonical_key_order",
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+        let mut seen = std::collections::BTreeSet::new();
+
+        for mutation in &expected {
             let root = tempfile::tempdir().unwrap();
             let (store, mut session) = new_session(root.path());
             push_complete_at(&mut session, "hello", None, "2026-01-01T00:00:00Z");
@@ -8857,28 +8880,61 @@ mod tests {
                 boundaries: vec![],
             };
             let mut attempt = applied_attempt(&batch, &candidates, &output);
-            match mutation {
-                "model" => attempt.model = "other".into(),
-                "messages" => {
-                    let mut request: StructuredChatRequest =
-                        serde_json::from_str(&attempt.request_json).unwrap();
-                    request.messages.pop();
-                    attempt.request_json = serde_json::to_string(&request).unwrap();
+            let mut request: Value = serde_json::from_str(&attempt.request_json).unwrap();
+            match *mutation {
+                "wrong_model" => request["model"] = json!("wrong-model"),
+                "fewer_messages" => {
+                    request["messages"].as_array_mut().unwrap().pop();
                 }
-                "budget" => {
-                    let mut request: StructuredChatRequest =
-                        serde_json::from_str(&attempt.request_json).unwrap();
-                    request.num_ctx = 0;
-                    attempt.request_json = serde_json::to_string(&request).unwrap();
+                "extra_messages" => {
+                    let extra = request["messages"][1].clone();
+                    request["messages"].as_array_mut().unwrap().push(extra);
                 }
-                "payload" => {
-                    let mut request: StructuredChatRequest =
-                        serde_json::from_str(&attempt.request_json).unwrap();
-                    request.messages[1].content = "{\"batch\":{},\"candidate_snapshot\":{}}".into();
-                    attempt.request_json = serde_json::to_string(&request).unwrap();
+                "swapped_order" => request["messages"].as_array_mut().unwrap().swap(0, 1),
+                "wrong_system_role" => request["messages"][0]["role"] = json!("user"),
+                "wrong_user_role" => request["messages"][1]["role"] = json!("system"),
+                "wrong_prompt" => request["messages"][0]["content"] = json!("wrong prompt"),
+                "wrong_schema" => request["schema"] = json!({"type": "array"}),
+                "zero_num_ctx" => request["num_ctx"] = json!(0),
+                "zero_num_predict" => request["num_predict"] = json!(0),
+                "batch_payload" | "candidate_payload" | "payload_unknown_field" => {
+                    let mut payload: Value =
+                        serde_json::from_str(request["messages"][1]["content"].as_str().unwrap())
+                            .unwrap();
+                    match *mutation {
+                        "batch_payload" => payload["batch"]["batch_key"] = json!("wrong-batch"),
+                        "candidate_payload" => {
+                            payload["candidate_snapshot"]["snapshot_sha256"] =
+                                json!("0".repeat(64));
+                        }
+                        "payload_unknown_field" => payload["unexpected"] = json!(true),
+                        _ => unreachable!(),
+                    }
+                    request["messages"][1]["content"] =
+                        json!(serde_json::to_string(&payload).unwrap());
                 }
-                "whitespace" => attempt.request_json = format!(" {}", attempt.request_json),
+                "request_unknown_field" => request["unexpected"] = json!(true),
+                "leading_whitespace" => attempt.request_json = format!(" {}", attempt.request_json),
+                "trailing_whitespace" => {
+                    attempt.request_json = format!("{} ", attempt.request_json)
+                }
+                "noncanonical_key_order" => {
+                    attempt.request_json = format!(
+                        "{{\"messages\":{},\"model\":{},\"schema\":{},\"num_ctx\":{},\"num_predict\":{}}}",
+                        serde_json::to_string(&request["messages"]).unwrap(),
+                        serde_json::to_string(&request["model"]).unwrap(),
+                        serde_json::to_string(&request["schema"]).unwrap(),
+                        serde_json::to_string(&request["num_ctx"]).unwrap(),
+                        serde_json::to_string(&request["num_predict"]).unwrap(),
+                    );
+                }
                 _ => unreachable!(),
+            }
+            if !matches!(
+                *mutation,
+                "leading_whitespace" | "trailing_whitespace" | "noncanonical_key_order"
+            ) {
+                attempt.request_json = serde_json::to_string(&request).unwrap();
             }
             attempt.request_sha256 = sha256_bytes(attempt.request_json.as_bytes());
             assert!(matches!(
@@ -8887,14 +8943,40 @@ mod tests {
                     .apply_consolidation_attempt(&batch, &candidates, &attempt),
                 Err(ConsolidationApplyError::Rejected { .. })
             ));
-            assert!(
-                store
-                    .retrieval()
-                    .consolidation_attempts(&session.id)
-                    .unwrap()
-                    .is_empty()
+            let connection = Connection::open(store.retrieval().index_path()).unwrap();
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT count(*) FROM memory_entity_mentions WHERE session_id=?1",
+                        params![session.id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                0
             );
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT count(*) FROM consolidation_batches WHERE session_id=?1 AND status='applied' AND projection_schema_version=4",
+                        params![session.id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT count(*) FROM consolidation_watermarks WHERE session_id=?1",
+                        params![session.id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                0
+            );
+            seen.insert(*mutation);
         }
+        assert_eq!(seen, expected);
     }
 
     #[test]
