@@ -9243,6 +9243,213 @@ mod tests {
     }
 
     #[test]
+    fn mention_reference_mapping_covers_existing_candidate_targets() {
+        let root = tempfile::tempdir().unwrap();
+        let (store, mut session) = new_session(root.path());
+        push_complete_at(
+            &mut session,
+            "王明认识李雷。甲叫小王，乙也叫小王。",
+            None,
+            "2026-01-01T00:00:00Z",
+        );
+        let setup = next_batch(&store, &mut session);
+        let e = &setup.events[0];
+        let mut p1 = new_entity_output("local_p1", "小王", quote_nth(e, "小王", 0));
+        p1.basis = EntityResolutionBasis::Ambiguous;
+        p1.disambiguation = EntityDisambiguation::Pending;
+        let mut p2 = new_entity_output("local_p2", "小王", quote_nth(e, "小王", 1));
+        p2.basis = EntityResolutionBasis::Ambiguous;
+        p2.disambiguation = EntityDisambiguation::Pending;
+        apply_output(
+            &store,
+            &setup,
+            &empty_candidates(),
+            &StructuredConsolidationOutput {
+                entities: vec![
+                    new_entity_output("local_wang", "王明", quote_nth(e, "王明", 0)),
+                    new_entity_output("local_li", "李雷", quote_nth(e, "李雷", 0)),
+                    p1,
+                    p2,
+                ],
+                claims: vec![],
+                boundaries: vec![],
+            },
+        )
+        .unwrap();
+        let candidates = store.retrieval().consolidation_candidates(16, 16).unwrap();
+        let wang = candidates
+            .entities
+            .iter()
+            .find(|x| x.canonical_name == "王明")
+            .unwrap()
+            .entity_id
+            .clone();
+        let li = candidates
+            .entities
+            .iter()
+            .find(|x| x.canonical_name == "李雷")
+            .unwrap()
+            .entity_id
+            .clone();
+        let pending = candidates
+            .entities
+            .iter()
+            .find(|x| x.canonical_name == "小王")
+            .unwrap()
+            .entity_id
+            .clone();
+        let old = Connection::open(store.retrieval().index_path()).unwrap().query_row("SELECT entity_status FROM memory_entity_mentions WHERE entity_id=?1 ORDER BY mention_id LIMIT 1",[&pending],|r|r.get::<_,String>(0)).unwrap();
+        assert_eq!(old, "pending");
+        push_complete_at(
+            &mut session,
+            "小明即王明。小新即小王。小明认识李雷。李雷认识王明。小王认识王明。",
+            None,
+            "2026-01-02T00:00:00Z",
+        );
+        let batch = next_batch(&store, &mut session);
+        let e = &batch.events[0];
+        let existing = |local: &str, name: &str, target: &str, alias_text: &str, identity: &str| {
+            ConsolidatedEntityOutput {
+                local_id: local.into(),
+                name: name.into(),
+                kind: MemoryEntityKind::Person,
+                resolution: EntityResolution::Existing,
+                disambiguation: EntityDisambiguation::Resolved,
+                basis: EntityResolutionBasis::ExplicitAlias,
+                existing_entity_id: Some(target.into()),
+                name_evidence: quote_nth(e, alias_text, 0),
+                existing_identity_evidence: Some(quote_nth(e, identity, 0)),
+                resolution_evidence: Some(quote_nth(e, &format!("{alias_text}即{identity}。"), 0)),
+                aliases: vec![EntityAliasOutput {
+                    text: alias_text.into(),
+                    kind: MemoryAliasKind::ExplicitAlias,
+                    stable_identifier_kind: None,
+                    evidence: quote_nth(e, alias_text, 0),
+                    proof_evidence: quote_nth(e, &format!("{alias_text}即{identity}。"), 0),
+                }],
+            }
+        };
+        let claim = |id: &str,
+                     subject: String,
+                     object: String,
+                     quote: &str,
+                     subject_text: &str,
+                     object_text: &str| ConsolidatedClaimOutput {
+            local_id: id.into(),
+            subject_ref: subject,
+            predicate_key: format!("relation.{id}"),
+            object: ConsolidatedClaimObject {
+                kind: ConsolidationClaimObjectKind::Entity,
+                text: None,
+                entity_ref: Some(object),
+                span: None,
+            },
+            polarity: ClaimPolarity::Assert,
+            cardinality: ClaimCardinality::Single,
+            certainty: ClaimCertainty::Certain,
+            disposition: ClaimDisposition::New,
+            replaces_claim_ids: vec![],
+            conflicts_with_claim_ids: vec![],
+            event_time: None,
+            valid_from: None,
+            valid_to: None,
+            evidence: vec![ConsolidationClaimEvidence {
+                kind: ConsolidationEvidenceKind::Assertion,
+                quote: quote_nth(e, quote, 0),
+                subject_span: quote_nth(e, subject_text, 1),
+                relation_span: quote_nth(
+                    e,
+                    "认识",
+                    match id {
+                        "local_b" => 1,
+                        "local_c" => 2,
+                        _ => 0,
+                    },
+                ),
+                object_span: quote_nth(
+                    e,
+                    object_text,
+                    match id {
+                        "local_b" => 1,
+                        "local_c" => 2,
+                        _ => 0,
+                    },
+                ),
+                speech_act_span: None,
+            }],
+        };
+        let output = StructuredConsolidationOutput {
+            entities: vec![
+                existing("local_wang", "小明", &wang, "小明", "王明"),
+                existing("local_pending", "小新", &pending, "小新", "小王"),
+            ],
+            claims: vec![
+                claim(
+                    "local_a",
+                    "local_wang".into(),
+                    li.clone(),
+                    "小明认识李雷。",
+                    "小明",
+                    "李雷",
+                ),
+                claim(
+                    "local_b",
+                    li.clone(),
+                    wang.clone(),
+                    "李雷认识王明。",
+                    "李雷",
+                    "王明",
+                ),
+                claim(
+                    "local_c",
+                    pending.clone(),
+                    wang.clone(),
+                    "小王认识王明。",
+                    "小王",
+                    "王明",
+                ),
+            ],
+            boundaries: vec![],
+        };
+        apply_output(&store, &batch, &candidates, &output).unwrap();
+        let c = Connection::open(store.retrieval().index_path()).unwrap();
+        let rows=c.prepare("SELECT mention_kind,entity_id,entity_status FROM memory_entity_mentions WHERE batch_key=?1").unwrap().query_map([&batch.batch_key],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        let mut seen = std::collections::BTreeSet::new();
+        assert!(
+            rows.iter()
+                .any(|r| r.0 == "claim_subject" && r.1 == wang && r.2 == "resolved")
+        );
+        seen.insert("existing_local_ref");
+        assert!(
+            rows.iter()
+                .any(|r| r.0 == "claim_subject" && r.1 == li && r.2 == "resolved")
+        );
+        seen.insert("direct_untouched_candidate");
+        assert!(
+            rows.iter()
+                .any(|r| r.0 == "claim_subject" && r.1 == pending && r.2 == "resolved")
+        );
+        seen.insert("direct_touched_candidate_override");
+        assert!(
+            rows.iter()
+                .any(|r| r.0 == "claim_object" && r.1 == wang && r.2 == "resolved")
+        );
+        seen.insert("direct_current_existing_target");
+        assert_eq!(
+            seen,
+            [
+                "existing_local_ref",
+                "direct_untouched_candidate",
+                "direct_touched_candidate_override",
+                "direct_current_existing_target"
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert_eq!(c.query_row("SELECT entity_status FROM memory_entity_mentions WHERE entity_id=?1 AND batch_key=?2",[&pending,&setup.batch_key],|r|r.get::<_,String>(0)).unwrap(),"pending");
+    }
+
+    #[test]
     fn mention_episode_soft_vote_uses_stored_resolved_history_only() {
         let root = tempfile::tempdir().unwrap();
         let (store, mut session) = new_session(root.path());
