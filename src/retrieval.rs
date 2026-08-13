@@ -2965,6 +2965,11 @@ fn prepare_complete_catalog_writes<'a>(
                     "文档 {document_id} 的向量维度不匹配"
                 )));
             }
+            if !is_unit_vector(&write.vector) {
+                return Err(RetrievalError::CorruptIndex(format!(
+                    "文档 {document_id} 的向量必须为有限非零单位向量"
+                )));
+            }
             let vector_blob = encode_f32_le(&write.vector)
                 .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
             Ok(PreparedCatalogEmbedding {
@@ -5680,6 +5685,43 @@ mod tests {
         (root, store, session, spec)
     }
 
+    fn embedding_catalog_two_session_fixture(
+        messages: [&str; 2],
+    ) -> (
+        tempfile::TempDir,
+        SessionStore,
+        Vec<Session>,
+        VectorIndexSpec,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let mut sessions = Vec::new();
+        for message in messages {
+            let mut session = store
+                .create("model", "http://localhost", None, Default::default(), false)
+                .unwrap();
+            append_complete_turn(&mut session, message, "answer", "");
+            let path = store.save(&mut session).unwrap();
+            store.retrieval().sync_session(&session, &path).unwrap();
+            sessions.push(session);
+        }
+        let spec = VectorIndexSpec::from_config(&aggregate_memory_config()).unwrap();
+        (root, store, sessions, spec)
+    }
+
+    fn embedding_catalog_assert_leaf_snapshot_rejects(
+        corrupt: impl FnOnce(&Connection, &Session, &LeafEmbeddingSnapshot),
+    ) {
+        let (_root, store, session, spec) = embedding_catalog_fixture("corruption fixture");
+        let snapshot = store.retrieval().leaf_embedding_snapshot(&spec).unwrap();
+        let connection = Connection::open(store.retrieval().index_path()).unwrap();
+        corrupt(&connection, &session, &snapshot);
+        assert!(matches!(
+            store.retrieval().leaf_embedding_snapshot(&spec),
+            Err(RetrievalError::CorruptIndex(_))
+        ));
+    }
+
     fn embedding_catalog_unit_writes(
         snapshot: &LeafEmbeddingSnapshot,
         dimensions: usize,
@@ -5752,6 +5794,92 @@ mod tests {
     }
 
     #[test]
+    fn embedding_catalog_leaf_snapshot_rejects_catalog_and_member_corruption() {
+        embedding_catalog_assert_leaf_snapshot_rejects(|connection, _, snapshot| {
+            connection
+                .execute(
+                    "DELETE FROM retrieval_documents WHERE document_id=?1",
+                    [&snapshot.documents[0].document_id],
+                )
+                .unwrap();
+        });
+        embedding_catalog_assert_leaf_snapshot_rejects(|connection, _, snapshot| {
+            connection
+                .execute(
+                    "INSERT INTO retrieval_documents
+                     (document_id,event_id,start_char,end_char,granularity,content_sha256,
+                      exact_content,lexical_content,ngram_content)
+                     SELECT 'corrupt-extra-retrieval',event_id,start_char,end_char,granularity,
+                            content_sha256,exact_content,lexical_content,ngram_content
+                     FROM retrieval_documents WHERE document_id=?1",
+                    [&snapshot.documents[0].document_id],
+                )
+                .unwrap();
+        });
+        embedding_catalog_assert_leaf_snapshot_rejects(|connection, _, snapshot| {
+            connection
+                .execute(
+                    "DELETE FROM memory_documents WHERE document_id=?1",
+                    [&snapshot.documents[0].document_id],
+                )
+                .unwrap();
+        });
+        embedding_catalog_assert_leaf_snapshot_rejects(|connection, _, snapshot| {
+            connection
+                .execute(
+                    "INSERT INTO memory_documents
+                     (document_id,session_id,granularity,source_sha256,start_sequence,
+                      end_sequence,member_count)
+                     SELECT 'corrupt-extra-memory',session_id,granularity,source_sha256,
+                            start_sequence,end_sequence,member_count
+                     FROM memory_documents WHERE document_id=?1",
+                    [&snapshot.documents[0].document_id],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO memory_document_members
+                     (document_id,ordinal,event_id,start_char,end_char,content_sha256)
+                     SELECT 'corrupt-extra-memory',ordinal,event_id,start_char,end_char,content_sha256
+                     FROM memory_document_members WHERE document_id=?1",
+                    [&snapshot.documents[0].document_id],
+                )
+                .unwrap();
+        });
+        embedding_catalog_assert_leaf_snapshot_rejects(|connection, _, snapshot| {
+            connection
+                .execute(
+                    "INSERT INTO memory_document_members
+                     (document_id,ordinal,event_id,start_char,end_char,content_sha256)
+                     SELECT document_id,1,event_id,start_char,end_char,content_sha256
+                     FROM memory_document_members WHERE document_id=?1 AND ordinal=0",
+                    [&snapshot.documents[0].document_id],
+                )
+                .unwrap();
+        });
+
+        let (_root, store, sessions, spec) =
+            embedding_catalog_two_session_fixture(["first session", "second session"]);
+        let snapshot = store.retrieval().leaf_embedding_snapshot(&spec).unwrap();
+        let target = snapshot
+            .documents
+            .iter()
+            .find(|document| document.session_id == sessions[0].id)
+            .unwrap();
+        let connection = Connection::open(store.retrieval().index_path()).unwrap();
+        connection
+            .execute(
+                "UPDATE memory_documents SET session_id=?1 WHERE document_id=?2",
+                params![sessions[1].id, target.document_id],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.retrieval().leaf_embedding_snapshot(&spec),
+            Err(RetrievalError::CorruptIndex(_))
+        ));
+    }
+
+    #[test]
     fn embedding_catalog_leaf_complete_publish_noop_and_stale_cas() {
         let (_root, store, session, spec) = embedding_catalog_fixture("hello catalog");
         let snapshot = store.retrieval().leaf_embedding_snapshot(&spec).unwrap();
@@ -5787,10 +5915,14 @@ mod tests {
             &session.id,
         );
         assert_eq!(before, after);
+        let mut tampered_vector = vec![0.0; spec.dimensions];
+        tampered_vector[spec.dimensions - 1] = 1.0;
+        let tampered_blob = encode_f32_le(&tampered_vector).unwrap();
         connection
             .execute(
-                "UPDATE memory_embeddings SET embedded_at='tampered' WHERE document_id=?1",
-                [&writes[0].document_id],
+                "UPDATE memory_embeddings SET vector_blob=?1,embedded_at='tampered'
+                 WHERE document_id=?2",
+                params![tampered_blob, writes[0].document_id],
             )
             .unwrap();
         assert!(matches!(
@@ -5799,6 +5931,14 @@ mod tests {
                 .publish_leaf_embedding_catalog(&spec, &fresh, &writes),
             Err(RetrievalError::EmbeddingCatalogStale { .. })
         ));
+        let retained = connection
+            .query_row(
+                "SELECT vector_blob,embedded_at FROM memory_embeddings WHERE document_id=?1",
+                [&writes[0].document_id],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(retained, (tampered_blob, "tampered".into()));
     }
 
     #[test]
@@ -5904,13 +6044,24 @@ mod tests {
                 v[0].vector[0] = f32::NAN;
                 v
             },
+            {
+                let mut v = writes.clone();
+                v[0].vector.fill(0.0);
+                v
+            },
+            {
+                let mut v = writes.clone();
+                v[0].vector.fill(0.0);
+                v[0].vector[0] = 0.5;
+                v
+            },
         ] {
-            assert!(
+            assert!(matches!(
                 store
                     .retrieval()
-                    .publish_leaf_embedding_catalog(&spec, &snapshot, &invalid)
-                    .is_err()
-            );
+                    .publish_leaf_embedding_catalog(&spec, &snapshot, &invalid),
+                Err(RetrievalError::CorruptIndex(_))
+            ));
             assert_eq!(
                 connection
                     .query_row("SELECT count(*) FROM memory_embeddings", [], |r| r
@@ -5938,21 +6089,124 @@ mod tests {
     }
 
     #[test]
-    fn embedding_catalog_leaf_change_invalidates_only_own_session_aggregates() {
-        let root = tempfile::tempdir().unwrap();
-        let store = SessionStore::new(root.path()).unwrap();
+    fn embedding_catalog_stale_leaf_row_is_refreshed_exactly_and_invalidates_aggregate() {
+        let (_root, store, session, spec) = embedding_catalog_fixture("stale row refresh");
+        let source_path = store.root().join(format!("{}.json", session.id));
+        let source_before = fs::read(&source_path).unwrap();
+        let leaf = store.retrieval().leaf_embedding_snapshot(&spec).unwrap();
+        let writes = embedding_catalog_unit_writes(&leaf, spec.dimensions);
+        store
+            .retrieval()
+            .publish_leaf_embedding_catalog(&spec, &leaf, &writes)
+            .unwrap();
+        store
+            .retrieval()
+            .materialize_episode_documents(&session.id, &aggregate_memory_config())
+            .unwrap();
+        let aggregate = store
+            .retrieval()
+            .aggregate_embedding_snapshot(&spec)
+            .unwrap();
+        let aggregate_blobs =
+            canonical_aggregate_blobs_from_snapshot(&aggregate, spec.dimensions).unwrap();
+        let aggregate_writes = aggregate
+            .documents
+            .iter()
+            .map(|document| EmbeddingWrite {
+                document_id: document.document_id.clone(),
+                expected_source_sha256: document.source_sha256.clone(),
+                vector: decode_f32_le(&aggregate_blobs[&document.document_id], spec.dimensions)
+                    .unwrap(),
+            })
+            .collect::<Vec<_>>();
+        store
+            .retrieval()
+            .publish_aggregate_embedding_catalog(&spec, &aggregate, &aggregate_writes)
+            .unwrap();
+
+        let target = 0;
+        let stale_blob = encode_f32_le(&vec![0.25; spec.dimensions]).unwrap();
+        let connection = Connection::open(store.retrieval().index_path()).unwrap();
+        connection
+            .execute(
+                "UPDATE memory_embeddings
+                 SET model='stale-model',source_sha256=?1,index_fingerprint=?2,
+                     vector_blob=?3,embedded_at='stale-time'
+                 WHERE document_id=?4",
+                params![
+                    "b".repeat(64),
+                    "c".repeat(64),
+                    stale_blob,
+                    writes[target].document_id
+                ],
+            )
+            .unwrap();
+        let fresh = store.retrieval().leaf_embedding_snapshot(&spec).unwrap();
+        assert!(fresh.documents[target].reusable_vector.is_none());
+        let report = store
+            .retrieval()
+            .publish_leaf_embedding_catalog(&spec, &fresh, &writes)
+            .unwrap();
+        assert!(report.changed);
+        assert_eq!(report.reused, writes.len() - 1);
+
+        let fingerprint = spec.fingerprint().unwrap();
+        let expected_blob = encode_f32_le(&writes[target].vector).unwrap();
+        let restored = connection
+            .query_row(
+                "SELECT model,dimensions,source_sha256,index_fingerprint,vector_blob,embedded_at
+                 FROM memory_embeddings WHERE document_id=?1",
+                [&writes[target].document_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Vec<u8>>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(restored.0, spec.model);
+        assert_eq!(restored.1, i64::try_from(spec.dimensions).unwrap());
+        assert_eq!(restored.2, writes[target].expected_source_sha256);
+        assert_eq!(restored.3, fingerprint);
+        assert_eq!(restored.4, expected_blob);
+        assert_ne!(restored.5, "stale-time");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM memory_episode_materializations WHERE session_id=?1",
+                    [&session.id],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM memory_embeddings e JOIN memory_documents d
+                     ON d.document_id=e.document_id
+                     WHERE d.session_id=?1 AND d.granularity IN ('episode','session')",
+                    [&session.id],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(fs::read(source_path).unwrap(), source_before);
+    }
+
+    #[test]
+    fn embedding_catalog_fragment_change_invalidates_only_own_session_aggregates() {
+        let long_first = "甲".repeat(441);
+        let long_second = "乙".repeat(441);
+        let (_root, store, sessions, spec) =
+            embedding_catalog_two_session_fixture([&long_first, &long_second]);
         let config = aggregate_memory_config();
-        let spec = VectorIndexSpec::from_config(&config).unwrap();
-        let mut sessions = Vec::new();
-        for title in ["one", "two"] {
-            let mut session = store
-                .create("model", "http://localhost", None, Default::default(), false)
-                .unwrap();
-            append_complete_turn(&mut session, title, "answer", "");
-            let path = store.save(&mut session).unwrap();
-            store.retrieval().sync_session(&session, &path).unwrap();
-            sessions.push(session);
-        }
         let leaf = store.retrieval().leaf_embedding_snapshot(&spec).unwrap();
         let writes = embedding_catalog_unit_writes(&leaf, spec.dimensions);
         store
@@ -5983,15 +6237,40 @@ mod tests {
             .retrieval()
             .publish_aggregate_embedding_catalog(&spec, &aggregate, &aggregate_writes)
             .unwrap();
+        let aggregate_counts = sessions
+            .iter()
+            .map(|session| {
+                aggregate
+                    .documents
+                    .iter()
+                    .filter(|document| document.session_id == session.id)
+                    .count()
+            })
+            .collect::<Vec<_>>();
         let fresh = store.retrieval().leaf_embedding_snapshot(&spec).unwrap();
         let mut changed = writes.clone();
         let target = fresh
             .documents
             .iter()
-            .position(|d| d.session_id == sessions[0].id)
+            .position(|document| {
+                document.session_id == sessions[0].id
+                    && document.granularity == RetrievalDocumentGranularity::Fragment
+            })
             .unwrap();
+        assert_eq!(
+            fresh.documents[target].granularity,
+            RetrievalDocumentGranularity::Fragment
+        );
         changed[target].vector.fill(0.0);
         changed[target].vector[(target + 1) % spec.dimensions] = 1.0;
+        assert_ne!(writes[target].vector, changed[target].vector);
+        assert!(
+            writes
+                .iter()
+                .zip(&changed)
+                .enumerate()
+                .all(|(index, (before, after))| index == target || before.vector == after.vector)
+        );
         store
             .retrieval()
             .publish_leaf_embedding_catalog(&spec, &fresh, &changed)
@@ -6010,12 +6289,36 @@ mod tests {
         assert_eq!(
             connection
                 .query_row(
+                    "SELECT count(*) FROM memory_embeddings e JOIN memory_documents d
+                     ON d.document_id=e.document_id
+                     WHERE d.session_id=?1 AND d.granularity IN ('episode','session')",
+                    [&sessions[0].id],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
                     "SELECT count(*) FROM memory_episode_materializations WHERE session_id=?1",
                     [&sessions[1].id],
                     |r| r.get::<_, i64>(0)
                 )
                 .unwrap(),
             1
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM memory_embeddings e JOIN memory_documents d
+                     ON d.document_id=e.document_id
+                     WHERE d.session_id=?1 AND d.granularity IN ('episode','session')",
+                    [&sessions[1].id],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            i64::try_from(aggregate_counts[1]).unwrap()
         );
     }
 
@@ -6027,8 +6330,7 @@ mod tests {
             Err(RetrievalError::CorruptIndex(_))
         ));
         let leaf = store.retrieval().leaf_embedding_snapshot(&spec).unwrap();
-        let mut writes = embedding_catalog_unit_writes(&leaf, spec.dimensions);
-        writes[0].vector.fill(1.0);
+        let writes = embedding_catalog_unit_writes(&leaf, spec.dimensions);
         store
             .retrieval()
             .publish_leaf_embedding_catalog(&spec, &leaf, &writes)
@@ -6037,29 +6339,47 @@ mod tests {
             .retrieval()
             .materialize_episode_documents(&session.id, &aggregate_memory_config())
             .unwrap();
+        let message_write = writes
+            .iter()
+            .find(|write| {
+                leaf.documents
+                    .iter()
+                    .find(|document| document.document_id == write.document_id)
+                    .is_some_and(|document| {
+                        document.granularity == RetrievalDocumentGranularity::Message
+                    })
+            })
+            .unwrap();
+        let non_unit_blob = encode_f32_le(&vec![0.5; spec.dimensions]).unwrap();
+        let connection = Connection::open(store.retrieval().index_path()).unwrap();
+        connection
+            .execute(
+                "UPDATE memory_embeddings SET vector_blob=?1 WHERE document_id=?2",
+                params![non_unit_blob, message_write.document_id],
+            )
+            .unwrap();
         assert!(matches!(
             store.retrieval().aggregate_embedding_snapshot(&spec),
             Err(RetrievalError::CorruptIndex(_))
         ));
-        let fresh = store.retrieval().leaf_embedding_snapshot(&spec).unwrap();
-        writes = embedding_catalog_unit_writes(&fresh, spec.dimensions);
-        store
-            .retrieval()
-            .publish_leaf_embedding_catalog(&spec, &fresh, &writes)
-            .unwrap();
-        store
-            .retrieval()
-            .materialize_episode_documents(&session.id, &aggregate_memory_config())
+        connection
+            .execute(
+                "UPDATE memory_embeddings SET vector_blob=?1 WHERE document_id=?2",
+                params![
+                    encode_f32_le(&message_write.vector).unwrap(),
+                    message_write.document_id
+                ],
+            )
             .unwrap();
         let aggregate = store
             .retrieval()
             .aggregate_embedding_snapshot(&spec)
             .unwrap();
-        let connection = Connection::open(store.retrieval().index_path()).unwrap();
         connection
             .execute(
-                "UPDATE memory_embeddings SET embedded_at='tampered' WHERE document_id=?1",
-                [&writes[0].document_id],
+                "UPDATE memory_episode_materializations
+                 SET materialized_at='2030-01-01T00:00:00Z' WHERE session_id=?1",
+                [&session.id],
             )
             .unwrap();
         let blobs = canonical_aggregate_blobs_from_snapshot(&aggregate, spec.dimensions).unwrap();
@@ -6080,6 +6400,18 @@ mod tests {
             ),
             Err(RetrievalError::EmbeddingCatalogStale { .. })
         ));
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM memory_embeddings e JOIN memory_documents d
+                     ON d.document_id=e.document_id
+                     WHERE d.granularity IN ('episode','session')",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
