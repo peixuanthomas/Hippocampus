@@ -8979,47 +8979,277 @@ mod tests {
         assert_eq!(seen, expected);
     }
 
-    #[test]
-    fn mention_ledger_audit_rejects_complete_tuple_tamper_and_deletion() {
-        let root = tempfile::tempdir().unwrap();
-        let (store, mut session) = new_session(root.path());
-        push_complete_at(&mut session, "Alice", None, "2026-01-01T00:00:00Z");
-        let batch = next_batch(&store, &mut session);
-        let candidates = empty_candidates();
-        let output = StructuredConsolidationOutput {
+    struct MentionTamperFixture {
+        store: SessionStore,
+        session_id: String,
+        target_mention_id: String,
+        alternate_batch_key: String,
+        alternate_entity_id: String,
+        alternate_source_record_id: String,
+        alternate_user_event_id: String,
+        alternate_user_sequence: i64,
+        alternate_user_start: i64,
+        alternate_user_end: i64,
+        alternate_user_hash: String,
+        alternate_assistant_event_id: String,
+        alternate_assistant_sequence: i64,
+        alternate_assistant_start: i64,
+        alternate_assistant_end: i64,
+        alternate_assistant_hash: String,
+    }
+
+    fn mention_tamper_fixture(root: &std::path::Path) -> MentionTamperFixture {
+        let (store, mut session) = new_session(root);
+        push_complete_at(&mut session, "Alice Alice", None, "2026-01-01T00:00:00Z");
+        let first_batch = next_batch(&store, &mut session);
+        let first_output = StructuredConsolidationOutput {
             entities: vec![new_entity_output(
                 "local_alice",
                 "Alice",
-                quote_nth(&batch.events[0], "Alice", 0),
+                quote_nth(&first_batch.events[0], "Alice", 0),
             )],
             claims: vec![],
             boundaries: vec![],
         };
-        apply_output(&store, &batch, &candidates, &output).unwrap();
+        apply_output(&store, &first_batch, &empty_candidates(), &first_output).unwrap();
+
+        push_complete_at(
+            &mut session,
+            "Bob Bob",
+            Some("Carol Carol"),
+            "2026-01-01T00:01:00Z",
+        );
+        let second_batch = next_batch(&store, &mut session);
+        let second_candidates = store.retrieval().consolidation_candidates(16, 16).unwrap();
+        let second_user = second_batch
+            .events
+            .iter()
+            .find(|event| event.role == EventRole::User)
+            .unwrap()
+            .clone();
+        let second_assistant = second_batch
+            .events
+            .iter()
+            .find(|event| event.role == EventRole::Assistant)
+            .unwrap()
+            .clone();
+        let second_output = StructuredConsolidationOutput {
+            entities: vec![new_entity_output(
+                "local_bob",
+                "Bob",
+                quote_nth(&second_user, "Bob", 0),
+            )],
+            claims: vec![],
+            boundaries: vec![],
+        };
+        apply_output(&store, &second_batch, &second_candidates, &second_output).unwrap();
+
         let connection = Connection::open(store.retrieval().index_path()).unwrap();
-        connection
-            .execute(
-                "UPDATE memory_entity_mentions SET created_at='2026-01-01T00:00:02Z'",
-                [],
+        let (target_mention_id,): (String,) = connection
+            .query_row(
+                "SELECT mention_id FROM memory_entity_mentions WHERE batch_key=?1",
+                [&first_batch.batch_key],
+                |row| Ok((row.get(0)?,)),
+            )
+            .unwrap();
+        let (alternate_entity_id, alternate_source_record_id): (String, String) = connection
+            .query_row(
+                "SELECT entity_id, source_record_id FROM memory_entity_mentions WHERE batch_key=?1",
+                [&second_batch.batch_key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
         drop(connection);
-        assert!(matches!(
-            store.retrieval().consolidation_candidates(1, 1),
-            Err(RetrievalError::CorruptIndex(_))
-        ));
 
-        let connection = Connection::open(store.retrieval().index_path()).unwrap();
-        assert!(
-            connection
-                .execute("UPDATE consolidation_batches SET model='tampered'", [])
-                .is_err()
+        let alternate_user = quote_nth(&second_user, "Bob", 0);
+        let alternate_assistant = quote_nth(&second_assistant, "Carol", 0);
+        MentionTamperFixture {
+            store,
+            session_id: session.id,
+            target_mention_id,
+            alternate_batch_key: second_batch.batch_key,
+            alternate_entity_id,
+            alternate_source_record_id,
+            alternate_user_event_id: second_user.event_id,
+            alternate_user_sequence: second_user.sequence as i64,
+            alternate_user_start: alternate_user.start_char as i64,
+            alternate_user_end: alternate_user.end_char as i64,
+            alternate_user_hash: alternate_user.content_sha256,
+            alternate_assistant_event_id: second_assistant.event_id,
+            alternate_assistant_sequence: second_assistant.sequence as i64,
+            alternate_assistant_start: alternate_assistant.start_char as i64,
+            alternate_assistant_end: alternate_assistant.end_char as i64,
+            alternate_assistant_hash: alternate_assistant.content_sha256,
+        }
+    }
+
+    fn refresh_tampered_mention_id(connection: &Connection, mention_id: &str) {
+        let (session_id, batch_key, kind, source, entity_id, status, event_id, sequence, role, start, end, hash): (
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            i64,
+            String,
+            i64,
+            i64,
+            String,
+        ) = connection
+            .query_row(
+                "SELECT session_id,batch_key,mention_kind,source_record_id,entity_id,entity_status,event_id,sequence,role,start_char,end_char,content_sha256 FROM memory_entity_mentions WHERE mention_id=?1",
+                [mention_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?, row.get(10)?, row.get(11)?)),
+            )
+            .unwrap();
+        let replacement = deterministic_id(
+            "mention",
+            &[
+                &session_id,
+                &batch_key,
+                &kind,
+                &source,
+                &entity_id,
+                &status,
+                &event_id,
+                &sequence.to_string(),
+                &role,
+                &start.to_string(),
+                &end.to_string(),
+                &hash,
+            ],
         );
-        assert!(
-            connection
-                .execute("DELETE FROM consolidation_batches", [])
-                .is_err()
-        );
+        connection
+            .execute(
+                "UPDATE memory_entity_mentions SET mention_id=?1 WHERE mention_id=?2",
+                params![replacement, mention_id],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn mention_ledger_audit_rejects_every_tuple_field_tamper() {
+        let expected = [
+            "mention_id",
+            "session_id",
+            "batch_key",
+            "mention_kind",
+            "source_record_id",
+            "entity_id",
+            "entity_status",
+            "event_id",
+            "sequence",
+            "role",
+            "start_char",
+            "end_char",
+            "content_sha256",
+            "created_at",
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+        let mut seen = std::collections::BTreeSet::new();
+
+        for field in &expected {
+            let root = tempfile::tempdir().unwrap();
+            let fixture = mention_tamper_fixture(root.path());
+            let connection = Connection::open(fixture.store.retrieval().index_path()).unwrap();
+            let changed = match *field {
+                "mention_id" => {
+                    connection
+                        .execute(
+                            "UPDATE memory_entity_mentions SET mention_id=?1 WHERE mention_id=?2",
+                            params![
+                                deterministic_id("mention", &["schema-valid-but-wrong"]),
+                                fixture.target_mention_id,
+                            ],
+                        )
+                        .unwrap()
+                }
+                "session_id" => connection
+                    .execute(
+                        "UPDATE memory_entity_mentions SET session_id=?1 WHERE mention_id=?2",
+                        params![
+                            format!("other-{}", fixture.session_id),
+                            fixture.target_mention_id
+                        ],
+                    )
+                    .unwrap(),
+                "batch_key" => connection
+                    .execute(
+                        "UPDATE memory_entity_mentions SET batch_key=?1 WHERE mention_id=?2",
+                        params![fixture.alternate_batch_key, fixture.target_mention_id],
+                    )
+                    .unwrap(),
+                "mention_kind" => connection
+                    .execute(
+                        "UPDATE memory_entity_mentions SET mention_kind='alias' WHERE mention_id=?1",
+                        [&fixture.target_mention_id],
+                    )
+                    .unwrap(),
+                "source_record_id" => connection
+                    .execute(
+                        "UPDATE memory_entity_mentions SET source_record_id=?1 WHERE mention_id=?2",
+                        params![fixture.alternate_source_record_id, fixture.target_mention_id],
+                    )
+                    .unwrap(),
+                "entity_id" => connection
+                    .execute(
+                        "UPDATE memory_entity_mentions SET entity_id=?1 WHERE mention_id=?2",
+                        params![fixture.alternate_entity_id, fixture.target_mention_id],
+                    )
+                    .unwrap(),
+                "entity_status" => connection
+                    .execute(
+                        "UPDATE memory_entity_mentions SET entity_status='pending' WHERE mention_id=?1",
+                        [&fixture.target_mention_id],
+                    )
+                    .unwrap(),
+                "event_id" | "content_sha256" => connection
+                    .execute(
+                        "UPDATE memory_entity_mentions SET event_id=?1,sequence=?2,role='user',start_char=?3,end_char=?4,content_sha256=?5 WHERE mention_id=?6",
+                        params![fixture.alternate_user_event_id, fixture.alternate_user_sequence, fixture.alternate_user_start, fixture.alternate_user_end, fixture.alternate_user_hash, fixture.target_mention_id],
+                    )
+                    .unwrap(),
+                "sequence" => connection
+                    .execute(
+                        "UPDATE memory_entity_mentions SET sequence=?1 WHERE mention_id=?2",
+                        params![fixture.alternate_user_sequence, fixture.target_mention_id],
+                    )
+                    .unwrap(),
+                "role" => connection
+                    .execute(
+                        "UPDATE memory_entity_mentions SET event_id=?1,sequence=?2,role='assistant',start_char=?3,end_char=?4,content_sha256=?5 WHERE mention_id=?6",
+                        params![fixture.alternate_assistant_event_id, fixture.alternate_assistant_sequence, fixture.alternate_assistant_start, fixture.alternate_assistant_end, fixture.alternate_assistant_hash, fixture.target_mention_id],
+                    )
+                    .unwrap(),
+                "start_char" | "end_char" => connection
+                    .execute(
+                        "UPDATE memory_entity_mentions SET start_char=6,end_char=11 WHERE mention_id=?1",
+                        [&fixture.target_mention_id],
+                    )
+                    .unwrap(),
+                "created_at" => connection
+                    .execute(
+                        "UPDATE memory_entity_mentions SET created_at='2026-01-01T00:00:02Z' WHERE mention_id=?1",
+                        [&fixture.target_mention_id],
+                    )
+                    .unwrap(),
+                _ => unreachable!(),
+            };
+            assert_eq!(changed, 1, "{field}");
+            if *field != "mention_id" {
+                refresh_tampered_mention_id(&connection, &fixture.target_mention_id);
+            }
+            drop(connection);
+            assert!(matches!(
+                fixture.store.retrieval().consolidation_candidates(16, 16),
+                Err(RetrievalError::CorruptIndex(_))
+            ));
+            seen.insert(*field);
+        }
+        assert_eq!(seen, expected);
     }
 
     #[test]
