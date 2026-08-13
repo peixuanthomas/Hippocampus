@@ -12780,6 +12780,223 @@ mod tests {
     }
 
     #[test]
+    fn mention_projection_records_confirmed_assistant_but_rejects_assistant_only_fact() {
+        let expected = ["confirmed_assistant", "assistant_only_rejected"]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut seen = std::collections::BTreeSet::new();
+
+        let confirmed_root = tempfile::tempdir().unwrap();
+        let (confirmed_store, mut confirmed_session) = new_session(confirmed_root.path());
+        push_complete_at(
+            &mut confirmed_session,
+            "Tell me Alice's favorite color.",
+            Some("Alice likes blue."),
+            "2026-01-01T00:00:00Z",
+        );
+        push_complete_at(
+            &mut confirmed_session,
+            "Yes, Alice likes blue.",
+            None,
+            "2026-01-01T00:01:00Z",
+        );
+        let confirmed_batch = next_batch(&confirmed_store, &mut confirmed_session);
+        let first_user = confirmed_batch
+            .events
+            .iter()
+            .find(|event| event.role == EventRole::User && event.sequence == 1)
+            .unwrap();
+        let assistant = confirmed_batch
+            .events
+            .iter()
+            .find(|event| event.role == EventRole::Assistant)
+            .unwrap();
+        let confirmation = confirmed_batch
+            .events
+            .iter()
+            .find(|event| event.role == EventRole::User && event.sequence > assistant.sequence)
+            .unwrap();
+        let mut confirmed_claim = text_claim_output(
+            "local_color",
+            "local_alice",
+            "preference.color",
+            "blue",
+            quote_nth(assistant, "Alice", 0),
+            quote_nth(assistant, "likes", 0),
+            quote_nth(assistant, "blue", 0),
+            full_quote(assistant),
+        );
+        confirmed_claim.evidence.push(ConsolidationClaimEvidence {
+            kind: ConsolidationEvidenceKind::UserConfirmation,
+            quote: full_quote(confirmation),
+            subject_span: quote_nth(confirmation, "Alice", 0),
+            relation_span: quote_nth(confirmation, "likes", 0),
+            object_span: quote_nth(confirmation, "blue", 0),
+            speech_act_span: Some(quote_nth(confirmation, "Yes", 0)),
+        });
+        let confirmed_output = StructuredConsolidationOutput {
+            entities: vec![new_entity_output(
+                "local_alice",
+                "Alice",
+                quote_nth(first_user, "Alice", 0),
+            )],
+            claims: vec![confirmed_claim],
+            boundaries: vec![],
+        };
+        let report = apply_output(
+            &confirmed_store,
+            &confirmed_batch,
+            &empty_candidates(),
+            &confirmed_output,
+        )
+        .unwrap();
+        assert_eq!(report.mentions_created, 3);
+        let connection = Connection::open(confirmed_store.retrieval().index_path()).unwrap();
+        let subject_entity_id: String = connection
+            .query_row("SELECT subject_entity_id FROM memory_claims", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let assistant_evidence_id: String = connection
+            .query_row(
+                "SELECT evidence_id FROM memory_claim_evidence WHERE role='assistant' AND kind='assertion'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let confirmation_evidence_id: String = connection
+            .query_row(
+                "SELECT evidence_id FROM memory_claim_evidence WHERE role='user' AND kind='user_confirmation'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        for (source_record_id, event, span, role) in [
+            (
+                assistant_evidence_id,
+                assistant,
+                quote_nth(assistant, "Alice", 0),
+                "assistant",
+            ),
+            (
+                confirmation_evidence_id,
+                confirmation,
+                quote_nth(confirmation, "Alice", 0),
+                "user",
+            ),
+        ] {
+            let (kind, entity_id, event_id, sequence, stored_role, start, end, hash, status): (
+                String,
+                String,
+                String,
+                i64,
+                String,
+                i64,
+                i64,
+                String,
+                String,
+            ) = connection
+                .query_row(
+                    "SELECT mention_kind,entity_id,event_id,sequence,role,start_char,end_char,content_sha256,entity_status FROM memory_entity_mentions WHERE source_record_id=?1",
+                    [&source_record_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?)),
+                )
+                .unwrap();
+            assert_eq!(kind, "claim_subject");
+            assert_eq!(entity_id, subject_entity_id);
+            assert_eq!(event_id, event.event_id);
+            assert_eq!(sequence, event.sequence as i64);
+            assert_eq!(stored_role, role);
+            assert_eq!(start, span.start_char as i64);
+            assert_eq!(end, span.end_char as i64);
+            assert_eq!(hash, span.content_sha256);
+            assert_eq!(status, "resolved");
+        }
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM memory_entity_mentions WHERE mention_kind='claim_object'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        seen.insert("confirmed_assistant");
+
+        let rejected_root = tempfile::tempdir().unwrap();
+        let (rejected_store, mut rejected_session) = new_session(rejected_root.path());
+        push_complete_at(
+            &mut rejected_session,
+            "Tell me Alice's favorite color.",
+            Some("Alice likes blue."),
+            "2026-01-01T00:00:00Z",
+        );
+        let rejected_batch = next_batch(&rejected_store, &mut rejected_session);
+        let rejected_user = rejected_batch
+            .events
+            .iter()
+            .find(|event| event.role == EventRole::User)
+            .unwrap();
+        let rejected_assistant = rejected_batch
+            .events
+            .iter()
+            .find(|event| event.role == EventRole::Assistant)
+            .unwrap();
+        let rejected_output = StructuredConsolidationOutput {
+            entities: vec![new_entity_output(
+                "local_alice",
+                "Alice",
+                quote_nth(rejected_user, "Alice", 0),
+            )],
+            claims: vec![text_claim_output(
+                "local_color",
+                "local_alice",
+                "preference.color",
+                "blue",
+                quote_nth(rejected_assistant, "Alice", 0),
+                quote_nth(rejected_assistant, "likes", 0),
+                quote_nth(rejected_assistant, "blue", 0),
+                full_quote(rejected_assistant),
+            )],
+            boundaries: vec![],
+        };
+        match apply_output(
+            &rejected_store,
+            &rejected_batch,
+            &empty_candidates(),
+            &rejected_output,
+        ) {
+            Err(ConsolidationApplyError::Rejected {
+                validation_json, ..
+            }) => {
+                let diagnostic: Value = serde_json::from_str(&validation_json).unwrap();
+                assert_eq!(diagnostic["code"], "assistant_only_claim");
+                assert_eq!(diagnostic["path"], "claims[0].evidence");
+            }
+            other => panic!("expected assistant-only rejection, got {other:?}"),
+        }
+        let connection = Connection::open(rejected_store.retrieval().index_path()).unwrap();
+        for query in [
+            "SELECT count(*) FROM memory_entity_mentions",
+            "SELECT count(*) FROM consolidation_batches WHERE status='applied' AND projection_schema_version=4",
+            "SELECT count(*) FROM consolidation_watermarks",
+            "SELECT count(*) FROM memory_entities",
+            "SELECT count(*) FROM memory_claims",
+        ] {
+            assert_eq!(
+                connection
+                    .query_row(query, [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                0,
+                "{query}"
+            );
+        }
+        seen.insert("assistant_only_rejected");
+        assert_eq!(seen, expected);
+    }
+
+    #[test]
     fn contradiction_matrix_is_shared_by_planned_stored_and_candidate_claims() {
         let candidate = |object: &str,
                          polarity: ClaimPolarity,
