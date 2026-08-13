@@ -16,18 +16,25 @@ use crate::context::ContextAssembler;
 use crate::knowledge::{KnowledgeRecall, KnowledgeTrace};
 use crate::model::{
     AgentChatRequest, AgentMessage, AgentRoundResult, ChatEvent, ChatEventKind, ContextPlan,
-    ContextTrace, ModelRequestTrace, ProvenanceQuality, Session, SessionStatus, TokenUsage,
-    ToolCall, ToolDefinition, ToolFunctionDefinition, ToolResultTrace, ToolRoundTrace, Turn,
-    TurnStatus, WebSourceTrace, WebTrace, agent_context_sha256, content_sha256, utc_now,
+    ContextTrace, ModelRequestTrace, ProvenanceQuality, RetrievalDocumentGranularity, Session,
+    SessionStatus, TokenUsage, ToolCall, ToolDefinition, ToolFunctionDefinition, ToolResultTrace,
+    ToolRoundTrace, Turn, TurnStatus, WebSourceTrace, WebTrace, agent_context_sha256,
+    content_sha256, utc_now,
 };
 #[cfg(test)]
 use crate::ollama::StructuredChatRequest;
 use crate::ollama::{
-    ChatBackend, ChatRequest, OllamaError, WebFetchResponse, WebSearchResponse,
+    ChatBackend, ChatRequest, EmbeddingRequest, OllamaError, WebFetchResponse, WebSearchResponse,
     validate_public_http_url,
 };
-use crate::retrieval::{RecallResult, RecalledEvidence};
+use crate::retrieval::{
+    AggregateEmbeddingSnapshot, LeafEmbeddingSnapshot, RecallResult, RecalledEvidence,
+    RetrievalError,
+};
 use crate::store::SessionStore;
+use crate::vector::{
+    EmbeddingWrite, VectorError, VectorIndexSpec, equal_mean, l2_normalize, weighted_pool,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LimitAction {
@@ -41,6 +48,77 @@ pub enum PreparationStatus {
     LimitWarning,
     Blocked,
     Ended,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmbeddingRefreshReport {
+    pub leaf_documents: usize,
+    pub leaf_reused: usize,
+    pub leaf_embedded_inputs: usize,
+    pub backend_batches: usize,
+    pub aggregate_documents: usize,
+    pub leaf_committed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbeddingRefreshStage {
+    LeafSnapshot,
+    Planning,
+    Backend,
+    LeafPublish,
+    Materialization,
+    AggregateSnapshot,
+    AggregatePublish,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum EmbeddingRefreshError {
+    #[error("记忆嵌入功能未启用")]
+    Disabled,
+    #[error("嵌入刷新在 {stage:?} 阶段被取消（批次 {batch:?}）")]
+    Cancelled {
+        stage: EmbeddingRefreshStage,
+        batch: Option<usize>,
+    },
+    #[error("嵌入批次 {batch} 在 {timeout_secs} 秒后超时")]
+    Timeout { batch: usize, timeout_secs: u64 },
+    #[error("嵌入批次 {batch} 调用失败: {source}")]
+    Backend {
+        batch: usize,
+        #[source]
+        source: OllamaError,
+    },
+    #[error("嵌入批次 {batch} 返回无效响应: {message}")]
+    InvalidResponse { batch: usize, message: String },
+    #[error("嵌入配置无效: {source}")]
+    InvalidConfig {
+        #[source]
+        source: VectorError,
+    },
+    #[error("文档 {document_id} 的向量无效: {source}")]
+    Vector {
+        document_id: String,
+        #[source]
+        source: VectorError,
+    },
+    #[error("嵌入刷新在 {stage:?} 阶段访问派生索引失败: {source}")]
+    Retrieval {
+        stage: EmbeddingRefreshStage,
+        #[source]
+        source: RetrievalError,
+    },
+    #[error("会话 {session_id} 的 episode materialization 失败: {source}")]
+    Materialization {
+        session_id: String,
+        #[source]
+        source: RetrievalError,
+    },
+    #[error("嵌入刷新在 {stage:?} 阶段的阻塞任务失败: {source}")]
+    TaskJoin {
+        stage: EmbeddingRefreshStage,
+        #[source]
+        source: tokio::task::JoinError,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -128,6 +206,169 @@ struct ToolExecution {
     failed: bool,
 }
 
+fn check_embedding_cancellation(
+    cancellation: &CancellationToken,
+    stage: EmbeddingRefreshStage,
+    batch: Option<usize>,
+) -> std::result::Result<(), EmbeddingRefreshError> {
+    if cancellation.is_cancelled() {
+        Err(EmbeddingRefreshError::Cancelled { stage, batch })
+    } else {
+        Ok(())
+    }
+}
+
+fn embedding_catalog_error(stage: EmbeddingRefreshStage, message: String) -> EmbeddingRefreshError {
+    EmbeddingRefreshError::Retrieval {
+        stage,
+        source: RetrievalError::CorruptIndex(message),
+    }
+}
+
+fn derive_long_message_vectors(
+    snapshot: &LeafEmbeddingSnapshot,
+    vectors: &mut [Option<Vec<f32>>],
+    leaf_reused: &mut usize,
+    cancellation: &CancellationToken,
+) -> std::result::Result<(), EmbeddingRefreshError> {
+    let mut fragments_by_message: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (index, document) in snapshot.documents.iter().enumerate() {
+        if document.granularity == RetrievalDocumentGranularity::Fragment {
+            fragments_by_message
+                .entry(&document.message_document_id)
+                .or_default()
+                .push(index);
+        }
+    }
+    for (message_index, message) in snapshot.documents.iter().enumerate() {
+        check_embedding_cancellation(cancellation, EmbeddingRefreshStage::Planning, None)?;
+        if message.granularity != RetrievalDocumentGranularity::Message
+            || message.content.chars().count() <= 240
+        {
+            continue;
+        }
+        let message_len = message.content.chars().count();
+        if message.start_char != 0 || message.end_char != message_len {
+            return Err(embedding_catalog_error(
+                EmbeddingRefreshStage::Planning,
+                format!("长消息 {} 的规范范围无效", message.document_id),
+            ));
+        }
+        let mut fragment_indices = fragments_by_message
+            .get(message.document_id.as_str())
+            .cloned()
+            .unwrap_or_default();
+        fragment_indices.sort_by(|left, right| {
+            let left = &snapshot.documents[*left];
+            let right = &snapshot.documents[*right];
+            (left.start_char, left.end_char, left.document_id.as_str()).cmp(&(
+                right.start_char,
+                right.end_char,
+                right.document_id.as_str(),
+            ))
+        });
+        let mut expected_ranges = Vec::new();
+        let mut start = 0_usize;
+        while start < message_len {
+            let end = start.saturating_add(240).min(message_len);
+            expected_ranges.push((start, end));
+            if end == message_len {
+                break;
+            }
+            start = start.checked_add(200).ok_or_else(|| {
+                embedding_catalog_error(
+                    EmbeddingRefreshStage::Planning,
+                    format!("长消息 {} 的分片范围溢出", message.document_id),
+                )
+            })?;
+        }
+        let actual_ranges = fragment_indices
+            .iter()
+            .map(|index| {
+                let fragment = &snapshot.documents[*index];
+                (fragment.start_char, fragment.end_char)
+            })
+            .collect::<Vec<_>>();
+        if actual_ranges != expected_ranges {
+            return Err(embedding_catalog_error(
+                EmbeddingRefreshStage::Planning,
+                format!("长消息 {} 的分片窗口不规范", message.document_id),
+            ));
+        }
+        if fragment_indices
+            .iter()
+            .all(|index| snapshot.documents[*index].reusable_vector.is_some())
+        {
+            *leaf_reused += 1;
+        }
+        let mut covered_end = 0_usize;
+        let mut weighted = Vec::with_capacity(fragment_indices.len());
+        for fragment_index in fragment_indices {
+            let fragment = &snapshot.documents[fragment_index];
+            let new_start = covered_end.max(fragment.start_char);
+            let weight = fragment.end_char.checked_sub(new_start).ok_or_else(|| {
+                embedding_catalog_error(
+                    EmbeddingRefreshStage::Planning,
+                    format!("长消息 {} 的分片覆盖无效", message.document_id),
+                )
+            })?;
+            if weight == 0 || fragment.start_char > covered_end {
+                return Err(embedding_catalog_error(
+                    EmbeddingRefreshStage::Planning,
+                    format!("长消息 {} 的分片覆盖不连续", message.document_id),
+                ));
+            }
+            covered_end = covered_end.max(fragment.end_char);
+            let vector = vectors[fragment_index].as_deref().ok_or_else(|| {
+                embedding_catalog_error(
+                    EmbeddingRefreshStage::Planning,
+                    format!("分片 {} 缺少规划向量", fragment.document_id),
+                )
+            })?;
+            weighted.push((vector, weight));
+        }
+        if covered_end != message_len {
+            return Err(embedding_catalog_error(
+                EmbeddingRefreshStage::Planning,
+                format!("长消息 {} 的分片未覆盖全文", message.document_id),
+            ));
+        }
+        vectors[message_index] =
+            Some(
+                weighted_pool(&weighted).map_err(|source| EmbeddingRefreshError::Vector {
+                    document_id: message.document_id.clone(),
+                    source,
+                })?,
+            );
+    }
+    Ok(())
+}
+
+fn aggregate_embedding_writes(
+    snapshot: &AggregateEmbeddingSnapshot,
+) -> std::result::Result<Vec<EmbeddingWrite>, EmbeddingRefreshError> {
+    snapshot
+        .documents
+        .iter()
+        .map(|document| {
+            let vectors = document
+                .direct_messages
+                .iter()
+                .map(|message| message.vector.as_slice())
+                .collect::<Vec<_>>();
+            let vector = equal_mean(&vectors).map_err(|source| EmbeddingRefreshError::Vector {
+                document_id: document.document_id.clone(),
+                source,
+            })?;
+            Ok(EmbeddingWrite {
+                document_id: document.document_id.clone(),
+                expected_source_sha256: document.source_sha256.clone(),
+                vector,
+            })
+        })
+        .collect()
+}
+
 impl<B: ChatBackend> ChatEngine<B> {
     pub fn new(store: SessionStore, client: B) -> Self {
         Self::with_config(store, client, AppConfig::default())
@@ -152,6 +393,265 @@ impl<B: ChatBackend> ChatEngine<B> {
 
     pub fn config(&self) -> &AppConfig {
         &self.config
+    }
+
+    /// Refreshes the complete embedding catalog.
+    ///
+    /// Cancellation is observed until the final check immediately before leaf publication. After
+    /// that commit point cancellation is deliberately ignored so the derived aggregate tail can
+    /// be brought to a consistent result.
+    pub async fn refresh_embeddings(
+        &self,
+        cancellation: CancellationToken,
+    ) -> std::result::Result<EmbeddingRefreshReport, EmbeddingRefreshError> {
+        if !self.config.memory.enabled {
+            return Err(EmbeddingRefreshError::Disabled);
+        }
+        check_embedding_cancellation(&cancellation, EmbeddingRefreshStage::LeafSnapshot, None)?;
+
+        let memory_config = self.config.memory.clone();
+        let spec = VectorIndexSpec::from_config(&memory_config)
+            .map_err(|source| EmbeddingRefreshError::InvalidConfig { source })?;
+        let retrieval = self.store.retrieval().clone();
+        let snapshot_spec = spec.clone();
+        let leaf_snapshot =
+            tokio::task::spawn_blocking(move || retrieval.leaf_embedding_snapshot(&snapshot_spec))
+                .await
+                .map_err(|source| EmbeddingRefreshError::TaskJoin {
+                    stage: EmbeddingRefreshStage::LeafSnapshot,
+                    source,
+                })?
+                .map_err(|source| EmbeddingRefreshError::Retrieval {
+                    stage: EmbeddingRefreshStage::LeafSnapshot,
+                    source,
+                })?;
+
+        let mut vectors = vec![None; leaf_snapshot.documents.len()];
+        let mut pending = Vec::new();
+        let mut leaf_reused = 0_usize;
+        for (index, document) in leaf_snapshot.documents.iter().enumerate() {
+            check_embedding_cancellation(&cancellation, EmbeddingRefreshStage::Planning, None)?;
+            match document.granularity {
+                RetrievalDocumentGranularity::Fragment => {
+                    if let Some(vector) = &document.reusable_vector {
+                        vectors[index] = Some(vector.clone());
+                        leaf_reused += 1;
+                    } else {
+                        pending.push((index, document.content.clone()));
+                    }
+                }
+                RetrievalDocumentGranularity::Message => {
+                    if document.content.chars().count() <= 240 {
+                        if let Some(vector) = &document.reusable_vector {
+                            vectors[index] = Some(vector.clone());
+                            leaf_reused += 1;
+                        } else {
+                            pending.push((index, document.content.clone()));
+                        }
+                    }
+                }
+                _ => {
+                    return Err(embedding_catalog_error(
+                        EmbeddingRefreshStage::Planning,
+                        format!("leaf catalog 包含非 leaf 文档 {}", document.document_id),
+                    ));
+                }
+            }
+        }
+
+        let mut backend_batches = 0_usize;
+        for (batch_index, chunk) in pending
+            .chunks(memory_config.embedding_batch_size)
+            .enumerate()
+        {
+            let batch = batch_index + 1;
+            check_embedding_cancellation(
+                &cancellation,
+                EmbeddingRefreshStage::Backend,
+                Some(batch),
+            )?;
+            let request = EmbeddingRequest {
+                model: spec.model.clone(),
+                input: chunk.iter().map(|(_, content)| content.clone()).collect(),
+                dimensions: None,
+                truncate: false,
+            };
+            backend_batches += 1;
+            let call = self.client.embed(request);
+            let response = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {
+                    return Err(EmbeddingRefreshError::Cancelled {
+                        stage: EmbeddingRefreshStage::Backend,
+                        batch: Some(batch),
+                    });
+                }
+                timed = tokio::time::timeout(
+                    Duration::from_secs(memory_config.embedding_timeout_secs),
+                    call,
+                ) => match timed {
+                    Ok(Ok(response)) => response,
+                    Ok(Err(source)) => {
+                        return Err(EmbeddingRefreshError::Backend { batch, source });
+                    }
+                    Err(_) => {
+                        return Err(EmbeddingRefreshError::Timeout {
+                            batch,
+                            timeout_secs: memory_config.embedding_timeout_secs,
+                        });
+                    }
+                },
+            };
+            if response.model != spec.model {
+                return Err(EmbeddingRefreshError::InvalidResponse {
+                    batch,
+                    message: format!("模型不匹配：期望 {}，实际 {}", spec.model, response.model),
+                });
+            }
+            if response.embeddings.len() != chunk.len() {
+                return Err(EmbeddingRefreshError::InvalidResponse {
+                    batch,
+                    message: format!(
+                        "向量数量不匹配：期望 {}，实际 {}",
+                        chunk.len(),
+                        response.embeddings.len()
+                    ),
+                });
+            }
+            for ((document_index, _), vector) in chunk.iter().zip(response.embeddings) {
+                let document = &leaf_snapshot.documents[*document_index];
+                if vector.len() != spec.dimensions {
+                    return Err(EmbeddingRefreshError::Vector {
+                        document_id: document.document_id.clone(),
+                        source: VectorError::DimensionMismatch {
+                            expected: spec.dimensions,
+                            actual: vector.len(),
+                        },
+                    });
+                }
+                vectors[*document_index] = Some(l2_normalize(&vector).map_err(|source| {
+                    EmbeddingRefreshError::Vector {
+                        document_id: document.document_id.clone(),
+                        source,
+                    }
+                })?);
+            }
+        }
+
+        derive_long_message_vectors(
+            &leaf_snapshot,
+            &mut vectors,
+            &mut leaf_reused,
+            &cancellation,
+        )?;
+        let writes = leaf_snapshot
+            .documents
+            .iter()
+            .zip(vectors)
+            .map(|(document, vector)| {
+                vector
+                    .map(|vector| EmbeddingWrite {
+                        document_id: document.document_id.clone(),
+                        expected_source_sha256: document.source_sha256.clone(),
+                        vector,
+                    })
+                    .ok_or_else(|| {
+                        embedding_catalog_error(
+                            EmbeddingRefreshStage::Planning,
+                            format!("文档 {} 缺少规划向量", document.document_id),
+                        )
+                    })
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        check_embedding_cancellation(&cancellation, EmbeddingRefreshStage::LeafPublish, None)?;
+        let retrieval = self.store.retrieval().clone();
+        let publish_spec = spec.clone();
+        let publish_snapshot = leaf_snapshot.clone();
+        let leaf_publish = tokio::task::spawn_blocking(move || {
+            retrieval.publish_leaf_embedding_catalog(&publish_spec, &publish_snapshot, &writes)
+        })
+        .await
+        .map_err(|source| EmbeddingRefreshError::TaskJoin {
+            stage: EmbeddingRefreshStage::LeafPublish,
+            source,
+        })?
+        .map_err(|source| EmbeddingRefreshError::Retrieval {
+            stage: EmbeddingRefreshStage::LeafPublish,
+            source,
+        })?;
+
+        let mut session_ids = leaf_snapshot.session_ids.clone();
+        session_ids.sort();
+        let original_len = session_ids.len();
+        session_ids.dedup();
+        if session_ids.len() != original_len {
+            return Err(embedding_catalog_error(
+                EmbeddingRefreshStage::Materialization,
+                "leaf snapshot 包含重复会话".into(),
+            ));
+        }
+        for session_id in session_ids {
+            let retrieval = self.store.retrieval().clone();
+            let materialization_config = memory_config.clone();
+            let error_session_id = session_id.clone();
+            tokio::task::spawn_blocking(move || {
+                retrieval.materialize_episode_documents(&session_id, &materialization_config)
+            })
+            .await
+            .map_err(|source| EmbeddingRefreshError::TaskJoin {
+                stage: EmbeddingRefreshStage::Materialization,
+                source,
+            })?
+            .map_err(|source| EmbeddingRefreshError::Materialization {
+                session_id: error_session_id,
+                source,
+            })?;
+        }
+
+        let retrieval = self.store.retrieval().clone();
+        let aggregate_spec = spec.clone();
+        let aggregate_snapshot = tokio::task::spawn_blocking(move || {
+            retrieval.aggregate_embedding_snapshot(&aggregate_spec)
+        })
+        .await
+        .map_err(|source| EmbeddingRefreshError::TaskJoin {
+            stage: EmbeddingRefreshStage::AggregateSnapshot,
+            source,
+        })?
+        .map_err(|source| EmbeddingRefreshError::Retrieval {
+            stage: EmbeddingRefreshStage::AggregateSnapshot,
+            source,
+        })?;
+        let aggregate_writes = aggregate_embedding_writes(&aggregate_snapshot)?;
+        let aggregate_documents = aggregate_snapshot.documents.len();
+        let retrieval = self.store.retrieval().clone();
+        let aggregate_spec = spec.clone();
+        tokio::task::spawn_blocking(move || {
+            retrieval.publish_aggregate_embedding_catalog(
+                &aggregate_spec,
+                &aggregate_snapshot,
+                &aggregate_writes,
+            )
+        })
+        .await
+        .map_err(|source| EmbeddingRefreshError::TaskJoin {
+            stage: EmbeddingRefreshStage::AggregatePublish,
+            source,
+        })?
+        .map_err(|source| EmbeddingRefreshError::Retrieval {
+            stage: EmbeddingRefreshStage::AggregatePublish,
+            source,
+        })?;
+
+        Ok(EmbeddingRefreshReport {
+            leaf_documents: leaf_snapshot.documents.len(),
+            leaf_reused,
+            leaf_embedded_inputs: pending.len(),
+            backend_batches,
+            aggregate_documents,
+            leaf_committed: leaf_publish.changed,
+        })
     }
 
     /// Best-effort derived-memory extraction. Source session data is never mutated here, and a

@@ -30,7 +30,10 @@ pub use consolidation::{
     structured_consolidation_schema,
 };
 pub use context::ContextAssembler;
-pub use engine::{ChatEngine, LimitAction, PreparedTurn};
+pub use engine::{
+    ChatEngine, EmbeddingRefreshError, EmbeddingRefreshReport, EmbeddingRefreshStage, LimitAction,
+    PreparedTurn,
+};
 pub use episode::{
     EMBEDDING_COSINE_SIMILARITY_THRESHOLD, ENTITY_JACCARD_DISTANCE_THRESHOLD,
     EPISODE_ALGORITHM_VERSION, EpisodeBoundaryDecision, EpisodeDocument, EpisodeGapState,
