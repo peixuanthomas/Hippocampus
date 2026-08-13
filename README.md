@@ -208,11 +208,3 @@ retrieval.rebuild()?;
 知识 SQLite 可通过 `knowledge rebuild` 从状态与不可变快照重建；会话 SQLite 可通过 `RetrievalStore::rebuild()` 从全部会话 JSON 重建。所有读取都会校验原始内容、Unicode span、revision 与派生行，发现索引被修改时拒绝使用。
 
 默认上下文窗口为 32768，输出预留 4096，安全余量 512，输入预算因此为 28160。80% 起执行精确 probe，90% 起要求裁剪决策。流中的 logprob 数只用于实时显示；最终 `prompt_eval_count` 和 `eval_count` 才是权威值。没有收到最终事件时，未知计数保持为 `null`，不会用 probe 或估算值冒充。
-
-## 验证
-
-```bash
-cargo fmt --check
-cargo test
-cargo clippy --all-targets -- -D warnings
-```
