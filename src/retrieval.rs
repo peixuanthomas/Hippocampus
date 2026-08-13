@@ -513,9 +513,13 @@ impl RetrievalStore {
         )?;
         for prepared_write in &prepared {
             if matches!(prepared_write.granularity.as_str(), "episode" | "session") {
-                if prewrite_readiness.get(&prepared_write.session_id)
-                    != Some(&AggregateReadiness::Ready)
-                {
+                let Some(audit) = prewrite_readiness.get(&prepared_write.session_id) else {
+                    return Err(RetrievalError::CorruptIndex(format!(
+                        "文档 {} 缺少缓存的 aggregate readiness",
+                        prepared_write.document_id
+                    )));
+                };
+                if audit.readiness != AggregateReadiness::Ready {
                     return Err(RetrievalError::CorruptIndex(format!(
                         "文档 {} 的 aggregate 输入不完整或不兼容",
                         prepared_write.document_id
@@ -526,6 +530,11 @@ impl RetrievalStore {
                     &prepared_write.document_id,
                     &prepared_write.session_id,
                     &prepared_write.source_sha256,
+                )?;
+                validate_canonical_aggregate_vector_blob(
+                    &prepared_write.document_id,
+                    &prepared_write.vector_blob,
+                    &audit.canonical_vector_blobs,
                 )?;
             }
         }
@@ -593,9 +602,13 @@ impl RetrievalStore {
             )?;
             for prepared_write in &prepared {
                 if matches!(prepared_write.granularity.as_str(), "episode" | "session") {
-                    if final_readiness.get(&prepared_write.session_id)
-                        != Some(&AggregateReadiness::Ready)
-                    {
+                    let Some(audit) = final_readiness.get(&prepared_write.session_id) else {
+                        return Err(RetrievalError::CorruptIndex(format!(
+                            "文档 {} 缺少写后缓存的 aggregate readiness",
+                            prepared_write.document_id
+                        )));
+                    };
+                    if audit.readiness != AggregateReadiness::Ready {
                         return Err(RetrievalError::CorruptIndex(format!(
                             "文档 {} 的 aggregate 输入在批量写入后不完整或不兼容",
                             prepared_write.document_id
@@ -606,6 +619,11 @@ impl RetrievalStore {
                         &prepared_write.document_id,
                         &prepared_write.session_id,
                         &prepared_write.source_sha256,
+                    )?;
+                    validate_canonical_aggregate_vector_blob(
+                        &prepared_write.document_id,
+                        &prepared_write.vector_blob,
+                        &audit.canonical_vector_blobs,
                     )?;
                 }
             }
@@ -727,24 +745,32 @@ impl RetrievalStore {
         ) in rows
         {
             let parsed_granularity = parse_memory_granularity(&granularity)?;
+            if embedding_source_sha256 != source_sha256 {
+                continue;
+            }
             if matches!(granularity.as_str(), "episode" | "session") {
                 match aggregate_readiness.get(&session_id) {
-                    Some(AggregateReadiness::Ready) => validate_aggregate_document_source(
-                        connection,
-                        &document_id,
-                        &session_id,
-                        &source_sha256,
-                    )?,
-                    Some(AggregateReadiness::Stale) => continue,
+                    Some(audit) if audit.readiness == AggregateReadiness::Ready => {
+                        validate_aggregate_document_source(
+                            connection,
+                            &document_id,
+                            &session_id,
+                            &source_sha256,
+                        )?;
+                        validate_canonical_aggregate_vector_blob(
+                            &document_id,
+                            &bytes,
+                            &audit.canonical_vector_blobs,
+                        )?;
+                    }
+                    Some(audit) if audit.readiness == AggregateReadiness::Stale => continue,
+                    Some(_) => unreachable!("aggregate readiness variants are exhaustive"),
                     None => {
                         return Err(aggregate_corruption(format!(
                             "会话 {session_id} 缺少缓存的 aggregate readiness"
                         )));
                     }
                 }
-            }
-            if embedding_source_sha256 != source_sha256 {
-                continue;
             }
             let vector = decode_f32_le(&bytes, dimensions).map_err(|error| {
                 RetrievalError::CorruptIndex(format!("文档 {document_id} 的兼容向量损坏：{error}"))
@@ -787,6 +813,18 @@ impl RetrievalStore {
             .map_err(|error| self.database_error(error))?;
         let session = self.get_session_from_connection(&transaction, session_id)?;
         self.verify_fresh(&session)?;
+        if validate_aggregate_raw_source(
+            &transaction,
+            &self.root,
+            session_id,
+            &session.source_file,
+            &session.source_sha256,
+        )? != AggregateReadiness::Ready
+        {
+            return Err(RetrievalError::StaleIndex {
+                session_id: session_id.to_owned(),
+            });
+        }
         let (messages, watermark, suggestions, ledger_snapshot_sha256) =
             load_episode_snapshot(&transaction, session_id, &spec, &fingerprint)?;
         let plan = plan_episodes(&EpisodePlanInput {
@@ -806,14 +844,17 @@ impl RetrievalStore {
             config,
         )?;
         self.validate_aggregate_derived_integrity(&transaction)?;
-        if self.validate_episode_materialization_phase(
-            &transaction,
-            session_id,
-            &spec,
-            &fingerprint,
-            false,
-            AggregateAuditPhase::MaterializeFinal,
-        )? != AggregateReadiness::Ready
+        if self
+            .validate_episode_materialization_phase(
+                &transaction,
+                session_id,
+                &spec,
+                &fingerprint,
+                false,
+                AggregateAuditPhase::MaterializeFinal,
+            )?
+            .readiness
+            != AggregateReadiness::Ready
         {
             return Err(RetrievalError::CorruptIndex(format!(
                 "会话 {session_id} 的 episode materialization 写后审计未就绪"
@@ -899,7 +940,7 @@ impl RetrievalStore {
         fingerprint: &str,
         require_complete_message_embeddings: bool,
         phase: AggregateAuditPhase,
-    ) -> RetrievalResult<AggregateReadiness> {
+    ) -> RetrievalResult<AggregateSessionAudit> {
         #[cfg(test)]
         self.run_aggregate_audit_test_hook(AggregateAuditHookPoint::Materialization {
             session_id: session_id.to_owned(),
@@ -907,14 +948,24 @@ impl RetrievalStore {
         });
         #[cfg(not(test))]
         let _ = phase;
-        validate_episode_materialization(
+        let audit = validate_episode_materialization(
             connection,
             &self.root,
             session_id,
             spec,
             fingerprint,
             require_complete_message_embeddings,
-        )
+        )?;
+        if require_complete_message_embeddings && audit.readiness == AggregateReadiness::Ready {
+            validate_existing_canonical_aggregate_embeddings(
+                connection,
+                session_id,
+                spec,
+                fingerprint,
+                &audit.canonical_vector_blobs,
+            )?;
+        }
+        Ok(audit)
     }
 
     fn aggregate_readiness_by_session(
@@ -925,7 +976,7 @@ impl RetrievalStore {
         fingerprint: &str,
         require_complete_message_embeddings: bool,
         phase: AggregateAuditPhase,
-    ) -> RetrievalResult<HashMap<String, AggregateReadiness>> {
+    ) -> RetrievalResult<HashMap<String, AggregateSessionAudit>> {
         let mut ordered_sessions = sessions.iter().collect::<Vec<_>>();
         ordered_sessions.sort();
         ordered_sessions
@@ -2419,6 +2470,28 @@ enum AggregateReadiness {
 }
 
 #[derive(Debug)]
+struct AggregateSessionAudit {
+    readiness: AggregateReadiness,
+    canonical_vector_blobs: HashMap<String, Vec<u8>>,
+}
+
+impl AggregateSessionAudit {
+    fn stale() -> Self {
+        Self {
+            readiness: AggregateReadiness::Stale,
+            canonical_vector_blobs: HashMap::new(),
+        }
+    }
+
+    fn ready(canonical_vector_blobs: HashMap<String, Vec<u8>>) -> Self {
+        Self {
+            readiness: AggregateReadiness::Ready,
+            canonical_vector_blobs,
+        }
+    }
+}
+
+#[derive(Debug)]
 struct PreparedEmbedding {
     document_id: String,
     session_id: String,
@@ -2438,7 +2511,7 @@ fn validate_episode_materialization(
     spec: &VectorIndexSpec,
     fingerprint: &str,
     require_complete_message_embeddings: bool,
-) -> RetrievalResult<AggregateReadiness> {
+) -> RetrievalResult<AggregateSessionAudit> {
     let materialization = connection
         .query_row(
             "SELECT m.source_session_sha256, m.ledger_snapshot_sha256,
@@ -2486,7 +2559,7 @@ fn validate_episode_materialization(
         source_file,
     )) = materialization
     else {
-        return Ok(AggregateReadiness::Stale);
+        return Ok(AggregateSessionAudit::stale());
     };
 
     for (label, hash) in [
@@ -2562,16 +2635,29 @@ fn validate_episode_materialization(
         )));
     }
 
-    let raw_source_stale =
-        validate_aggregate_raw_source(root, expected_session, &source_file, &indexed_source)?
-            == AggregateReadiness::Stale;
+    let raw_source_stale = validate_aggregate_raw_source(
+        connection,
+        root,
+        expected_session,
+        &source_file,
+        &indexed_source,
+    )? == AggregateReadiness::Stale;
     if materialized_source != indexed_source || materialized_fingerprint != fingerprint {
-        return Ok(AggregateReadiness::Stale);
+        return Ok(AggregateSessionAudit::stale());
     }
 
     let (messages, watermark, suggestions, current_ledger_snapshot) =
         load_episode_snapshot(connection, expected_session, spec, fingerprint)?;
     let complete_message_coverage = messages.iter().all(|message| message.embedding.is_some());
+    let direct_message_embeddings = messages
+        .iter()
+        .filter_map(|message| {
+            message
+                .embedding
+                .as_ref()
+                .map(|embedding| (message.member.document_id.clone(), embedding.clone()))
+        })
+        .collect::<HashMap<_, _>>();
     let plan = plan_episodes(&EpisodePlanInput {
         session_id: expected_session.to_owned(),
         source_session_sha256: indexed_source,
@@ -2582,7 +2668,7 @@ fn validate_episode_materialization(
     })
     .map_err(|error| aggregate_corruption(format!("重算 episode plan 失败：{error}")))?;
     if require_complete_message_embeddings && !complete_message_coverage {
-        return Ok(AggregateReadiness::Stale);
+        return Ok(AggregateSessionAudit::stale());
     }
     if current_ledger_snapshot != stored_ledger_snapshot
         || plan.plan_input_sha256 != stored_plan_input
@@ -2610,9 +2696,208 @@ fn validate_episode_materialization(
         )));
     }
     if raw_source_stale {
-        return Ok(AggregateReadiness::Stale);
+        return Ok(AggregateSessionAudit::stale());
     }
-    Ok(AggregateReadiness::Ready)
+    let canonical_vector_blobs = if complete_message_coverage {
+        canonical_aggregate_vector_blobs(
+            &expected_documents,
+            &direct_message_embeddings,
+            spec.dimensions,
+        )?
+    } else {
+        HashMap::new()
+    };
+    Ok(AggregateSessionAudit::ready(canonical_vector_blobs))
+}
+
+fn canonical_aggregate_vector_blobs(
+    documents: &[EpisodeDocument],
+    direct_message_embeddings: &HashMap<String, Vec<f32>>,
+    dimensions: usize,
+) -> RetrievalResult<HashMap<String, Vec<u8>>> {
+    let mut vectors = HashMap::with_capacity(documents.len());
+    for document in documents {
+        let vector = canonical_aggregate_vector(
+            &document.members,
+            direct_message_embeddings,
+            dimensions,
+            &document.document_id,
+        )?;
+        let bytes = encode_f32_le(&vector).map_err(|error| {
+            aggregate_corruption(format!(
+                "aggregate document {} 的规范向量无法编码：{error}",
+                document.document_id
+            ))
+        })?;
+        if vectors
+            .insert(document.document_id.clone(), bytes)
+            .is_some()
+        {
+            return Err(aggregate_corruption(format!(
+                "aggregate catalog 包含重复文档 {}",
+                document.document_id
+            )));
+        }
+    }
+    Ok(vectors)
+}
+
+fn canonical_aggregate_vector(
+    members: &[EpisodeMember],
+    direct_message_embeddings: &HashMap<String, Vec<f32>>,
+    dimensions: usize,
+    document_id: &str,
+) -> RetrievalResult<Vec<f32>> {
+    if members.is_empty() {
+        return Err(aggregate_corruption(format!(
+            "aggregate document {document_id} 没有直接 message 成员"
+        )));
+    }
+    let mut normalized_sum = vec![0.0_f64; dimensions];
+    for member in members {
+        let vector = direct_message_embeddings
+            .get(&member.document_id)
+            .ok_or_else(|| {
+                aggregate_corruption(format!(
+                    "aggregate document {document_id} 的直接 message {} 缺少兼容向量",
+                    member.document_id
+                ))
+            })?;
+        if vector.len() != dimensions {
+            return Err(aggregate_corruption(format!(
+                "aggregate document {document_id} 的直接 message {} 向量维度不匹配",
+                member.document_id
+            )));
+        }
+        let mut norm_squared = 0.0_f64;
+        for value in vector {
+            if !value.is_finite() {
+                return Err(aggregate_corruption(format!(
+                    "aggregate document {document_id} 的直接 message {} 向量包含非有限值",
+                    member.document_id
+                )));
+            }
+            let value = f64::from(*value);
+            norm_squared += value * value;
+        }
+        if !norm_squared.is_finite() || norm_squared <= 0.0 {
+            return Err(aggregate_corruption(format!(
+                "aggregate document {document_id} 的直接 message {} 向量范数无效",
+                member.document_id
+            )));
+        }
+        let norm = norm_squared.sqrt();
+        if !norm.is_finite() || norm <= 0.0 {
+            return Err(aggregate_corruption(format!(
+                "aggregate document {document_id} 的直接 message {} 向量范数无效",
+                member.document_id
+            )));
+        }
+        for (sum, value) in normalized_sum.iter_mut().zip(vector) {
+            *sum += f64::from(*value) / norm;
+            if !sum.is_finite() {
+                return Err(aggregate_corruption(format!(
+                    "aggregate document {document_id} 的规范向量累加溢出"
+                )));
+            }
+        }
+    }
+
+    let member_count = members.len() as f64;
+    let mean = normalized_sum
+        .into_iter()
+        .map(|value| value / member_count)
+        .collect::<Vec<_>>();
+    let mean_norm_squared = mean.iter().map(|value| value * value).sum::<f64>();
+    if !mean_norm_squared.is_finite() || mean_norm_squared <= 0.0 {
+        return Err(aggregate_corruption(format!(
+            "aggregate document {document_id} 的规范均值向量范数无效"
+        )));
+    }
+    let mean_norm = mean_norm_squared.sqrt();
+    if !mean_norm.is_finite() || mean_norm <= 0.0 {
+        return Err(aggregate_corruption(format!(
+            "aggregate document {document_id} 的规范均值向量范数无效"
+        )));
+    }
+    mean.into_iter()
+        .map(|value| {
+            let normalized = (value / mean_norm) as f32;
+            if normalized.is_finite() {
+                Ok(normalized)
+            } else {
+                Err(aggregate_corruption(format!(
+                    "aggregate document {document_id} 的规范向量包含非有限值"
+                )))
+            }
+        })
+        .collect()
+}
+
+fn validate_canonical_aggregate_vector_blob(
+    document_id: &str,
+    actual: &[u8],
+    canonical_vector_blobs: &HashMap<String, Vec<u8>>,
+) -> RetrievalResult<()> {
+    let expected = canonical_vector_blobs.get(document_id).ok_or_else(|| {
+        aggregate_corruption(format!("aggregate document {document_id} 缺少规范向量"))
+    })?;
+    if actual != expected {
+        return Err(aggregate_corruption(format!(
+            "aggregate document {document_id} 的向量不是直接 message 向量的规范聚合"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_existing_canonical_aggregate_embeddings(
+    connection: &Connection,
+    session_id: &str,
+    spec: &VectorIndexSpec,
+    fingerprint: &str,
+    canonical_vector_blobs: &HashMap<String, Vec<u8>>,
+) -> RetrievalResult<()> {
+    let dimensions = usize_to_i64(spec.dimensions)
+        .map_err(|error| aggregate_corruption(format!("aggregate 向量维度损坏：{error}")))?;
+    let mut statement = connection
+        .prepare(
+            "SELECT d.document_id, e.vector_blob
+             FROM memory_documents d
+             JOIN memory_embeddings e ON e.document_id=d.document_id
+             WHERE d.session_id=?1 AND d.granularity IN ('episode','session')
+               AND e.model=?2 AND e.dimensions=?3 AND e.index_fingerprint=?4
+               AND e.source_sha256=d.source_sha256
+             ORDER BY d.document_id",
+        )
+        .map_err(|error| {
+            aggregate_corruption(format!(
+                "读取会话 {session_id} 的现有 aggregate 向量失败：{error}"
+            ))
+        })?;
+    let rows = statement
+        .query_map(
+            params![session_id, spec.model, dimensions, fingerprint],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )
+        .map_err(|error| {
+            aggregate_corruption(format!(
+                "读取会话 {session_id} 的现有 aggregate 向量失败：{error}"
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            aggregate_corruption(format!(
+                "读取会话 {session_id} 的现有 aggregate 向量失败：{error}"
+            ))
+        })?;
+    for (document_id, vector_blob) in rows {
+        validate_canonical_aggregate_vector_blob(
+            &document_id,
+            &vector_blob,
+            canonical_vector_blobs,
+        )?;
+    }
+    Ok(())
 }
 
 fn validate_aggregate_document_source(
@@ -2653,6 +2938,7 @@ fn validate_aggregate_document_source(
 }
 
 fn validate_aggregate_raw_source(
+    connection: &Connection,
     root: &Path,
     expected_session: &str,
     source_file: &str,
@@ -2685,6 +2971,37 @@ fn validate_aggregate_raw_source(
         )));
     }
     session.refresh_cumulative_usage();
+    let expected_events = derive_events(&session);
+    let mut statement = connection
+        .prepare(
+            "SELECT event_id, session_id, turn_id, sequence, role, created_at, content,
+                    content_sha256, reply_to_event_id, token_count, turn_status,
+                    done_reason, error
+             FROM events WHERE session_id=?1 ORDER BY sequence, event_id",
+        )
+        .map_err(|error| {
+            aggregate_corruption(format!(
+                "读取会话 {expected_session} 的索引事件投影失败：{error}"
+            ))
+        })?;
+    let indexed_events = statement
+        .query_map([expected_session], map_event)
+        .map_err(|error| {
+            aggregate_corruption(format!(
+                "读取会话 {expected_session} 的索引事件投影失败：{error}"
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            aggregate_corruption(format!(
+                "读取会话 {expected_session} 的索引事件投影失败：{error}"
+            ))
+        })?;
+    if indexed_events != expected_events {
+        return Err(aggregate_corruption(format!(
+            "会话 {expected_session} 的规范原文件事件投影与索引不匹配"
+        )));
+    }
     Ok(AggregateReadiness::Ready)
 }
 
@@ -4490,16 +4807,13 @@ CREATE INDEX memory_boundary_suggestions_session_event
         let config = aggregate_memory_config();
         let (spec, report) = materialize_with_canonical_embeddings(&store, &session, &config);
         let doc = report.episode_documents[0].clone();
+        let write = aggregate_writes(&store, &report, &spec, 1.0)
+            .into_iter()
+            .find(|write| write.document_id == doc.document_id)
+            .unwrap();
         store
             .retrieval()
-            .upsert_embeddings(
-                &spec,
-                &[EmbeddingWrite {
-                    document_id: doc.document_id.clone(),
-                    expected_source_sha256: doc.source_sha256,
-                    vector: vec![1.0; spec.dimensions],
-                }],
-            )
+            .upsert_embeddings(&spec, &[write])
             .unwrap();
         assert!(
             store
@@ -5104,8 +5418,7 @@ CREATE INDEX memory_boundary_suggestions_session_event
              END;",
             original.document_id.replace('\'', "''"), blob_literal
         )).unwrap();
-        let mut replacement = original.clone();
-        replacement.vector = vec![6.0; spec.dimensions];
+        let replacement = original.clone();
         assert!(matches!(
             store.retrieval().upsert_embeddings(&spec, &[replacement]),
             Err(RetrievalError::CorruptIndex(_))
@@ -5129,6 +5442,99 @@ CREATE INDEX memory_boundary_suggestions_session_event
                 )
                 .unwrap(),
             1
+        );
+    }
+
+    #[test]
+    fn episode_aggregate_arbitrary_valid_length_vector_is_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let mut session = store
+            .create("model", "http://localhost", None, Default::default(), false)
+            .unwrap();
+        append_complete_turn(&mut session, "u", "a", "");
+        let path = store.save(&mut session).unwrap();
+        store.retrieval().sync_session(&session, &path).unwrap();
+        let config = aggregate_memory_config();
+        let (spec, report) = materialize_with_canonical_embeddings(&store, &session, &config);
+        let mut write = aggregate_writes(&store, &report, &spec, 5.0).remove(0);
+        write.vector = vec![1.0; spec.dimensions];
+
+        assert!(matches!(
+            store.retrieval().upsert_embeddings(&spec, &[write]),
+            Err(RetrievalError::CorruptIndex(_))
+        ));
+        let connection = Connection::open(store.retrieval().index_path()).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM memory_embeddings e
+                     JOIN memory_documents d ON d.document_id=e.document_id
+                     WHERE d.session_id=?1 AND d.granularity IN ('episode','session')",
+                    [&session.id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn episode_aggregate_vector_is_normalized_mean_of_direct_messages() {
+        let dimensions = 32;
+        let members = [
+            EpisodeMember {
+                document_id: "message-one".into(),
+                event_id: "event-one".into(),
+                sequence: 1,
+                role: EventRole::User,
+                span: SourceSpan {
+                    event_id: "event-one".into(),
+                    start_char: 0,
+                    end_char: 1,
+                },
+                content_sha256: "1".repeat(64),
+            },
+            EpisodeMember {
+                document_id: "message-two".into(),
+                event_id: "event-two".into(),
+                sequence: 2,
+                role: EventRole::Assistant,
+                span: SourceSpan {
+                    event_id: "event-two".into(),
+                    start_char: 0,
+                    end_char: 1,
+                },
+                content_sha256: "2".repeat(64),
+            },
+        ];
+        let mut first = vec![0.0; dimensions];
+        first[0] = 3.0;
+        let mut second = vec![0.0; dimensions];
+        second[1] = 4.0;
+        let mut embeddings = HashMap::from([
+            ("message-one".to_owned(), first),
+            ("message-two".to_owned(), second),
+        ]);
+
+        let vector =
+            canonical_aggregate_vector(&members, &embeddings, dimensions, "aggregate").unwrap();
+        let expected = std::f64::consts::FRAC_1_SQRT_2 as f32;
+        assert_eq!(vector[0].to_bits(), expected.to_bits());
+        assert_eq!(vector[1].to_bits(), expected.to_bits());
+        assert!(vector[2..].iter().all(|value| *value == 0.0));
+
+        embeddings.insert("message-one".into(), vec![0.0; dimensions]);
+        assert!(
+            canonical_aggregate_vector(&members, &embeddings, dimensions, "aggregate").is_err()
+        );
+        embeddings.insert("message-one".into(), vec![1.0; dimensions - 1]);
+        assert!(
+            canonical_aggregate_vector(&members, &embeddings, dimensions, "aggregate").is_err()
+        );
+        embeddings.insert("message-one".into(), vec![f32::NAN; dimensions]);
+        assert!(
+            canonical_aggregate_vector(&members, &embeddings, dimensions, "aggregate").is_err()
         );
     }
 
@@ -5165,8 +5571,6 @@ CREATE INDEX memory_boundary_suggestions_session_event
                     .unwrap()
             })
             .collect::<Vec<_>>();
-        assert_ne!(before[0].vector, before[1].vector);
-
         let corrupted_bytes = encode_f32_le(&vec![91.0; spec.dimensions]).unwrap();
         let blob_literal = corrupted_bytes
             .iter()
@@ -5213,6 +5617,63 @@ CREATE INDEX memory_boundary_suggestions_session_event
             1
         );
         assert_eq!(fs::read(path).unwrap(), source_before);
+    }
+
+    #[test]
+    fn episode_aggregate_unsubmitted_existing_corruption_rolls_back() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let mut session = store
+            .create("model", "http://localhost", None, Default::default(), false)
+            .unwrap();
+        append_complete_turn(&mut session, "u", "a", "");
+        let path = store.save(&mut session).unwrap();
+        store.retrieval().sync_session(&session, &path).unwrap();
+        let config = aggregate_memory_config();
+        let (spec, report) = materialize_with_canonical_embeddings(&store, &session, &config);
+        let writes = aggregate_writes(&store, &report, &spec, 23.0);
+        assert_eq!(writes.len(), 2);
+        store.retrieval().upsert_embeddings(&spec, &writes).unwrap();
+
+        let connection = Connection::open(store.retrieval().index_path()).unwrap();
+        let before = writes
+            .iter()
+            .map(|write| stored_embedding_unchecked(&connection, &write.document_id))
+            .collect::<Vec<_>>();
+        let corrupted_bytes = encode_f32_le(&vec![93.0; spec.dimensions]).unwrap();
+        let blob_literal = corrupted_bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        connection
+            .execute_batch(&format!(
+                "CREATE TRIGGER aggregate_submitted_write_corrupts_unsubmitted
+                 AFTER UPDATE OF vector_blob ON memory_embeddings
+                 WHEN NEW.document_id = '{}'
+                 BEGIN
+                     UPDATE memory_embeddings SET vector_blob=X'{}'
+                     WHERE document_id='{}';
+                 END;",
+                writes[1].document_id.replace('\'', "''"),
+                blob_literal,
+                writes[0].document_id.replace('\'', "''"),
+            ))
+            .unwrap();
+
+        assert!(matches!(
+            store
+                .retrieval()
+                .upsert_embeddings(&spec, std::slice::from_ref(&writes[1])),
+            Err(RetrievalError::CorruptIndex(_))
+        ));
+        connection
+            .execute_batch("DROP TRIGGER aggregate_submitted_write_corrupts_unsubmitted;")
+            .unwrap();
+        let after = writes
+            .iter()
+            .map(|write| stored_embedding_unchecked(&connection, &write.document_id))
+            .collect::<Vec<_>>();
+        assert_eq!(after, before);
     }
 
     #[test]
@@ -5345,8 +5806,7 @@ CREATE INDEX memory_boundary_suggestions_session_event
                 fs::write(&path, changed_source).unwrap();
             }
 
-            let mut replacement = target_write.clone();
-            replacement.vector = vec![73.0; spec.dimensions];
+            let replacement = target_write.clone();
             assert!(
                 matches!(
                     store.retrieval().upsert_embeddings(&spec, &[replacement]),
@@ -5452,8 +5912,7 @@ CREATE INDEX memory_boundary_suggestions_session_event
 
             let connection = Connection::open(store.retrieval().index_path()).unwrap();
             apply_projection_audit_tamper(&connection, &session.id, tamper);
-            let mut replacement = target_write.clone();
-            replacement.vector = vec![83.0; spec.dimensions];
+            let replacement = target_write.clone();
             assert!(
                 matches!(
                     store.retrieval().upsert_embeddings(&spec, &[replacement]),
@@ -5623,8 +6082,7 @@ CREATE INDEX memory_boundary_suggestions_session_event
             )
             .unwrap();
 
-        let mut replacement = target_write.clone();
-        replacement.vector = vec![89.0; spec.dimensions];
+        let replacement = target_write.clone();
         assert!(matches!(
             store.retrieval().upsert_embeddings(&spec, &[replacement]),
             Err(RetrievalError::CorruptIndex(_))
@@ -5689,8 +6147,7 @@ CREATE INDEX memory_boundary_suggestions_session_event
             )
             .unwrap();
 
-        let mut replacement = target_write.clone();
-        replacement.vector = vec![97.0; spec.dimensions];
+        let replacement = target_write.clone();
         assert!(matches!(
             store.retrieval().upsert_embeddings(&spec, &[replacement]),
             Err(RetrievalError::CorruptIndex(_))
@@ -5708,6 +6165,78 @@ CREATE INDEX memory_boundary_suggestions_session_event
             Err(RetrievalError::CorruptIndex(_))
         ));
         fs::write(&path, source_before).unwrap();
+    }
+
+    #[test]
+    fn episode_aggregate_source_projection_rejects_hash_coherent_content_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let mut session = store
+            .create("model", "http://localhost", None, Default::default(), false)
+            .unwrap();
+        session.turns.push(Turn::pending("original content".into()));
+        let path = store.save(&mut session).unwrap();
+        let config = aggregate_memory_config();
+        let (spec, report) = materialize_with_canonical_embeddings(&store, &session, &config);
+        let aggregate_writes = aggregate_writes(&store, &report, &spec, 67.0);
+        store
+            .retrieval()
+            .upsert_embeddings(&spec, &aggregate_writes)
+            .unwrap();
+        let target_write = aggregate_writes.last().unwrap().clone();
+
+        let mut replacement = session.clone();
+        replacement.turns[0].user_content = "replacement content".into();
+        replacement.validate().unwrap();
+        replacement.refresh_cumulative_usage();
+        let mut replacement_bytes = serde_json::to_vec_pretty(&replacement).unwrap();
+        replacement_bytes.push(b'\n');
+        let replacement_hash = bytes_sha256(&replacement_bytes);
+        fs::write(&path, &replacement_bytes).unwrap();
+
+        let connection = Connection::open(store.retrieval().index_path()).unwrap();
+        connection
+            .execute(
+                "UPDATE indexed_sessions SET source_sha256=?1 WHERE session_id=?2",
+                params![replacement_hash, session.id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE memory_episode_materializations SET source_session_sha256=?1
+                 WHERE session_id=?2",
+                params![replacement_hash, session.id],
+            )
+            .unwrap();
+        let before = episode_materialization_sql_state(&connection, &session.id);
+        let target_before = stored_embedding_unchecked(&connection, &target_write.document_id);
+
+        assert!(matches!(
+            store
+                .retrieval()
+                .upsert_embeddings(&spec, std::slice::from_ref(&target_write)),
+            Err(RetrievalError::CorruptIndex(_))
+        ));
+        assert!(matches!(
+            store.retrieval().compatible_embeddings(&spec),
+            Err(RetrievalError::CorruptIndex(_))
+        ));
+        assert!(matches!(
+            store
+                .retrieval()
+                .materialize_episode_documents(&session.id, &config),
+            Err(RetrievalError::CorruptIndex(_))
+        ));
+
+        assert_eq!(
+            episode_materialization_sql_state(&connection, &session.id),
+            before
+        );
+        assert_eq!(
+            stored_embedding_unchecked(&connection, &target_write.document_id),
+            target_before
+        );
+        assert_eq!(fs::read(path).unwrap(), replacement_bytes);
     }
 
     fn apply_aggregate_audit_tamper(
@@ -6161,25 +6690,47 @@ CREATE INDEX memory_boundary_suggestions_session_event
         spec: &VectorIndexSpec,
         value: f32,
     ) -> Vec<EmbeddingWrite> {
-        let mut documents = report.episode_documents.clone();
-        let session_document_id = report.session_document_id.as_ref().unwrap();
-        let session_document = Connection::open(store.retrieval().index_path()).unwrap().query_row(
-            "SELECT session_id, granularity, source_sha256, start_sequence, end_sequence, member_count FROM memory_documents WHERE document_id=?1",
-            [session_document_id],
-            |row| Ok(EpisodeDocument {
-                document_id: session_document_id.clone(), session_id: row.get(0)?, granularity: row.get(1)?,
-                source_sha256: row.get(2)?, start_sequence: i64_to_u64(row.get(3)?).unwrap(),
-                end_sequence: i64_to_u64(row.get(4)?).unwrap(), members: Vec::with_capacity(i64_to_usize(row.get(5)?).unwrap()),
-            }),
-        ).unwrap();
-        documents.push(session_document);
+        let connection = Connection::open(store.retrieval().index_path()).unwrap();
+        let fingerprint = spec.fingerprint().unwrap();
+        let (messages, _, _, _) =
+            load_episode_snapshot(&connection, &report.session_id, spec, &fingerprint).unwrap();
+        let complete_message_coverage = messages.iter().all(|message| message.embedding.is_some());
+        let direct_message_embeddings = messages
+            .into_iter()
+            .filter_map(|message| {
+                message
+                    .embedding
+                    .map(|embedding| (message.member.document_id, embedding))
+            })
+            .collect::<HashMap<_, _>>();
+        let documents = aggregate_documents_for_plan(report);
+        if !complete_message_coverage {
+            return documents
+                .into_iter()
+                .enumerate()
+                .map(|(index, document)| EmbeddingWrite {
+                    document_id: document.document_id,
+                    expected_source_sha256: document.source_sha256,
+                    vector: vec![value + index as f32; spec.dimensions],
+                })
+                .collect();
+        }
+        let canonical_vector_blobs = canonical_aggregate_vector_blobs(
+            &documents,
+            &direct_message_embeddings,
+            spec.dimensions,
+        )
+        .unwrap();
         documents
             .into_iter()
-            .enumerate()
-            .map(|(index, document)| EmbeddingWrite {
+            .map(|document| EmbeddingWrite {
+                vector: decode_f32_le(
+                    canonical_vector_blobs.get(&document.document_id).unwrap(),
+                    spec.dimensions,
+                )
+                .unwrap(),
                 document_id: document.document_id,
                 expected_source_sha256: document.source_sha256,
-                vector: vec![value + index as f32; spec.dimensions],
             })
             .collect()
     }
