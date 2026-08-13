@@ -10,7 +10,11 @@ use hippocampus::model::{
     BudgetConfig, ChatEventKind, ChatMessage, Session, TokenUsage, Turn, identity_instruction,
 };
 use hippocampus::ollama::{ChatBackend, ChatRequest};
-use hippocampus::{ChatEngine, KnowledgeSyncReport, LimitAction, OllamaClient, SessionStore};
+use hippocampus::{
+    ChatEngine, ConsolidationRunReport, ConsolidationRunStatus, ConsolidationTrigger,
+    KnowledgeSyncReport, LimitAction, OllamaClient, SessionStore,
+};
+use serde::Serialize;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
@@ -52,6 +56,27 @@ enum Command {
     Serve(ServeArgs),
     /// 管理版本化本地知识库
     Knowledge(KnowledgeArgs),
+    /// 管理派生记忆
+    Memory(MemoryArgs),
+}
+
+#[derive(Debug, Args)]
+struct MemoryArgs {
+    #[command(subcommand)]
+    command: MemoryCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum MemoryCommand {
+    /// 从会话原始事件构建派生记忆
+    Consolidate {
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
+        session: Option<String>,
+        #[arg(long, required_unless_present = "session", conflicts_with = "session")]
+        all: bool,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -216,6 +241,7 @@ async fn run() -> Result<()> {
         Some(Command::Ask(args)) => run_ask(store, &cli.host, args, &config).await,
         Some(Command::Serve(args)) => run_serve(store, &cli.host, args, &config).await,
         Some(Command::Knowledge(args)) => run_knowledge(store, &cli.host, args, &config).await,
+        Some(Command::Memory(args)) => run_memory(store, args, &config).await,
     }
 }
 
@@ -267,7 +293,7 @@ async fn run_new_tui(
 ) -> Result<()> {
     auto_sync_knowledge(&store, host, config).await?;
     let prompt = args.read_prompt(config)?;
-    let mut session = store.create_named(
+    let session = store.create_named(
         &args.model,
         host,
         config.ai_name(),
@@ -280,8 +306,16 @@ async fn run_new_tui(
         .check_model(&session.model, session.budget.context_window)
         .await?;
     let engine = ChatEngine::with_config(store.clone(), client, config.clone());
-    session = hippocampus::tui::run(engine, session, info).await?;
+    let outcome = hippocampus::tui::run(engine, session, info).await?;
+    let mut session = outcome.session;
     store.save(&mut session)?;
+    run_tui_exit_consolidation(
+        &store,
+        &session,
+        config,
+        consolidation_trigger_for_tui_exit(outcome.exit_reason),
+    )
+    .await;
     Ok(())
 }
 
@@ -294,8 +328,16 @@ async fn run_resume_tui(store: SessionStore, identifier: &str, config: &AppConfi
         .check_model(&session.model, session.budget.context_window)
         .await?;
     let engine = ChatEngine::with_config(store.clone(), client, config.clone());
-    session = hippocampus::tui::run(engine, session, info).await?;
+    let outcome = hippocampus::tui::run(engine, session, info).await?;
+    let mut session = outcome.session;
     store.save(&mut session)?;
+    run_tui_exit_consolidation(
+        &store,
+        &session,
+        config,
+        consolidation_trigger_for_tui_exit(outcome.exit_reason),
+    )
+    .await;
     Ok(())
 }
 
@@ -444,6 +486,200 @@ async fn run_knowledge(
         }
     }
     Ok(())
+}
+
+async fn run_memory(store: SessionStore, args: MemoryArgs, config: &AppConfig) -> Result<()> {
+    match args.command {
+        MemoryCommand::Consolidate { session, all, json } => {
+            run_memory_consolidate(store, session, all, json, config).await
+        }
+    }
+}
+
+async fn run_memory_consolidate(
+    store: SessionStore,
+    identifier: Option<String>,
+    all: bool,
+    json_output: bool,
+    config: &AppConfig,
+) -> Result<()> {
+    let sessions = if all {
+        store.list_sessions()?
+    } else {
+        vec![
+            store.load(
+                identifier
+                    .as_deref()
+                    .expect("clap requires a session when --all is absent"),
+            )?,
+        ]
+    };
+    let cancellation = cancellation_on_ctrl_c();
+    let mut reports = Vec::with_capacity(sessions.len());
+    for session in sessions {
+        if cancellation.is_cancelled() {
+            break;
+        }
+        if !json_output && config.memory.enabled {
+            eprintln!("巩固中：会话 {}（模型 {}）…", session.id, session.model);
+        }
+        let report = consolidate_for_session(
+            &store,
+            &session,
+            config,
+            ConsolidationTrigger::Manual,
+            cancellation.clone(),
+        )
+        .await;
+        let stop = report.status == ConsolidationRunStatus::Cancelled;
+        reports.push(report);
+        if stop || cancellation.is_cancelled() {
+            break;
+        }
+    }
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&ConsolidationReports { reports: &reports })?
+        );
+    } else {
+        for report in &reports {
+            println!("{}", format_consolidation_report(report));
+            for warning in &report.warnings {
+                println!("警告：{warning}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn consolidation_trigger_for_tui_exit(
+    exit_reason: hippocampus::tui::TuiExitReason,
+) -> ConsolidationTrigger {
+    match exit_reason {
+        hippocampus::tui::TuiExitReason::ExitCommand => ConsolidationTrigger::TuiExit,
+        hippocampus::tui::TuiExitReason::IdleCtrlC => ConsolidationTrigger::TuiIdleCtrlC,
+    }
+}
+
+async fn run_tui_exit_consolidation(
+    store: &SessionStore,
+    session: &Session,
+    config: &AppConfig,
+    trigger: ConsolidationTrigger,
+) {
+    if config.memory.enabled {
+        eprintln!("巩固中：会话 {}（模型 {}）…", session.id, session.model);
+    }
+    let report =
+        consolidate_for_session(store, session, config, trigger, cancellation_on_ctrl_c()).await;
+    eprintln!("{}", format_consolidation_report(&report));
+    for warning in &report.warnings {
+        eprintln!("警告：{warning}");
+    }
+}
+
+async fn consolidate_for_session(
+    store: &SessionStore,
+    session: &Session,
+    config: &AppConfig,
+    trigger: ConsolidationTrigger,
+    cancellation: CancellationToken,
+) -> ConsolidationRunReport {
+    if !config.memory.enabled {
+        return synthetic_consolidation_report(
+            session,
+            trigger,
+            ConsolidationRunStatus::Disabled,
+            Vec::new(),
+        );
+    }
+    if cancellation.is_cancelled() {
+        return synthetic_consolidation_report(
+            session,
+            trigger,
+            ConsolidationRunStatus::Cancelled,
+            Vec::new(),
+        );
+    }
+    let client = match OllamaClient::new(&session.ollama_host) {
+        Ok(client) => client,
+        Err(error) => {
+            return synthetic_consolidation_report(
+                session,
+                trigger,
+                ConsolidationRunStatus::Failed,
+                vec![format!("无法创建 Ollama 客户端：{error}")],
+            );
+        }
+    };
+    ChatEngine::with_config(store.clone(), client, config.clone())
+        .consolidate_session(session, trigger, cancellation)
+        .await
+}
+
+fn synthetic_consolidation_report(
+    session: &Session,
+    trigger: ConsolidationTrigger,
+    status: ConsolidationRunStatus,
+    warnings: Vec<String>,
+) -> ConsolidationRunReport {
+    ConsolidationRunReport {
+        session_id: session.id.clone(),
+        trigger,
+        model: session.model.clone(),
+        status,
+        batches_attempted: 0,
+        batches_applied: 0,
+        events_attempted: 0,
+        events_applied: 0,
+        entities_attempted: 0,
+        entities_applied: 0,
+        claims_attempted: 0,
+        claims_applied: 0,
+        boundaries_attempted: 0,
+        boundaries_applied: 0,
+        watermark_before: 0,
+        watermark_after: 0,
+        warnings,
+    }
+}
+
+#[derive(Serialize)]
+struct ConsolidationReports<'a> {
+    reports: &'a [ConsolidationRunReport],
+}
+
+fn format_consolidation_report(report: &ConsolidationRunReport) -> String {
+    format!(
+        "会话 {}｜模型 {}｜{}｜批次 {}/{}｜事件 {}/{}｜实体 {}/{}｜声明 {}/{}｜边界 {}/{}｜水位 {}→{}",
+        report.session_id,
+        report.model,
+        consolidation_status_label(report.status),
+        report.batches_applied,
+        report.batches_attempted,
+        report.events_applied,
+        report.events_attempted,
+        report.entities_applied,
+        report.entities_attempted,
+        report.claims_applied,
+        report.claims_attempted,
+        report.boundaries_applied,
+        report.boundaries_attempted,
+        report.watermark_before,
+        report.watermark_after,
+    )
+}
+
+const fn consolidation_status_label(status: ConsolidationRunStatus) -> &'static str {
+    match status {
+        ConsolidationRunStatus::Disabled => "已禁用",
+        ConsolidationRunStatus::UpToDate => "已是最新",
+        ConsolidationRunStatus::Completed => "已完成",
+        ConsolidationRunStatus::Partial => "部分完成",
+        ConsolidationRunStatus::Failed => "失败",
+        ConsolidationRunStatus::Cancelled => "已取消",
+    }
 }
 
 async fn auto_sync_knowledge(store: &SessionStore, host: &str, config: &AppConfig) -> Result<()> {
@@ -824,5 +1060,112 @@ mod tests {
         };
         assert_eq!(query, "海棠计划");
         assert!(json);
+    }
+
+    #[test]
+    fn memory_consolidate_target_rules_parse() {
+        let single =
+            Cli::try_parse_from(["hippocampus", "memory", "consolidate", "session-a"]).unwrap();
+        assert!(matches!(
+            single.command,
+            Some(Command::Memory(MemoryArgs {
+                command: MemoryCommand::Consolidate {
+                    session: Some(session),
+                    all: false,
+                    json: false,
+                },
+            })) if session == "session-a"
+        ));
+
+        let all = Cli::try_parse_from(["hippocampus", "memory", "consolidate", "--all", "--json"])
+            .unwrap();
+        assert!(matches!(
+            all.command,
+            Some(Command::Memory(MemoryArgs {
+                command: MemoryCommand::Consolidate {
+                    session: None,
+                    all: true,
+                    json: true,
+                },
+            }))
+        ));
+
+        assert!(Cli::try_parse_from(["hippocampus", "memory", "consolidate"]).is_err());
+        assert!(
+            Cli::try_parse_from(["hippocampus", "memory", "consolidate", "session-a", "--all",])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn tui_exit_reasons_map_to_exact_consolidation_triggers() {
+        assert_eq!(
+            consolidation_trigger_for_tui_exit(hippocampus::tui::TuiExitReason::ExitCommand),
+            ConsolidationTrigger::TuiExit
+        );
+        assert_eq!(
+            consolidation_trigger_for_tui_exit(hippocampus::tui::TuiExitReason::IdleCtrlC),
+            ConsolidationTrigger::TuiIdleCtrlC
+        );
+    }
+
+    #[test]
+    fn memory_consolidation_output_is_machine_stable() {
+        let statuses = [
+            ConsolidationRunStatus::Disabled,
+            ConsolidationRunStatus::UpToDate,
+            ConsolidationRunStatus::Completed,
+            ConsolidationRunStatus::Partial,
+            ConsolidationRunStatus::Failed,
+            ConsolidationRunStatus::Cancelled,
+        ];
+        let reports = statuses
+            .into_iter()
+            .enumerate()
+            .map(|(index, status)| ConsolidationRunReport {
+                session_id: format!("session-{index}"),
+                trigger: ConsolidationTrigger::Manual,
+                model: format!("model-{index}"),
+                status,
+                batches_attempted: 2,
+                batches_applied: 1,
+                events_attempted: 4,
+                events_applied: 3,
+                entities_attempted: 5,
+                entities_applied: 4,
+                claims_attempted: 6,
+                claims_applied: 5,
+                boundaries_attempted: 7,
+                boundaries_applied: 6,
+                watermark_before: 8,
+                watermark_after: 9,
+                warnings: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let encoded = serde_json::to_value(ConsolidationReports { reports: &reports }).unwrap();
+        let object = encoded.as_object().unwrap();
+        assert_eq!(object.len(), 1);
+        assert!(object.contains_key("reports"));
+        let encoded_reports = object["reports"].as_array().unwrap();
+        for (report, expected_status) in encoded_reports.iter().zip([
+            "disabled",
+            "up_to_date",
+            "completed",
+            "partial",
+            "failed",
+            "cancelled",
+        ]) {
+            assert_eq!(report["trigger"], "manual");
+            assert_eq!(report["status"], expected_status);
+        }
+        for report in &reports {
+            let human = format_consolidation_report(report);
+            assert!(human.contains(&report.session_id));
+            assert!(human.contains(&report.model));
+            assert!(human.contains("批次 1/2"));
+            assert!(human.contains("事件 3/4"));
+            assert!(human.contains("水位 8→9"));
+            assert!(human.contains(consolidation_status_label(report.status)));
+        }
     }
 }

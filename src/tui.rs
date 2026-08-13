@@ -55,6 +55,18 @@ enum Activity {
     Switching,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TuiExitReason {
+    ExitCommand,
+    IdleCtrlC,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TuiRunOutcome {
+    pub session: Session,
+    pub exit_reason: TuiExitReason,
+}
+
 enum SwitchOutcome {
     Noop,
     Ready(Box<SwitchReady>),
@@ -428,22 +440,22 @@ impl App {
         }
     }
 
-    fn handle_idle_submit(&mut self) -> Result<bool> {
+    fn handle_idle_submit(&mut self) -> Result<Option<TuiExitReason>> {
         let input = self.editor.take().trim_end().to_owned();
         if input.trim().is_empty() {
-            return Ok(true);
+            return Ok(None);
         }
         if input.starts_with('/') {
             return self.handle_command(&input);
         }
         self.start_turn(input);
-        Ok(true)
+        Ok(None)
     }
 
-    fn handle_command(&mut self, command: &str) -> Result<bool> {
+    fn handle_command(&mut self, command: &str) -> Result<Option<TuiExitReason>> {
         let parts = command.split_whitespace().collect::<Vec<_>>();
         match parts.as_slice() {
-            ["/exit"] => return Ok(false),
+            ["/exit"] => return Ok(Some(TuiExitReason::ExitCommand)),
             ["/save"] => {
                 let path = self.engine.store().save(&mut self.session)?;
                 self.push_system(format!("已原子保存：{}", path.display()));
@@ -496,7 +508,7 @@ impl App {
             ["/think", ..] => self.push_error("用法：/think on|off"),
             _ => self.push_error("未知命令；输入 /help 查看命令。"),
         }
-        Ok(true)
+        Ok(None)
     }
 
     fn push_system(&mut self, content: impl Into<String>) {
@@ -714,7 +726,7 @@ pub async fn run(
     engine: ChatEngine<OllamaClient>,
     session: Session,
     model_info: ModelInfo,
-) -> Result<Session> {
+) -> Result<TuiRunOutcome> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         bail!("TUI 需要交互终端；脚本调用请使用 `hippocampus ask \"问题\"`");
     }
@@ -733,7 +745,7 @@ pub async fn run(
     let mut alternate_screen = false;
     let mut bracketed_paste = false;
     let mut mouse_capture = false;
-    let result: Result<Session> = async {
+    let result: Result<TuiRunOutcome> = async {
         alternate_screen = true;
         execute!(terminal.backend_mut(), EnterAlternateScreen)?;
         bracketed_paste = true;
@@ -753,7 +765,7 @@ pub async fn run(
     match (result, cleanup) {
         (Err(error), _) => Err(error),
         (Ok(_), Err(error)) => Err(error),
-        (Ok(session), Ok(())) => Ok(session),
+        (Ok(outcome), Ok(())) => Ok(outcome),
     }
 }
 
@@ -788,7 +800,7 @@ fn restore_terminal(
 async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     mut app: App,
-) -> Result<Session> {
+) -> Result<TuiRunOutcome> {
     loop {
         app.drain_background();
         terminal.draw(|frame| draw(frame, &mut app))?;
@@ -797,11 +809,11 @@ async fn run_loop(
         }
         match event::read()? {
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
-                if !handle_key(&mut app, key)? {
-                    if app.activity == Activity::Idle {
-                        return Ok(app.session);
-                    }
-                    app.cancel_generation();
+                if let Some(exit_reason) = handle_key(&mut app, key)? {
+                    return Ok(TuiRunOutcome {
+                        session: app.session,
+                        exit_reason,
+                    });
                 }
             }
             Event::Paste(text) if app.activity == Activity::Idle => {
@@ -819,23 +831,23 @@ async fn run_loop(
     }
 }
 
-fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
+fn handle_key(app: &mut App, key: KeyEvent) -> Result<Option<TuiExitReason>> {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         if app.activity == Activity::AwaitingLimit {
             app.resolve_limit(limit_action_for_key(key).expect("Ctrl+C ends pending limit"));
-            return Ok(true);
+            return Ok(None);
         }
         if app.activity == Activity::Idle {
-            return Ok(false);
+            return Ok(Some(TuiExitReason::IdleCtrlC));
         }
         app.cancel_generation();
-        return Ok(true);
+        return Ok(None);
     }
     if app.activity == Activity::AwaitingLimit {
         if let Some(action) = limit_action_for_key(key) {
             app.resolve_limit(action);
         }
-        return Ok(true);
+        return Ok(None);
     }
 
     match key.code {
@@ -845,7 +857,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
         KeyCode::PageDown => {
             app.scroll_down(8);
         }
-        _ if app.activity != Activity::Idle => return Ok(true),
+        _ if app.activity != Activity::Idle => return Ok(None),
         KeyCode::Enter
             if key
                 .modifiers
@@ -883,7 +895,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
         }
         _ => {}
     }
-    Ok(true)
+    Ok(None)
 }
 
 fn limit_action_for_key(key: KeyEvent) -> Option<LimitAction> {
@@ -1432,6 +1444,30 @@ mod tests {
     use super::*;
     use crate::model::{ChatMessage, ContextPlan, Session, Turn};
 
+    fn test_app() -> App {
+        let root = tempfile::tempdir().unwrap();
+        let store = crate::store::SessionStore::new(root.path()).unwrap();
+        let session = Session::new(
+            "session-id".into(),
+            "model-name".into(),
+            "http://localhost:11434".into(),
+            "system".into(),
+            Default::default(),
+            true,
+        )
+        .unwrap();
+        let client = OllamaClient::new(&session.ollama_host).unwrap();
+        App::new(
+            ChatEngine::new(store, client),
+            session,
+            ModelInfo {
+                version: "test".into(),
+                name: "model-name".into(),
+                context_length: 32_768,
+            },
+        )
+    }
+
     fn session_with_turn(turn: Turn) -> Session {
         let mut session = Session::new(
             "session-id".into(),
@@ -1632,5 +1668,70 @@ mod tests {
     #[test]
     fn same_session_switch_reports_idle_status() {
         assert_eq!(same_session_status(), "已是当前会话。");
+    }
+
+    #[tokio::test]
+    async fn only_explicit_idle_exit_intents_request_consolidation() {
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+        let mut app = test_app();
+        app.editor.insert_str("/exit");
+        assert_eq!(
+            handle_key(&mut app, enter).unwrap(),
+            Some(TuiExitReason::ExitCommand)
+        );
+
+        let mut app = test_app();
+        app.editor.insert_str("/exit extra");
+        assert_eq!(handle_key(&mut app, enter).unwrap(), None);
+        assert!(app.messages.iter().any(|message| {
+            message.role == Role::Error && message.content.contains("未知命令")
+        }));
+
+        let mut app = test_app();
+        assert_eq!(
+            handle_key(&mut app, ctrl_c).unwrap(),
+            Some(TuiExitReason::IdleCtrlC)
+        );
+
+        let mut app = test_app();
+        let cancellation = CancellationToken::new();
+        app.activity = Activity::Preparing;
+        app.cancellation = Some(cancellation.clone());
+        assert_eq!(handle_key(&mut app, ctrl_c).unwrap(), None);
+        assert!(cancellation.is_cancelled());
+        assert_eq!(app.activity, Activity::Cancelling);
+
+        let mut app = test_app();
+        let cancellation = CancellationToken::new();
+        app.activity = Activity::Generating;
+        app.cancellation = Some(cancellation.clone());
+        assert_eq!(handle_key(&mut app, ctrl_c).unwrap(), None);
+        assert!(cancellation.is_cancelled());
+        assert_eq!(app.activity, Activity::Cancelling);
+
+        let mut app = test_app();
+        let (decision_tx, mut decision_rx) = mpsc::unbounded_channel();
+        app.activity = Activity::AwaitingLimit;
+        app.decision_tx = Some(decision_tx);
+        assert_eq!(handle_key(&mut app, ctrl_c).unwrap(), None);
+        assert_eq!(decision_rx.try_recv().unwrap(), LimitAction::EndSession);
+        assert_eq!(app.activity, Activity::Preparing);
+
+        let mut app = test_app();
+        app.activity = Activity::Switching;
+        app.switch_task = Some(tokio::spawn(async {
+            std::future::pending::<()>().await;
+        }));
+        assert_eq!(handle_key(&mut app, ctrl_c).unwrap(), None);
+        assert_eq!(app.activity, Activity::Idle);
+        assert_eq!(app.status, "已取消会话切换。");
+
+        let mut app = test_app();
+        app.editor.insert_str("/session unknown-session");
+        assert_eq!(handle_key(&mut app, enter).unwrap(), None);
+        assert_eq!(app.activity, Activity::Switching);
+        app.cancel_generation();
     }
 }
