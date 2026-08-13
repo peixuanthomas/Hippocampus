@@ -6423,15 +6423,7 @@ fn evidence_has_invalid_context(value: &str) -> bool {
             .chars()
             .next_back()
             .is_some_and(|ch| matches!(ch, '吗' | '么' | '呢' | '嘛'))
-        || [
-            "do", "does", "did", "is", "are", "was", "were", "can", "could", "would", "should",
-        ]
-        .iter()
-        .any(|word| {
-            trimmed
-                .strip_prefix(word)
-                .is_some_and(|tail| tail.starts_with(' '))
-        })
+        || starts_with_plain_interrogative(trimmed)
         || starts_with_contracted_interrogative(trimmed)
         || starts_with_wh_interrogative(trimmed);
     let conditional = ["如果", "若是", "假如", "要是", "除非"]
@@ -6465,36 +6457,36 @@ fn evidence_has_invalid_context(value: &str) -> bool {
         ]
         .iter()
         .any(|marker| contains_ascii_word(&normalized, marker));
-    let quoted_envelope = value.chars().any(|ch| {
-        matches!(
-            ch,
-            '"' | '“' | '”' | '‘' | '’' | '「' | '」' | '『' | '』' | '`'
-        )
-    });
+    let quoted_envelope = contains_balanced_quote_syntax(value);
     let hedged = contains_confirmation_hedge(&normalized);
     question || conditional || attribution || quoted_envelope || hedged
 }
 
+fn is_confirmation_separator(character: char) -> bool {
+    character.is_whitespace()
+        || matches!(
+            character,
+            ',' | '，'
+                | ':'
+                | '：'
+                | ';'
+                | '；'
+                | '('
+                | ')'
+                | '（'
+                | '）'
+                | '['
+                | ']'
+                | '【'
+                | '】'
+                | '-'
+                | '–'
+                | '—'
+        )
+}
+
 fn after_optional_confirmation_cue(value: &str) -> [&str; 2] {
-    let leading = value.trim_start_matches(|ch: char| {
-        ch.is_whitespace()
-            || matches!(
-                ch,
-                ',' | '，'
-                    | ':'
-                    | '：'
-                    | ';'
-                    | '；'
-                    | '('
-                    | ')'
-                    | '（'
-                    | '）'
-                    | '['
-                    | ']'
-                    | '【'
-                    | '】'
-            )
-    });
+    let leading = value.trim_start_matches(is_confirmation_separator);
     let after_optional_cue = [
         "that's right",
         "affirmative",
@@ -6512,20 +6504,28 @@ fn after_optional_confirmation_cue(value: &str) -> [&str; 2] {
     .iter()
     .find_map(|cue| {
         leading.strip_prefix(cue).and_then(|tail| {
-            tail.chars()
-                .next()
-                .is_some_and(|ch| {
-                    ch.is_whitespace() || matches!(ch, ',' | '，' | ':' | '：' | ';' | '；')
-                })
-                .then(|| {
-                    tail.trim_start_matches(|ch: char| {
-                        ch.is_whitespace() || matches!(ch, ',' | '，' | ':' | '：' | ';' | '；')
-                    })
-                })
+            let after_separators = tail.trim_start_matches(is_confirmation_separator);
+            (after_separators.len() < tail.len()).then_some(after_separators)
         })
     })
     .unwrap_or(leading);
     [leading, after_optional_cue]
+}
+
+fn starts_with_plain_interrogative(value: &str) -> bool {
+    after_optional_confirmation_cue(value)
+        .into_iter()
+        .any(|candidate| {
+            [
+                "do", "does", "did", "is", "are", "was", "were", "can", "could", "would", "should",
+            ]
+            .iter()
+            .any(|auxiliary| {
+                candidate
+                    .strip_prefix(auxiliary)
+                    .is_some_and(|tail| tail.chars().next().is_some_and(char::is_whitespace))
+            })
+        })
 }
 
 fn starts_with_contracted_interrogative(value: &str) -> bool {
@@ -6578,7 +6578,7 @@ fn starts_with_wh_interrogative(value: &str) -> bool {
 }
 
 fn contains_confirmation_hedge(value: &str) -> bool {
-    ["似乎", "可能", "也许", "大概", "我觉得", "我猜"]
+    ["似乎", "可能", "也许", "或许", "大概", "我觉得", "我猜"]
         .iter()
         .any(|phrase| value.contains(phrase))
         || ["maybe", "perhaps", "probably", "possibly"]
@@ -6587,6 +6587,57 @@ fn contains_confirmation_hedge(value: &str) -> bool {
         || ["i think", "i guess"]
             .iter()
             .any(|phrase| contains_ascii_phrase(value, phrase))
+}
+
+fn contains_balanced_quote_syntax(value: &str) -> bool {
+    let characters = value.chars().collect::<Vec<_>>();
+    [('“', '”'), ('「', '」'), ('『', '』')]
+        .into_iter()
+        .any(|(opener, closer)| has_ordered_quote_pair(&characters, opener, closer, false))
+        || has_ordered_quote_pair(&characters, '‘', '’', true)
+        || has_unescaped_delimiter_pair(value, '"')
+        || has_unescaped_delimiter_pair(value, '`')
+}
+
+fn has_ordered_quote_pair(
+    characters: &[char],
+    opener: char,
+    closer: char,
+    ignore_in_word: bool,
+) -> bool {
+    let mut saw_opener = false;
+    for (index, character) in characters.iter().copied().enumerate() {
+        if ignore_in_word
+            && matches!(character, '‘' | '’')
+            && index > 0
+            && index + 1 < characters.len()
+            && characters[index - 1].is_alphanumeric()
+            && characters[index + 1].is_alphanumeric()
+        {
+            continue;
+        }
+        if character == opener {
+            saw_opener = true;
+        } else if character == closer && saw_opener {
+            return true;
+        }
+    }
+    false
+}
+
+fn has_unescaped_delimiter_pair(value: &str, delimiter: char) -> bool {
+    let mut escaped = false;
+    let mut count = 0_u8;
+    for character in value.chars() {
+        if character == delimiter && !escaped {
+            count += 1;
+            if count == 2 {
+                return true;
+            }
+        }
+        escaped = if character == '\\' { !escaped } else { false };
+    }
+    false
 }
 
 fn contains_cjk_a_not_a_question(value: &str) -> bool {
@@ -9415,6 +9466,7 @@ mod tests {
             "似乎",
             "可能",
             "也许",
+            "或许",
             "大概",
             "我觉得",
             "我猜",
@@ -9423,17 +9475,77 @@ mod tests {
                 "Yes, {hedge} Alice lives in Paris"
             )));
         }
+        for auxiliary in [
+            "do", "does", "did", "is", "are", "was", "were", "can", "could", "would", "should",
+        ] {
+            assert!(evidence_has_invalid_context(&format!(
+                "{auxiliary} Alice live in Paris"
+            )));
+            assert!(evidence_has_invalid_context(&format!(
+                "Yes, {auxiliary} Alice live in Paris"
+            )));
+        }
+        for contracted in [
+            "don't",
+            "doesn't",
+            "didn't",
+            "isn't",
+            "aren't",
+            "wasn't",
+            "weren't",
+            "can't",
+            "cannot",
+            "won't",
+            "wouldn't",
+            "shouldn't",
+            "couldn't",
+            "haven't",
+            "hasn't",
+            "hadn't",
+        ] {
+            assert!(evidence_has_invalid_context(&format!(
+                "{contracted} Alice live in Paris"
+            )));
+            assert!(evidence_has_invalid_context(&format!(
+                "Yes, {contracted} Alice live in Paris"
+            )));
+        }
         for interrogative in [
             "who", "what", "when", "where", "why", "how", "which", "whose", "whom",
         ] {
             assert!(evidence_has_invalid_context(&format!(
+                "{interrogative} Alice lives in Paris"
+            )));
+            assert!(evidence_has_invalid_context(&format!(
                 "Yes, {interrogative} Alice lives in Paris"
             )));
         }
-        for content in [
-            "Yes, maybe Alice lives in Paris",
+        assert!(evidence_has_invalid_context(
+            "Yes—could Alice be living in Paris"
+        ));
+        for quoted in [
             "Yes, ‘Alice lives in Paris’",
-            "Yes, who says Alice lives in Paris",
+            "Yes, “Alice lives in Paris”",
+            "Yes, \"Alice lives in Paris\"",
+            "Yes, 「Alice lives in Paris」",
+            "Yes, 『Alice lives in Paris』",
+            "Yes, `Alice lives in Paris`",
+        ] {
+            assert!(evidence_has_invalid_context(quoted));
+        }
+        assert!(!evidence_has_invalid_context("Yes, Alice’s home is Paris"));
+        for (content, relation) in [
+            ("Yes, maybe Alice lives in Paris", "lives in"),
+            ("Yes, 或许 Alice lives in Paris", "lives in"),
+            ("Yes, ‘Alice lives in Paris’", "lives in"),
+            ("Yes, “Alice lives in Paris”", "lives in"),
+            ("Yes, \"Alice lives in Paris\"", "lives in"),
+            ("Yes, 「Alice lives in Paris」", "lives in"),
+            ("Yes, 『Alice lives in Paris』", "lives in"),
+            ("Yes, `Alice lives in Paris`", "lives in"),
+            ("Yes, who says Alice lives in Paris", "lives in"),
+            ("Yes, does Alice live in Paris", "live in"),
+            ("Yes—could Alice be living in Paris", "be living in"),
         ] {
             let root = tempfile::tempdir().unwrap();
             let (store, mut session) = new_session(root.path());
@@ -9446,7 +9558,7 @@ mod tests {
                 "residence.city",
                 "Paris",
                 quote_nth(event, "Alice", 0),
-                quote_nth(event, "lives in", 0),
+                quote_nth(event, relation, 0),
                 quote_nth(event, "Paris", 0),
                 full_quote(event),
             );
@@ -9510,14 +9622,57 @@ mod tests {
             )
             .is_ok()
         );
+
+        let root = tempfile::tempdir().unwrap();
+        let (store, mut session) = new_session(root.path());
+        push_complete_at(
+            &mut session,
+            "Yes, Alice’s home is Paris",
+            None,
+            "2026-01-01T00:00:00Z",
+        );
+        let batch = next_batch(&store, &mut session);
+        let event = &batch.events[0];
+        let mut claim = text_claim_output(
+            "local_residence",
+            "local_alice",
+            "residence.city",
+            "Paris",
+            quote_nth(event, "Alice", 0),
+            quote_nth(event, "home is", 0),
+            quote_nth(event, "Paris", 0),
+            full_quote(event),
+        );
+        claim.evidence[0].kind = ConsolidationEvidenceKind::UserConfirmation;
+        claim.evidence[0].speech_act_span = Some(quote_nth(event, "Yes", 0));
+        assert!(
+            apply_output(
+                &store,
+                &batch,
+                &empty_candidates(),
+                &StructuredConsolidationOutput {
+                    entities: vec![new_entity_output(
+                        "local_alice",
+                        "Alice",
+                        quote_nth(event, "Alice", 0),
+                    )],
+                    claims: vec![claim],
+                    boundaries: Vec::new(),
+                },
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn stored_confirmation_rejects_coherently_rehashed_invalid_context() {
-        for invalid in [
-            "Yes, maybe Alice lives in Paris",
-            "Yes, ‘Alice lives in Paris’",
-            "Yes, who says Alice lives in Paris",
+        for (invalid, relation, relation_occurrence) in [
+            ("Yes, maybe Alice lives in Paris", "lives in", 2),
+            ("Yes, 或许 Alice lives in Paris", "lives in", 2),
+            ("Yes, ‘Alice lives in Paris’", "lives in", 2),
+            ("Yes, who says Alice lives in Paris", "lives in", 2),
+            ("Yes, does Alice live in Paris", "live in", 0),
+            ("Yes—could Alice be living in Paris", "be living in", 0),
         ] {
             let root = tempfile::tempdir().unwrap();
             let (store, mut session) = new_session(root.path());
@@ -9565,7 +9720,7 @@ mod tests {
             let old_outer = quote_nth(event, valid, 1);
             let new_outer = quote_nth(event, invalid, 0);
             let new_subject = quote_nth(event, "Alice", 2);
-            let new_relation = quote_nth(event, "lives in", 2);
+            let new_relation = quote_nth(event, relation, relation_occurrence);
             let new_object = quote_nth(event, "Paris", 2);
             let new_speech = quote_nth(event, "Yes", 2);
             let connection = Connection::open(store.retrieval().index_path()).unwrap();

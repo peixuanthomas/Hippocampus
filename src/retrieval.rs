@@ -258,10 +258,27 @@ impl RetrievalStore {
                 })?
                 .join(path)
         };
-        let root = canonical_root_key(&root);
-        if root.exists() && !root.is_dir() {
+        let resolved_root = canonical_root_key(&root);
+        if resolved_root.exists() && !resolved_root.is_dir() {
             return Err(RetrievalError::Io {
-                path: root.clone(),
+                path: resolved_root,
+                source: std::io::Error::new(
+                    std::io::ErrorKind::NotADirectory,
+                    "session root is not a directory",
+                ),
+            });
+        }
+        fs::create_dir_all(&resolved_root).map_err(|source| RetrievalError::Io {
+            path: resolved_root.clone(),
+            source,
+        })?;
+        let root = fs::canonicalize(&resolved_root).map_err(|source| RetrievalError::Io {
+            path: resolved_root,
+            source,
+        })?;
+        if !root.is_dir() {
+            return Err(RetrievalError::Io {
+                path: root,
                 source: std::io::Error::new(
                     std::io::ErrorKind::NotADirectory,
                     "session root is not a directory",
@@ -3403,6 +3420,7 @@ CREATE INDEX memory_boundary_suggestions_session_event
         let expected = fs::canonicalize(parent.path()).unwrap().join("root");
         assert!(!direct.exists());
         let first = RetrievalStore::new(&through_missing).unwrap();
+        assert!(expected.is_dir());
         let second = RetrievalStore::new(&direct).unwrap();
         assert_eq!(first.root(), expected);
         assert_eq!(second.root(), expected);
@@ -3441,6 +3459,7 @@ CREATE INDEX memory_boundary_suggestions_session_event
         assert!(!through_symlink_parent.exists());
         assert!(!direct.exists());
         let first = RetrievalStore::new(&through_symlink_parent).unwrap();
+        assert!(expected.is_dir());
         let second = RetrievalStore::new(&direct).unwrap();
         assert_eq!(first.root(), expected);
         assert_eq!(second.root(), expected);
@@ -3490,6 +3509,36 @@ CREATE INDEX memory_boundary_suggestions_session_event
         assert_eq!(direct_b.index_path(), canonical_b.join(INDEX_FILENAME));
         assert!(!Arc::ptr_eq(&through_link.root_lock, &direct_b.root_lock));
         assert!(Arc::ptr_eq(&fresh_link.root_lock, &direct_b.root_lock));
+
+        let missing_link = parent.path().join("missing-sessions");
+        symlink(&target_a, &missing_link).unwrap();
+        let missing_root = missing_link.join("nested").join("sessions");
+        let pinned_missing = RetrievalStore::new(&missing_root).unwrap();
+        let pinned_target = canonical_a.join("nested").join("sessions");
+        assert_eq!(pinned_missing.root(), pinned_target);
+        assert!(pinned_target.is_dir());
+
+        fs::remove_file(&missing_link).unwrap();
+        symlink(&target_b, &missing_link).unwrap();
+        pinned_missing.open_connection().unwrap();
+        assert!(pinned_target.join(INDEX_FILENAME).is_file());
+        assert!(
+            !canonical_b
+                .join("nested")
+                .join("sessions")
+                .join(INDEX_FILENAME)
+                .exists()
+        );
+
+        let fresh_missing = RetrievalStore::new(&missing_root).unwrap();
+        let fresh_target = canonical_b.join("nested").join("sessions");
+        assert_eq!(fresh_missing.root(), fresh_target);
+        assert!(!Arc::ptr_eq(
+            &pinned_missing.root_lock,
+            &fresh_missing.root_lock
+        ));
+        fresh_missing.open_connection().unwrap();
+        assert!(fresh_target.join(INDEX_FILENAME).is_file());
     }
 
     #[test]
@@ -3502,9 +3551,9 @@ CREATE INDEX memory_boundary_suggestions_session_event
             .join("sessions");
         let store = RetrievalStore::new(&missing).unwrap();
         assert_eq!(store.root(), expected);
-        assert!(!store.root().exists());
-        store.open_connection().unwrap();
         assert!(store.root().is_dir());
+        assert!(!store.index_path().exists());
+        store.open_connection().unwrap();
         assert!(store.index_path().is_file());
 
         let file = parent.path().join("not-a-directory");

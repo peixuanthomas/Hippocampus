@@ -441,7 +441,9 @@ mod tests {
             .join("sessions");
         let store = SessionStore::new(&missing).unwrap();
         assert_eq!(store.root(), expected);
-        assert!(!store.root().exists());
+        assert!(store.root().is_dir());
+        assert!(!store.retrieval().index_path().exists());
+        assert_eq!(store.knowledge().root().parent(), Some(expected.as_path()));
         let session = store
             .create(
                 "model",
