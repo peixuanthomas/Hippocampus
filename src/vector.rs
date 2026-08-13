@@ -4,6 +4,8 @@ use thiserror::Error;
 use crate::config::MemoryConfig;
 use crate::model::RetrievalDocumentGranularity;
 
+pub const EMBEDDING_PREPROCESSING_VERSION: u32 = 2;
+
 /// The complete compatibility contract for a persisted vector index.
 ///
 /// HNSW tuning is included deliberately: changing it requires rebuilding the
@@ -40,6 +42,14 @@ pub enum VectorError {
     DimensionMismatch { expected: usize, actual: usize },
     #[error("向量包含非有限值")]
     NonFiniteValue,
+    #[error("向量范数必须大于零")]
+    ZeroNorm,
+    #[error("向量池不能为空")]
+    EmptyPool,
+    #[error("向量权重必须为正整数")]
+    ZeroWeight,
+    #[error("向量运算结果超出有限数值范围")]
+    NonFiniteComputation,
     #[error("向量字节长度无效：期望 {expected}，实际 {actual}")]
     InvalidByteLength { expected: usize, actual: usize },
     #[error("向量维度溢出")]
@@ -99,8 +109,9 @@ impl VectorIndexSpec {
         let hnsw_ef_search =
             u64::try_from(self.hnsw_ef_search).map_err(|_| VectorError::DimensionOverflow)?;
         let mut hasher = Sha256::new();
-        hasher.update(b"hippocampus-vector-index-v1\0");
+        hasher.update(b"hippocampus-vector-index-v2\0");
         for value in [
+            &EMBEDDING_PREPROCESSING_VERSION.to_le_bytes()[..],
             self.model.as_bytes(),
             &dimensions.to_le_bytes(),
             &hnsw_m.to_le_bytes(),
@@ -112,6 +123,111 @@ impl VectorIndexSpec {
         }
         Ok(format!("{:x}", hasher.finalize()))
     }
+}
+
+fn normalized_f64(vector: &[f32]) -> Result<Vec<f64>, VectorError> {
+    if vector.is_empty() {
+        return Err(VectorError::EmptyVector);
+    }
+    let mut squared_norm = 0.0_f64;
+    for &value in vector {
+        if !value.is_finite() {
+            return Err(VectorError::NonFiniteValue);
+        }
+        let value = f64::from(value);
+        squared_norm += value * value;
+        if !squared_norm.is_finite() {
+            return Err(VectorError::NonFiniteComputation);
+        }
+    }
+    if squared_norm == 0.0 {
+        return Err(VectorError::ZeroNorm);
+    }
+    let norm = squared_norm.sqrt();
+    if !norm.is_finite() || norm == 0.0 {
+        return Err(VectorError::NonFiniteComputation);
+    }
+    Ok(vector
+        .iter()
+        .map(|&value| f64::from(value) / norm)
+        .collect())
+}
+
+fn normalized_f32(vector: &[f64]) -> Result<Vec<f32>, VectorError> {
+    let mut squared_norm = 0.0_f64;
+    for &value in vector {
+        if !value.is_finite() {
+            return Err(VectorError::NonFiniteComputation);
+        }
+        squared_norm += value * value;
+        if !squared_norm.is_finite() {
+            return Err(VectorError::NonFiniteComputation);
+        }
+    }
+    if squared_norm == 0.0 {
+        return Err(VectorError::ZeroNorm);
+    }
+    let norm = squared_norm.sqrt();
+    if !norm.is_finite() || norm == 0.0 {
+        return Err(VectorError::NonFiniteComputation);
+    }
+    vector
+        .iter()
+        .map(|value| {
+            let normalized = (value / norm) as f32;
+            if normalized.is_finite() {
+                Ok(normalized)
+            } else {
+                Err(VectorError::NonFiniteComputation)
+            }
+        })
+        .collect()
+}
+
+pub fn l2_normalize(vector: &[f32]) -> Result<Vec<f32>, VectorError> {
+    normalized_f32(&normalized_f64(vector)?)
+}
+
+pub fn weighted_pool(vectors: &[(&[f32], usize)]) -> Result<Vec<f32>, VectorError> {
+    let Some((first, _)) = vectors.first() else {
+        return Err(VectorError::EmptyPool);
+    };
+    if first.is_empty() {
+        return Err(VectorError::EmptyVector);
+    }
+    let dimensions = first.len();
+    let mut pooled = vec![0.0_f64; dimensions];
+    for &(vector, weight) in vectors {
+        if weight == 0 {
+            return Err(VectorError::ZeroWeight);
+        }
+        if vector.len() != dimensions {
+            return Err(VectorError::DimensionMismatch {
+                expected: dimensions,
+                actual: vector.len(),
+            });
+        }
+        let normalized = normalized_f64(vector)?;
+        let weight = weight as f64;
+        if !weight.is_finite() {
+            return Err(VectorError::NonFiniteComputation);
+        }
+        for (output, value) in pooled.iter_mut().zip(normalized) {
+            *output += value * weight;
+            if !output.is_finite() {
+                return Err(VectorError::NonFiniteComputation);
+            }
+        }
+    }
+    normalized_f32(&pooled)
+}
+
+pub fn equal_mean(vectors: &[&[f32]]) -> Result<Vec<f32>, VectorError> {
+    let weighted = vectors
+        .iter()
+        .map(|vector| (*vector, 1_usize))
+        .collect::<Vec<_>>();
+    weighted_pool(&weighted)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -242,6 +358,10 @@ mod tests {
         let fingerprint = base.fingerprint().unwrap();
         assert_eq!(
             fingerprint,
+            "90cff08d6771a56d92b5bd472bcb215b4cc144dc39280dc26edbe2b9c80c7e81"
+        );
+        assert_ne!(
+            fingerprint,
             "c591bf40346074f1407af6274f5be8e6889b73f549bd0c9a20a288d870fe16de"
         );
         let mut changed = base.clone();
@@ -260,6 +380,66 @@ mod tests {
         changed.hnsw_ef_search = 96;
         assert_ne!(fingerprint, changed.fingerprint().unwrap());
         assert_eq!(fingerprint, base.fingerprint().unwrap());
+    }
+
+    fn assert_unit(vector: &[f32]) {
+        assert!(vector.iter().all(|value| value.is_finite()));
+        let norm = vector
+            .iter()
+            .map(|value| f64::from(*value).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        assert!((norm - 1.0).abs() <= 1e-5, "norm was {norm}");
+    }
+
+    #[test]
+    fn normalization_handles_basis_and_extreme_finite_values() {
+        assert_eq!(l2_normalize(&[0.0, 1.0]).unwrap(), vec![0.0, 1.0]);
+        assert_eq!(l2_normalize(&[3.0, 4.0]).unwrap(), vec![0.6, 0.8]);
+        for input in [[f32::MAX, f32::MAX], [f32::MIN_POSITIVE, f32::MIN_POSITIVE]] {
+            assert_unit(&l2_normalize(&input).unwrap());
+        }
+    }
+
+    #[test]
+    fn normalization_rejects_zero_and_non_finite_vectors() {
+        assert_eq!(l2_normalize(&[]), Err(VectorError::EmptyVector));
+        assert_eq!(l2_normalize(&[0.0, -0.0]), Err(VectorError::ZeroNorm));
+        assert_eq!(
+            l2_normalize(&[f32::INFINITY]),
+            Err(VectorError::NonFiniteValue)
+        );
+        assert_eq!(l2_normalize(&[f32::NAN]), Err(VectorError::NonFiniteValue));
+    }
+
+    #[test]
+    fn pooling_validates_inputs() {
+        assert_eq!(weighted_pool(&[]), Err(VectorError::EmptyPool));
+        assert_eq!(weighted_pool(&[(&[], 1)]), Err(VectorError::EmptyVector));
+        assert_eq!(weighted_pool(&[(&[1.0], 0)]), Err(VectorError::ZeroWeight));
+        assert_eq!(
+            weighted_pool(&[(&[1.0, 0.0], 1), (&[1.0], 1)]),
+            Err(VectorError::DimensionMismatch {
+                expected: 2,
+                actual: 1
+            })
+        );
+    }
+
+    #[test]
+    fn weighted_pool_reflects_unequal_coverage() {
+        let pooled = weighted_pool(&[(&[1.0, 0.0], 240), (&[0.0, 1.0], 1)]).unwrap();
+        assert!(pooled[0] > 0.999 && pooled[1] > 0.0 && pooled[1] < 0.005);
+        assert_unit(&pooled);
+    }
+
+    #[test]
+    fn equal_mean_ignores_input_magnitude() {
+        let pooled = equal_mean(&[&[10.0, 0.0], &[0.0, 0.001]]).unwrap();
+        let expected = 0.5_f32.sqrt();
+        assert!((pooled[0] - expected).abs() <= 1e-6);
+        assert!((pooled[1] - expected).abs() <= 1e-6);
+        assert_unit(&pooled);
     }
 
     #[test]

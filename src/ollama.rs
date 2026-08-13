@@ -458,6 +458,12 @@ fn validate_embedding_response(
     if response.model.trim().is_empty() {
         return Err(OllamaError::Protocol("Ollama 嵌入响应缺少模型名".into()));
     }
+    if response.model != request.model {
+        return Err(OllamaError::Protocol(format!(
+            "Ollama 嵌入响应模型 {:?} 与请求模型 {:?} 不一致",
+            response.model, request.model
+        )));
+    }
     if response.embeddings.len() != request.input.len() {
         return Err(OllamaError::Protocol(format!(
             "Ollama 返回 {} 个向量，但请求包含 {} 个输入",
@@ -1356,17 +1362,20 @@ mod tests {
         let request = embedding_request();
         assert!(validate_embedding_request(&request).is_ok());
         for payload in [
-            json!({"model":"m","embeddings":[[1.0, 2.0, 3.0]]}),
-            json!({"model":"m","embeddings":[[1.0, 2.0], [3.0, 4.0]]}),
-            json!({"model":"m","embeddings":[[1.0, 2.0, 3.0], [4.0, 5.0]]}),
-            json!({"model":"m","embeddings":[[], []]}),
+            json!({"model":"qwen3-embedding:8b","embeddings":[[1.0, 2.0, 3.0]]}),
+            json!({"model":"qwen3-embedding:8b","embeddings":[[1.0, 2.0], [3.0, 4.0]]}),
+            json!({"model":"qwen3-embedding:8b","embeddings":[[1.0, 2.0, 3.0], [4.0, 5.0]]}),
+            json!({"model":"qwen3-embedding:8b","embeddings":[[], []]}),
             json!({"model":"","embeddings":[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]}),
+            json!({"model":"   ","embeddings":[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]}),
+            json!({"model":"other","embeddings":[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]}),
+            json!({"model":"qwen3-embedding:8b ","embeddings":[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]}),
         ] {
             assert!(parse_embedding_response(payload, &request).is_err());
         }
 
         let nonfinite = EmbeddingResponse {
-            model: "m".into(),
+            model: request.model.clone(),
             embeddings: vec![vec![1.0, f32::NAN, 3.0], vec![4.0, 5.0, 6.0]],
             prompt_eval_count: None,
             total_duration: None,

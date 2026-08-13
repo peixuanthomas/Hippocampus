@@ -53,6 +53,7 @@ pub use retrieval::{
 };
 pub use store::{IndexSyncAfterSourceCommit, SessionStore};
 pub use vector::{
-    EmbeddingCoverage, EmbeddingWrite, StoredEmbedding, VectorError, VectorIndexSpec,
-    decode_f32_le, encode_f32_le,
+    EMBEDDING_PREPROCESSING_VERSION, EmbeddingCoverage, EmbeddingWrite, StoredEmbedding,
+    VectorError, VectorIndexSpec, decode_f32_le, encode_f32_le, equal_mean, l2_normalize,
+    weighted_pool,
 };
