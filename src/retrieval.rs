@@ -3899,14 +3899,99 @@ CREATE INDEX memory_boundary_suggestions_session_event
             .unwrap();
         append_complete_turn(&mut session, "你好🙂", "回复", "");
         let path = store.save(&mut session).unwrap();
+        let source_bytes = fs::read(&path).unwrap();
         store.retrieval().sync_session(&session, &path).unwrap();
+        let replay_before = store.retrieval().replay_session(&session.id).unwrap();
+        let spec = VectorIndexSpec {
+            model: "fixture-embedding-model".into(),
+            dimensions: 32,
+            hnsw_m: 16,
+            hnsw_ef_construction: 200,
+            hnsw_ef_search: 64,
+        };
         let connection = Connection::open(store.retrieval().index_path()).unwrap();
+        let (document_id, source_sha256): (String, String) = connection
+            .query_row(
+                "SELECT document_id, source_sha256 FROM memory_documents
+                 WHERE session_id=?1 AND granularity='message' ORDER BY document_id LIMIT 1",
+                [&session.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        drop(connection);
+        store
+            .retrieval()
+            .upsert_embeddings(
+                &spec,
+                &[EmbeddingWrite {
+                    document_id: document_id.clone(),
+                    expected_source_sha256: source_sha256,
+                    vector: (0..spec.dimensions)
+                        .map(|index| index as f32 - 7.5)
+                        .collect(),
+                }],
+            )
+            .unwrap();
+        let embedding_before = store
+            .retrieval()
+            .compatible_embeddings(&spec)
+            .unwrap()
+            .into_iter()
+            .find(|embedding| embedding.document_id == document_id)
+            .unwrap();
+        assert_eq!(
+            embedding_before.granularity,
+            RetrievalDocumentGranularity::Message
+        );
+
+        let connection = Connection::open(store.retrieval().index_path()).unwrap();
+        connection
+            .execute_batch(
+                "DROP TRIGGER memory_documents_before_source_span_delete;
+                 DROP TABLE memory_episode_boundaries;
+                 DROP TABLE memory_episode_materializations;
+                 CREATE TRIGGER memory_documents_before_source_span_delete
+                 BEFORE DELETE ON source_spans
+                 BEGIN
+                     DELETE FROM memory_documents
+                     WHERE document_id IN (
+                         SELECT document_id FROM memory_document_members
+                         WHERE event_id = OLD.event_id
+                           AND start_char = OLD.start_char
+                           AND end_char = OLD.end_char
+                     );
+                 END;",
+            )
+            .unwrap();
         connection
             .pragma_update(None, "user_version", 5_i64)
             .unwrap();
+        for table in [
+            "memory_episode_boundaries",
+            "memory_episode_materializations",
+        ] {
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                        [table],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                0
+            );
+        }
+        let historical_trigger: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='memory_documents_before_source_span_delete'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!historical_trigger.contains("memory_episode_materializations"));
         drop(connection);
         let reopened = RetrievalStore::new(root.path()).unwrap();
-        reopened.replay_session(&session.id).unwrap();
+        assert_eq!(reopened.replay_session(&session.id).unwrap(), replay_before);
         let connection = Connection::open(reopened.index_path()).unwrap();
         assert_eq!(
             connection
@@ -3914,8 +3999,32 @@ CREATE INDEX memory_boundary_suggestions_session_event
                 .unwrap(),
             6
         );
+        for table in [
+            "memory_episode_boundaries",
+            "memory_episode_materializations",
+        ] {
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                        [table],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                1
+            );
+        }
         let trigger: String = connection.query_row("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='memory_documents_before_source_span_delete'", [], |row| row.get(0)).unwrap();
         assert!(trigger.contains("memory_episode_materializations"));
+        drop(connection);
+        let embedding_after = reopened
+            .compatible_embeddings(&spec)
+            .unwrap()
+            .into_iter()
+            .find(|embedding| embedding.document_id == document_id)
+            .unwrap();
+        assert_eq!(embedding_after, embedding_before);
+        assert_eq!(fs::read(path).unwrap(), source_bytes);
     }
 
     #[test]
