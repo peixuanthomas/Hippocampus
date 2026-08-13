@@ -1,6 +1,6 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+#[cfg(test)]
 use std::fs;
-use std::path::{Component, Path};
 
 use chrono::{DateTime, FixedOffset};
 use rusqlite::{Connection, OptionalExtension, Transaction, params, types::ValueRef};
@@ -1166,38 +1166,7 @@ fn verify_indexed_source_file(
     connection: &Connection,
     session_id: &str,
 ) -> RetrievalResult<()> {
-    let stored = connection
-        .query_row(
-            "SELECT source_file, source_sha256 FROM indexed_sessions WHERE session_id = ?1",
-            [session_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-        )
-        .optional()
-        .map_err(|error| store.database_error(error))?;
-    let Some((source_file, source_sha256)) = stored else {
-        return Err(RetrievalError::StaleIndex {
-            session_id: session_id.to_owned(),
-        });
-    };
-    let mut components = Path::new(&source_file).components();
-    if !matches!(components.next(), Some(Component::Normal(_)))
-        || components.next().is_some()
-        || !is_lower_sha256(&source_sha256)
-    {
-        return Err(RetrievalError::CorruptIndex(format!(
-            "会话 {session_id} 的源文件记录损坏"
-        )));
-    }
-    let path = store.root().join(source_file);
-    let bytes = fs::read(&path).map_err(|_| RetrievalError::StaleIndex {
-        session_id: session_id.to_owned(),
-    })?;
-    if sha256_bytes(&bytes) != source_sha256 {
-        return Err(RetrievalError::StaleIndex {
-            session_id: session_id.to_owned(),
-        });
-    }
-    Ok(())
+    store.verify_indexed_session_source_projection(connection, session_id)
 }
 
 fn validate_candidate_limit(value: usize, name: &str) -> RetrievalResult<()> {
@@ -2054,6 +2023,7 @@ pub(crate) fn validate_full_derived_integrity(connection: &Connection) -> Retrie
 }
 
 fn validate_applied_mention_projection(connection: &Connection) -> RetrievalResult<()> {
+    let mut expected_by_batch = BTreeMap::<String, Vec<Vec<String>>>::new();
     let mut statement = connection.prepare(
         "SELECT attempt_id, batch_key, session_id, from_sequence, through_sequence, trigger, model,
                 request_json, request_sha256, input_event_ids, input_event_hashes, response_json,
@@ -2101,19 +2071,60 @@ fn validate_applied_mention_projection(connection: &Connection) -> RetrievalResu
         let mut expected = validated_mentions(&payload.batch, &attempt, &plan)
             .map_err(candidate_database_error)?
             .into_iter()
-            .map(|mention| mention.id)
+            .map(|mention| {
+                vec![
+                    mention.id,
+                    payload.batch.session_id.clone(),
+                    payload.batch.batch_key.clone(),
+                    mention.kind.to_owned(),
+                    mention.source.to_owned(),
+                    mention.entity.to_owned(),
+                    mention.status.as_str().to_owned(),
+                    mention.quote.quote.event_id.clone(),
+                    mention.quote.sequence.to_string(),
+                    match mention.quote.role {
+                        EventRole::User => "user",
+                        EventRole::Assistant => "assistant",
+                        EventRole::System => "system",
+                    }
+                    .to_owned(),
+                    mention.quote.quote.start_char.to_string(),
+                    mention.quote.quote.end_char.to_string(),
+                    mention.quote.quote.content_sha256.clone(),
+                    attempt.completed_at.clone(),
+                ]
+            })
             .collect::<Vec<_>>();
         expected.sort();
-        let actual = connection.prepare(
-            "SELECT mention_id FROM memory_entity_mentions WHERE batch_key=?1 ORDER BY mention_id",
-        ).and_then(|mut rows| rows.query_map([&attempt.batch_key], |row| row.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()).map_err(candidate_database_error)?;
-        if expected != actual {
+        if expected_by_batch
+            .insert(attempt.batch_key.clone(), expected)
+            .is_some()
+        {
             return Err(RetrievalError::CorruptIndex(format!(
-                "批次 {} 的实体提及投影与不可变账本不一致",
+                "批次 {} 存在多个当前 applied 账本记录",
                 attempt.batch_key
             )));
         }
+    }
+    let actual = connection.prepare(
+        "SELECT batch_key, mention_id, session_id, batch_key, mention_kind, source_record_id,
+                entity_id, entity_status, event_id, CAST(sequence AS TEXT), role, CAST(start_char AS TEXT), CAST(end_char AS TEXT),
+                content_sha256, created_at FROM memory_entity_mentions ORDER BY batch_key, mention_id",
+    ).and_then(|mut rows| rows.query_map([], |row| Ok((
+        row.get::<_, String>(0)?,
+        (1..15).map(|index| row.get::<_, String>(index)).collect::<rusqlite::Result<Vec<_>>>()?,
+    )))?.collect::<rusqlite::Result<Vec<_>>>()).map_err(candidate_database_error)?;
+    let mut actual_by_batch = BTreeMap::<String, Vec<Vec<String>>>::new();
+    for (batch, row) in actual {
+        actual_by_batch.entry(batch).or_default().push(row);
+    }
+    for batch in expected_by_batch.keys() {
+        actual_by_batch.entry(batch.clone()).or_default();
+    }
+    if expected_by_batch != actual_by_batch {
+        return Err(RetrievalError::CorruptIndex(
+            "实体提及投影与不可变账本的完整元组不一致".into(),
+        ));
     }
     Ok(())
 }

@@ -1961,6 +1961,64 @@ impl RetrievalStore {
         Ok(())
     }
 
+    pub(crate) fn verify_indexed_session_source_projection(
+        &self,
+        connection: &Connection,
+        session_id: &str,
+    ) -> RetrievalResult<()> {
+        let indexed = self.get_session_from_connection(connection, session_id)?;
+        if indexed.source_file != format!("{session_id}.json")
+            || indexed.source_sha256.len() != 64
+            || !indexed
+                .source_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "会话 {session_id} 的源文件绑定不精确"
+            )));
+        }
+        let path = self.root.join(&indexed.source_file);
+        let bytes = fs::read(path).map_err(|_| RetrievalError::StaleIndex {
+            session_id: session_id.to_owned(),
+        })?;
+        if bytes_sha256(&bytes) != indexed.source_sha256 {
+            return Err(RetrievalError::StaleIndex {
+                session_id: session_id.to_owned(),
+            });
+        }
+        let mut source: Session =
+            serde_json::from_slice(&bytes).map_err(|error| RetrievalError::InvalidSource {
+                path: self.root.join(&indexed.source_file),
+                message: error.to_string(),
+            })?;
+        source.normalize_legacy_provenance();
+        source
+            .validate()
+            .map_err(|error| RetrievalError::InvalidSource {
+                path: self.root.join(&indexed.source_file),
+                message: error.to_string(),
+            })?;
+        if source.id != session_id {
+            return Err(RetrievalError::StaleIndex {
+                session_id: session_id.to_owned(),
+            });
+        }
+        let indexed_events = connection.prepare(
+            "SELECT event_id, session_id, turn_id, sequence, role, created_at, content, content_sha256,
+                    reply_to_event_id, token_count, turn_status, done_reason, error
+             FROM events WHERE session_id=?1 ORDER BY sequence",
+        ).and_then(|mut statement| statement.query_map([session_id], map_event)?.collect::<rusqlite::Result<Vec<_>>>() )
+            .map_err(|error| self.database_error(error))?;
+        let expected = derive_events(&source);
+        if indexed_events != expected {
+            return Err(RetrievalError::StaleIndex {
+                session_id: session_id.to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     pub(crate) fn database_error(&self, source: rusqlite::Error) -> RetrievalError {
         RetrievalError::Database {
             path: self.index_path.clone(),
@@ -4114,7 +4172,16 @@ fn prepare_memory_state_schema(
         // They cannot be upgraded row by row without trusting the old derived state, so discard
         // only the replayable projection and retain raw events plus the immutable attempt ledger.
         connection.execute_batch(
-            "DELETE FROM memory_entity_mentions;
+            "DELETE FROM memory_embeddings
+               WHERE document_id IN (SELECT document_id FROM memory_documents
+                                     WHERE granularity IN ('episode','session'));
+             DELETE FROM memory_episode_materializations;
+             DELETE FROM memory_episode_boundaries;
+             DELETE FROM memory_document_members
+               WHERE document_id IN (SELECT document_id FROM memory_documents
+                                     WHERE granularity IN ('episode','session'));
+             DELETE FROM memory_documents WHERE granularity IN ('episode','session');
+             DELETE FROM memory_entity_mentions;
              DELETE FROM memory_episode_boundaries;
              DELETE FROM memory_episode_materializations;
              DELETE FROM memory_claim_evidence;
