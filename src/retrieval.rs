@@ -4775,21 +4775,108 @@ mod tests {
              VALUES('ent_test','person','Test','test','resolved','s','b','e',0,1,?1,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
             ["a".repeat(64)],
         ).unwrap();
-        let valid_id = format!("mention_{}", "a".repeat(64));
+        let suffix = |byte: u8, index: usize| {
+            let mut value = "a".repeat(64).into_bytes();
+            value[index] = byte;
+            String::from_utf8(value).unwrap()
+        };
         let valid_hash = "b".repeat(64);
-        for (id, hash) in [
-            (format!("mention_A{}", "a".repeat(63)), valid_hash.clone()),
-            (format!("mention_{}Z", "a".repeat(63)), valid_hash.clone()),
-            (format!("wrong___{}", "a".repeat(64)), valid_hash.clone()),
-            (valid_id.clone(), format!("{}G", "b".repeat(63))),
-            (valid_id.clone(), format!("{}C", "b".repeat(63))),
-        ] {
-            assert!(connection.execute(
+        let valid_id = |index: usize| format!("mention_{}", suffix(b'c', index));
+        let mut expected = std::collections::BTreeSet::new();
+        let mut seen = std::collections::BTreeSet::new();
+        let mut insert = |label: &str, mention_id: String, hash: String, valid: bool| {
+            expected.insert(label.to_owned());
+            let result = connection.execute(
                 "INSERT INTO memory_entity_mentions(mention_id,session_id,batch_key,mention_kind,source_record_id,entity_id,entity_status,event_id,sequence,role,start_char,end_char,content_sha256,created_at)
-                 VALUES(?1,'s','b','entity_name','source','ent_test','resolved','e',1,'user',0,1,?2,'2026-01-01T00:00:00Z')",
-                params![id, hash],
-            ).is_err());
+                 VALUES(?1,?2,'b','entity_name',?3,'ent_test','resolved','e',1,'user',0,1,?4,'2026-01-01T00:00:00Z')",
+                params![
+                    mention_id,
+                    format!("session-{label}"),
+                    format!("source-{label}"),
+                    hash
+                ],
+            );
+            if valid {
+                assert_eq!(result.unwrap(), 1, "{label}");
+            } else {
+                assert!(
+                    matches!(
+                        result,
+                        Err(rusqlite::Error::SqliteFailure(error, _))
+                            if error.code == rusqlite::ErrorCode::ConstraintViolation
+                    ),
+                    "{label}: {result:?}"
+                );
+            }
+            seen.insert(label.to_owned());
+        };
+
+        insert("id_valid_control", valid_id(0), valid_hash.clone(), true);
+        for (position, index) in [("start", 0), ("middle", 31), ("end", 63)] {
+            insert(
+                &format!("id_uppercase_{position}"),
+                format!("mention_{}", suffix(b'A', index)),
+                valid_hash.clone(),
+                false,
+            );
+            insert(
+                &format!("id_nonhex_g_{position}"),
+                format!("mention_{}", suffix(b'g', index)),
+                valid_hash.clone(),
+                false,
+            );
+            insert(
+                &format!("id_nonhex_underscore_{position}"),
+                format!("mention_{}", suffix(b'_', index)),
+                valid_hash.clone(),
+                false,
+            );
         }
+        for (label, id) in [
+            ("id_wrong_prefix", format!("wrong___{}", "a".repeat(64))),
+            ("id_missing_prefix", "a".repeat(64)),
+            ("id_suffix_short_63", format!("mention_{}", "a".repeat(63))),
+            ("id_suffix_long_65", format!("mention_{}", "a".repeat(65))),
+            ("id_empty", String::new()),
+            ("id_blank", " ".into()),
+        ] {
+            insert(label, id, valid_hash.clone(), false);
+        }
+        insert("hash_valid_control", valid_id(1), valid_hash.clone(), true);
+        for (ordinal, (position, index)) in [("start", 0), ("middle", 31), ("end", 63)]
+            .into_iter()
+            .enumerate()
+        {
+            insert(
+                &format!("hash_uppercase_{position}"),
+                valid_id(2 + ordinal * 3),
+                suffix(b'B', index),
+                false,
+            );
+            insert(
+                &format!("hash_nonhex_g_{position}"),
+                valid_id(3 + ordinal * 3),
+                suffix(b'g', index),
+                false,
+            );
+            insert(
+                &format!("hash_nonhex_underscore_{position}"),
+                valid_id(4 + ordinal * 3),
+                suffix(b'_', index),
+                false,
+            );
+        }
+        for (ordinal, (label, hash)) in [
+            ("hash_short_63", "b".repeat(63)),
+            ("hash_long_65", "b".repeat(65)),
+            ("hash_empty", String::new()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            insert(label, valid_id(11 + ordinal), hash, false);
+        }
+        assert_eq!(seen, expected);
     }
 
     #[test]
