@@ -4530,7 +4530,8 @@ CREATE INDEX IF NOT EXISTS memory_entities_normalized
     ON memory_entities(normalized_name, kind, entity_id);
 
 CREATE TABLE IF NOT EXISTS memory_entity_mentions (
-    mention_id TEXT PRIMARY KEY CHECK(mention_id GLOB 'mention_[0-9a-f]*' AND length(mention_id) = 72),
+    mention_id TEXT PRIMARY KEY CHECK(mention_id GLOB 'mention_*' AND length(mention_id) = 72
+        AND substr(mention_id, 9) NOT GLOB '*[^0-9a-f]*'),
     session_id TEXT NOT NULL CHECK(length(session_id) > 0),
     batch_key TEXT NOT NULL CHECK(length(batch_key) > 0),
     mention_kind TEXT NOT NULL CHECK(mention_kind IN ('entity_name','alias','claim_subject','claim_object')),
@@ -4542,7 +4543,8 @@ CREATE TABLE IF NOT EXISTS memory_entity_mentions (
     role TEXT NOT NULL CHECK(role IN ('user','assistant')),
     start_char INTEGER NOT NULL CHECK(start_char >= 0),
     end_char INTEGER NOT NULL CHECK(end_char > start_char),
-    content_sha256 TEXT NOT NULL CHECK(length(content_sha256) = 64 AND content_sha256 GLOB '[0-9a-f]*'),
+    content_sha256 TEXT NOT NULL CHECK(length(content_sha256) = 64
+        AND content_sha256 NOT GLOB '*[^0-9a-f]*'),
     created_at TEXT NOT NULL,
     UNIQUE(batch_key, mention_kind, source_record_id, entity_id, event_id, start_char, end_char),
     FOREIGN KEY(entity_id) REFERENCES memory_entities(entity_id)
@@ -4707,6 +4709,34 @@ mod tests {
     use crate::context::ContextAssembler;
     use crate::model::{ContextTrace, ModelRequestTrace, TokenUsage, Turn, TurnStatus, utc_now};
     use crate::store::SessionStore;
+
+    #[test]
+    fn mention_ddl_rejects_non_lowercase_ids_and_hashes() {
+        let root = tempfile::tempdir().unwrap();
+        let store = RetrievalStore::new(root.path()).unwrap();
+        let connection = store.open_connection().unwrap();
+        connection.execute(
+            "INSERT INTO memory_entities(entity_id,kind,canonical_name,normalized_name,disambiguation,
+             created_session_id,created_batch_key,created_event_id,created_start,created_end,created_hash,created_at,updated_at)
+             VALUES('ent_test','person','Test','test','resolved','s','b','e',0,1,?1,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+            ["a".repeat(64)],
+        ).unwrap();
+        let valid_id = format!("mention_{}", "a".repeat(64));
+        let valid_hash = "b".repeat(64);
+        for (id, hash) in [
+            (format!("mention_A{}", "a".repeat(63)), valid_hash.clone()),
+            (format!("mention_{}Z", "a".repeat(63)), valid_hash.clone()),
+            (format!("wrong___{}", "a".repeat(64)), valid_hash.clone()),
+            (valid_id.clone(), format!("{}G", "b".repeat(63))),
+            (valid_id.clone(), format!("{}C", "b".repeat(63))),
+        ] {
+            assert!(connection.execute(
+                "INSERT INTO memory_entity_mentions(mention_id,session_id,batch_key,mention_kind,source_record_id,entity_id,entity_status,event_id,sequence,role,start_char,end_char,content_sha256,created_at)
+                 VALUES(?1,'s','b','entity_name','source','ent_test','resolved','e',1,'user',0,1,?2,'2026-01-01T00:00:00Z')",
+                params![id, hash],
+            ).is_err());
+        }
+    }
 
     const OLD_MEMORY_V1_SCHEMA: &str = r#"
 CREATE TABLE consolidation_watermarks (
@@ -4949,7 +4979,7 @@ CREATE INDEX memory_boundary_suggestions_session_event
     }
 
     #[test]
-    fn v5_to_v6_preserves_leaf_vectors_and_replaces_trigger() {
+    fn v5_to_v7_preserves_leaf_vectors_and_replaces_trigger() {
         let root = tempfile::tempdir().unwrap();
         let store = SessionStore::new(root.path()).unwrap();
         let mut session = store
@@ -5055,7 +5085,7 @@ CREATE INDEX memory_boundary_suggestions_session_event
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            6
+            7
         );
         for table in [
             "memory_episode_boundaries",
@@ -7325,7 +7355,7 @@ CREATE INDEX memory_boundary_suggestions_session_event
                  );
                  INSERT INTO consolidation_batches VALUES
                      ('future-attempt', 'future-applied', '{\"future\":true}');
-                 PRAGMA user_version=7;",
+                 PRAGMA user_version=8;",
             )
             .unwrap();
         drop(connection);
@@ -7334,7 +7364,7 @@ CREATE INDEX memory_boundary_suggestions_session_event
         let store = RetrievalStore::new(root.path()).unwrap();
         assert!(matches!(
             store.rebuild(),
-            Err(RetrievalError::UnsupportedIndexVersion(7))
+            Err(RetrievalError::UnsupportedIndexVersion(8))
         ));
         assert!(index.is_file());
         assert_eq!(fs::read(&index).unwrap(), original_bytes);
@@ -7344,7 +7374,7 @@ CREATE INDEX memory_boundary_suggestions_session_event
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            7
+            8
         );
         assert_eq!(
             connection

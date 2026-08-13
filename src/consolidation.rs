@@ -8843,6 +8843,103 @@ mod tests {
         )
     }
 
+    #[test]
+    fn canonical_applied_request_rejects_every_contract_mutation() {
+        for mutation in ["model", "messages", "budget", "payload", "whitespace"] {
+            let root = tempfile::tempdir().unwrap();
+            let (store, mut session) = new_session(root.path());
+            push_complete_at(&mut session, "hello", None, "2026-01-01T00:00:00Z");
+            let batch = next_batch(&store, &mut session);
+            let candidates = empty_candidates();
+            let output = StructuredConsolidationOutput {
+                entities: vec![],
+                claims: vec![],
+                boundaries: vec![],
+            };
+            let mut attempt = applied_attempt(&batch, &candidates, &output);
+            match mutation {
+                "model" => attempt.model = "other".into(),
+                "messages" => {
+                    let mut request: StructuredChatRequest =
+                        serde_json::from_str(&attempt.request_json).unwrap();
+                    request.messages.pop();
+                    attempt.request_json = serde_json::to_string(&request).unwrap();
+                }
+                "budget" => {
+                    let mut request: StructuredChatRequest =
+                        serde_json::from_str(&attempt.request_json).unwrap();
+                    request.num_ctx = 0;
+                    attempt.request_json = serde_json::to_string(&request).unwrap();
+                }
+                "payload" => {
+                    let mut request: StructuredChatRequest =
+                        serde_json::from_str(&attempt.request_json).unwrap();
+                    request.messages[1].content = "{\"batch\":{},\"candidate_snapshot\":{}}".into();
+                    attempt.request_json = serde_json::to_string(&request).unwrap();
+                }
+                "whitespace" => attempt.request_json = format!(" {}", attempt.request_json),
+                _ => unreachable!(),
+            }
+            attempt.request_sha256 = sha256_bytes(attempt.request_json.as_bytes());
+            assert!(matches!(
+                store
+                    .retrieval()
+                    .apply_consolidation_attempt(&batch, &candidates, &attempt),
+                Err(ConsolidationApplyError::Rejected { .. })
+            ));
+            assert!(
+                store
+                    .retrieval()
+                    .consolidation_attempts(&session.id)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn mention_ledger_audit_rejects_complete_tuple_tamper_and_deletion() {
+        let root = tempfile::tempdir().unwrap();
+        let (store, mut session) = new_session(root.path());
+        push_complete_at(&mut session, "Alice", None, "2026-01-01T00:00:00Z");
+        let batch = next_batch(&store, &mut session);
+        let candidates = empty_candidates();
+        let output = StructuredConsolidationOutput {
+            entities: vec![new_entity_output(
+                "local_alice",
+                "Alice",
+                full_quote(&batch.events[0]),
+            )],
+            claims: vec![],
+            boundaries: vec![],
+        };
+        apply_output(&store, &batch, &candidates, &output).unwrap();
+        let connection = Connection::open(store.retrieval().index_path()).unwrap();
+        connection
+            .execute(
+                "UPDATE memory_entity_mentions SET created_at='2026-01-01T00:00:02Z'",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        assert!(matches!(
+            store.retrieval().consolidation_candidates(1, 1),
+            Err(RetrievalError::CorruptIndex(_))
+        ));
+
+        let connection = Connection::open(store.retrieval().index_path()).unwrap();
+        assert!(
+            connection
+                .execute("UPDATE consolidation_batches SET model='tampered'", [])
+                .is_err()
+        );
+        assert!(
+            connection
+                .execute("DELETE FROM consolidation_batches", [])
+                .is_err()
+        );
+    }
+
     fn episode_memory_config() -> MemoryConfig {
         MemoryConfig {
             enabled: true,
