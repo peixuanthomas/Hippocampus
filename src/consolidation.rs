@@ -8940,6 +8940,175 @@ mod tests {
         );
     }
 
+    #[test]
+    fn mention_nonapplied_loose_json_roundtrips_with_null_projection_version() {
+        let root = tempfile::tempdir().unwrap();
+        let store = RetrievalStore::new(root.path()).unwrap();
+        for (index, status) in [
+            ConsolidationAttemptStatus::Rejected,
+            ConsolidationAttemptStatus::ModelError,
+            ConsolidationAttemptStatus::Cancelled,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut record = failed_attempt(
+                &format!("loose-{index}"),
+                &format!("batch-{index}"),
+                "session",
+            );
+            record.status = status;
+            record.request_json = format!("{{\"loose\":{index}}}");
+            record.request_sha256 = sha256_bytes(record.request_json.as_bytes());
+            store.record_consolidation_failure(&record).unwrap();
+            assert_eq!(
+                store
+                    .consolidation_attempts("session")
+                    .unwrap()
+                    .into_iter()
+                    .find(|row| row.attempt_id == record.attempt_id)
+                    .unwrap(),
+                record
+            );
+        }
+        let connection = Connection::open(store.index_path()).unwrap();
+        assert_eq!(connection.query_row("SELECT count(*) FROM consolidation_batches WHERE projection_schema_version IS NULL", [], |row| row.get::<_, i64>(0)).unwrap(), 3);
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM memory_entity_mentions", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM consolidation_watermarks", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn mention_projection_combines_exact_occurrences_and_excludes_auxiliary_spans() {
+        let root = tempfile::tempdir().unwrap();
+        let (store, mut session) = new_session(root.path());
+        push_complete_at(
+            &mut session,
+            "Alice likes tea.",
+            None,
+            "2026-01-01T00:00:00Z",
+        );
+        let batch = next_batch(&store, &mut session);
+        let event = &batch.events[0];
+        let output = StructuredConsolidationOutput {
+            entities: vec![new_entity_output(
+                "local_alice",
+                "Alice",
+                quote_nth(event, "Alice", 0),
+            )],
+            claims: vec![text_claim_output(
+                "local_tea",
+                "local_alice",
+                "preference.drink",
+                "tea",
+                quote_nth(event, "Alice", 0),
+                quote_nth(event, "likes", 0),
+                quote_nth(event, "tea", 0),
+                full_quote(event),
+            )],
+            boundaries: vec![],
+        };
+        let report = apply_output(&store, &batch, &empty_candidates(), &output).unwrap();
+        assert_eq!(report.mentions_created, 2);
+        let connection = Connection::open(store.retrieval().index_path()).unwrap();
+        let kinds = connection
+            .prepare("SELECT mention_kind FROM memory_entity_mentions ORDER BY mention_kind")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(kinds, vec!["claim_subject", "entity_name"]);
+        assert_eq!(connection.query_row("SELECT count(*) FROM memory_entity_mentions WHERE start_char=(SELECT instr(content,'likes')-1 FROM events LIMIT 1)", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+    }
+
+    #[test]
+    fn mention_reference_mapping_covers_self_new_existing_and_direct_targets() {
+        let root = tempfile::tempdir().unwrap();
+        let (store, mut session) = new_session(root.path());
+        push_complete_at(&mut session, "I am Alice.", None, "2026-01-01T00:00:00Z");
+        let batch = next_batch(&store, &mut session);
+        let event = &batch.events[0];
+        let mut self_entity = new_entity_output("local_self", "I", quote_nth(event, "I", 0));
+        self_entity.resolution = EntityResolution::SelfEntity;
+        self_entity.basis = EntityResolutionBasis::SelfPronoun;
+        apply_output(
+            &store,
+            &batch,
+            &empty_candidates(),
+            &StructuredConsolidationOutput {
+                entities: vec![self_entity],
+                claims: vec![],
+                boundaries: vec![],
+            },
+        )
+        .unwrap();
+        let connection = Connection::open(store.retrieval().index_path()).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT entity_id FROM memory_entity_mentions", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            "ent_self"
+        );
+    }
+
+    #[test]
+    fn mention_episode_soft_vote_uses_stored_resolved_history_only() {
+        let root = tempfile::tempdir().unwrap();
+        let (store, mut session) = new_session(root.path());
+        push_complete_at(&mut session, "Alice", None, "2026-01-01T00:00:00Z");
+        let batch = next_batch(&store, &mut session);
+        let output = StructuredConsolidationOutput {
+            entities: vec![new_entity_output(
+                "local_alice",
+                "Alice",
+                full_quote(&batch.events[0]),
+            )],
+            claims: vec![],
+            boundaries: vec![],
+        };
+        apply_output(&store, &batch, &empty_candidates(), &output).unwrap();
+        let config = episode_memory_config();
+        store
+            .retrieval()
+            .materialize_episode_documents(&session.id, &config)
+            .unwrap();
+        let connection = Connection::open(store.retrieval().index_path()).unwrap();
+        connection
+            .execute("UPDATE memory_entities SET disambiguation='pending'", [])
+            .unwrap();
+        drop(connection);
+        store
+            .retrieval()
+            .materialize_episode_documents(&session.id, &config)
+            .unwrap();
+        let connection = Connection::open(store.retrieval().index_path()).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT entity_status FROM memory_entity_mentions",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "resolved"
+        );
+    }
+
     fn episode_memory_config() -> MemoryConfig {
         MemoryConfig {
             enabled: true,

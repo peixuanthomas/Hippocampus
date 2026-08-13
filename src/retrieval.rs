@@ -4738,6 +4738,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn memory_state_v4_fresh_index_records_current_schema() {
+        let root = tempfile::tempdir().unwrap();
+        let store = RetrievalStore::new(root.path()).unwrap();
+        let connection = store.open_connection().unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            7
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT value FROM memory_schema_meta WHERE key='state_schema_version'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            4
+        );
+    }
+
     const OLD_MEMORY_V1_SCHEMA: &str = r#"
 CREATE TABLE consolidation_watermarks (
     session_id TEXT PRIMARY KEY,
