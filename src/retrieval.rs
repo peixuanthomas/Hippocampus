@@ -31,8 +31,8 @@ use crate::vector::{
 };
 
 pub const INDEX_FILENAME: &str = ".hippocampus-index.sqlite3";
-const INDEX_SCHEMA_VERSION: i64 = 6;
-const MEMORY_STATE_SCHEMA_VERSION: i64 = 3;
+const INDEX_SCHEMA_VERSION: i64 = 7;
+const MEMORY_STATE_SCHEMA_VERSION: i64 = 4;
 
 #[derive(Debug, Error)]
 pub enum RetrievalError {
@@ -1792,12 +1792,12 @@ impl RetrievalStore {
         let version = connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .map_err(|source| self.database_error(source))?;
-        if !matches!(version, 0 | 1 | 2 | 3 | 4 | 5 | INDEX_SCHEMA_VERSION) {
+        if !matches!(version, 0 | 1 | 2 | 3 | 4 | 5 | 6 | INDEX_SCHEMA_VERSION) {
             return Err(RetrievalError::UnsupportedIndexVersion(version));
         }
         let existing_memory_version = read_existing_memory_state_version(&connection)
             .map_err(|source| self.database_error(source))?;
-        if existing_memory_version.is_some_and(|value| !matches!(value, 1..=3)) {
+        if existing_memory_version.is_some_and(|value| !matches!(value, 1..=4)) {
             return Err(RetrievalError::UnsupportedMemoryStateVersion(
                 existing_memory_version.expect("checked as some"),
             ));
@@ -2086,19 +2086,16 @@ fn load_episode_snapshot(
 ) -> RetrievalResult<EpisodeSnapshot> {
     let watermark = load_validated_consolidation_watermark(transaction, session_id)?;
     let mut entities = HashMap::<String, std::collections::BTreeSet<String>>::new();
-    // Only resolved entities participate.  All rows below have already passed
-    // the consolidation ledger integrity audit in the same transaction.
-    for query in [
-        "SELECT e.created_event_id, e.entity_id FROM memory_entities e WHERE e.disambiguation='resolved'",
-        "SELECT a.event_id, e.entity_id FROM memory_entity_aliases a JOIN memory_entities e ON e.entity_id=a.entity_id WHERE e.disambiguation='resolved'",
-        "SELECT v.event_id, e.entity_id FROM memory_claim_evidence v JOIN memory_claims c ON c.claim_id=v.claim_id JOIN memory_entities e ON e.entity_id=c.subject_entity_id WHERE e.disambiguation='resolved'",
-        "SELECT v.event_id, e.entity_id FROM memory_claim_evidence v JOIN memory_claims c ON c.claim_id=v.claim_id JOIN memory_entities e ON e.entity_id=c.object_entity_id WHERE c.object_kind='entity' AND e.disambiguation='resolved'",
-    ] {
+    // Historical resolution is immutable: later entity promotion must never alter
+    // the entity set that was observed for an older episode input.
+    for query in ["SELECT event_id, entity_id FROM memory_entity_mentions
+         WHERE session_id=?1 AND entity_status='resolved' ORDER BY event_id, entity_id, mention_id"]
+    {
         let mut statement = transaction
             .prepare(query)
             .map_err(|error| RetrievalError::CorruptIndex(format!("读取实体证据失败：{error}")))?;
         let rows = statement
-            .query_map([], |row| {
+            .query_map([session_id], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })
             .map_err(|error| RetrievalError::CorruptIndex(format!("读取实体证据失败：{error}")))?;
@@ -3030,7 +3027,7 @@ fn load_validated_consolidation_watermark(
         let applied_batches = connection
             .query_row(
                 "SELECT count(*) FROM consolidation_batches
-                 WHERE session_id=?1 AND status='applied'",
+                 WHERE session_id=?1 AND status='applied' AND projection_schema_version=4",
                 [session_id],
                 |row| row.get::<_, i64>(0),
             )
@@ -3127,6 +3124,7 @@ fn load_validated_consolidation_watermark(
         .prepare(
             "SELECT through_sequence, input_event_ids, input_event_hashes, completed_at
              FROM consolidation_batches WHERE session_id=?1 AND status='applied'
+               AND projection_schema_version=4
              ORDER BY through_sequence DESC, attempt_id",
         )
         .and_then(|mut statement| {
@@ -4101,12 +4099,23 @@ fn prepare_memory_state_schema(
     connection: &Connection,
     existing_version: Option<i64>,
 ) -> rusqlite::Result<()> {
+    if !table_has_column(
+        connection,
+        "consolidation_batches",
+        "projection_schema_version",
+    )? {
+        connection.execute_batch(
+            "ALTER TABLE consolidation_batches ADD COLUMN projection_schema_version INTEGER
+             CHECK(projection_schema_version IS NULL OR projection_schema_version = 4);",
+        )?;
+    }
     if existing_version != Some(MEMORY_STATE_SCHEMA_VERSION) {
         // Pre-v3 rows use different deterministic-ID, evidence, or transition-order contracts.
         // They cannot be upgraded row by row without trusting the old derived state, so discard
         // only the replayable projection and retain raw events plus the immutable attempt ledger.
         connection.execute_batch(
-            "DELETE FROM memory_episode_boundaries;
+            "DELETE FROM memory_entity_mentions;
+             DELETE FROM memory_episode_boundaries;
              DELETE FROM memory_episode_materializations;
              DELETE FROM memory_claim_evidence;
              DELETE FROM memory_claim_transitions;
@@ -4414,6 +4423,7 @@ CREATE TABLE IF NOT EXISTS consolidation_batches (
     completed_at TEXT NOT NULL,
     validation_json TEXT,
     error_json TEXT,
+    projection_schema_version INTEGER CHECK(projection_schema_version IS NULL OR projection_schema_version = 4),
     CHECK(from_sequence <= through_sequence),
     CHECK((response_json IS NULL AND response_sha256 IS NULL)
        OR (response_json IS NOT NULL AND response_sha256 IS NOT NULL))
@@ -4422,6 +4432,12 @@ CREATE INDEX IF NOT EXISTS consolidation_batches_session_started
     ON consolidation_batches(session_id, started_at, attempt_id);
 CREATE INDEX IF NOT EXISTS consolidation_batches_batch_key
     ON consolidation_batches(batch_key);
+CREATE TRIGGER IF NOT EXISTS consolidation_batches_immutable_update
+BEFORE UPDATE ON consolidation_batches
+BEGIN SELECT RAISE(ABORT, 'consolidation_batches is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS consolidation_batches_immutable_delete
+BEFORE DELETE ON consolidation_batches
+BEGIN SELECT RAISE(ABORT, 'consolidation_batches is immutable'); END;
 
 CREATE TABLE IF NOT EXISTS memory_schema_meta (
     key TEXT PRIMARY KEY,
@@ -4445,6 +4461,31 @@ CREATE TABLE IF NOT EXISTS memory_entities (
 );
 CREATE INDEX IF NOT EXISTS memory_entities_normalized
     ON memory_entities(normalized_name, kind, entity_id);
+
+CREATE TABLE IF NOT EXISTS memory_entity_mentions (
+    mention_id TEXT PRIMARY KEY CHECK(mention_id GLOB 'mention_[0-9a-f]*' AND length(mention_id) = 72),
+    session_id TEXT NOT NULL CHECK(length(session_id) > 0),
+    batch_key TEXT NOT NULL CHECK(length(batch_key) > 0),
+    mention_kind TEXT NOT NULL CHECK(mention_kind IN ('entity_name','alias','claim_subject','claim_object')),
+    source_record_id TEXT NOT NULL CHECK(length(source_record_id) > 0),
+    entity_id TEXT NOT NULL CHECK(length(entity_id) > 0),
+    entity_status TEXT NOT NULL CHECK(entity_status IN ('resolved','pending')),
+    event_id TEXT NOT NULL CHECK(length(event_id) > 0),
+    sequence INTEGER NOT NULL CHECK(sequence >= 0),
+    role TEXT NOT NULL CHECK(role IN ('user','assistant')),
+    start_char INTEGER NOT NULL CHECK(start_char >= 0),
+    end_char INTEGER NOT NULL CHECK(end_char > start_char),
+    content_sha256 TEXT NOT NULL CHECK(length(content_sha256) = 64 AND content_sha256 GLOB '[0-9a-f]*'),
+    created_at TEXT NOT NULL,
+    UNIQUE(batch_key, mention_kind, source_record_id, entity_id, event_id, start_char, end_char),
+    FOREIGN KEY(entity_id) REFERENCES memory_entities(entity_id)
+);
+CREATE INDEX IF NOT EXISTS memory_entity_mentions_session_event_status_entity
+    ON memory_entity_mentions(session_id, event_id, entity_status, entity_id, mention_id);
+CREATE INDEX IF NOT EXISTS memory_entity_mentions_entity_status_session_event
+    ON memory_entity_mentions(entity_id, entity_status, session_id, event_id, mention_id);
+CREATE INDEX IF NOT EXISTS memory_entity_mentions_batch
+    ON memory_entity_mentions(batch_key, mention_id);
 
 CREATE TABLE IF NOT EXISTS memory_entity_aliases (
     alias_id TEXT PRIMARY KEY,
@@ -4594,7 +4635,7 @@ mod tests {
         ConsolidationClaimEvidence, ConsolidationClaimObjectKind, ConsolidationEvent,
         ConsolidationEvidenceKind, ConsolidationQuote, EntityAliasOutput, EntityDisambiguation,
         EntityResolution, EntityResolutionBasis, MemoryAliasKind, MemoryEntityKind,
-        StructuredConsolidationOutput,
+        StructuredConsolidationOutput, canonical_consolidation_request,
     };
     use crate::context::ContextAssembler;
     use crate::model::{ContextTrace, ModelRequestTrace, TokenUsage, Turn, TurnStatus, utc_now};
@@ -6594,7 +6635,17 @@ CREATE INDEX memory_boundary_suggestions_session_event
         let candidates = store.retrieval().consolidation_candidates(1, 1).unwrap();
         assert!(candidates.entities.is_empty());
         assert!(candidates.claims.is_empty());
-        let request_json = serde_json::json!({ "batch_key": batch.batch_key }).to_string();
+        let request_json = serde_json::to_string(
+            &canonical_consolidation_request(
+                "fixture-model".into(),
+                &batch,
+                &candidates,
+                4096,
+                1024,
+            )
+            .unwrap(),
+        )
+        .unwrap();
         let response_json = serde_json::to_string(&output).unwrap();
         let started_at = batch.events.last().unwrap().created_at.clone();
         let completed_at = (DateTime::parse_from_rfc3339(&started_at).unwrap()
@@ -8426,7 +8477,7 @@ CREATE INDEX memory_boundary_suggestions_session_event
                     |row| row.get::<_, i64>(0),
                 )
                 .unwrap(),
-            3
+            4
         );
         assert_eq!(
             (
@@ -8511,7 +8562,7 @@ CREATE INDEX memory_boundary_suggestions_session_event
                     |row| row.get::<_, i64>(0),
                 )
                 .unwrap(),
-            3
+            4
         );
         assert!(table_has_column(&connection, "memory_claims", "normalized_relation").unwrap());
         assert!(
@@ -8586,7 +8637,7 @@ CREATE INDEX memory_boundary_suggestions_session_event
                     |row| row.get::<_, i64>(0),
                 )
                 .unwrap(),
-            3
+            4
         );
         assert!(table_has_column(&connection, "memory_claim_transitions", "ordinal").unwrap());
         assert_eq!(
