@@ -8142,9 +8142,12 @@ mod tests {
             report
         );
     }
+    use crate::config::MemoryConfig;
+    use crate::episode::EpisodeSignalState;
     use crate::model::{EventRole, Session, Turn, TurnStatus, content_sha256, utc_now};
     use crate::retrieval::INDEX_FILENAME;
     use crate::store::SessionStore;
+    use crate::vector::{EmbeddingWrite, VectorIndexSpec};
 
     fn new_session(root: &std::path::Path) -> (SessionStore, Session) {
         let store = SessionStore::new(root).unwrap();
@@ -8461,6 +8464,25 @@ mod tests {
             candidates,
             &applied_attempt(batch, output),
         )
+    }
+
+    fn episode_memory_config() -> MemoryConfig {
+        MemoryConfig {
+            enabled: true,
+            embedding_dimensions: 32,
+            episode_gap_minutes: 30,
+            ..MemoryConfig::default()
+        }
+    }
+
+    fn materialize_episodes(
+        store: &SessionStore,
+        session_id: &str,
+    ) -> RetrievalResult<crate::episode::EpisodeMaterializationReport> {
+        let memory = episode_memory_config();
+        store
+            .retrieval()
+            .materialize_episode_documents(session_id, &memory)
     }
 
     #[test]
@@ -8962,15 +8984,495 @@ mod tests {
 
     #[test]
     fn episode_signal_pending_entities_do_not_enter_resolved_projection() {
-        assert_eq!(EntityDisambiguation::Pending.as_str(), "pending");
-        assert_eq!(EntityDisambiguation::Resolved.as_str(), "resolved");
+        let root = tempfile::tempdir().unwrap();
+        let (store, mut session) = new_session(root.path());
+        push_complete_at(
+            &mut session,
+            "Alice opened the project.",
+            Some("Noted."),
+            "2026-01-01T00:00:00Z",
+        );
+        push_complete_at(
+            &mut session,
+            "He joined the project.",
+            Some("Noted."),
+            "2026-01-01T00:01:00Z",
+        );
+        let batch = next_batch(&store, &mut session);
+        let alice_event = batch
+            .events
+            .iter()
+            .find(|event| event.content == "Alice opened the project.")
+            .unwrap();
+        let bob_event = batch
+            .events
+            .iter()
+            .find(|event| event.content == "He joined the project.")
+            .unwrap();
+        let mut pending_bob = new_entity_output("local_bob", "He", quote_nth(bob_event, "He", 0));
+        pending_bob.basis = EntityResolutionBasis::Ambiguous;
+        pending_bob.disambiguation = EntityDisambiguation::Pending;
+        apply_output(
+            &store,
+            &batch,
+            &empty_candidates(),
+            &StructuredConsolidationOutput {
+                entities: vec![
+                    new_entity_output("local_alice", "Alice", quote_nth(alice_event, "Alice", 0)),
+                    pending_bob,
+                ],
+                claims: Vec::new(),
+                boundaries: Vec::new(),
+            },
+        )
+        .unwrap();
+        let source_path = store.root().join(format!("{}.json", session.id));
+        let raw_before = fs::read(&source_path).unwrap();
+
+        let report = materialize_episodes(&store, &session.id).unwrap();
+        assert_eq!(fs::read(&source_path).unwrap(), raw_before);
+        let bob_decision = report
+            .boundary_decisions
+            .iter()
+            .find(|decision| decision.before_event_id == bob_event.event_id)
+            .unwrap();
+        assert_eq!(
+            bob_decision
+                .soft_signals
+                .iter()
+                .find(|signal| signal.name == "entity_jaccard_distance")
+                .unwrap()
+                .state,
+            EpisodeSignalState::Abstain,
+            "a pending pronoun must not be projected as a resolved entity for the second user event"
+        );
+        let connection = Connection::open(store.retrieval().index_path()).unwrap();
+        let decision_json: String = connection
+            .query_row(
+                "SELECT decision_json FROM memory_episode_boundaries
+                 WHERE session_id=?1 AND before_event_id=?2",
+                params![session.id, bob_event.event_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let persisted: crate::episode::EpisodeBoundaryDecision =
+            serde_json::from_str(&decision_json).unwrap();
+        assert_eq!(persisted, *bob_decision);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT disambiguation FROM memory_entities WHERE canonical_name='He'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "pending"
+        );
     }
 
     #[test]
     fn episode_signal_watermark_absence_is_distinct_from_covered_sequence() {
-        let absent = None::<usize>;
-        let covered = Some(3_usize);
-        assert_ne!(absent, covered);
+        let add_first_turn = |session: &mut Session| {
+            push_complete_at(
+                session,
+                "Alice opened the project.",
+                Some("Noted."),
+                "2026-01-01T00:00:00Z",
+            );
+        };
+        let add_second_turn = |session: &mut Session| {
+            push_complete_at(
+                session,
+                "The budget is now separate.",
+                Some("Noted."),
+                "2026-01-01T00:01:00Z",
+            );
+        };
+        let make_session = |root: &std::path::Path| {
+            let (store, mut session) = new_session(root);
+            add_first_turn(&mut session);
+            add_second_turn(&mut session);
+            (store, session)
+        };
+
+        let absent_root = tempfile::tempdir().unwrap();
+        let (absent_store, mut absent_session) = make_session(absent_root.path());
+        absent_store.save(&mut absent_session).unwrap();
+        let absent = materialize_episodes(&absent_store, &absent_session.id).unwrap();
+
+        let covered_root = tempfile::tempdir().unwrap();
+        let (covered_store, mut covered_session) = new_session(covered_root.path());
+        add_first_turn(&mut covered_session);
+        let batch = next_batch(&covered_store, &mut covered_session);
+        apply_output(
+            &covered_store,
+            &batch,
+            &empty_candidates(),
+            &StructuredConsolidationOutput {
+                entities: Vec::new(),
+                claims: Vec::new(),
+                boundaries: Vec::new(),
+            },
+        )
+        .unwrap();
+        add_second_turn(&mut covered_session);
+        covered_store.save(&mut covered_session).unwrap();
+        let covered = materialize_episodes(&covered_store, &covered_session.id).unwrap();
+
+        assert_ne!(absent.plan_input_sha256, covered.plan_input_sha256);
+        let absent_first = absent.boundary_decisions.first().unwrap();
+        let covered_first = covered.boundary_decisions.first().unwrap();
+        let covered_second = covered.boundary_decisions.last().unwrap();
+        assert_eq!(
+            absent_first
+                .soft_signals
+                .iter()
+                .find(|signal| signal.name == "model_topic_shift")
+                .unwrap()
+                .state,
+            EpisodeSignalState::Abstain
+        );
+        assert_eq!(
+            covered_first
+                .soft_signals
+                .iter()
+                .find(|signal| signal.name == "model_topic_shift")
+                .unwrap()
+                .state,
+            EpisodeSignalState::False
+        );
+        assert_eq!(
+            covered_second
+                .soft_signals
+                .iter()
+                .find(|signal| signal.name == "model_topic_shift")
+                .unwrap()
+                .state,
+            EpisodeSignalState::Abstain,
+            "the consolidation-derived model signal must not apply beyond the real watermark"
+        );
+        assert_eq!(
+            covered_store
+                .retrieval()
+                .consolidation_watermark(&covered_session.id)
+                .unwrap()
+                .through_sequence,
+            batch.through_sequence
+        );
+    }
+
+    #[test]
+    fn episode_materialization_rejects_coherent_boundary_outside_its_applied_batch() {
+        let root = tempfile::tempdir().unwrap();
+        let (store, mut session) = new_session(root.path());
+        push_complete_at(
+            &mut session,
+            "Change topic: Alice arrived.",
+            Some("Noted."),
+            "2026-01-01T00:00:00Z",
+        );
+        push_turn(
+            &mut session,
+            "Hold this for later.",
+            TurnStatus::Pending,
+            None,
+        );
+        let batch = next_batch(&store, &mut session);
+        let in_batch = batch
+            .events
+            .iter()
+            .find(|event| event.role == EventRole::User)
+            .unwrap();
+        apply_output(
+            &store,
+            &batch,
+            &empty_candidates(),
+            &StructuredConsolidationOutput {
+                entities: Vec::new(),
+                claims: Vec::new(),
+                boundaries: vec![ConsolidationBoundaryOutput {
+                    before_event_id: in_batch.event_id.clone(),
+                    reason: BoundarySuggestionReason::ExplicitTopicTransition,
+                    evidence: vec![quote_nth(in_batch, "Change topic", 0)],
+                }],
+            },
+        )
+        .unwrap();
+        materialize_episodes(&store, &session.id).unwrap();
+        let source_path = store.root().join(format!("{}.json", session.id));
+        let raw_before = fs::read(&source_path).unwrap();
+        let connection = Connection::open(store.retrieval().index_path()).unwrap();
+        let materialization_before: (i64, Option<String>) = connection
+            .query_row(
+                "SELECT count(*), group_concat(plan_input_sha256, '|')
+                 FROM memory_episode_materializations WHERE session_id=?1",
+                [&session.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let aggregates_before: (i64, Option<String>) = connection
+            .query_row(
+                "SELECT count(*), group_concat(document_id || ':' || source_sha256, '|')
+                 FROM memory_documents
+                 WHERE session_id=?1 AND granularity IN ('episode', 'session')",
+                [&session.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let (outside_event_id, outside_hash): (String, String) = connection
+            .query_row(
+                "SELECT event_id, content_sha256 FROM events
+                 WHERE session_id=?1 AND content='Hold this for later.'",
+                [&session.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let evidence_json = serde_json::to_string(&vec![ConsolidationQuote {
+            event_id: outside_event_id.clone(),
+            start_char: 0,
+            end_char: "Hold this for later.".chars().count(),
+            content_sha256: outside_hash,
+        }])
+        .unwrap();
+        let reason = BoundarySuggestionReason::ExplicitTopicTransition.as_str();
+        let boundary_id = deterministic_id(
+            "boundary",
+            &[
+                &session.id,
+                &batch.batch_key,
+                &outside_event_id,
+                reason,
+                &evidence_json,
+            ],
+        );
+        connection
+            .execute(
+                "UPDATE memory_boundary_suggestions
+                 SET boundary_id=?1, before_event_id=?2, evidence_json=?3",
+                params![boundary_id, outside_event_id, evidence_json],
+            )
+            .unwrap();
+        drop(connection);
+
+        assert!(matches!(
+            materialize_episodes(&store, &session.id),
+            Err(RetrievalError::CorruptIndex(_))
+        ));
+        assert_eq!(fs::read(&source_path).unwrap(), raw_before);
+        let connection = Connection::open(store.retrieval().index_path()).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*), group_concat(plan_input_sha256, '|')
+                     FROM memory_episode_materializations WHERE session_id=?1",
+                    [&session.id],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+                )
+                .unwrap(),
+            materialization_before
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*), group_concat(document_id || ':' || source_sha256, '|')
+                     FROM memory_documents
+                     WHERE session_id=?1 AND granularity IN ('episode', 'session')",
+                    [&session.id],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+                )
+                .unwrap(),
+            aggregates_before
+        );
+    }
+
+    #[test]
+    fn successful_consolidation_invalidates_episode_freshness_and_aggregate_embeddings() {
+        let root = tempfile::tempdir().unwrap();
+        let (store, mut session) = new_session(root.path());
+        push_complete_at(
+            &mut session,
+            "Alice opened the project.",
+            Some("I recorded the project opening."),
+            "2026-01-01T00:00:00Z",
+        );
+        push_complete_at(
+            &mut session,
+            "The project budget is ten dollars.",
+            Some("I recorded the budget."),
+            "2026-01-01T00:01:00Z",
+        );
+        store.save(&mut session).unwrap();
+        let memory = episode_memory_config();
+        let spec = VectorIndexSpec::from_config(&memory).unwrap();
+        let initial = materialize_episodes(&store, &session.id).unwrap();
+        let connection = Connection::open(store.retrieval().index_path()).unwrap();
+        let leaf_writes = connection
+            .prepare(
+                "SELECT document_id, source_sha256 FROM memory_documents
+                 WHERE session_id=?1 AND granularity='message' ORDER BY document_id",
+            )
+            .unwrap()
+            .query_map([&session.id], |row| {
+                Ok(EmbeddingWrite {
+                    document_id: row.get(0)?,
+                    expected_source_sha256: row.get(1)?,
+                    vector: vec![1.0; 32],
+                })
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            leaf_writes.len(),
+            4,
+            "all complete user/assistant messages are leaves"
+        );
+        drop(connection);
+        store
+            .retrieval()
+            .upsert_embeddings(&spec, &leaf_writes)
+            .unwrap();
+        assert_eq!(
+            Connection::open(store.retrieval().index_path())
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM memory_episode_materializations WHERE session_id=?1",
+                    [&session.id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0,
+            "writing leaves invalidates episode freshness before aggregate publication"
+        );
+        let rematerialized = materialize_episodes(&store, &session.id).unwrap();
+        assert_ne!(initial.plan_input_sha256, "");
+        assert_ne!(rematerialized.plan_input_sha256, "");
+        let connection = Connection::open(store.retrieval().index_path()).unwrap();
+        let aggregate_writes = connection
+            .prepare(
+                "SELECT document_id, source_sha256 FROM memory_documents
+                 WHERE session_id=?1 AND granularity IN ('episode', 'session')
+                 ORDER BY document_id",
+            )
+            .unwrap()
+            .query_map([&session.id], |row| {
+                Ok(EmbeddingWrite {
+                    document_id: row.get(0)?,
+                    expected_source_sha256: row.get(1)?,
+                    vector: vec![0.5; 32],
+                })
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(!aggregate_writes.is_empty());
+        drop(connection);
+        store
+            .retrieval()
+            .upsert_embeddings(&spec, &aggregate_writes)
+            .unwrap();
+        let compatible_before = store.retrieval().compatible_embeddings(&spec).unwrap();
+        assert!(compatible_before.iter().any(|embedding| {
+            embedding.session_id == session.id
+                && embedding.granularity == crate::model::RetrievalDocumentGranularity::Message
+        }));
+        assert!(compatible_before.iter().any(|embedding| {
+            embedding.session_id == session.id
+                && matches!(
+                    embedding.granularity,
+                    crate::model::RetrievalDocumentGranularity::Episode
+                        | crate::model::RetrievalDocumentGranularity::Session
+                )
+        }));
+        assert_eq!(
+            Connection::open(store.retrieval().index_path())
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM memory_episode_materializations WHERE session_id=?1",
+                    [&session.id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1,
+            "episode freshness metadata exists before the successful consolidation"
+        );
+        let source_path = store.root().join(format!("{}.json", session.id));
+        let raw_before = fs::read(&source_path).unwrap();
+        let batch = store
+            .retrieval()
+            .next_consolidation_batch(&session.id)
+            .unwrap()
+            .unwrap();
+        let candidates = store
+            .retrieval()
+            .consolidation_candidates(512, 512)
+            .unwrap();
+        let applied = apply_output(
+            &store,
+            &batch,
+            &candidates,
+            &StructuredConsolidationOutput {
+                entities: Vec::new(),
+                claims: Vec::new(),
+                boundaries: Vec::new(),
+            },
+        )
+        .unwrap();
+        assert_eq!(applied.watermark_after, batch.through_sequence);
+        assert_eq!(fs::read(&source_path).unwrap(), raw_before);
+        assert_eq!(
+            store
+                .retrieval()
+                .consolidation_watermark(&session.id)
+                .unwrap()
+                .through_sequence,
+            batch.through_sequence
+        );
+        assert!(
+            store
+                .retrieval()
+                .consolidation_attempts(&session.id)
+                .unwrap()
+                .iter()
+                .any(|attempt| attempt.status == ConsolidationAttemptStatus::Applied)
+        );
+        let connection = Connection::open(store.retrieval().index_path()).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM memory_episode_materializations WHERE session_id=?1",
+                    [&session.id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM memory_embeddings e
+                     JOIN memory_documents d ON d.document_id=e.document_id
+                     WHERE d.session_id=?1 AND d.granularity IN ('episode', 'session')",
+                    [&session.id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM memory_embeddings e
+                     JOIN memory_documents d ON d.document_id=e.document_id
+                     WHERE d.session_id=?1 AND d.granularity='message'",
+                    [&session.id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            i64::try_from(leaf_writes.len()).unwrap()
+        );
+        drop(connection);
+        assert!(materialize_episodes(&store, &session.id).is_ok());
     }
 
     #[test]
