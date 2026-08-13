@@ -980,6 +980,12 @@ impl RetrievalStore {
             .map_err(|e| self.database_error(e))?;
         insert_attempt(&transaction, attempt).map_err(|e| self.database_error(e))?;
         compare_and_swap_watermark(&transaction, batch, &attempt.completed_at)?;
+        transaction
+            .execute(
+                "DELETE FROM memory_episode_materializations WHERE session_id=?1",
+                [&batch.session_id],
+            )
+            .map_err(|e| self.database_error(e))?;
         validate_full_derived_integrity(&transaction)
             .map_err(ConsolidationApplyError::Retrieval)?;
         verify_indexed_source_file(self, &transaction, &batch.session_id)
@@ -1478,7 +1484,7 @@ fn candidate_database_error(source: rusqlite::Error) -> RetrievalError {
     RetrievalError::CorruptIndex(format!("无法读取巩固候选：{source}"))
 }
 
-fn validate_full_derived_integrity(connection: &Connection) -> RetrievalResult<()> {
+pub(crate) fn validate_full_derived_integrity(connection: &Connection) -> RetrievalResult<()> {
     for (query, label) in [
         (
             "SELECT a.alias_id FROM memory_entity_aliases a

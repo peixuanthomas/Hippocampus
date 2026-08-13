@@ -10,6 +10,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::config::MemoryConfig;
+use crate::consolidation::validate_full_derived_integrity;
+use crate::episode::{
+    EpisodeBoundarySuggestion, EpisodeDocument, EpisodeInputMessage, EpisodeMaterializationReport,
+    EpisodeMember, EpisodePlanInput, plan_episodes, session_document_id,
+};
 use crate::knowledge::{KnowledgeStore, KnowledgeTrace};
 use crate::model::{
     ChatMessage, ContextItemTrace, EventRole, EvidenceKind, ModelRequestTrace, ProvenanceQuality,
@@ -23,7 +29,7 @@ use crate::vector::{
 };
 
 pub const INDEX_FILENAME: &str = ".hippocampus-index.sqlite3";
-const INDEX_SCHEMA_VERSION: i64 = 5;
+const INDEX_SCHEMA_VERSION: i64 = 6;
 const MEMORY_STATE_SCHEMA_VERSION: i64 = 3;
 
 #[derive(Debug, Error)]
@@ -400,6 +406,7 @@ impl RetrievalStore {
             .map_err(|error| self.database_error(error))?;
         let mut document_ids = HashSet::with_capacity(writes.len());
         let mut prepared = Vec::with_capacity(writes.len());
+        let mut leaf_sessions = HashSet::new();
         for write in writes {
             if !document_ids.insert(write.document_id.as_str()) {
                 return Err(RetrievalError::CorruptIndex(format!(
@@ -421,11 +428,11 @@ impl RetrievalStore {
             }
             let bytes = encode_f32_le(&write.vector)
                 .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
-            let current_hash = transaction
+            let (current_hash, session_id, granularity) = transaction
                 .query_row(
-                    "SELECT source_sha256 FROM memory_documents WHERE document_id=?1",
+                    "SELECT source_sha256, session_id, granularity FROM memory_documents WHERE document_id=?1",
                     [&write.document_id],
-                    |row| row.get::<_, String>(0),
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
                 )
                 .optional()
                 .map_err(|error| self.database_error(error))?
@@ -437,6 +444,9 @@ impl RetrievalStore {
                     "文档 {} 的源哈希已变化",
                     write.document_id
                 )));
+            }
+            if matches!(granularity.as_str(), "message" | "fragment") {
+                leaf_sessions.insert(session_id);
             }
             prepared.push((&write.document_id, &write.expected_source_sha256, bytes));
         }
@@ -467,6 +477,14 @@ impl RetrievalStore {
                 )
                 .map_err(|error| self.database_error(error))?;
         }
+        for session_id in leaf_sessions {
+            transaction
+                .execute(
+                    "DELETE FROM memory_episode_materializations WHERE session_id=?1",
+                    [session_id],
+                )
+                .map_err(|error| self.database_error(error))?;
+        }
         transaction
             .commit()
             .map_err(|error| self.database_error(error))?;
@@ -489,8 +507,12 @@ impl RetrievalStore {
                 "SELECT d.document_id, d.session_id, d.granularity, d.source_sha256,
                         e.model, e.dimensions, e.index_fingerprint, e.vector_blob, e.embedded_at
                  FROM memory_documents d JOIN memory_embeddings e ON e.document_id=d.document_id
+                 JOIN indexed_sessions s ON s.session_id=d.session_id
+                 LEFT JOIN memory_episode_materializations m ON m.session_id=d.session_id
                  WHERE e.model=?1 AND e.dimensions=?2 AND e.source_sha256=d.source_sha256
                    AND e.index_fingerprint=?3
+                   AND (d.granularity IN ('message', 'fragment') OR
+                        (m.source_session_sha256=s.source_sha256 AND m.vector_index_fingerprint=?3))
                  ORDER BY d.document_id ASC",
             )
             .map_err(|error| self.database_error(error))?;
@@ -571,8 +593,12 @@ impl RetrievalStore {
             .query_row(
                 "SELECT count(*) FROM memory_documents d
                  JOIN memory_embeddings e ON e.document_id=d.document_id
+                 JOIN indexed_sessions s ON s.session_id=d.session_id
+                 LEFT JOIN memory_episode_materializations m ON m.session_id=d.session_id
                  WHERE e.model=?1 AND e.dimensions=?2 AND e.source_sha256=d.source_sha256
-                   AND e.index_fingerprint=?3",
+                   AND e.index_fingerprint=?3
+                   AND (d.granularity IN ('message', 'fragment') OR
+                        (m.source_session_sha256=s.source_sha256 AND m.vector_index_fingerprint=?3))",
                 params![
                     spec.model,
                     usize_to_i64(spec.dimensions).map_err(|error| self.database_error(error))?,
@@ -586,6 +612,54 @@ impl RetrievalStore {
             compatible,
             stale: total.saturating_sub(compatible),
         })
+    }
+
+    /// Rebuild the session's aggregate provenance catalog without generating
+    /// text or calling a model.  Existing aggregate vectors are retained but
+    /// become incompatible when their source hash no longer matches.
+    pub fn materialize_episode_documents(
+        &self,
+        session_id: &str,
+        config: &MemoryConfig,
+    ) -> RetrievalResult<EpisodeMaterializationReport> {
+        config
+            .validate()
+            .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+        let spec = VectorIndexSpec::from_config(config)
+            .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+        let fingerprint = spec
+            .fingerprint()
+            .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+        let _guard = self.acquire_root_write()?;
+        let mut connection = self.open_connection()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| self.database_error(error))?;
+        let session = self.get_session_from_connection(&transaction, session_id)?;
+        self.verify_fresh(&session)?;
+        validate_full_derived_integrity(&transaction)?;
+        let (messages, watermark, suggestions, ledger_snapshot_sha256) =
+            load_episode_snapshot(&transaction, session_id, &spec, &fingerprint)?;
+        let plan = plan_episodes(&EpisodePlanInput {
+            session_id: session_id.to_owned(),
+            source_session_sha256: session.source_sha256.clone(),
+            gap_minutes: config.episode_gap_minutes,
+            consolidation_watermark: watermark,
+            messages,
+            suggestions,
+        })
+        .map_err(RetrievalError::CorruptIndex)?;
+        persist_episode_plan(
+            &transaction,
+            &plan,
+            ledger_snapshot_sha256,
+            &fingerprint,
+            config,
+        )?;
+        transaction
+            .commit()
+            .map_err(|error| self.database_error(error))?;
+        Ok(plan)
     }
 
     pub(crate) fn acquire_root_read(&self) -> RetrievalResult<RwLockReadGuard<'_, ()>> {
@@ -1132,6 +1206,12 @@ impl RetrievalStore {
                 ],
             )
             .map_err(|error| self.database_error(error))?;
+        transaction
+            .execute(
+                "DELETE FROM memory_episode_materializations WHERE session_id=?1",
+                [&source.session.id],
+            )
+            .map_err(|error| self.database_error(error))?;
 
         let events = derive_events(&source.session);
         let event_by_id = events
@@ -1417,7 +1497,7 @@ impl RetrievalStore {
         let version = connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .map_err(|source| self.database_error(source))?;
-        if !matches!(version, 0 | 1 | 2 | 3 | 4 | INDEX_SCHEMA_VERSION) {
+        if !matches!(version, 0 | 1 | 2 | 3 | 4 | 5 | INDEX_SCHEMA_VERSION) {
             return Err(RetrievalError::UnsupportedIndexVersion(version));
         }
         let existing_memory_version = read_existing_memory_state_version(&connection)
@@ -1490,10 +1570,17 @@ impl RetrievalStore {
                 .pragma_update(None, "user_version", INDEX_SCHEMA_VERSION)
                 .map_err(|e| self.database_error(e))?;
             transaction.commit().map_err(|e| self.database_error(e))?;
-        } else if matches!(version, 0 | 3 | 4) {
+        } else if matches!(version, 0 | 3 | 4 | 5) {
             let transaction = connection
                 .transaction()
                 .map_err(|e| self.database_error(e))?;
+            if version == 5 {
+                transaction
+                    .execute_batch(
+                        "DROP TRIGGER IF EXISTS memory_documents_before_source_span_delete;",
+                    )
+                    .map_err(|e| self.database_error(e))?;
+            }
             transaction
                 .execute_batch(SCHEMA_SQL)
                 .map_err(|e| self.database_error(e))?;
@@ -1687,6 +1774,324 @@ fn insert_memory_document(
         ],
     )?;
     Ok(())
+}
+
+type EpisodeSnapshot = (
+    Vec<EpisodeInputMessage>,
+    Option<u64>,
+    Vec<EpisodeBoundarySuggestion>,
+    String,
+);
+
+fn load_episode_snapshot(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    spec: &VectorIndexSpec,
+    fingerprint: &str,
+) -> RetrievalResult<EpisodeSnapshot> {
+    let watermark = transaction
+        .query_row(
+            "SELECT through_sequence FROM consolidation_watermarks WHERE session_id=?1",
+            [session_id],
+            |row| i64_to_u64(row.get(0)?),
+        )
+        .optional()
+        .map_err(|error| RetrievalError::CorruptIndex(format!("读取巩固水位失败：{error}")))?;
+    let mut entities = HashMap::<String, std::collections::BTreeSet<String>>::new();
+    // Only resolved entities participate.  All rows below have already passed
+    // the consolidation ledger integrity audit in the same transaction.
+    for query in [
+        "SELECT e.created_event_id, e.entity_id FROM memory_entities e WHERE e.disambiguation='resolved'",
+        "SELECT a.event_id, e.entity_id FROM memory_entity_aliases a JOIN memory_entities e ON e.entity_id=a.entity_id WHERE e.disambiguation='resolved'",
+        "SELECT v.event_id, e.entity_id FROM memory_claim_evidence v JOIN memory_claims c ON c.claim_id=v.claim_id JOIN memory_entities e ON e.entity_id=c.subject_entity_id WHERE e.disambiguation='resolved'",
+        "SELECT v.event_id, e.entity_id FROM memory_claim_evidence v JOIN memory_claims c ON c.claim_id=v.claim_id JOIN memory_entities e ON e.entity_id=c.object_entity_id WHERE c.object_kind='entity' AND e.disambiguation='resolved'",
+    ] {
+        let mut statement = transaction
+            .prepare(query)
+            .map_err(|error| RetrievalError::CorruptIndex(format!("读取实体证据失败：{error}")))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| RetrievalError::CorruptIndex(format!("读取实体证据失败：{error}")))?;
+        for row in rows {
+            let (event, entity) = row.map_err(|error| {
+                RetrievalError::CorruptIndex(format!("读取实体证据失败：{error}"))
+            })?;
+            entities.entry(event).or_default().insert(entity);
+        }
+    }
+    let mut embeddings = HashMap::<String, Vec<f32>>::new();
+    let mut embedding_statement = transaction.prepare(
+        "SELECT d.document_id, e.vector_blob FROM memory_documents d JOIN memory_embeddings e ON e.document_id=d.document_id
+         WHERE d.session_id=?1 AND d.granularity='message' AND e.model=?2 AND e.dimensions=?3
+           AND e.source_sha256=d.source_sha256 AND e.index_fingerprint=?4",
+    ).map_err(|error| RetrievalError::CorruptIndex(format!("读取消息向量失败：{error}")))?;
+    let embedding_rows = embedding_statement
+        .query_map(
+            params![
+                session_id,
+                spec.model,
+                usize_to_i64(spec.dimensions)
+                    .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?,
+                fingerprint
+            ],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )
+        .map_err(|error| RetrievalError::CorruptIndex(format!("读取消息向量失败：{error}")))?;
+    for row in embedding_rows {
+        let (id, bytes) = row
+            .map_err(|error| RetrievalError::CorruptIndex(format!("读取消息向量失败：{error}")))?;
+        embeddings.insert(
+            id,
+            decode_f32_le(&bytes, spec.dimensions)
+                .map_err(|error| RetrievalError::CorruptIndex(format!("消息向量损坏：{error}")))?,
+        );
+    }
+    let mut statement = transaction
+        .prepare(
+            "SELECT event_id, sequence, role, created_at, content, content_sha256
+         FROM events WHERE session_id=?1 AND role IN ('user','assistant') ORDER BY sequence",
+        )
+        .map_err(|error| RetrievalError::CorruptIndex(format!("读取原文事件失败：{error}")))?;
+    let rows = statement
+        .query_map([session_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })
+        .map_err(|error| RetrievalError::CorruptIndex(format!("读取原文事件失败：{error}")))?;
+    let mut messages = Vec::new();
+    for row in rows {
+        let (event_id, sequence, role, created_at, content, hash) = row
+            .map_err(|error| RetrievalError::CorruptIndex(format!("读取原文事件失败：{error}")))?;
+        if content.trim().is_empty() {
+            continue;
+        }
+        let sequence = i64_to_u64(sequence)
+            .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+        let expected_end = content.chars().count();
+        let document_id = format!("{event_id}:0:{expected_end}");
+        let members = transaction.prepare("SELECT d.source_sha256,d.start_sequence,d.end_sequence,d.member_count,m.ordinal,m.event_id,m.start_char,m.end_char,m.content_sha256 FROM memory_documents d JOIN memory_document_members m ON m.document_id=d.document_id WHERE d.document_id=?1 AND d.session_id=?2 AND d.granularity='message'")
+            .map_err(|e| RetrievalError::CorruptIndex(format!("读取 message document 失败：{e}")))?
+            .query_map(params![document_id, session_id], |row| Ok((row.get::<_,String>(0)?,row.get::<_,i64>(1)?,row.get::<_,i64>(2)?,row.get::<_,i64>(3)?,row.get::<_,i64>(4)?,row.get::<_,String>(5)?,row.get::<_,i64>(6)?,row.get::<_,i64>(7)?,row.get::<_,String>(8)?)))
+            .map_err(|e| RetrievalError::CorruptIndex(format!("读取 message document 失败：{e}")))?.collect::<Result<Vec<_>,_>>().map_err(|e| RetrievalError::CorruptIndex(format!("读取 message document 失败：{e}")))?;
+        if members.len() != 1 {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "事件 {event_id} 未恰好对应一个完整 message document"
+            )));
+        }
+        let (
+            document_hash,
+            start_seq,
+            end_seq,
+            count,
+            ordinal,
+            member_event,
+            start,
+            end,
+            member_hash,
+        ) = members.into_iter().next().expect("checked");
+        let start =
+            i64_to_usize(start).map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+        let end =
+            i64_to_usize(end).map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+        if document_hash != hash
+            || start_seq != i64::try_from(sequence).unwrap_or(-1)
+            || end_seq != start_seq
+            || count != 1
+            || ordinal != 0
+            || member_event != event_id
+            || start != 0
+            || end != expected_end
+            || member_hash != hash
+        {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "事件 {event_id} 缺少唯一完整 message 成员"
+            )));
+        }
+        let role = match role.as_str() {
+            "user" => EventRole::User,
+            "assistant" => EventRole::Assistant,
+            _ => {
+                return Err(RetrievalError::CorruptIndex(format!(
+                    "事件 {event_id} 角色损坏"
+                )));
+            }
+        };
+        messages.push(EpisodeInputMessage {
+            member: EpisodeMember {
+                document_id: document_id.clone(),
+                event_id: event_id.clone(),
+                sequence,
+                role,
+                span: SourceSpan {
+                    event_id: event_id.clone(),
+                    start_char: 0,
+                    end_char: expected_end,
+                },
+                content_sha256: hash,
+            },
+            created_at,
+            resolved_entity_ids: entities.remove(&event_id).unwrap_or_default(),
+            embedding: embeddings.remove(&document_id),
+        });
+    }
+    let mut suggestions = Vec::new();
+    let mut statement = transaction.prepare("SELECT DISTINCT before_event_id, reason FROM memory_boundary_suggestions WHERE session_id=?1 ORDER BY before_event_id, reason")
+        .map_err(|error| RetrievalError::CorruptIndex(format!("读取边界建议失败：{error}")))?;
+    let rows = statement
+        .query_map([session_id], |row| {
+            Ok(EpisodeBoundarySuggestion {
+                before_event_id: row.get(0)?,
+                reason: row.get(1)?,
+            })
+        })
+        .map_err(|error| RetrievalError::CorruptIndex(format!("读取边界建议失败：{error}")))?;
+    for row in rows {
+        suggestions.push(
+            row.map_err(|error| {
+                RetrievalError::CorruptIndex(format!("读取边界建议失败：{error}"))
+            })?,
+        );
+    }
+    let snapshot = episode_snapshot_hash(watermark, &messages, &suggestions);
+    Ok((messages, watermark, suggestions, snapshot))
+}
+
+fn persist_episode_plan(
+    transaction: &Transaction<'_>,
+    plan: &EpisodeMaterializationReport,
+    ledger_snapshot_sha256: String,
+    fingerprint: &str,
+    config: &MemoryConfig,
+) -> RetrievalResult<()> {
+    let mut documents = plan.episode_documents.clone();
+    if !documents.is_empty() {
+        let members = documents
+            .iter()
+            .flat_map(|document| document.members.clone())
+            .collect::<Vec<_>>();
+        documents.push(EpisodeDocument {
+            document_id: session_document_id(&plan.session_id),
+            session_id: plan.session_id.clone(),
+            granularity: "session".into(),
+            source_sha256: aggregate_members_hash("session", &plan.session_id, &members),
+            start_sequence: members.first().expect("documents nonempty").sequence,
+            end_sequence: members.last().expect("documents nonempty").sequence,
+            members,
+        });
+    }
+    let ids = documents
+        .iter()
+        .map(|document| document.document_id.as_str())
+        .collect::<Vec<_>>();
+    if ids.is_empty() { transaction.execute("DELETE FROM memory_documents WHERE session_id=?1 AND granularity IN ('episode','session')", [plan.session_id.as_str()]) }
+    else { let placeholders = std::iter::repeat_n("?", ids.len()).collect::<Vec<_>>().join(","); let mut values: Vec<&dyn rusqlite::ToSql> = vec![&plan.session_id]; for id in &ids { values.push(id); } transaction.execute(&format!("DELETE FROM memory_documents WHERE session_id=? AND granularity IN ('episode','session') AND document_id NOT IN ({placeholders})"), rusqlite::params_from_iter(values)) }.map_err(|error| RetrievalError::CorruptIndex(format!("清理旧 episode 失败：{error}")))?;
+    for document in &documents {
+        upsert_aggregate_document(transaction, document)?;
+    }
+    transaction
+        .execute(
+            "DELETE FROM memory_episode_boundaries WHERE session_id=?1",
+            [&plan.session_id],
+        )
+        .map_err(|error| RetrievalError::CorruptIndex(format!("清理边界审计失败：{error}")))?;
+    for decision in &plan.boundary_decisions {
+        let json = serde_json::to_string(decision).map_err(|error| {
+            RetrievalError::CorruptIndex(format!("边界审计序列化失败：{error}"))
+        })?;
+        transaction.execute("INSERT INTO memory_episode_boundaries(session_id,before_event_id,decision_json,input_sha256) VALUES(?1,?2,?3,?4)", params![plan.session_id, decision.before_event_id, json, decision.input_sha256]).map_err(|error| RetrievalError::CorruptIndex(format!("写入边界审计失败：{error}")))?;
+    }
+    transaction.execute("INSERT INTO memory_episode_materializations(session_id,source_session_sha256,ledger_snapshot_sha256,vector_index_fingerprint,plan_input_sha256,algorithm_version,gap_minutes,topic_similarity_threshold,episode_count,boundary_count,materialized_at) VALUES(?1,?2,?3,?4,?5,1,?6,0.60,?7,?8,?9) ON CONFLICT(session_id) DO UPDATE SET source_session_sha256=excluded.source_session_sha256,ledger_snapshot_sha256=excluded.ledger_snapshot_sha256,vector_index_fingerprint=excluded.vector_index_fingerprint,plan_input_sha256=excluded.plan_input_sha256,algorithm_version=excluded.algorithm_version,gap_minutes=excluded.gap_minutes,topic_similarity_threshold=excluded.topic_similarity_threshold,episode_count=excluded.episode_count,boundary_count=excluded.boundary_count,materialized_at=excluded.materialized_at", params![plan.session_id, plan.source_session_sha256, ledger_snapshot_sha256, fingerprint, plan.plan_input_sha256, i64::try_from(config.episode_gap_minutes).unwrap_or(i64::MAX), i64::try_from(plan.episode_documents.len()).unwrap_or(i64::MAX), i64::try_from(plan.boundary_decisions.len()).unwrap_or(i64::MAX), Utc::now().to_rfc3339()]).map_err(|error| RetrievalError::CorruptIndex(format!("写入 episode freshness 失败：{error}")))?;
+    Ok(())
+}
+
+fn upsert_aggregate_document(
+    transaction: &Transaction<'_>,
+    document: &EpisodeDocument,
+) -> RetrievalResult<()> {
+    transaction.execute("INSERT INTO memory_documents(document_id,session_id,granularity,source_sha256,start_sequence,end_sequence,member_count) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(document_id) DO UPDATE SET session_id=excluded.session_id,granularity=excluded.granularity,source_sha256=excluded.source_sha256,start_sequence=excluded.start_sequence,end_sequence=excluded.end_sequence,member_count=excluded.member_count", params![document.document_id, document.session_id, document.granularity, document.source_sha256, i64::try_from(document.start_sequence).unwrap_or(i64::MAX), i64::try_from(document.end_sequence).unwrap_or(i64::MAX), i64::try_from(document.members.len()).unwrap_or(i64::MAX)]).map_err(|error| RetrievalError::CorruptIndex(format!("写入 aggregate document 失败：{error}")))?;
+    transaction
+        .execute(
+            "DELETE FROM memory_document_members WHERE document_id=?1",
+            [&document.document_id],
+        )
+        .map_err(|error| {
+            RetrievalError::CorruptIndex(format!("替换 aggregate members 失败：{error}"))
+        })?;
+    for (ordinal, member) in document.members.iter().enumerate() {
+        if member.span.start_char != 0 {
+            return Err(RetrievalError::CorruptIndex(
+                "aggregate member 不是完整原文 message".into(),
+            ));
+        }
+        transaction.execute("INSERT INTO memory_document_members(document_id,ordinal,event_id,start_char,end_char,content_sha256) VALUES(?1,?2,?3,?4,?5,?6)", params![document.document_id, i64::try_from(ordinal).unwrap_or(i64::MAX), member.event_id, i64::try_from(member.span.start_char).unwrap_or(i64::MAX), i64::try_from(member.span.end_char).unwrap_or(i64::MAX), member.content_sha256]).map_err(|error| RetrievalError::CorruptIndex(format!("写入 aggregate member 失败：{error}")))?;
+    }
+    Ok(())
+}
+
+fn aggregate_members_hash(
+    granularity: &str,
+    session_id: &str,
+    members: &[EpisodeMember],
+) -> String {
+    let mut hasher = Sha256::new();
+    for value in [
+        b"hippocampus-aggregate-source-v1".as_slice(),
+        granularity.as_bytes(),
+        session_id.as_bytes(),
+        &(members.len() as u64).to_le_bytes(),
+    ] {
+        hash_length_prefixed(&mut hasher, value);
+    }
+    for member in members {
+        for value in [
+            member.document_id.as_bytes(),
+            member.event_id.as_bytes(),
+            &member.sequence.to_le_bytes(),
+            member.role.as_str().as_bytes(),
+            &u64::try_from(member.span.start_char)
+                .unwrap_or(u64::MAX)
+                .to_le_bytes(),
+            &u64::try_from(member.span.end_char)
+                .unwrap_or(u64::MAX)
+                .to_le_bytes(),
+            member.content_sha256.as_bytes(),
+        ] {
+            hash_length_prefixed(&mut hasher, value);
+        }
+    }
+    format!("{:x}", hasher.finalize())
+}
+fn episode_snapshot_hash(
+    watermark: Option<u64>,
+    messages: &[EpisodeInputMessage],
+    suggestions: &[EpisodeBoundarySuggestion],
+) -> String {
+    let mut hasher = Sha256::new();
+    hash_length_prefixed(&mut hasher, b"hippocampus-episode-ledger-snapshot-v1");
+    hash_length_prefixed(&mut hasher, &watermark.unwrap_or(u64::MAX).to_le_bytes());
+    for message in messages {
+        hash_length_prefixed(&mut hasher, message.member.event_id.as_bytes());
+        for entity in &message.resolved_entity_ids {
+            hash_length_prefixed(&mut hasher, entity.as_bytes());
+        }
+    }
+    for suggestion in suggestions {
+        hash_length_prefixed(&mut hasher, suggestion.before_event_id.as_bytes());
+        hash_length_prefixed(&mut hasher, suggestion.reason.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+fn hash_length_prefixed(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(value);
 }
 
 fn backfill_memory_documents(transaction: &Transaction<'_>) -> rusqlite::Result<()> {
@@ -2260,7 +2665,9 @@ fn prepare_memory_state_schema(
         // They cannot be upgraded row by row without trusting the old derived state, so discard
         // only the replayable projection and retain raw events plus the immutable attempt ledger.
         connection.execute_batch(
-            "DELETE FROM memory_claim_evidence;
+            "DELETE FROM memory_episode_boundaries;
+             DELETE FROM memory_episode_materializations;
+             DELETE FROM memory_claim_evidence;
              DELETE FROM memory_claim_transitions;
              DELETE FROM memory_boundary_suggestions;
              DELETE FROM memory_claims;
@@ -2493,6 +2900,8 @@ CREATE TABLE IF NOT EXISTS memory_embeddings (
 CREATE TRIGGER IF NOT EXISTS memory_documents_before_source_span_delete
 BEFORE DELETE ON source_spans
 BEGIN
+    DELETE FROM memory_episode_materializations
+    WHERE session_id = (SELECT session_id FROM events WHERE event_id = OLD.event_id);
     DELETE FROM memory_documents
     WHERE document_id IN (
         SELECT document_id FROM memory_document_members
@@ -2504,6 +2913,28 @@ END;
 
 CREATE INDEX IF NOT EXISTS memory_documents_session_granularity
     ON memory_documents(session_id, granularity, document_id);
+
+CREATE TABLE IF NOT EXISTS memory_episode_boundaries (
+    session_id TEXT NOT NULL REFERENCES indexed_sessions(session_id) ON DELETE CASCADE,
+    before_event_id TEXT NOT NULL REFERENCES events(event_id) ON DELETE CASCADE,
+    decision_json TEXT NOT NULL CHECK(length(decision_json) > 0),
+    input_sha256 TEXT NOT NULL CHECK(length(input_sha256) = 64),
+    PRIMARY KEY(session_id, before_event_id)
+);
+
+CREATE TABLE IF NOT EXISTS memory_episode_materializations (
+    session_id TEXT PRIMARY KEY REFERENCES indexed_sessions(session_id) ON DELETE CASCADE,
+    source_session_sha256 TEXT NOT NULL CHECK(length(source_session_sha256) = 64),
+    ledger_snapshot_sha256 TEXT NOT NULL CHECK(length(ledger_snapshot_sha256) = 64),
+    vector_index_fingerprint TEXT NOT NULL CHECK(length(vector_index_fingerprint) = 64),
+    plan_input_sha256 TEXT NOT NULL CHECK(length(plan_input_sha256) = 64),
+    algorithm_version INTEGER NOT NULL CHECK(algorithm_version = 1),
+    gap_minutes INTEGER NOT NULL CHECK(gap_minutes >= 0),
+    topic_similarity_threshold REAL NOT NULL CHECK(topic_similarity_threshold = 0.60),
+    episode_count INTEGER NOT NULL CHECK(episode_count >= 0),
+    boundary_count INTEGER NOT NULL CHECK(boundary_count >= 0),
+    materialized_at TEXT NOT NULL
+);
 
 CREATE INDEX IF NOT EXISTS events_session_sequence
     ON events(session_id, sequence);
@@ -2881,6 +3312,88 @@ CREATE INDEX memory_boundary_suggestions_session_event
                  UPDATE memory_schema_meta SET value=2 WHERE key='state_schema_version';",
             )
             .unwrap();
+    }
+
+    #[test]
+    fn episode_materialize_preserves_direct_messages_and_is_idempotent() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let mut session = store
+            .create("model", "http://localhost", None, Default::default(), false)
+            .unwrap();
+        append_complete_turn(&mut session, "短", "较长的原始回复", "ignored");
+        append_complete_turn(&mut session, "第二条", "第二个回复", "ignored");
+        let path = store.save(&mut session).unwrap();
+        store.retrieval().sync_session(&session, &path).unwrap();
+        let mut config = MemoryConfig::default();
+        config.enabled = true;
+        let first = store
+            .retrieval()
+            .materialize_episode_documents(&session.id, &config)
+            .unwrap();
+        let second = store
+            .retrieval()
+            .materialize_episode_documents(&session.id, &config)
+            .unwrap();
+        assert_eq!(first.episode_documents, second.episode_documents);
+        let connection = Connection::open(store.retrieval().index_path()).unwrap();
+        let aggregate_members: i64 = connection.query_row("SELECT count(*) FROM memory_document_members m JOIN memory_documents d ON d.document_id=m.document_id WHERE d.granularity IN ('episode','session') AND (m.start_char <> 0 OR m.event_id || ':0:' || m.end_char NOT IN (SELECT document_id FROM memory_documents WHERE granularity='message'))", [], |row| row.get(0)).unwrap();
+        assert_eq!(aggregate_members, 0);
+        assert!(first.session_document_id.is_some());
+    }
+
+    #[test]
+    fn embedding_aggregate_freshness_excludes_stale_aggregate_vectors() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let mut session = store
+            .create("model", "http://localhost", None, Default::default(), false)
+            .unwrap();
+        append_complete_turn(&mut session, "u", "a", "");
+        let path = store.save(&mut session).unwrap();
+        store.retrieval().sync_session(&session, &path).unwrap();
+        let mut config = MemoryConfig::default();
+        config.enabled = true;
+        let report = store
+            .retrieval()
+            .materialize_episode_documents(&session.id, &config)
+            .unwrap();
+        let spec = VectorIndexSpec::from_config(&config).unwrap();
+        let doc = report.episode_documents[0].clone();
+        store
+            .retrieval()
+            .upsert_embeddings(
+                &spec,
+                &[EmbeddingWrite {
+                    document_id: doc.document_id.clone(),
+                    expected_source_sha256: doc.source_sha256,
+                    vector: vec![1.0; spec.dimensions],
+                }],
+            )
+            .unwrap();
+        assert!(
+            store
+                .retrieval()
+                .compatible_embeddings(&spec)
+                .unwrap()
+                .iter()
+                .any(|value| value.document_id == doc.document_id)
+        );
+        let connection = Connection::open(store.retrieval().index_path()).unwrap();
+        connection
+            .execute(
+                "DELETE FROM memory_episode_materializations WHERE session_id=?1",
+                [&session.id],
+            )
+            .unwrap();
+        assert!(
+            !store
+                .retrieval()
+                .compatible_embeddings(&spec)
+                .unwrap()
+                .iter()
+                .any(|value| value.document_id == doc.document_id)
+        );
     }
 
     fn append_complete_turn(

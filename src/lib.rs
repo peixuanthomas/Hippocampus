@@ -2,6 +2,7 @@ pub mod config;
 pub mod consolidation;
 pub mod context;
 pub mod engine;
+pub mod episode;
 pub mod knowledge;
 pub mod model;
 pub mod ollama;
@@ -30,6 +31,12 @@ pub use consolidation::{
 };
 pub use context::ContextAssembler;
 pub use engine::{ChatEngine, LimitAction, PreparedTurn};
+pub use episode::{
+    EMBEDDING_COSINE_SIMILARITY_THRESHOLD, ENTITY_JACCARD_DISTANCE_THRESHOLD,
+    EPISODE_ALGORITHM_VERSION, EpisodeBoundaryDecision, EpisodeDocument, EpisodeGapState,
+    EpisodeMaterializationReport, EpisodeMember, EpisodeSignal, EpisodeSignalState,
+    SOFT_BOUNDARY_VOTE_THRESHOLD,
+};
 pub use knowledge::{KnowledgeRecall, KnowledgeStore, KnowledgeSyncReport, KnowledgeTrace};
 pub use model::{
     AgentChatRequest, AgentMessage, AgentRoundResult, BudgetConfig, EventRole, EvidenceKind,
