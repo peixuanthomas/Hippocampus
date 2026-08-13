@@ -9253,6 +9253,222 @@ mod tests {
     }
 
     #[test]
+    fn mention_ledger_audit_rejects_row_batch_and_global_deletion() {
+        let expected = ["one_row", "one_batch", "global"]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut seen = std::collections::BTreeSet::new();
+
+        for arm in &expected {
+            let root = tempfile::tempdir().unwrap();
+            let fixture = mention_tamper_fixture(root.path());
+            let connection = Connection::open(fixture.store.retrieval().index_path()).unwrap();
+            let batch_count: i64 = connection
+                .query_row(
+                    "SELECT count(DISTINCT batch_key) FROM memory_entity_mentions",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(batch_count, 2);
+            let deleted = match *arm {
+                "one_row" => connection
+                    .execute(
+                        "DELETE FROM memory_entity_mentions WHERE mention_id=?1",
+                        [&fixture.target_mention_id],
+                    )
+                    .unwrap(),
+                "one_batch" => connection
+                    .execute(
+                        "DELETE FROM memory_entity_mentions WHERE batch_key<>?1",
+                        [&fixture.alternate_batch_key],
+                    )
+                    .unwrap(),
+                "global" => connection
+                    .execute("DELETE FROM memory_entity_mentions", [])
+                    .unwrap(),
+                _ => unreachable!(),
+            };
+            assert!(deleted >= 1, "{arm}");
+            drop(connection);
+            assert!(matches!(
+                fixture.store.retrieval().consolidation_candidates(16, 16),
+                Err(RetrievalError::CorruptIndex(_))
+            ));
+            seen.insert(*arm);
+        }
+        assert_eq!(seen, expected);
+    }
+
+    #[test]
+    fn mention_ledger_audit_rejects_orphan_extra_batch_row() {
+        let root = tempfile::tempdir().unwrap();
+        let fixture = mention_tamper_fixture(root.path());
+        let connection = Connection::open(fixture.store.retrieval().index_path()).unwrap();
+        let (session_id, kind, entity_id, status, event_id, sequence, role, start, end, hash): (
+            String,
+            String,
+            String,
+            String,
+            String,
+            i64,
+            String,
+            i64,
+            i64,
+            String,
+        ) = connection
+            .query_row(
+                "SELECT session_id,mention_kind,entity_id,entity_status,event_id,sequence,role,start_char,end_char,content_sha256 FROM memory_entity_mentions WHERE mention_id=?1",
+                [&fixture.target_mention_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?)),
+            )
+            .unwrap();
+        let batch_key = "orphan-v4-batch";
+        let source_record_id = "orphan-v4-source";
+        let mention_id = deterministic_id(
+            "mention",
+            &[
+                &session_id,
+                batch_key,
+                &kind,
+                source_record_id,
+                &entity_id,
+                &status,
+                &event_id,
+                &sequence.to_string(),
+                &role,
+                &start.to_string(),
+                &end.to_string(),
+                &hash,
+            ],
+        );
+        assert_eq!(
+            connection
+                .execute(
+                    "INSERT INTO memory_entity_mentions(mention_id,session_id,batch_key,mention_kind,source_record_id,entity_id,entity_status,event_id,sequence,role,start_char,end_char,content_sha256,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,'2026-01-01T00:00:01Z')",
+                    params![mention_id, session_id, batch_key, kind, source_record_id, entity_id, status, event_id, sequence, role, start, end, hash],
+                )
+                .unwrap(),
+            1
+        );
+        drop(connection);
+        assert!(matches!(
+            fixture.store.retrieval().consolidation_candidates(16, 16),
+            Err(RetrievalError::CorruptIndex(_))
+        ));
+    }
+
+    #[test]
+    fn mention_ledger_is_immutable() {
+        let root = tempfile::tempdir().unwrap();
+        let fixture = mention_tamper_fixture(root.path());
+        let connection = Connection::open(fixture.store.retrieval().index_path()).unwrap();
+        let batch_key = fixture.alternate_batch_key;
+        let before: String = connection
+            .query_row(
+                "SELECT json_object('attempt_id',attempt_id,'batch_key',batch_key,'session_id',session_id,'from_sequence',from_sequence,'through_sequence',through_sequence,'trigger',trigger,'model',model,'request_json',request_json,'request_sha256',request_sha256,'input_event_ids',input_event_ids,'input_event_hashes',input_event_hashes,'response_json',response_json,'response_sha256',response_sha256,'status',status,'input_tokens',input_tokens,'output_tokens',output_tokens,'latency_ms',latency_ms,'started_at',started_at,'completed_at',completed_at,'validation_json',validation_json,'error_json',error_json,'projection_schema_version',projection_schema_version) FROM consolidation_batches WHERE batch_key=?1",
+                [&batch_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            connection
+                .execute(
+                    "UPDATE consolidation_batches SET model='tampered' WHERE batch_key=?1",
+                    [&batch_key],
+                )
+                .is_err()
+        );
+        let after_update: String = connection
+            .query_row(
+                "SELECT json_object('attempt_id',attempt_id,'batch_key',batch_key,'session_id',session_id,'from_sequence',from_sequence,'through_sequence',through_sequence,'trigger',trigger,'model',model,'request_json',request_json,'request_sha256',request_sha256,'input_event_ids',input_event_ids,'input_event_hashes',input_event_hashes,'response_json',response_json,'response_sha256',response_sha256,'status',status,'input_tokens',input_tokens,'output_tokens',output_tokens,'latency_ms',latency_ms,'started_at',started_at,'completed_at',completed_at,'validation_json',validation_json,'error_json',error_json,'projection_schema_version',projection_schema_version) FROM consolidation_batches WHERE batch_key=?1",
+                [&batch_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(after_update, before);
+        assert!(
+            connection
+                .execute(
+                    "DELETE FROM consolidation_batches WHERE batch_key=?1",
+                    [&batch_key],
+                )
+                .is_err()
+        );
+        let after_delete: String = connection
+            .query_row(
+                "SELECT json_object('attempt_id',attempt_id,'batch_key',batch_key,'session_id',session_id,'from_sequence',from_sequence,'through_sequence',through_sequence,'trigger',trigger,'model',model,'request_json',request_json,'request_sha256',request_sha256,'input_event_ids',input_event_ids,'input_event_hashes',input_event_hashes,'response_json',response_json,'response_sha256',response_sha256,'status',status,'input_tokens',input_tokens,'output_tokens',output_tokens,'latency_ms',latency_ms,'started_at',started_at,'completed_at',completed_at,'validation_json',validation_json,'error_json',error_json,'projection_schema_version',projection_schema_version) FROM consolidation_batches WHERE batch_key=?1",
+                [&batch_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(after_delete, before);
+    }
+
+    #[test]
+    fn mention_ledger_preopen_hash_coherent_corruption_is_detected() {
+        let root = tempfile::tempdir().unwrap();
+        let fixture = mention_tamper_fixture(root.path());
+        let source_path = root.path().join(format!("{}.json", fixture.session_id));
+        let source_before = std::fs::read(&source_path).unwrap();
+        let connection = Connection::open(fixture.store.retrieval().index_path()).unwrap();
+        let events_before = connection
+            .prepare("SELECT event_id,session_id,sequence,role,created_at,content,content_sha256 FROM events ORDER BY event_id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?, row.get::<_, String>(6)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        connection
+            .execute_batch(
+                "DROP TRIGGER consolidation_batches_immutable_update;
+                 DROP TRIGGER consolidation_batches_immutable_delete;",
+            )
+            .unwrap();
+        let request_json: String = connection
+            .query_row(
+                "SELECT request_json FROM consolidation_batches WHERE batch_key=?1",
+                [&fixture.alternate_batch_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut request: Value = serde_json::from_str(&request_json).unwrap();
+        request["preopen_unknown"] = json!(true);
+        let corrupted_request_json = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            connection
+                .execute(
+                    "UPDATE consolidation_batches SET request_json=?1,request_sha256=?2 WHERE batch_key=?3",
+                    params![
+                        corrupted_request_json,
+                        sha256_bytes(corrupted_request_json.as_bytes()),
+                        fixture.alternate_batch_key
+                    ],
+                )
+                .unwrap(),
+            1
+        );
+        drop(connection);
+        drop(fixture);
+
+        let reopened = RetrievalStore::new(root.path()).unwrap();
+        assert!(matches!(
+            reopened.consolidation_candidates(16, 16),
+            Err(RetrievalError::CorruptIndex(_))
+        ));
+        assert_eq!(std::fs::read(source_path).unwrap(), source_before);
+        let connection = Connection::open(reopened.index_path()).unwrap();
+        let events_after = connection
+            .prepare("SELECT event_id,session_id,sequence,role,created_at,content,content_sha256 FROM events ORDER BY event_id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?, row.get::<_, String>(6)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(events_after, events_before);
+    }
+
+    #[test]
     fn mention_nonapplied_loose_json_roundtrips_with_null_projection_version() {
         let root = tempfile::tempdir().unwrap();
         let store = RetrievalStore::new(root.path()).unwrap();
