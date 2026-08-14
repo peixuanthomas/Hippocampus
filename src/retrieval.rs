@@ -447,6 +447,13 @@ struct VectorIndexCache {
     index: Arc<HnswVectorIndex>,
 }
 
+struct PendingVectorIndexCache {
+    fingerprint: String,
+    catalog_sha256: String,
+    index: Arc<HnswVectorIndex>,
+    observed_identity: Option<(String, String)>,
+}
+
 #[derive(Clone)]
 struct ProjectedVectorCandidate {
     document_id: String,
@@ -1971,6 +1978,9 @@ impl RetrievalStore {
                 retrieval_config,
             )?;
             let bm25_ms = elapsed_ms(channel_started);
+            let query_kind = classify_query(raw_query);
+            result.trace.query_kind = query_kind;
+            result.trace.budget_allocation = memory_budget_trace(memory_config, query_kind);
             result.trace.channels = vec![
                 channel_trace(
                     RetrievalChannel::Bm25,
@@ -2118,7 +2128,7 @@ impl RetrievalStore {
         connection: &Connection,
         spec: &VectorIndexSpec,
         session_filter: Option<&str>,
-    ) -> RetrievalResult<Arc<HnswVectorIndex>> {
+    ) -> RetrievalResult<(Arc<HnswVectorIndex>, Option<PendingVectorIndexCache>)> {
         spec.validate()
             .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
         let total = if let Some(session_id) = session_filter {
@@ -2151,10 +2161,11 @@ impl RetrievalStore {
         if session_filter.is_some() {
             return HnswVectorIndex::rebuild(spec.clone(), rows)
                 .map(Arc::new)
+                .map(|index| (index, None))
                 .map_err(|error| RetrievalError::CorruptIndex(error.to_string()));
         }
         let catalog_sha256 = embedding_catalog_identity(&rows);
-        {
+        let observed_identity = {
             let cache = self
                 .vector_cache
                 .lock()
@@ -2163,23 +2174,46 @@ impl RetrievalStore {
                 && cache.fingerprint == fingerprint
                 && cache.catalog_sha256 == catalog_sha256
             {
-                return Ok(Arc::clone(&cache.index));
+                return Ok((Arc::clone(&cache.index), None));
             }
-        }
+            cache
+                .as_ref()
+                .map(|cache| (cache.fingerprint.clone(), cache.catalog_sha256.clone()))
+        };
         let index = Arc::new(
             HnswVectorIndex::rebuild(spec.clone(), rows)
                 .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?,
         );
+        let pending = PendingVectorIndexCache {
+            fingerprint,
+            catalog_sha256,
+            index: Arc::clone(&index),
+            observed_identity,
+        };
+        Ok((index, Some(pending)))
+    }
+
+    fn publish_vector_index_cache(&self, pending: PendingVectorIndexCache) -> RetrievalResult<()> {
         let mut cache = self
             .vector_cache
             .lock()
             .map_err(|_| RetrievalError::VectorCachePoisoned)?;
+        let current_identity = cache
+            .as_ref()
+            .map(|cache| (cache.fingerprint.clone(), cache.catalog_sha256.clone()));
+        let pending_identity = (pending.fingerprint.clone(), pending.catalog_sha256.clone());
+        if current_identity.as_ref() == Some(&pending_identity) {
+            return Ok(());
+        }
+        if current_identity != pending.observed_identity {
+            return Ok(());
+        }
         *cache = Some(VectorIndexCache {
-            fingerprint,
-            catalog_sha256,
-            index: Arc::clone(&index),
+            fingerprint: pending.fingerprint,
+            catalog_sha256: pending.catalog_sha256,
+            index: pending.index,
         });
-        Ok(index)
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2211,7 +2245,8 @@ impl RetrievalStore {
         )?;
         let bm25_ms = elapsed_ms(bm25_started);
         bm25.trace.budget_allocation = memory_budget_trace(&memory_config, bm25.trace.query_kind);
-        let index = self.load_vector_index_from_connection(&transaction, spec, session_filter)?;
+        let (index, pending_vector_cache) =
+            self.load_vector_index_from_connection(&transaction, spec, session_filter)?;
         if index.is_empty() {
             return Err(RetrievalError::CorruptIndex("没有兼容的向量索引".into()));
         }
@@ -2228,21 +2263,42 @@ impl RetrievalStore {
             })
             .map(|hit| hit.document_id.clone())
             .collect::<BTreeSet<_>>();
-        let mut graph_seeds = bm25
-            .trace
-            .candidates
-            .iter()
-            .filter(|candidate| {
-                matches!(
-                    candidate.reason.as_str(),
-                    "selected_core" | "evidence_budget" | "selection_limit"
-                )
-            })
-            .map(|candidate| GraphRecallSeed {
+        let mut bm25_document_ids = BTreeSet::new();
+        for candidate in &bm25.trace.candidates {
+            if candidate.document_id.is_empty()
+                || !bm25_document_ids.insert(candidate.document_id.clone())
+            {
+                return Err(RetrievalError::CorruptIndex(
+                    "BM25 candidate 文档 ID 为空或重复".into(),
+                ));
+            }
+        }
+        let mut bm25_seed_rows = Vec::new();
+        for candidate in bm25.trace.candidates.iter().filter(|candidate| {
+            matches!(
+                candidate.reason.as_str(),
+                "selected_core" | "evidence_budget" | "selection_limit"
+            )
+        }) {
+            if candidate.span.event_id == current_user_event_id
+                || recent_event_ids
+                    .iter()
+                    .any(|id| id == &candidate.span.event_id)
+                || candidate.role == EventRole::System
+                || session_filter.is_some_and(|scope| candidate.session_id != scope)
+            {
+                continue;
+            }
+            bm25_seed_rows.push(candidate);
+        }
+        let mut graph_seeds = bm25_seed_rows
+            .into_iter()
+            .enumerate()
+            .map(|(index, candidate)| GraphRecallSeed {
                 channel: RetrievalChannel::Bm25,
                 source_id: candidate.document_id.clone(),
                 document_id: Some(candidate.document_id.clone()),
-                rank: candidate.raw_rank,
+                rank: index + 1,
                 score: candidate.bm25_score,
             })
             .collect::<Vec<_>>();
@@ -2251,7 +2307,15 @@ impl RetrievalStore {
             .map(String::as_str)
             .collect::<HashSet<_>>();
         let mut projected = Vec::new();
+        let mut vector_seed_rows = Vec::new();
+        let mut vector_seed_documents = BTreeSet::new();
         for (rank_index, hit) in hits.iter().enumerate() {
+            if hit.document_id.is_empty() || !vector_seed_documents.insert(hit.document_id.clone())
+            {
+                return Err(RetrievalError::CorruptIndex(
+                    "Vector graph seed 文档 ID 为空或重复".into(),
+                ));
+            }
             let mut hit_projection = self.project_vector_hit(
                 &transaction,
                 &index,
@@ -2267,17 +2331,23 @@ impl RetrievalStore {
                     || session_filter.is_some_and(|scope| raw.session_id != scope)
             });
             if !blocked {
-                graph_seeds.push(GraphRecallSeed {
-                    channel: RetrievalChannel::Vector,
-                    source_id: hit.document_id.clone(),
-                    document_id: Some(hit.document_id.clone()),
-                    rank: rank_index + 1,
-                    score: f64::from(hit.cosine_similarity),
-                });
+                vector_seed_rows.push(hit);
             }
             hit_projection.truncate(memory_config.candidate_limit);
             projected.extend(hit_projection);
         }
+        graph_seeds.extend(
+            vector_seed_rows
+                .into_iter()
+                .enumerate()
+                .map(|(index, hit)| GraphRecallSeed {
+                    channel: RetrievalChannel::Vector,
+                    source_id: hit.document_id.clone(),
+                    document_id: Some(hit.document_id.clone()),
+                    rank: index + 1,
+                    score: f64::from(hit.cosine_similarity),
+                }),
+        );
         let mut fused = HashMap::<(String, usize, usize), FusedRawCandidate>::new();
         let mut excluded_vectors = Vec::new();
         let eligible = ["selected_core", "evidence_budget", "selection_limit"];
@@ -2601,6 +2671,9 @@ impl RetrievalStore {
         transaction
             .commit()
             .map_err(|error| self.database_error(error))?;
+        if let Some(pending) = pending_vector_cache {
+            self.publish_vector_index_cache(pending)?;
+        }
         Ok(result)
     }
 

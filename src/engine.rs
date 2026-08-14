@@ -1158,12 +1158,52 @@ impl<B: ChatBackend> ChatEngine<B> {
                 }
             }
         } else {
-            self.store.retrieval().keyword_recall(
-                &user_content,
-                &current_event_id,
-                &recent_event_ids,
-                session.retrieval.clone(),
-            )
+            self.store
+                .retrieval()
+                .keyword_recall(
+                    &user_content,
+                    &current_event_id,
+                    &recent_event_ids,
+                    session.retrieval.clone(),
+                )
+                .map(|mut recall| {
+                    recall.trace.query_kind = memory_query_kind;
+                    recall.trace.budget_allocation = memory_budget.clone();
+                    recall.trace.channels = vec![
+                        crate::model::ChannelTrace {
+                            channel: RetrievalChannel::Bm25,
+                            status: "ok".into(),
+                            candidate_count: recall.trace.candidates.len(),
+                            ..Default::default()
+                        },
+                        crate::model::ChannelTrace {
+                            channel: RetrievalChannel::Vector,
+                            status: "disabled".into(),
+                            ..Default::default()
+                        },
+                        crate::model::ChannelTrace {
+                            channel: RetrievalChannel::Entity,
+                            status: "disabled".into(),
+                            ..Default::default()
+                        },
+                        crate::model::ChannelTrace {
+                            channel: RetrievalChannel::State,
+                            status: "disabled".into(),
+                            ..Default::default()
+                        },
+                        crate::model::ChannelTrace {
+                            channel: RetrievalChannel::Episode,
+                            status: "disabled".into(),
+                            ..Default::default()
+                        },
+                        crate::model::ChannelTrace {
+                            channel: RetrievalChannel::Graph,
+                            status: "disabled".into(),
+                            ..Default::default()
+                        },
+                    ];
+                    recall
+                })
         }
         .inspect_err(|error| {
             session.turns[turn_index].context_trace.retrieval = crate::model::RetrievalTrace {
