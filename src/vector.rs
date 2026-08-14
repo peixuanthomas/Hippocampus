@@ -392,6 +392,13 @@ impl HnswVectorIndex {
     pub fn fingerprint(&self) -> &str {
         &self.fingerprint
     }
+
+    pub fn vector_for_document(&self, document_id: &str) -> Option<&[f32]> {
+        self.embeddings
+            .binary_search_by(|embedding| embedding.document_id.as_str().cmp(document_id))
+            .ok()
+            .map(|index| self.embeddings[index].vector.as_slice())
+    }
 }
 
 fn validate_stored_embedding(

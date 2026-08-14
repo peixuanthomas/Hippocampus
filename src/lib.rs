@@ -43,8 +43,9 @@ pub use episode::{
 pub use knowledge::{KnowledgeRecall, KnowledgeStore, KnowledgeSyncReport, KnowledgeTrace};
 pub use model::{
     AgentChatRequest, AgentMessage, AgentRoundResult, BudgetConfig, EventRole, EvidenceKind,
-    ProvenanceQuality, RetrievalConfig, RetrievalTrace, Session, SourceSpan, TokenUsage, ToolCall,
-    ToolDefinition, ToolResultTrace, ToolRoundTrace, Turn, WebSourceTrace, WebTrace,
+    FusionCandidateTrace, ProvenanceQuality, RetrievalConfig, RetrievalTrace, Session, SourceSpan,
+    TokenUsage, ToolCall, ToolDefinition, ToolResultTrace, ToolRoundTrace, Turn, WebSourceTrace,
+    WebTrace,
 };
 pub use ollama::{
     ModelInfo, OllamaClient, WebFetchResponse, WebSearchResponse, WebSearchResult,

@@ -201,6 +201,78 @@ pub struct RankedCandidate {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FusionCandidateTrace {
+    #[serde(default)]
+    pub fused_rank: usize,
+    #[serde(default)]
+    pub document_id: String,
+    #[serde(default = "default_source_span")]
+    pub span: SourceSpan,
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default = "default_retrieval_granularity")]
+    pub granularity: RetrievalDocumentGranularity,
+    #[serde(default)]
+    pub source_document_ids: Vec<String>,
+    #[serde(default)]
+    pub episode_id: Option<String>,
+    #[serde(default)]
+    pub bm25_rank: Option<usize>,
+    #[serde(default)]
+    pub bm25_score: Option<f64>,
+    #[serde(default)]
+    pub vector_rank: Option<usize>,
+    #[serde(default)]
+    pub vector_score: Option<f64>,
+    #[serde(default)]
+    pub rrf_score: f64,
+    #[serde(default)]
+    pub protected_exact: bool,
+    #[serde(default)]
+    pub selected: bool,
+    #[serde(default)]
+    pub reason: String,
+}
+
+impl Default for FusionCandidateTrace {
+    fn default() -> Self {
+        Self {
+            fused_rank: 0,
+            document_id: String::new(),
+            span: SourceSpan {
+                event_id: String::new(),
+                start_char: 0,
+                end_char: 0,
+            },
+            session_id: String::new(),
+            granularity: RetrievalDocumentGranularity::Message,
+            source_document_ids: Vec::new(),
+            episode_id: None,
+            bm25_rank: None,
+            bm25_score: None,
+            vector_rank: None,
+            vector_score: None,
+            rrf_score: 0.0,
+            protected_exact: false,
+            selected: false,
+            reason: String::new(),
+        }
+    }
+}
+
+fn default_source_span() -> SourceSpan {
+    SourceSpan {
+        event_id: String::new(),
+        start_char: 0,
+        end_char: 0,
+    }
+}
+
+fn default_retrieval_granularity() -> RetrievalDocumentGranularity {
+    RetrievalDocumentGranularity::Message
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SelectedEvidence {
     pub span: SourceSpan,
@@ -221,6 +293,8 @@ pub struct RetrievalTrace {
     pub config: RetrievalConfig,
     #[serde(default)]
     pub candidates: Vec<RankedCandidate>,
+    #[serde(default)]
+    pub fusion_candidates: Vec<FusionCandidateTrace>,
     #[serde(default)]
     pub selected_evidence: Vec<SelectedEvidence>,
     #[serde(default)]
@@ -247,6 +321,7 @@ impl Default for RetrievalTrace {
             query_terms: Vec::new(),
             config: RetrievalConfig::default(),
             candidates: Vec::new(),
+            fusion_candidates: Vec::new(),
             selected_evidence: Vec::new(),
             error: None,
             query_kind: QueryKind::default(),
