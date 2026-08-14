@@ -2128,6 +2128,14 @@ struct PreparedReplayAttempt {
     plan: ValidatedPlan,
 }
 
+struct ClassifiableReplayAttempt {
+    prepared: PreparedReplayAttempt,
+    input_inactive: bool,
+    candidate_provenance_active: bool,
+    excluded_gap: bool,
+    completed_at: DateTime<FixedOffset>,
+}
+
 fn replay_plan_create_ids(plan: &ValidatedPlan) -> (Vec<String>, Vec<String>) {
     let entities = plan
         .entities
@@ -2206,6 +2214,44 @@ pub(crate) fn consolidation_ledger_snapshot(
         row_count,
         digest_sha256: format!("{:x}", hasher.finalize()),
     })
+}
+
+pub(crate) fn validate_consolidation_ledger_semantics(
+    connection: &Connection,
+) -> RetrievalResult<()> {
+    let mut statement = connection
+        .prepare(
+            "SELECT attempt_id,batch_key,session_id,from_sequence,through_sequence,trigger,
+                    model,request_json,request_sha256,input_event_ids,input_event_hashes,
+                    response_json,response_sha256,status,input_tokens,output_tokens,latency_ms,
+                    started_at,completed_at,validation_json,error_json,projection_schema_version
+             FROM consolidation_batches ORDER BY attempt_id",
+        )
+        .map_err(candidate_database_error)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((map_stored_attempt(row)?, row.get::<_, Option<i64>>(21)?))
+        })
+        .map_err(candidate_database_error)?;
+    for row in rows {
+        let (stored, projection_schema_version) = row.map_err(candidate_database_error)?;
+        let attempt = decode_stored_attempt(stored)?;
+        if !matches!(projection_schema_version, None | Some(4)) {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "巩固尝试 {} 包含未知 projection schema version",
+                attempt.attempt_id
+            )));
+        }
+        if attempt.status != ConsolidationAttemptStatus::Applied
+            && projection_schema_version.is_some()
+        {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "非 applied 巩固尝试 {} 不得声明 projection schema version",
+                attempt.attempt_id
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn snapshot_compatible_legacy_watermarks(
@@ -2394,7 +2440,7 @@ pub(crate) fn prepare_consolidation_replay(
                     latency_ms, started_at, completed_at, validation_json, error_json
              FROM consolidation_batches
              WHERE status='applied' AND projection_schema_version=4
-             ORDER BY completed_at, attempt_id",
+             ORDER BY attempt_id",
         )
         .map_err(candidate_database_error)?;
     let records = statement
@@ -2403,12 +2449,7 @@ pub(crate) fn prepare_consolidation_replay(
         .collect::<Result<Vec<_>, _>>()
         .map_err(candidate_database_error)?;
     let mut seen_batches = HashSet::new();
-    let mut blocked_sessions = HashSet::new();
-    let mut attempts = Vec::new();
-    let mut skipped_inactive = 0;
-    let mut skipped_dependency = 0;
-    let mut unavailable_entity_creates = HashSet::new();
-    let mut unavailable_claim_creates = HashSet::new();
+    let mut classifiable = Vec::new();
     for stored in records {
         let attempt = decode_stored_attempt(stored)?;
         if !seen_batches.insert((attempt.session_id.clone(), attempt.batch_key.clone())) {
@@ -2502,25 +2543,77 @@ pub(crate) fn prepare_consolidation_replay(
                     .any(|input| input.event_id == event.id)
                 && !control.allows_event(&event.session_id, &event.id)
         });
-        let (plan_entity_creates, plan_claim_creates) = replay_plan_create_ids(&plan);
-        let skipped = if blocked_sessions.contains(&attempt.session_id) {
-            skipped_dependency += 1;
-            true
-        } else if inactive {
-            blocked_sessions.insert(attempt.session_id.clone());
-            skipped_inactive += 1;
-            true
-        } else if !candidate_provenance_active || excluded_gap {
-            blocked_sessions.insert(attempt.session_id.clone());
-            skipped_dependency += 1;
-            true
-        } else {
-            attempts.push(PreparedReplayAttempt {
+        let completed_at = parse_stored_time(&attempt.completed_at, "attempt.completed_at")?;
+        classifiable.push(ClassifiableReplayAttempt {
+            prepared: PreparedReplayAttempt {
                 attempt,
                 batch: payload.batch,
                 candidates: payload.candidate_snapshot,
                 plan,
-            });
+            },
+            input_inactive: inactive,
+            candidate_provenance_active,
+            excluded_gap,
+            completed_at,
+        });
+    }
+
+    classifiable.sort_by(|left, right| {
+        (
+            left.prepared.batch.session_id.as_str(),
+            left.prepared.batch.watermark_before,
+            left.prepared.batch.through_sequence,
+            left.prepared.attempt.attempt_id.as_str(),
+        )
+            .cmp(&(
+                right.prepared.batch.session_id.as_str(),
+                right.prepared.batch.watermark_before,
+                right.prepared.batch.through_sequence,
+                right.prepared.attempt.attempt_id.as_str(),
+            ))
+    });
+    let mut previous_through_by_session = HashMap::<String, usize>::new();
+    for item in &classifiable {
+        let batch = &item.prepared.batch;
+        if batch.through_sequence <= batch.watermark_before {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "会话 {} 的 applied-v4 batch {} 水位区间无效",
+                batch.session_id, batch.batch_key
+            )));
+        }
+        if let Some(previous_through) = previous_through_by_session.get(&batch.session_id)
+            && batch.watermark_before != *previous_through
+        {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "会话 {} 的 applied-v4 batches 存在重叠、倒序、分支或断链",
+                batch.session_id
+            )));
+        }
+        previous_through_by_session.insert(batch.session_id.clone(), batch.through_sequence);
+    }
+
+    let mut blocked_sessions = HashSet::new();
+    let mut active_attempts = Vec::new();
+    let mut skipped_inactive = 0;
+    let mut skipped_dependency = 0;
+    let mut unavailable_entity_creates = HashSet::new();
+    let mut unavailable_claim_creates = HashSet::new();
+    for item in classifiable {
+        let session_id = item.prepared.attempt.session_id.clone();
+        let (plan_entity_creates, plan_claim_creates) = replay_plan_create_ids(&item.prepared.plan);
+        let skipped = if blocked_sessions.contains(&session_id) {
+            skipped_dependency += 1;
+            true
+        } else if item.input_inactive {
+            blocked_sessions.insert(session_id);
+            skipped_inactive += 1;
+            true
+        } else if !item.candidate_provenance_active || item.excluded_gap {
+            blocked_sessions.insert(session_id);
+            skipped_dependency += 1;
+            true
+        } else {
+            active_attempts.push((item.completed_at, item.prepared));
             false
         };
         if skipped {
@@ -2528,6 +2621,15 @@ pub(crate) fn prepare_consolidation_replay(
             unavailable_claim_creates.extend(plan_claim_creates);
         }
     }
+    active_attempts.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.attempt.attempt_id.cmp(&right.1.attempt.attempt_id))
+    });
+    let attempts = active_attempts
+        .into_iter()
+        .map(|(_, attempt)| attempt)
+        .collect();
     Ok(PreparedConsolidationReplay {
         attempts,
         skipped_inactive,

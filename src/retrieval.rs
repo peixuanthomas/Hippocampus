@@ -17,7 +17,7 @@ use crate::consolidation::{
     consolidation_ledger_snapshot, normalize_match, original_claim_valid_to_by_id,
     prepare_consolidation_replay, replay_prepared_consolidation,
     restore_compatible_legacy_watermarks, snapshot_compatible_legacy_watermarks,
-    validate_full_derived_integrity,
+    validate_consolidation_ledger_semantics, validate_full_derived_integrity,
 };
 use crate::context::{WrappedHistoryCursor, wrapped_history_identity};
 use crate::control::{ControlLog, ControlState};
@@ -1689,6 +1689,7 @@ impl RetrievalStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| self.database_error(source))?;
         let ledger_before = consolidation_ledger_snapshot(&transaction)?;
+        validate_consolidation_ledger_semantics(&transaction)?;
         let replay = prepare_consolidation_replay(&transaction, &state, &all_events)?;
         let legacy_watermarks =
             snapshot_compatible_legacy_watermarks(&transaction, &state, &all_events)?;
