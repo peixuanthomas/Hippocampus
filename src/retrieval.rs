@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::config::MemoryConfig;
-use crate::consolidation::validate_full_derived_integrity;
+use crate::consolidation::{normalize_match, validate_full_derived_integrity};
 use crate::episode::{
     EMBEDDING_COSINE_SIMILARITY_THRESHOLD, EPISODE_ALGORITHM_VERSION, EpisodeBoundaryDecision,
     EpisodeBoundarySuggestion, EpisodeDocument, EpisodeInputMessage, EpisodeMaterializationReport,
@@ -20,10 +20,11 @@ use crate::episode::{
 };
 use crate::knowledge::{KnowledgeStore, KnowledgeTrace};
 use crate::model::{
-    ChannelTrace, ChatMessage, ContextItemTrace, EventRole, EvidenceKind, FusionCandidateTrace,
-    ModelRequestTrace, ProvenanceQuality, RankedCandidate, RetrievalChannel, RetrievalConfig,
-    RetrievalDocumentGranularity, RetrievalTrace, SCHEMA_VERSION, SelectedEvidence, Session,
-    SourceSpan, Turn, TurnStatus, WebTrace, content_sha256, context_sha256, event_id,
+    BudgetAllocationTrace, ChannelTrace, ChatMessage, ContextItemTrace, EventRole, EvidenceKind,
+    FusionCandidateTrace, ModelRequestTrace, ProvenanceQuality, QueryKind, RankedCandidate,
+    RetrievalChannel, RetrievalConfig, RetrievalDocumentGranularity, RetrievalTrace,
+    SCHEMA_VERSION, SelectedEvidence, Session, SourceSpan, Turn, TurnStatus, WebTrace,
+    content_sha256, context_sha256, event_id,
 };
 use crate::ollama::{ChatBackend, EmbeddingRequest};
 use crate::vector::{
@@ -34,6 +35,178 @@ use crate::vector::{
 pub const INDEX_FILENAME: &str = ".hippocampus-index.sqlite3";
 const INDEX_SCHEMA_VERSION: i64 = 7;
 const MEMORY_STATE_SCHEMA_VERSION: i64 = 4;
+
+pub fn classify_query(raw_query: &str) -> QueryKind {
+    let normalized = normalize_match(raw_query);
+    if normalized.is_empty() {
+        return QueryKind::GeneralSemantic;
+    }
+
+    if contains_any(&normalized, TEMPORAL_CHINESE)
+        || contains_english_cue(&normalized, TEMPORAL_ENGLISH)
+        || contains_ascii_date(&normalized)
+    {
+        QueryKind::TemporalState
+    } else if contains_any(&normalized, MULTI_HOP_CHINESE)
+        || contains_english_cue(&normalized, MULTI_HOP_ENGLISH)
+    {
+        QueryKind::MultiHop
+    } else if contains_any(&normalized, EVENT_RECAP_CHINESE)
+        || contains_english_cue(&normalized, EVENT_RECAP_ENGLISH)
+    {
+        QueryKind::EventRecap
+    } else if contains_any(&normalized, EXACT_FACT_CHINESE)
+        || contains_english_cue(&normalized, EXACT_FACT_ENGLISH)
+        || normalized
+            .chars()
+            .any(|character| character.is_ascii_digit())
+        || contains_paired_quote(&normalized)
+    {
+        QueryKind::ExactFact
+    } else {
+        QueryKind::GeneralSemantic
+    }
+}
+
+const TEMPORAL_CHINESE: &[&str] = &[
+    "现在",
+    "目前",
+    "当前",
+    "最新",
+    "截至",
+    "什么时候",
+    "何时",
+    "曾经",
+    "以前",
+    "过去",
+    "原来",
+    "后来",
+    "最近",
+    "更新后",
+    "还在",
+    "还叫",
+    "还住",
+    "当时",
+];
+const TEMPORAL_ENGLISH: &[&str] = &[
+    "now",
+    "currently",
+    "current",
+    "latest",
+    "as of",
+    "when",
+    "formerly",
+    "previously",
+    "before",
+    "after",
+    "recently",
+    "used to",
+    "still",
+];
+const MULTI_HOP_CHINESE: &[&str] = &[
+    "关系",
+    "关联",
+    "共同",
+    "都有哪些",
+    "两者",
+    "彼此",
+    "为什么",
+    "原因",
+    "因果",
+    "比较",
+    "区别",
+    "通过谁",
+    "如何联系",
+];
+const MULTI_HOP_ENGLISH: &[&str] = &[
+    "relationship",
+    "related",
+    "connection",
+    "both",
+    "common",
+    "why",
+    "because",
+    "cause",
+    "compare",
+    "difference",
+    "through whom",
+    "how are",
+];
+const EVENT_RECAP_CHINESE: &[&str] = &[
+    "回顾",
+    "聊过什么",
+    "说过什么",
+    "发生了什么",
+    "做了什么",
+    "那次",
+    "过程",
+    "经过",
+];
+const EVENT_RECAP_ENGLISH: &[&str] = &[
+    "recap",
+    "what happened",
+    "what did we",
+    "discussed before",
+    "conversation recap",
+    "remember when",
+];
+const EXACT_FACT_CHINESE: &[&str] = &[
+    "谁", "什么", "哪里", "哪儿", "哪个", "多少", "名称", "名字", "地址", "电话", "邮箱", "生日",
+    "日期", "时间", "暗号", "编号", "数字", "精确", "具体",
+];
+const EXACT_FACT_ENGLISH: &[&str] = &[
+    "who", "what", "where", "which", "how many", "name", "address", "phone", "email", "birthday",
+    "date", "time", "code", "number", "exact", "specific",
+];
+
+fn contains_any(value: &str, cues: &[&str]) -> bool {
+    cues.iter().any(|cue| value.contains(cue))
+}
+
+fn contains_english_cue(value: &str, cues: &[&str]) -> bool {
+    cues.iter().any(|cue| {
+        value.match_indices(cue).any(|(start, matched)| {
+            let end = start + matched.len();
+            ascii_word_boundary(value[..start].chars().next_back())
+                && ascii_word_boundary(value[end..].chars().next())
+        })
+    })
+}
+
+fn ascii_word_boundary(character: Option<char>) -> bool {
+    character.is_none_or(|character| !character.is_ascii_alphanumeric() && character != '_')
+}
+
+fn contains_ascii_date(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.windows(10).enumerate().any(|(start, candidate)| {
+        let end = start + candidate.len();
+        (start == 0 || !bytes[start - 1].is_ascii_digit())
+            && (end == bytes.len() || !bytes[end].is_ascii_digit())
+            && candidate[0..4].iter().all(u8::is_ascii_digit)
+            && candidate[4] == b'-'
+            && candidate[5..7].iter().all(u8::is_ascii_digit)
+            && candidate[7] == b'-'
+            && candidate[8..10].iter().all(u8::is_ascii_digit)
+    })
+}
+
+fn contains_paired_quote(value: &str) -> bool {
+    [
+        ('"', '"'),
+        ('\'', '\''),
+        ('“', '”'),
+        ('‘', '’'),
+        ('「', '」'),
+        ('『', '』'),
+    ]
+    .into_iter()
+    .any(|(open, close)| {
+        value
+            .find(open)
+            .is_some_and(|start| value[start + open.len_utf8()..].contains(close))
+    })
+}
 
 #[derive(Debug, Error)]
 pub enum RetrievalError {
@@ -1452,11 +1625,14 @@ impl RetrievalStore {
             .validate()
             .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
         let terms = query_terms(raw_query);
+        let query_kind = classify_query(raw_query);
         let mut trace = RetrievalTrace {
             status: "ok".into(),
             current_query_event_id: current_user_event_id.into(),
             query_terms: terms.clone(),
             config,
+            query_kind,
+            budget_allocation: BudgetAllocationTrace::for_query_kind(query_kind),
             ..Default::default()
         };
         if terms.is_empty() {

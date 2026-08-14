@@ -43,9 +43,9 @@ pub use episode::{
 pub use knowledge::{KnowledgeRecall, KnowledgeStore, KnowledgeSyncReport, KnowledgeTrace};
 pub use model::{
     AgentChatRequest, AgentMessage, AgentRoundResult, BudgetConfig, EventRole, EvidenceKind,
-    FusionCandidateTrace, ProvenanceQuality, RetrievalConfig, RetrievalTrace, Session, SourceSpan,
-    TokenUsage, ToolCall, ToolDefinition, ToolResultTrace, ToolRoundTrace, Turn, WebSourceTrace,
-    WebTrace,
+    FusionCandidateTrace, ProvenanceQuality, QueryKind, RetrievalConfig, RetrievalTrace, Session,
+    SourceSpan, TokenUsage, ToolCall, ToolDefinition, ToolResultTrace, ToolRoundTrace, Turn,
+    WebSourceTrace, WebTrace,
 };
 pub use ollama::{
     ModelInfo, OllamaClient, WebFetchResponse, WebSearchResponse, WebSearchResult,
@@ -55,7 +55,7 @@ pub use retrieval::{
     AggregateEmbeddingDocument, AggregateEmbeddingSnapshot, AnswerContext, AnswerContextItem,
     DirectMessageEmbedding, EmbeddingPublishReport, IndexedSession, LeafEmbeddingDocument,
     LeafEmbeddingSnapshot, RecallResult, RecalledEvidence, ResolvedSpan, RetrievalError,
-    RetrievalStore, StoredEvent, SyncReport,
+    RetrievalStore, StoredEvent, SyncReport, classify_query,
 };
 pub use store::{IndexSyncAfterSourceCommit, SessionStore};
 pub use vector::{

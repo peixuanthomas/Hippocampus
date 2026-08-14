@@ -6522,7 +6522,7 @@ fn validate_optional_rfc3339(
         .transpose()
 }
 
-fn normalize_match(value: &str) -> String {
+pub(crate) fn normalize_match(value: &str) -> String {
     let lowered = value
         .nfkc()
         .flat_map(char::to_lowercase)

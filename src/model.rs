@@ -155,12 +155,26 @@ const fn default_graph_percent() -> u8 {
 
 impl Default for BudgetAllocationTrace {
     fn default() -> Self {
+        Self::for_query_kind(QueryKind::GeneralSemantic)
+    }
+}
+
+impl BudgetAllocationTrace {
+    pub const fn for_query_kind(kind: QueryKind) -> Self {
+        let (recent_history_percent, exact_or_state_percent, episode_percent, graph_percent) =
+            match kind {
+                QueryKind::ExactFact => (45, 40, 5, 10),
+                QueryKind::GeneralSemantic => (45, 30, 15, 10),
+                QueryKind::EventRecap => (35, 20, 35, 10),
+                QueryKind::TemporalState => (35, 35, 15, 15),
+                QueryKind::MultiHop => (30, 25, 15, 30),
+            };
         Self {
-            query_kind: QueryKind::GeneralSemantic,
-            recent_history_percent: default_recent_history_percent(),
-            exact_or_state_percent: default_exact_or_state_percent(),
-            episode_percent: default_episode_percent(),
-            graph_percent: default_graph_percent(),
+            query_kind: kind,
+            recent_history_percent,
+            exact_or_state_percent,
+            episode_percent,
+            graph_percent,
         }
     }
 }
