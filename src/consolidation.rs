@@ -2446,6 +2446,11 @@ pub(crate) fn prepare_consolidation_replay(
             )));
         }
         validate_candidate_snapshot_against_raw(&payload.candidate_snapshot, &raw_by_id)?;
+        let candidate_provenance_active = candidate_snapshot_provenance_is_active(
+            &payload.candidate_snapshot,
+            control,
+            &raw_by_id,
+        )?;
         let response = attempt
             .response_json
             .as_deref()
@@ -2505,7 +2510,7 @@ pub(crate) fn prepare_consolidation_replay(
             blocked_sessions.insert(attempt.session_id.clone());
             skipped_inactive += 1;
             true
-        } else if excluded_gap {
+        } else if !candidate_provenance_active || excluded_gap {
             blocked_sessions.insert(attempt.session_id.clone());
             skipped_dependency += 1;
             true
@@ -2530,6 +2535,73 @@ pub(crate) fn prepare_consolidation_replay(
         unavailable_entity_creates,
         unavailable_claim_creates,
     })
+}
+
+fn candidate_snapshot_provenance_is_active(
+    snapshot: &ConsolidationCandidateSnapshot,
+    control: &ControlState,
+    raw_by_id: &HashMap<String, &StoredEvent>,
+) -> RetrievalResult<bool> {
+    let reference_is_active = |session_id: &str, event_id: &str| -> RetrievalResult<bool> {
+        let event = raw_by_id.get(event_id).ok_or_else(|| {
+            RetrievalError::CorruptIndex(format!(
+                "候选快照来源 event {event_id} 不存在于权威 raw source"
+            ))
+        })?;
+        if event.session_id != session_id {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "候选快照来源 event {event_id} 会话绑定错误"
+            )));
+        }
+        Ok(control.allows_session(session_id)
+            && control.allows_event(session_id, event_id)
+            && event
+                .turn_id
+                .as_deref()
+                .is_none_or(|turn_id| control.allows_turn(session_id, turn_id)))
+    };
+
+    for entity in &snapshot.entities {
+        if !reference_is_active(&entity.created_session_id, &entity.created_event_id)? {
+            return Ok(false);
+        }
+        for alias in &entity.aliases {
+            for event_id in [
+                alias.event_id.as_str(),
+                alias.proof_event_id.as_str(),
+                alias.identity_event_id.as_str(),
+            ] {
+                if !reference_is_active(&alias.session_id, event_id)? {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+    for claim in &snapshot.claims {
+        if !control.allows_session(&claim.session_id) {
+            return Ok(false);
+        }
+        for evidence in &claim.evidence {
+            if !reference_is_active(&evidence.session_id, &evidence.event_id)? {
+                return Ok(false);
+            }
+            for span in [
+                &evidence.subject_span,
+                &evidence.relation_span,
+                &evidence.object_span,
+            ] {
+                if !reference_is_active(&evidence.session_id, &span.event_id)? {
+                    return Ok(false);
+                }
+            }
+            if let Some(span) = &evidence.speech_act_span
+                && !reference_is_active(&evidence.session_id, &span.event_id)?
+            {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
 }
 
 fn validate_candidate_snapshot_against_raw(
