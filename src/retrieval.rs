@@ -57,9 +57,7 @@ pub fn classify_query(raw_query: &str) -> QueryKind {
         QueryKind::EventRecap
     } else if contains_any(&normalized, EXACT_FACT_CHINESE)
         || contains_english_cue(&normalized, EXACT_FACT_ENGLISH)
-        || normalized
-            .chars()
-            .any(|character| character.is_ascii_digit())
+        || normalized.chars().any(|character| character.is_numeric())
         || contains_paired_quote(&normalized)
     {
         QueryKind::ExactFact
