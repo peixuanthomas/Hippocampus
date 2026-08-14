@@ -813,7 +813,7 @@ pub(crate) fn recall_graph_from_connection(
                 }
             }
         }
-        let Some((_, _, _, seed_node_id, _, edge_ids, node_ids, edge_types, seed, seed_mass)) =
+        let Some((quality, _, _, seed_node_id, _, edge_ids, node_ids, edge_types, seed, seed_mass)) =
             best
         else {
             continue;
@@ -824,6 +824,7 @@ pub(crate) fn recall_graph_from_connection(
             edge_types,
             node_ids,
             score,
+            path_quality: quality,
             seed_channel: seed.channel,
             seed_node_id,
             seed_source_id: seed.source_id.clone(),

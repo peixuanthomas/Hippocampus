@@ -1001,6 +1001,9 @@ impl<B: ChatBackend> ChatEngine<B> {
                 ]
             })
             .collect::<Vec<_>>();
+        let memory_query_kind = crate::retrieval::classify_query(&user_content);
+        let memory_budget =
+            crate::retrieval::memory_budget_trace(&self.config.memory, memory_query_kind);
         let recall = if self.config.memory.enabled {
             let refresh_started = Instant::now();
             match self.refresh_embeddings(CancellationToken::new()).await {
@@ -1049,6 +1052,8 @@ impl<B: ChatBackend> ChatEngine<B> {
                                 .map(|mut recall| {
                                     let bm25_elapsed = elapsed_millis(fallback_started);
                                     recall.trace.status = "bm25_fallback".into();
+                                    recall.trace.query_kind = memory_query_kind;
+                                    recall.trace.budget_allocation = memory_budget.clone();
                                     recall.trace.warnings.push(message.clone());
                                     recall.trace.elapsed_ms =
                                         graph_elapsed.saturating_add(bm25_elapsed);
@@ -1108,6 +1113,8 @@ impl<B: ChatBackend> ChatEngine<B> {
                             let bm25_elapsed = elapsed_millis(fallback_started);
                             let message = format!("embedding refresh failed: {error}");
                             recall.trace.status = "bm25_fallback".into();
+                            recall.trace.query_kind = memory_query_kind;
+                            recall.trace.budget_allocation = memory_budget.clone();
                             recall.trace.warnings.push(message.clone());
                             recall.trace.elapsed_ms = refresh_elapsed.saturating_add(bm25_elapsed);
                             recall.trace.channels = vec![
@@ -1164,6 +1171,8 @@ impl<B: ChatBackend> ChatEngine<B> {
                 current_query_event_id: current_event_id.clone(),
                 error: Some(error.to_string()),
                 config: session.retrieval.clone(),
+                query_kind: memory_query_kind,
+                budget_allocation: memory_budget.clone(),
                 ..Default::default()
             };
         })?;

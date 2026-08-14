@@ -192,6 +192,8 @@ pub struct GraphPathTrace {
     #[serde(default)]
     pub score: f64,
     #[serde(default)]
+    pub path_quality: f64,
+    #[serde(default)]
     pub seed_channel: RetrievalChannel,
     #[serde(default)]
     pub seed_node_id: String,

@@ -1733,6 +1733,49 @@ impl RetrievalStore {
         session_filter: Option<&str>,
         config: RetrievalConfig,
     ) -> RetrievalResult<RecallResult> {
+        let connection = self.open_connection()?;
+        let mut result = self.keyword_recall_core_from_connection(
+            &connection,
+            raw_query,
+            current_user_event_id,
+            recent_event_ids,
+            session_filter,
+            config,
+        )?;
+        let recent = recent_event_ids.iter().map(String::as_str).collect();
+        let mut used_events = result
+            .evidence
+            .iter()
+            .map(|item| item.selected.span.event_id.clone())
+            .collect();
+        let mut used_hashes = result
+            .evidence
+            .iter()
+            .map(|item| item.selected.content_sha256.clone())
+            .collect();
+        self.expand_context(
+            &connection,
+            &mut result.trace,
+            &mut result.evidence,
+            current_user_event_id,
+            &recent,
+            &mut used_events,
+            &mut used_hashes,
+            session_filter,
+        )?;
+        Ok(result)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn keyword_recall_core_from_connection(
+        &self,
+        connection: &Connection,
+        raw_query: &str,
+        current_user_event_id: &str,
+        recent_event_ids: &[String],
+        session_filter: Option<&str>,
+        config: RetrievalConfig,
+    ) -> RetrievalResult<RecallResult> {
         config
             .validate()
             .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
@@ -1759,7 +1802,6 @@ impl RetrievalStore {
             .map(|term| format!("\"{}\"", term.replace('"', "")))
             .collect::<Vec<_>>()
             .join(" OR ");
-        let connection = self.open_connection()?;
         let mut statement = connection.prepare(
             "SELECT d.document_id, d.granularity, d.event_id, d.start_char, d.end_char, d.content_sha256, d.exact_content,
                     e.role, e.session_id, e.created_at, bm25(retrieval_documents_fts) AS score
@@ -1847,9 +1889,9 @@ impl RetrievalStore {
             } else if used_hashes.contains(&hash) {
                 candidate.reason = "duplicate_content".into();
             } else {
-                let source_event = self.get_event_from_connection(&connection, &span.event_id)?;
+                let source_event = self.get_event_from_connection(connection, &span.event_id)?;
                 let source_session =
-                    self.get_session_from_connection(&connection, &source_event.session_id)?;
+                    self.get_session_from_connection(connection, &source_event.session_id)?;
                 self.verify_fresh(&source_session)?;
                 verify_event_hash(&source_event)?;
                 let span_content = slice_chars(&source_event.content, &span)?;
@@ -1893,21 +1935,11 @@ impl RetrievalStore {
         }
         let mut evidence = Vec::new();
         for selected in trace.selected_evidence.clone() {
-            let event = self.get_event_from_connection(&connection, &selected.span.event_id)?;
+            let event = self.get_event_from_connection(connection, &selected.span.event_id)?;
             verify_event_hash(&event)?;
             let content = slice_chars(&event.content, &selected.span)?;
             evidence.push(RecalledEvidence { selected, content });
         }
-        self.expand_context(
-            &connection,
-            &mut trace,
-            &mut evidence,
-            current_user_event_id,
-            &recent,
-            &mut used_events,
-            &mut used_hashes,
-            session_filter,
-        )?;
         Ok(RecallResult { trace, evidence })
     }
 
@@ -1929,26 +1961,16 @@ impl RetrievalStore {
             .validate()
             .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
         let started = Instant::now();
-        let store = self.clone();
-        let query = raw_query.to_owned();
-        let current = current_user_event_id.to_owned();
-        let recent = recent_event_ids.to_vec();
-        let scope = session_filter.map(str::to_owned);
-        let bm25_config = retrieval_config.clone();
-        let bm25_task = tokio::task::spawn_blocking(move || {
-            let channel_started = Instant::now();
-            let result = store.keyword_recall_scoped(
-                &query,
-                &current,
-                &recent,
-                scope.as_deref(),
-                bm25_config,
-            );
-            result.map(|result| (result, elapsed_ms(channel_started)))
-        });
-
         if !memory_config.enabled {
-            let (mut result, bm25_ms) = join_blocking(bm25_task).await?;
+            let channel_started = Instant::now();
+            let mut result = self.keyword_recall_scoped(
+                raw_query,
+                current_user_event_id,
+                recent_event_ids,
+                session_filter,
+                retrieval_config,
+            )?;
+            let bm25_ms = elapsed_ms(channel_started);
             result.trace.channels = vec![
                 channel_trace(
                     RetrievalChannel::Bm25,
@@ -1969,52 +1991,39 @@ impl RetrievalStore {
 
         let spec = VectorIndexSpec::from_config(memory_config)
             .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
-        let index_store = self.clone();
-        let index_spec = spec.clone();
-        let index_scope = session_filter.map(str::to_owned);
-        let index_task = tokio::task::spawn_blocking(move || {
-            index_store.load_vector_index(&index_spec, index_scope.as_deref())
-        });
+        let query_kind = classify_query(raw_query);
+        let decided_budget = memory_budget_trace(memory_config, query_kind);
         let embed_started = Instant::now();
-        let embed_call = backend.embed(EmbeddingRequest {
-            model: spec.model.clone(),
-            input: vec![raw_query.to_owned()],
-            dimensions: None,
-            truncate: false,
-        });
-        let (bm25_joined, embedded, indexed) = tokio::join!(
-            bm25_task,
-            tokio::time::timeout(
-                Duration::from_secs(memory_config.embedding_timeout_secs),
-                embed_call
-            ),
-            index_task
-        );
-        let (mut bm25, bm25_ms) = join_blocking_result(bm25_joined)?;
+        let embedded = tokio::time::timeout(
+            Duration::from_secs(memory_config.embedding_timeout_secs),
+            backend.embed(EmbeddingRequest {
+                model: spec.model.clone(),
+                input: vec![raw_query.to_owned()],
+                dimensions: None,
+                truncate: false,
+            }),
+        )
+        .await;
         let vector_elapsed = elapsed_ms(embed_started);
-        let vector_input =
-            match validate_query_embedding(embedded, &spec).and_then(|query_vector| {
-                join_blocking_result(indexed).map(|index| (query_vector, index))
-            }) {
-                Ok(input) => input,
-                Err(error) => {
-                    apply_vector_fallback(&mut bm25, bm25_ms, vector_elapsed, error.to_string());
-                    bm25.trace.elapsed_ms = elapsed_ms(started);
-                    return Ok(bm25);
-                }
-            };
-        if vector_input.1.is_empty() {
-            apply_vector_fallback(
-                &mut bm25,
-                bm25_ms,
-                vector_elapsed,
-                "没有兼容的向量索引".into(),
-            );
-            bm25.trace.elapsed_ms = elapsed_ms(started);
-            return Ok(bm25);
-        }
-
-        let mut fallback = bm25.clone();
+        let query_vector = match validate_query_embedding(embedded, &spec) {
+            Ok(input) => input,
+            Err(error) => {
+                let bm25_started = Instant::now();
+                let mut fallback = self.keyword_recall_scoped(
+                    raw_query,
+                    current_user_event_id,
+                    recent_event_ids,
+                    session_filter,
+                    retrieval_config,
+                )?;
+                let bm25_ms = elapsed_ms(bm25_started);
+                fallback.trace.query_kind = query_kind;
+                fallback.trace.budget_allocation = decided_budget;
+                apply_vector_fallback(&mut fallback, bm25_ms, vector_elapsed, error.to_string());
+                fallback.trace.elapsed_ms = elapsed_ms(started);
+                return Ok(fallback);
+            }
+        };
         let fusion_store = self.clone();
         let fusion_query = raw_query.to_owned();
         let fusion_scope = session_filter.map(str::to_owned);
@@ -2022,19 +2031,18 @@ impl RetrievalStore {
         let fusion_recent = recent_event_ids.to_vec();
         let retrieval = retrieval_config.clone();
         let memory = memory_config.clone();
+        let fusion_spec = spec.clone();
         let fused_task = tokio::task::spawn_blocking(move || {
             fusion_store
                 .fuse_vector_recall(
-                    bm25,
                     &fusion_query,
-                    vector_input.0,
-                    vector_input.1,
+                    query_vector,
+                    &fusion_spec,
                     &fusion_current,
                     &fusion_recent,
                     fusion_scope.as_deref(),
                     retrieval,
                     memory,
-                    bm25_ms,
                     vector_elapsed,
                 )
                 .map_err(|error| match error {
@@ -2048,6 +2056,17 @@ impl RetrievalStore {
         let mut result = match join_blocking(fused_task).await {
             Ok(result) => result,
             Err(error) => {
+                let bm25_started = Instant::now();
+                let mut fallback = self.keyword_recall_scoped(
+                    raw_query,
+                    current_user_event_id,
+                    recent_event_ids,
+                    session_filter,
+                    retrieval_config,
+                )?;
+                let bm25_ms = elapsed_ms(bm25_started);
+                fallback.trace.query_kind = query_kind;
+                fallback.trace.budget_allocation = decided_budget;
                 let message = error.to_string();
                 let graph_elapsed = match &error {
                     RetrievalError::HybridRecall(failure) => failure.elapsed_ms,
@@ -2094,26 +2113,22 @@ impl RetrievalStore {
         Ok(result)
     }
 
-    fn load_vector_index(
+    fn load_vector_index_from_connection(
         &self,
+        connection: &Connection,
         spec: &VectorIndexSpec,
         session_filter: Option<&str>,
     ) -> RetrievalResult<Arc<HnswVectorIndex>> {
         spec.validate()
             .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
-        let _guard = self.acquire_root_read()?;
-        let mut connection = self.open_connection()?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Deferred)
-            .map_err(|error| self.database_error(error))?;
         let total = if let Some(session_id) = session_filter {
-            transaction.query_row(
+            connection.query_row(
                 "SELECT count(*) FROM memory_documents WHERE session_id=?1",
                 [session_id],
                 |row| i64_to_usize(row.get(0)?),
             )
         } else {
-            transaction.query_row("SELECT count(*) FROM memory_documents", [], |row| {
+            connection.query_row("SELECT count(*) FROM memory_documents", [], |row| {
                 i64_to_usize(row.get(0)?)
             })
         }
@@ -2122,7 +2137,7 @@ impl RetrievalStore {
             .fingerprint()
             .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
         let rows = self.compatible_embeddings_from_connection(
-            &transaction,
+            connection,
             spec,
             &fingerprint,
             session_filter,
@@ -2133,9 +2148,6 @@ impl RetrievalStore {
                 rows.len()
             )));
         }
-        transaction
-            .commit()
-            .map_err(|error| self.database_error(error))?;
         if session_filter.is_some() {
             return HnswVectorIndex::rebuild(spec.clone(), rows)
                 .map(Arc::new)
@@ -2173,19 +2185,36 @@ impl RetrievalStore {
     #[allow(clippy::too_many_arguments)]
     fn fuse_vector_recall(
         &self,
-        mut bm25: RecallResult,
         raw_query: &str,
         query_vector: Vec<f32>,
-        index: Arc<HnswVectorIndex>,
+        spec: &VectorIndexSpec,
         current_user_event_id: &str,
         recent_event_ids: &[String],
         session_filter: Option<&str>,
         retrieval_config: RetrievalConfig,
         memory_config: MemoryConfig,
-        bm25_ms: u64,
         vector_ms: u64,
     ) -> RetrievalResult<RecallResult> {
         let _guard = self.acquire_root_read()?;
+        let mut connection = self.open_connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(|error| self.database_error(error))?;
+        let bm25_started = Instant::now();
+        let mut bm25 = self.keyword_recall_core_from_connection(
+            &transaction,
+            raw_query,
+            current_user_event_id,
+            recent_event_ids,
+            session_filter,
+            retrieval_config.clone(),
+        )?;
+        let bm25_ms = elapsed_ms(bm25_started);
+        bm25.trace.budget_allocation = memory_budget_trace(&memory_config, bm25.trace.query_kind);
+        let index = self.load_vector_index_from_connection(&transaction, spec, session_filter)?;
+        if index.is_empty() {
+            return Err(RetrievalError::CorruptIndex("没有兼容的向量索引".into()));
+        }
         let hits = index
             .search(&query_vector, memory_config.vector_candidate_limit)
             .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
@@ -2199,10 +2228,6 @@ impl RetrievalStore {
             })
             .map(|hit| hit.document_id.clone())
             .collect::<BTreeSet<_>>();
-        let mut connection = self.open_connection()?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Deferred)
-            .map_err(|error| self.database_error(error))?;
         let mut graph_seeds = bm25
             .trace
             .candidates
@@ -2516,14 +2541,7 @@ impl RetrievalStore {
             HybridRecallFailure::timed(HybridRecallStage::Graph, error, graph_started)
         })?;
         let graph_ms = elapsed_ms(graph_started);
-        let selected_budget = memory_budget_for_query(&memory_config, bm25.trace.query_kind);
-        bm25.trace.budget_allocation = BudgetAllocationTrace {
-            query_kind: bm25.trace.query_kind,
-            recent_history_percent: selected_budget.recent_history,
-            exact_or_state_percent: selected_budget.exact_or_state,
-            episode_percent: selected_budget.episode,
-            graph_percent: selected_budget.graph,
-        };
+        bm25.trace.budget_allocation = memory_budget_trace(&memory_config, bm25.trace.query_kind);
         let graph_sidecar = self
             .prepare_graph_candidates(
                 &transaction,
@@ -3903,20 +3921,32 @@ impl RetrievalStore {
             let item = &graph.candidates[graph_index];
             let path = &mut graph.paths[item.path_index];
             let raw = &item.raw;
-            if let Some(candidate_index) = candidates
-                .iter()
-                .position(|candidate| candidate.span == raw.span && candidate.selected)
-            {
-                path.selected = true;
-                path.reason = "selected_coalesced".into();
-                candidates[candidate_index].selected = true;
+            let raw_chars = raw.content.chars().count();
+            if graph_slots >= graph_slot_budget {
+                path.reason = "graph_slot_limit".into();
+                continue;
+            }
+            if graph_chars + raw_chars > graph_char_budget {
+                path.reason = "graph_evidence_budget".into();
                 continue;
             }
             if sidecar.candidates.iter().any(|state| {
                 state.trace.selected && state.trace.evidence_span.as_ref() == Some(&raw.span)
             }) {
+                path.reason = "duplicate_state".into();
+                continue;
+            }
+            if let Some(candidate_index) = candidates.iter().position(|candidate| {
+                candidate.span == raw.span
+                    && candidate.selected
+                    && candidate.reason != "selected_state"
+                    && candidate.reason != "selected_graph"
+            }) {
                 path.selected = true;
                 path.reason = "selected_coalesced".into();
+                candidates[candidate_index].selected = true;
+                graph_slots += 1;
+                graph_chars += raw_chars;
                 continue;
             }
             let duplicate_reason = if selected_events.contains(&raw.span.event_id) {
@@ -3934,15 +3964,6 @@ impl RetrievalStore {
             };
             if let Some(reason) = duplicate_reason {
                 path.reason = reason.into();
-                continue;
-            }
-            let raw_chars = raw.content.chars().count();
-            if graph_slots >= graph_slot_budget {
-                path.reason = "graph_slot_limit".into();
-                continue;
-            }
-            if graph_chars + raw_chars > graph_char_budget {
-                path.reason = "graph_evidence_budget".into();
                 continue;
             }
             if selected.len() + state_only.len() + graph_only.len() >= retrieval_config.max_selected
@@ -9043,6 +9064,17 @@ fn memory_budget_for_query(config: &MemoryConfig, kind: QueryKind) -> MemoryBudg
         QueryKind::EventRecap => config.budgets.event_recap,
         QueryKind::TemporalState => config.budgets.temporal_state,
         QueryKind::MultiHop => config.budgets.multi_hop,
+    }
+}
+
+pub(crate) fn memory_budget_trace(config: &MemoryConfig, kind: QueryKind) -> BudgetAllocationTrace {
+    let budget = memory_budget_for_query(config, kind);
+    BudgetAllocationTrace {
+        query_kind: kind,
+        recent_history_percent: budget.recent_history,
+        exact_or_state_percent: budget.exact_or_state,
+        episode_percent: budget.episode,
+        graph_percent: budget.graph,
     }
 }
 
