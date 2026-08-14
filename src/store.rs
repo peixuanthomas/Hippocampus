@@ -7,6 +7,9 @@ use chrono::Utc;
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::control::{
+    ControlAction, ControlLog, ControlRecord, ControlResult, ControlState, ControlTarget,
+};
 use crate::knowledge::KnowledgeStore;
 use crate::model::{
     BudgetConfig, DEFAULT_SYSTEM_PROMPT, SCHEMA_VERSION, Session, SessionStatus, TurnStatus,
@@ -28,6 +31,7 @@ pub struct SessionStore {
     root: PathBuf,
     retrieval: RetrievalStore,
     knowledge: KnowledgeStore,
+    control: ControlLog,
 }
 
 impl SessionStore {
@@ -36,10 +40,12 @@ impl SessionStore {
         let retrieval = RetrievalStore::new(expanded.as_path())?;
         let root = retrieval.root().to_path_buf();
         let knowledge = KnowledgeStore::new(&root)?;
+        let control = ControlLog::new(&root)?;
         Ok(Self {
             root,
             retrieval,
             knowledge,
+            control,
         })
     }
 
@@ -53,6 +59,34 @@ impl SessionStore {
 
     pub fn knowledge(&self) -> &KnowledgeStore {
         &self.knowledge
+    }
+
+    pub fn control_log(&self) -> &ControlLog {
+        &self.control
+    }
+
+    pub fn control_state(&self) -> ControlResult<ControlState> {
+        self.control.replay()
+    }
+
+    pub fn apply_control(
+        &self,
+        action: ControlAction,
+        target: ControlTarget,
+    ) -> ControlResult<ControlRecord> {
+        let _guard = self
+            .retrieval
+            .acquire_root_write()
+            .map_err(|error| crate::control::ControlError::Locking(error.to_string()))?;
+        self.control.append(action, &target)
+    }
+
+    pub fn exclude(&self, target: ControlTarget) -> ControlResult<ControlRecord> {
+        self.apply_control(ControlAction::Exclude, target)
+    }
+
+    pub fn restore(&self, target: ControlTarget) -> ControlResult<ControlRecord> {
+        self.apply_control(ControlAction::Restore, target)
     }
 
     pub fn create(

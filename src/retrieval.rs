@@ -7878,7 +7878,7 @@ struct DerivedContext {
     knowledge_trace: KnowledgeTrace,
 }
 
-fn derive_events(session: &Session) -> Vec<StoredEvent> {
+pub(crate) fn derive_events(session: &Session) -> Vec<StoredEvent> {
     let mut events = Vec::new();
     if !session.system_prompt.is_empty() {
         events.push(StoredEvent {

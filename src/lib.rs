@@ -1,6 +1,7 @@
 pub mod config;
 pub mod consolidation;
 pub mod context;
+pub mod control;
 pub mod engine;
 pub mod episode;
 pub mod graph;
@@ -31,6 +32,10 @@ pub use consolidation::{
     structured_consolidation_schema,
 };
 pub use context::ContextAssembler;
+pub use control::{
+    CONTROL_LOG_VERSION, ControlAction, ControlError, ControlLog, ControlRecord, ControlResult,
+    ControlState, ControlTarget, ControlTargetKind,
+};
 pub use engine::{
     ChatEngine, EmbeddingRefreshError, EmbeddingRefreshReport, EmbeddingRefreshStage, LimitAction,
     PreparedTurn,
