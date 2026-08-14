@@ -6,7 +6,8 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use rusqlite::{
-    Connection, OptionalExtension, Transaction, TransactionBehavior, params, types::ValueRef,
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+    types::ValueRef,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -937,7 +938,7 @@ impl RetrievalStore {
         let _guard = self.acquire_root_read()?;
         let control = self.replay_control_state_under_guard()?;
         let expected = control.generation_sha256().to_owned();
-        let mut connection = self.open_connection()?;
+        let mut connection = self.open_status_connection()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Deferred)
             .map_err(|error| self.database_error(error))?;
@@ -8007,6 +8008,139 @@ impl RetrievalStore {
         }
         paths.sort();
         paths.iter().map(|path| self.read_source(path)).collect()
+    }
+
+    fn open_status_connection(&self) -> RetrievalResult<Connection> {
+        let connection =
+            Connection::open_with_flags(&self.index_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(|source| self.database_error(source))?;
+        connection
+            .busy_timeout(Duration::from_secs(5))
+            .map_err(|source| self.database_error(source))?;
+
+        let application_id = connection
+            .query_row("PRAGMA application_id", [], |row| row.get::<_, i64>(0))
+            .map_err(|source| self.database_error(source))?;
+        if application_id != 0 {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "派生索引 application_id 不受支持：{application_id}"
+            )));
+        }
+        let schema_version = connection
+            .query_row("PRAGMA schema_version", [], |row| row.get::<_, i64>(0))
+            .map_err(|source| self.database_error(source))?;
+        if schema_version <= 0 {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "派生索引 schema_version 无效：{schema_version}"
+            )));
+        }
+        let user_version = connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .map_err(|source| self.database_error(source))?;
+        if user_version != INDEX_SCHEMA_VERSION {
+            return Err(RetrievalError::UnsupportedIndexVersion(user_version));
+        }
+        match read_existing_memory_state_version(&connection)
+            .map_err(|source| self.database_error(source))?
+        {
+            Some(MEMORY_STATE_SCHEMA_VERSION) => {}
+            Some(version) => return Err(RetrievalError::UnsupportedMemoryStateVersion(version)),
+            None => {
+                return Err(RetrievalError::CorruptIndex(
+                    "派生索引缺少 memory state schema version".into(),
+                ));
+            }
+        }
+        match read_existing_graph_schema_version(&connection)
+            .map_err(|source| self.database_error(source))?
+        {
+            Some(crate::graph::GRAPH_SCHEMA_VERSION) => {}
+            Some(version) => return Err(RetrievalError::UnsupportedGraphSchemaVersion(version)),
+            None => {
+                return Err(RetrievalError::CorruptIndex(
+                    "派生索引缺少 graph schema version".into(),
+                ));
+            }
+        }
+
+        const REQUIRED_STATUS_TABLES: &[&str] = &[
+            "indexed_sessions",
+            "events",
+            "source_spans",
+            "answer_contexts",
+            "answer_context_items",
+            "retrieval_runs",
+            "retrieval_documents",
+            "retrieval_documents_fts",
+            "memory_documents",
+            "memory_document_members",
+            "memory_embeddings",
+            "memory_episode_boundaries",
+            "memory_episode_materializations",
+            "consolidation_watermarks",
+            "consolidation_batches",
+            "memory_schema_meta",
+            "memory_entities",
+            "memory_entity_mentions",
+            "memory_entity_aliases",
+            "memory_claims",
+            "memory_claim_evidence",
+            "memory_claim_transitions",
+            "memory_boundary_suggestions",
+            "memory_graph_nodes",
+            "memory_graph_edges",
+            "memory_graph_materializations",
+        ];
+        let mut table_statement = connection
+            .prepare("SELECT type FROM sqlite_schema WHERE name=?1")
+            .map_err(|source| self.database_error(source))?;
+        for table in REQUIRED_STATUS_TABLES {
+            let object_type = table_statement
+                .query_row([table], |row| row.get::<_, String>(0))
+                .optional()
+                .map_err(|source| self.database_error(source))?;
+            if object_type.as_deref() != Some("table") {
+                return Err(RetrievalError::CorruptIndex(format!(
+                    "派生索引缺少必要表 {table}"
+                )));
+            }
+        }
+        drop(table_statement);
+
+        const REQUIRED_STATUS_COLUMNS: &[&str] = &[
+            "SELECT session_id,title,created_at,updated_at,source_file,source_sha256,source_schema_version,indexed_at FROM indexed_sessions LIMIT 0",
+            "SELECT event_id,session_id,turn_id,sequence,role,created_at,content,content_sha256,reply_to_event_id,token_count,turn_status,done_reason,error FROM events LIMIT 0",
+            "SELECT event_id,start_char,end_char,content_sha256 FROM source_spans LIMIT 0",
+            "SELECT answer_event_id,turn_id,context_sha256,estimated_upper_tokens,exact_input_tokens,input_budget,decision,provenance_quality,request_model,request_think,request_context_window,request_max_output_tokens,identity_instruction FROM answer_contexts LIMIT 0",
+            "SELECT answer_event_id,ordinal,role,event_id,start_char,end_char,content_sha256 FROM answer_context_items LIMIT 0",
+            "SELECT answer_event_id,trace_json FROM retrieval_runs LIMIT 0",
+            "SELECT document_id,event_id,start_char,end_char,granularity,content_sha256,exact_content,lexical_content,ngram_content FROM retrieval_documents LIMIT 0",
+            "SELECT rowid,lexical_content,ngram_content FROM retrieval_documents_fts LIMIT 0",
+            "SELECT document_id,session_id,granularity,source_sha256,start_sequence,end_sequence,member_count FROM memory_documents LIMIT 0",
+            "SELECT document_id,ordinal,event_id,start_char,end_char,content_sha256 FROM memory_document_members LIMIT 0",
+            "SELECT document_id,model,dimensions,source_sha256,index_fingerprint,vector_blob,embedded_at FROM memory_embeddings LIMIT 0",
+            "SELECT session_id,before_event_id,decision_json,input_sha256 FROM memory_episode_boundaries LIMIT 0",
+            "SELECT session_id,source_session_sha256,ledger_snapshot_sha256,vector_index_fingerprint,plan_input_sha256,algorithm_version,gap_minutes,topic_similarity_threshold,episode_count,boundary_count,materialized_at FROM memory_episode_materializations LIMIT 0",
+            "SELECT session_id,through_sequence,through_event_id,through_event_sha256,updated_at FROM consolidation_watermarks LIMIT 0",
+            "SELECT attempt_id,batch_key,session_id,from_sequence,through_sequence,trigger,model,request_json,request_sha256,input_event_ids,input_event_hashes,response_json,response_sha256,status,input_tokens,output_tokens,latency_ms,started_at,completed_at,validation_json,error_json,projection_schema_version FROM consolidation_batches LIMIT 0",
+            "SELECT key,value FROM memory_schema_meta LIMIT 0",
+            "SELECT entity_id,kind,canonical_name,normalized_name,disambiguation,created_session_id,created_batch_key,created_event_id,created_start,created_end,created_hash,created_at,updated_at FROM memory_entities LIMIT 0",
+            "SELECT mention_id,session_id,batch_key,mention_kind,source_record_id,entity_id,entity_status,event_id,sequence,role,start_char,end_char,content_sha256,created_at FROM memory_entity_mentions LIMIT 0",
+            "SELECT alias_id,entity_id,alias_text,normalized_alias,alias_kind,stable_identifier_kind,session_id,batch_key,event_id,start_char,end_char,content_sha256,proof_event_id,proof_start_char,proof_end_char,proof_sha256,identity_event_id,identity_start_char,identity_end_char,identity_sha256,created_at FROM memory_entity_aliases LIMIT 0",
+            "SELECT claim_id,session_id,subject_entity_id,predicate_key,normalized_relation,object_kind,object_text,object_entity_id,normalized_object,polarity,cardinality,certainty,state,asserted_at,event_time,valid_from,valid_to,reference_time,created_batch_key,updated_batch_key,created_at,updated_at FROM memory_claims LIMIT 0",
+            "SELECT evidence_id,claim_id,session_id,batch_key,event_id,sequence,role,kind,start_char,end_char,content_sha256,subject_start_char,subject_end_char,subject_sha256,relation_start_char,relation_end_char,relation_sha256,object_start_char,object_end_char,object_sha256,speech_act_event_id,speech_act_start_char,speech_act_end_char,speech_act_sha256,created_at FROM memory_claim_evidence LIMIT 0",
+            "SELECT transition_id,claim_id,ordinal,from_state,to_state,reason,related_claim_id,session_id,batch_key,created_at FROM memory_claim_transitions LIMIT 0",
+            "SELECT boundary_id,session_id,batch_key,before_event_id,reason,evidence_json,created_at FROM memory_boundary_suggestions LIMIT 0",
+            "SELECT node_id,node_kind,source_id,session_id,granularity,source_sha256 FROM memory_graph_nodes LIMIT 0",
+            "SELECT edge_id,edge_type,source_node_id,target_node_id,weight,directed,provenance_json,provenance_sha256 FROM memory_graph_edges LIMIT 0",
+            "SELECT singleton,algorithm_version,vector_index_fingerprint,config_sha256,source_sha256,catalog_sha256,node_count,edge_count,materialized_at FROM memory_graph_materializations LIMIT 0",
+        ];
+        for query in REQUIRED_STATUS_COLUMNS {
+            connection
+                .prepare(query)
+                .map_err(|source| self.database_error(source))?;
+        }
+        Ok(connection)
     }
 
     pub(crate) fn open_connection(&self) -> RetrievalResult<Connection> {
