@@ -288,6 +288,12 @@ impl BudgetAllocationTrace {
             probes: Vec::new(),
         }
     }
+
+    pub fn normalize_usage(&mut self) {
+        for probe in &mut self.probes {
+            probe.usage.refresh();
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -550,6 +556,12 @@ impl Default for RetrievalTrace {
             warnings: Vec::new(),
             elapsed_ms: 0,
         }
+    }
+}
+
+impl RetrievalTrace {
+    pub fn normalize_usage(&mut self) {
+        self.budget_allocation.normalize_usage();
     }
 }
 
@@ -1259,6 +1271,7 @@ impl Turn {
     pub fn normalize(&mut self) {
         self.usage.refresh();
         self.probe_usage.refresh();
+        self.context_trace.retrieval.normalize_usage();
         self.context_trace.web.normalize();
     }
 }

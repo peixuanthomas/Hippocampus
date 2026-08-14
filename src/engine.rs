@@ -1480,6 +1480,37 @@ impl<B: ChatBackend> ChatEngine<B> {
         }
 
         let selected_plan = prepared.plan.clone();
+        let mandatory_tokens = selected_plan
+            .retrieval_trace
+            .budget_allocation
+            .mandatory_input_tokens;
+        if mandatory_tokens == 0 {
+            bail!("prepared adaptive plan 缺少精确 mandatory token 记录");
+        }
+        if mandatory_tokens > session.budget.trim_target() {
+            let message = "系统提示与当前输入超过 80% 安全裁剪目标，请缩短系统提示或当前输入";
+            apply_trace(
+                session,
+                prepared.turn_index,
+                &selected_plan,
+                "mandatory_above_trim_target",
+                start_before,
+                start_before,
+            );
+            let turn = &mut session.turns[prepared.turn_index];
+            turn.status = TurnStatus::Blocked;
+            turn.error = Some(message.into());
+            turn.touch();
+            session.status = SessionStatus::Paused;
+            self.store.save(session)?;
+            return Ok(self.prepared(
+                session,
+                prepared.turn_index,
+                selected_plan,
+                PreparationStatus::Blocked,
+                message,
+            ));
+        }
         let retained = selected_plan.selected_history_indices.len();
         let new_start = if retained > 0 {
             *selected_plan
@@ -5016,7 +5047,8 @@ mod tests {
             .prepare_turn(&mut b, "翡翠罗盘是什么".into())
             .await
             .unwrap();
-        assert_eq!(*probes.lock().unwrap(), 1);
+        // Mandatory baseline and evidence-bearing final requests are distinct exact probes.
+        assert_eq!(*probes.lock().unwrap(), 2);
         assert!(!prepared.plan.retrieval_trace.selected_evidence.is_empty());
         assert_eq!(
             store
