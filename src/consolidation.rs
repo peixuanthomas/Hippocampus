@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use unicode_normalization::UnicodeNormalization;
 
+use crate::control::ControlState;
 use crate::model::{ChatMessage, EventRole, TurnStatus};
 use crate::ollama::StructuredChatRequest;
 use crate::retrieval::{RetrievalError, RetrievalResult, RetrievalStore, StoredEvent};
@@ -745,8 +746,16 @@ impl RetrievalStore {
         &self,
         session_id: &str,
     ) -> RetrievalResult<Option<ConsolidationInputBatch>> {
-        let source_events = self.replay_session(session_id)?;
-        let watermark = self.consolidation_watermark(session_id)?;
+        let _guard = self.acquire_root_read()?;
+        let control = self.replay_control_state_under_guard()?;
+        let mut connection = self.open_connection()?;
+        let transaction = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+            .map_err(|error| self.database_error(error))?;
+        self.require_current_control_projection(&transaction, &control)?;
+        let source_events =
+            self.replay_session_from_connection_with_state(&transaction, session_id, &control)?;
+        let watermark = self.consolidation_watermark_from_connection(&transaction, session_id)?;
         let start_index = validated_resume_index(&source_events, &watermark)?;
 
         let mut events = Vec::new();
@@ -790,6 +799,11 @@ impl RetrievalStore {
                 )));
             }
 
+            if !control.allows_turn(session_id, turn_id) {
+                cursor = turn_end;
+                continue;
+            }
+
             if status == TurnStatus::Pending {
                 break;
             }
@@ -828,6 +842,10 @@ impl RetrievalStore {
         }
 
         let Some(first) = events.first() else {
+            self.require_unchanged_control_state(&control)?;
+            transaction
+                .commit()
+                .map_err(|error| self.database_error(error))?;
             return Ok(None);
         };
         let last = events
@@ -839,7 +857,7 @@ impl RetrievalStore {
             last.sequence,
             &events,
         );
-        Ok(Some(ConsolidationInputBatch {
+        let batch = ConsolidationInputBatch {
             batch_key,
             session_id: session_id.to_owned(),
             watermark_before: watermark.through_sequence,
@@ -850,7 +868,12 @@ impl RetrievalStore {
             turn_count,
             char_count,
             events,
-        }))
+        };
+        self.require_unchanged_control_state(&control)?;
+        transaction
+            .commit()
+            .map_err(|error| self.database_error(error))?;
+        Ok(Some(batch))
     }
 
     pub fn consolidation_watermark(
@@ -858,6 +881,14 @@ impl RetrievalStore {
         session_id: &str,
     ) -> RetrievalResult<ConsolidationWatermark> {
         let connection = self.open_connection()?;
+        self.consolidation_watermark_from_connection(&connection, session_id)
+    }
+
+    fn consolidation_watermark_from_connection(
+        &self,
+        connection: &Connection,
+        session_id: &str,
+    ) -> RetrievalResult<ConsolidationWatermark> {
         let stored = connection
             .query_row(
                 "SELECT through_sequence, through_event_id, through_event_sha256, updated_at
@@ -911,10 +942,20 @@ impl RetrievalStore {
     ) -> RetrievalResult<ConsolidationCandidateSnapshot> {
         validate_candidate_limit(entity_limit, "entity_limit")?;
         validate_candidate_limit(claim_limit, "claim_limit")?;
-        let connection = self.open_connection()?;
-        validate_full_derived_integrity(&connection)?;
-        let snapshot = load_candidate_snapshot(&connection, entity_limit, claim_limit)?;
-        self.verify_snapshot_source_freshness(&snapshot)?;
+        let _guard = self.acquire_root_read()?;
+        let control = self.replay_control_state_under_guard()?;
+        let mut connection = self.open_connection()?;
+        let transaction = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+            .map_err(|error| self.database_error(error))?;
+        self.require_current_control_projection(&transaction, &control)?;
+        validate_full_derived_integrity(&transaction)?;
+        let snapshot = load_candidate_snapshot(&transaction, entity_limit, claim_limit)?;
+        self.verify_snapshot_source_freshness(&transaction, &control, &snapshot)?;
+        self.require_unchanged_control_state(&control)?;
+        transaction
+            .commit()
+            .map_err(|error| self.database_error(error))?;
         Ok(snapshot)
     }
 
@@ -949,26 +990,33 @@ impl RetrievalStore {
             })?;
         let plan = validate_structured_output(batch, candidates, &output)?;
 
-        let _source_guard = self
-            .acquire_root_read()
-            .map_err(ConsolidationApplyError::Retrieval)?;
-        let preflight_connection = self.open_connection()?;
-        validate_full_derived_integrity(&preflight_connection)?;
-        validate_global_stable_aliases(&preflight_connection, &plan)?;
-        validate_plan_against_global_claims(&preflight_connection, &plan)?;
-        let global_state_sha256 = global_memory_state_hash(&preflight_connection)?;
-        verify_indexed_source_file(self, &preflight_connection, &batch.session_id)
-            .map_err(map_source_staleness)?;
-        drop(preflight_connection);
-        self.verify_snapshot_source_freshness(candidates)
-            .map_err(map_source_staleness)?;
-
         let pending = self
             .next_consolidation_batch(&batch.session_id)
             .map_err(map_source_staleness)?;
         if pending.as_ref() != Some(batch) {
             return Err(stale("当前待巩固批次已变化"));
         }
+
+        let _source_guard = self
+            .acquire_root_read()
+            .map_err(ConsolidationApplyError::Retrieval)?;
+        let control = self.replay_control_state_under_guard()?;
+        let preflight_connection = self.open_connection()?;
+        self.require_current_control_projection(&preflight_connection, &control)?;
+        for event in &batch.events {
+            if !control.allows_event(&batch.session_id, &event.event_id) {
+                return Err(stale("巩固批次包含已排除事件"));
+            }
+        }
+        validate_full_derived_integrity(&preflight_connection)?;
+        validate_global_stable_aliases(&preflight_connection, &plan)?;
+        validate_plan_against_global_claims(&preflight_connection, &plan)?;
+        let global_state_sha256 = global_memory_state_hash(&preflight_connection)?;
+        verify_indexed_source_file(self, &preflight_connection, &batch.session_id)
+            .map_err(map_source_staleness)?;
+        self.verify_snapshot_source_freshness(&preflight_connection, &control, candidates)
+            .map_err(map_source_staleness)?;
+        drop(preflight_connection);
         #[cfg(test)]
         self.run_consolidation_test_hook(
             crate::retrieval::ConsolidationHookPoint::AfterPendingBatchCheck,
@@ -980,6 +1028,9 @@ impl RetrievalStore {
         let transaction = connection
             .transaction()
             .map_err(|e| self.database_error(e))?;
+
+        self.require_unchanged_control_state(&control)?;
+        self.require_current_control_projection(&transaction, &control)?;
 
         verify_indexed_source_file(self, &transaction, &batch.session_id)
             .map_err(map_source_staleness)?;
@@ -1038,12 +1089,15 @@ impl RetrievalStore {
             .map_err(ConsolidationApplyError::Retrieval)?;
         verify_indexed_source_file(self, &transaction, &batch.session_id)
             .map_err(map_source_staleness)?;
+        self.require_unchanged_control_state(&control)?;
         transaction.commit().map_err(|e| self.database_error(e))?;
         Ok(report)
     }
 
     fn verify_snapshot_source_freshness(
         &self,
+        connection: &Connection,
+        control: &ControlState,
         snapshot: &ConsolidationCandidateSnapshot,
     ) -> RetrievalResult<()> {
         let mut expected_events = HashMap::<String, (String, usize, usize, String)>::new();
@@ -1083,7 +1137,12 @@ impl RetrievalStore {
             }
         }
         for (event_id, (session_id, start, end, expected_hash)) in expected_events {
-            let event = self.get_event(&event_id)?;
+            let event = self.get_event_from_connection(connection, &event_id)?;
+            if !control.allows_event(&event.session_id, &event.id) {
+                return Err(RetrievalError::ExcludedEvent(event.id));
+            }
+            let session = self.get_session_from_connection(connection, &event.session_id)?;
+            self.verify_fresh(&session)?;
             if event.session_id != session_id {
                 return Err(RetrievalError::CorruptIndex(format!(
                     "记忆来源事件 {event_id} 属于错误会话"

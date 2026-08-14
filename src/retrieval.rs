@@ -15,6 +15,7 @@ use crate::consolidation::{
     normalize_match, original_claim_valid_to_by_id, validate_full_derived_integrity,
 };
 use crate::context::{WrappedHistoryCursor, wrapped_history_identity};
+use crate::control::{ControlLog, ControlState};
 use crate::episode::{
     EMBEDDING_COSINE_SIMILARITY_THRESHOLD, EPISODE_ALGORITHM_VERSION, EpisodeBoundaryDecision,
     EpisodeBoundarySuggestion, EpisodeDocument, EpisodeInputMessage, EpisodeMaterializationReport,
@@ -256,6 +257,16 @@ pub enum RetrievalError {
     },
     #[error("派生索引内容校验失败：{0}")]
     CorruptIndex(String),
+    #[error("会话 {0} 已被控制日志排除")]
+    ExcludedSession(String),
+    #[error("事件 {0} 已被控制日志排除")]
+    ExcludedEvent(String),
+    #[error("control_projection_stale")]
+    ControlProjectionStale,
+    #[error("control_state_changed; retry the operation")]
+    ControlStateChanged,
+    #[error("控制日志校验失败，拒绝访问：{0}")]
+    Control(String),
     #[error("{kind} embedding catalog 已变化，请重新获取 snapshot")]
     EmbeddingCatalogStale { kind: String },
     #[error("会话根目录锁已损坏，拒绝继续访问：{path}")]
@@ -723,6 +734,146 @@ impl RetrievalStore {
         &self.index_path
     }
 
+    pub fn control_state(&self) -> RetrievalResult<ControlState> {
+        let _guard = self.acquire_root_read()?;
+        self.replay_control_state_under_guard()
+    }
+
+    pub(crate) fn replay_control_state_under_guard(&self) -> RetrievalResult<ControlState> {
+        ControlLog::new(&self.root)
+            .and_then(|log| log.replay())
+            .map_err(|error| RetrievalError::Control(error.to_string()))
+    }
+
+    pub(crate) fn require_unchanged_control_state(
+        &self,
+        expected: &ControlState,
+    ) -> RetrievalResult<()> {
+        if self.replay_control_state_under_guard()? != *expected {
+            return Err(RetrievalError::ControlStateChanged);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn control_projection_is_current(
+        &self,
+        connection: &Connection,
+        state: &ControlState,
+    ) -> RetrievalResult<bool> {
+        let marker = connection
+            .query_row(
+                "SELECT value FROM memory_schema_meta WHERE key='active_control_generation_sha256'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| self.database_error(error))?;
+        Ok(match marker {
+            Some(marker) => marker == state.generation_sha256(),
+            None => state.last_sequence() == 0,
+        })
+    }
+
+    pub(crate) fn require_current_control_projection(
+        &self,
+        connection: &Connection,
+        state: &ControlState,
+    ) -> RetrievalResult<()> {
+        if !self.control_projection_is_current(connection, state)? {
+            return Err(RetrievalError::ControlProjectionStale);
+        }
+        Ok(())
+    }
+
+    fn require_active_session(state: &ControlState, session_id: &str) -> RetrievalResult<()> {
+        if !state.allows_session(session_id) {
+            return Err(RetrievalError::ExcludedSession(session_id.to_owned()));
+        }
+        Ok(())
+    }
+
+    fn require_active_event(state: &ControlState, event: &StoredEvent) -> RetrievalResult<()> {
+        Self::require_active_session(state, &event.session_id)?;
+        if !state.allows_event(&event.session_id, &event.id) {
+            return Err(RetrievalError::ExcludedEvent(event.id.clone()));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn memory_document_is_active(
+        &self,
+        connection: &Connection,
+        state: &ControlState,
+        document_id: &str,
+    ) -> RetrievalResult<bool> {
+        let row = connection
+            .query_row(
+                "SELECT session_id,granularity,event_id FROM memory_documents WHERE document_id=?1",
+                [document_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| self.database_error(error))?;
+        let Some((session_id, granularity, event_id)) = row else {
+            return Ok(false);
+        };
+        if !state.allows_session(&session_id) {
+            return Ok(false);
+        }
+        if matches!(granularity.as_str(), "message" | "fragment") {
+            return Ok(event_id.is_some_and(|id| state.allows_event(&session_id, &id)));
+        }
+        let mut statement = connection.prepare(
+            "SELECT event_id FROM memory_document_members WHERE document_id=?1 ORDER BY ordinal"
+        ).map_err(|error| self.database_error(error))?;
+        let members = statement
+            .query_map([document_id], |row| row.get::<_, String>(0))
+            .map_err(|error| self.database_error(error))?;
+        let mut saw_member = false;
+        for member in members {
+            saw_member = true;
+            if !state.allows_event(
+                &session_id,
+                &member.map_err(|error| self.database_error(error))?,
+            ) {
+                return Ok(false);
+            }
+        }
+        Ok(saw_member)
+    }
+
+    fn active_memory_document_count(
+        &self,
+        connection: &Connection,
+        state: &ControlState,
+        session_filter: Option<&str>,
+    ) -> RetrievalResult<usize> {
+        let mut statement = connection
+            .prepare("SELECT document_id,session_id FROM memory_documents ORDER BY document_id")
+            .map_err(|error| self.database_error(error))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| self.database_error(error))?;
+        let mut total = 0;
+        for row in rows {
+            let (id, session_id) = row.map_err(|error| self.database_error(error))?;
+            if session_filter.is_none_or(|scope| scope == session_id)
+                && self.memory_document_is_active(connection, state, &id)?
+            {
+                total += 1;
+            }
+        }
+        Ok(total)
+    }
+
     pub fn sync_session(
         &self,
         expected_session: &Session,
@@ -737,6 +888,8 @@ impl RetrievalStore {
         expected_session: &Session,
         source_path: &Path,
     ) -> RetrievalResult<SyncReport> {
+        let state = self.replay_control_state_under_guard()?;
+        Self::require_active_session(&state, &expected_session.id)?;
         let source = self.read_source(source_path)?;
         if source.session.id != expected_session.id {
             return Err(RetrievalError::InvalidSource {
@@ -751,7 +904,8 @@ impl RetrievalStore {
         let transaction = connection
             .transaction()
             .map_err(|source| self.database_error(source))?;
-        let report = self.write_session(&transaction, &source, true)?;
+        let report = self.write_session(&transaction, &source, true, &state)?;
+        self.require_unchanged_control_state(&state)?;
         transaction
             .commit()
             .map_err(|source| self.database_error(source))?;
@@ -767,11 +921,22 @@ impl RetrievalStore {
         &self,
         config: &MemoryConfig,
     ) -> RetrievalResult<crate::graph::GraphMaterializationReport> {
+        let _guard = self.acquire_root_read()?;
+        let state = self.replay_control_state_under_guard()?;
+        let connection = self.open_connection()?;
+        self.require_current_control_projection(&connection, &state)?;
+        drop(connection);
+        drop(_guard);
         crate::graph::refresh_graph(self, config)
     }
 
     fn rebuild_under_root_write(&self) -> RetrievalResult<SyncReport> {
-        let sources = self.load_all_sources()?;
+        let state = self.replay_control_state_under_guard()?;
+        let sources = self
+            .load_all_sources()?
+            .into_iter()
+            .filter(|source| state.allows_session(&source.session.id))
+            .collect::<Vec<_>>();
         let mut connection = self.open_connection()?;
         let transaction = connection
             .transaction()
@@ -794,15 +959,19 @@ impl RetrievalStore {
             .map_err(|source| self.database_error(source))?;
         let mut total = SyncReport::default();
         for source in &sources {
-            add_report(&mut total, self.write_session(&transaction, source, false)?);
+            add_report(
+                &mut total,
+                self.write_session(&transaction, source, false, &state)?,
+            );
         }
         // Every immutable event/span now exists, independent of filename order.
         // The second pass only needs materialize answer references; it may
         // refresh that source's own derived documents without deleting events.
         for source in &sources {
-            let report = self.write_session(&transaction, source, true)?;
+            let report = self.write_session(&transaction, source, true, &state)?;
             total.answer_contexts += report.answer_contexts;
         }
+        self.require_unchanged_control_state(&state)?;
         transaction
             .commit()
             .map_err(|source| self.database_error(source))?;
@@ -820,6 +989,7 @@ impl RetrievalStore {
         spec.validate()
             .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
         let _guard = self.acquire_root_write()?;
+        let control = self.replay_control_state_under_guard()?;
         let mut connection = self.open_connection()?;
         let transaction = connection
             .transaction()
@@ -860,6 +1030,9 @@ impl RetrievalStore {
                 .ok_or_else(|| {
                     RetrievalError::CorruptIndex(format!("未知派生文档 {}", write.document_id))
                 })?;
+            if !self.memory_document_is_active(&transaction, &control, &write.document_id)? {
+                return Err(RetrievalError::ExcludedEvent(write.document_id.clone()));
+            }
             if current_hash != write.expected_source_sha256 {
                 return Err(RetrievalError::CorruptIndex(format!(
                     "文档 {} 的源哈希已变化",
@@ -1024,6 +1197,7 @@ impl RetrievalStore {
                 }
             }
         }
+        self.require_unchanged_control_state(&control)?;
         transaction
             .commit()
             .map_err(|error| self.database_error(error))?;
@@ -1036,8 +1210,11 @@ impl RetrievalStore {
     ) -> RetrievalResult<LeafEmbeddingSnapshot> {
         validate_embedding_spec(spec)?;
         let _guard = self.acquire_root_read()?;
+        let control = self.replay_control_state_under_guard()?;
         let connection = self.open_connection()?;
-        load_leaf_embedding_snapshot(self, &connection, spec)
+        let snapshot = load_leaf_embedding_snapshot(self, &connection, spec)?;
+        self.require_unchanged_control_state(&control)?;
+        Ok(snapshot)
     }
 
     pub fn publish_leaf_embedding_catalog(
@@ -1058,6 +1235,7 @@ impl RetrievalStore {
             writes,
         )?;
         let _guard = self.acquire_root_write()?;
+        let control = self.replay_control_state_under_guard()?;
         let mut connection = self.open_connection()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1117,6 +1295,7 @@ impl RetrievalStore {
             &prepared,
             "'message','fragment'",
         )?;
+        self.require_unchanged_control_state(&control)?;
         transaction
             .commit()
             .map_err(|error| self.database_error(error))?;
@@ -1133,8 +1312,11 @@ impl RetrievalStore {
     ) -> RetrievalResult<AggregateEmbeddingSnapshot> {
         validate_embedding_spec(spec)?;
         let _guard = self.acquire_root_read()?;
+        let control = self.replay_control_state_under_guard()?;
         let connection = self.open_connection()?;
-        load_aggregate_embedding_snapshot(self, &connection, spec)
+        let snapshot = load_aggregate_embedding_snapshot(self, &connection, spec)?;
+        self.require_unchanged_control_state(&control)?;
+        Ok(snapshot)
     }
 
     pub fn publish_aggregate_embedding_catalog(
@@ -1155,6 +1337,7 @@ impl RetrievalStore {
             writes,
         )?;
         let _guard = self.acquire_root_write()?;
+        let control = self.replay_control_state_under_guard()?;
         let mut connection = self.open_connection()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1205,6 +1388,7 @@ impl RetrievalStore {
             &prepared,
             "'episode','session'",
         )?;
+        self.require_unchanged_control_state(&control)?;
         transaction
             .commit()
             .map_err(|error| self.database_error(error))?;
@@ -1222,29 +1406,31 @@ impl RetrievalStore {
         spec.validate()
             .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
         let _guard = self.acquire_root_read()?;
+        let control = self.replay_control_state_under_guard()?;
         let connection = self.open_connection()?;
         let fingerprint = spec
             .fingerprint()
             .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
-        self.compatible_embeddings_from_connection(&connection, spec, &fingerprint, None)
+        let rows =
+            self.compatible_embeddings_from_connection(&connection, spec, &fingerprint, None)?;
+        self.require_unchanged_control_state(&control)?;
+        Ok(rows)
     }
 
     pub fn embedding_coverage(&self, spec: &VectorIndexSpec) -> RetrievalResult<EmbeddingCoverage> {
         spec.validate()
             .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
         let _guard = self.acquire_root_read()?;
+        let control = self.replay_control_state_under_guard()?;
         let connection = self.open_connection()?;
-        let total = connection
-            .query_row("SELECT count(*) FROM memory_documents", [], |row| {
-                i64_to_usize(row.get(0)?)
-            })
-            .map_err(|error| self.database_error(error))?;
+        let total = self.active_memory_document_count(&connection, &control, None)?;
         let fingerprint = spec
             .fingerprint()
             .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
         let compatible = self
             .compatible_embeddings_from_connection(&connection, spec, &fingerprint, None)?
             .len();
+        self.require_unchanged_control_state(&control)?;
         Ok(EmbeddingCoverage {
             total,
             compatible,
@@ -1302,6 +1488,14 @@ impl RetrievalStore {
             .map_err(|error| self.database_error(error))?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|error| self.database_error(error))?;
+        let control = self.replay_control_state_under_guard()?;
+        let mut active_rows = Vec::with_capacity(rows.len());
+        for row in rows {
+            if self.memory_document_is_active(connection, &control, &row.0)? {
+                active_rows.push(row);
+            }
+        }
+        let rows = active_rows;
         let aggregate_sessions = rows
             .iter()
             .filter(|row| matches!(row.2.as_str(), "episode" | "session"))
@@ -1399,10 +1593,13 @@ impl RetrievalStore {
             .fingerprint()
             .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
         let _guard = self.acquire_root_write()?;
+        let control = self.replay_control_state_under_guard()?;
+        Self::require_active_session(&control, session_id)?;
         let mut connection = self.open_connection()?;
         let transaction = connection
             .transaction()
             .map_err(|error| self.database_error(error))?;
+        self.require_current_control_projection(&transaction, &control)?;
         let session = self.get_session_from_connection(&transaction, session_id)?;
         self.verify_fresh(&session)?;
         if validate_aggregate_raw_source(
@@ -1452,6 +1649,7 @@ impl RetrievalStore {
                 "会话 {session_id} 的 episode materialization 写后审计未就绪"
             )));
         }
+        self.require_unchanged_control_state(&control)?;
         transaction
             .commit()
             .map_err(|error| self.database_error(error))?;
@@ -1639,8 +1837,14 @@ impl RetrievalStore {
     }
 
     pub fn get_session(&self, session_id: &str) -> RetrievalResult<IndexedSession> {
-        let connection = self.open_connection()?;
-        let session = connection
+        let _guard = self.acquire_root_read()?;
+        let state = self.replay_control_state_under_guard()?;
+        Self::require_active_session(&state, session_id)?;
+        let mut connection = self.open_connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(|error| self.database_error(error))?;
+        let session = transaction
             .query_row(
                 "SELECT session_id, title, created_at, updated_at, source_file, source_sha256, source_schema_version
                  FROM indexed_sessions WHERE session_id = ?1",
@@ -1651,23 +1855,43 @@ impl RetrievalStore {
             .map_err(|source| self.database_error(source))?
             .ok_or_else(|| RetrievalError::SessionNotFound(session_id.to_owned()))?;
         self.verify_fresh(&session)?;
+        self.require_unchanged_control_state(&state)?;
+        transaction
+            .commit()
+            .map_err(|error| self.database_error(error))?;
         Ok(session)
     }
 
     pub fn get_event(&self, event_id: &str) -> RetrievalResult<StoredEvent> {
-        let connection = self.open_connection()?;
-        let event = self.get_event_from_connection(&connection, event_id)?;
-        let session = self.get_session_from_connection(&connection, &event.session_id)?;
+        let _guard = self.acquire_root_read()?;
+        let state = self.replay_control_state_under_guard()?;
+        let mut connection = self.open_connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(|error| self.database_error(error))?;
+        let event = self.get_event_from_connection(&transaction, event_id)?;
+        Self::require_active_event(&state, &event)?;
+        let session = self.get_session_from_connection(&transaction, &event.session_id)?;
         self.verify_fresh(&session)?;
         verify_event_hash(&event)?;
+        self.require_unchanged_control_state(&state)?;
+        transaction
+            .commit()
+            .map_err(|error| self.database_error(error))?;
         Ok(event)
     }
 
     pub fn replay_session(&self, session_id: &str) -> RetrievalResult<Vec<StoredEvent>> {
-        let connection = self.open_connection()?;
-        let session = self.get_session_from_connection(&connection, session_id)?;
+        let _guard = self.acquire_root_read()?;
+        let state = self.replay_control_state_under_guard()?;
+        Self::require_active_session(&state, session_id)?;
+        let mut connection = self.open_connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(|error| self.database_error(error))?;
+        let session = self.get_session_from_connection(&transaction, session_id)?;
         self.verify_fresh(&session)?;
-        let mut statement = connection
+        let mut statement = transaction
             .prepare(
                 "SELECT event_id, session_id, turn_id, sequence, role, created_at, content,
                         content_sha256, reply_to_event_id, token_count, turn_status, done_reason, error
@@ -1681,21 +1905,62 @@ impl RetrievalStore {
         for row in rows {
             let event = row.map_err(|source| self.database_error(source))?;
             verify_event_hash(&event)?;
+            if state.allows_event(&event.session_id, &event.id) {
+                events.push(event);
+            }
+        }
+        drop(statement);
+        self.require_unchanged_control_state(&state)?;
+        transaction
+            .commit()
+            .map_err(|error| self.database_error(error))?;
+        Ok(events)
+    }
+
+    pub(crate) fn replay_session_from_connection_with_state(
+        &self,
+        connection: &Connection,
+        session_id: &str,
+        state: &ControlState,
+    ) -> RetrievalResult<Vec<StoredEvent>> {
+        Self::require_active_session(state, session_id)?;
+        let session = self.get_session_from_connection(connection, session_id)?;
+        self.verify_fresh(&session)?;
+        let mut statement = connection
+            .prepare(
+                "SELECT event_id, session_id, turn_id, sequence, role, created_at, content,
+                    content_sha256, reply_to_event_id, token_count, turn_status, done_reason, error
+             FROM events WHERE session_id=?1 ORDER BY sequence",
+            )
+            .map_err(|error| self.database_error(error))?;
+        let rows = statement
+            .query_map([session_id], map_event)
+            .map_err(|error| self.database_error(error))?;
+        let mut events = Vec::new();
+        for row in rows {
+            let event = row.map_err(|error| self.database_error(error))?;
+            verify_event_hash(&event)?;
             events.push(event);
         }
         Ok(events)
     }
 
     pub fn resolve_span(&self, span: &SourceSpan) -> RetrievalResult<ResolvedSpan> {
-        let connection = self.open_connection()?;
-        let event = self.get_event_from_connection(&connection, &span.event_id)?;
-        let session = self.get_session_from_connection(&connection, &event.session_id)?;
+        let _guard = self.acquire_root_read()?;
+        let state = self.replay_control_state_under_guard()?;
+        let mut connection = self.open_connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(|error| self.database_error(error))?;
+        let event = self.get_event_from_connection(&transaction, &span.event_id)?;
+        Self::require_active_event(&state, &event)?;
+        let session = self.get_session_from_connection(&transaction, &event.session_id)?;
         self.verify_fresh(&session)?;
         verify_event_hash(&event)?;
         let start_char =
             usize_to_i64(span.start_char).map_err(|source| self.database_error(source))?;
         let end_char = usize_to_i64(span.end_char).map_err(|source| self.database_error(source))?;
-        let saved_hash = connection
+        let saved_hash = transaction
             .query_row(
                 "SELECT content_sha256 FROM source_spans
                  WHERE event_id = ?1 AND start_char = ?2 AND end_char = ?3",
@@ -1712,11 +1977,16 @@ impl RetrievalStore {
                 span.event_id, span.start_char, span.end_char
             )));
         }
-        Ok(ResolvedSpan {
+        let resolved = ResolvedSpan {
             span: span.clone(),
             content,
             content_sha256: actual_hash,
-        })
+        };
+        self.require_unchanged_control_state(&state)?;
+        transaction
+            .commit()
+            .map_err(|error| self.database_error(error))?;
+        Ok(resolved)
     }
 
     /// Deterministic FTS5 recall.  The FTS expression is assembled solely
@@ -1746,6 +2016,16 @@ impl RetrievalStore {
         config: RetrievalConfig,
     ) -> RetrievalResult<RecallResult> {
         let _guard = self.acquire_root_read()?;
+        let state = self.replay_control_state_under_guard()?;
+        Self::require_active_session(&state, session_filter.unwrap_or_default()).or_else(
+            |error| {
+                if session_filter.is_none() {
+                    Ok(())
+                } else {
+                    Err(error)
+                }
+            },
+        )?;
         let mut connection = self.open_connection()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Deferred)
@@ -1757,6 +2037,7 @@ impl RetrievalStore {
             recent_event_ids,
             session_filter,
             config,
+            &state,
         )?;
         let recent = recent_event_ids.iter().map(String::as_str).collect();
         let mut used_events = result
@@ -1778,7 +2059,10 @@ impl RetrievalStore {
             &mut used_events,
             &mut used_hashes,
             session_filter,
+            &state,
         )?;
+        self.validate_recall_evidence_active(&transaction, &state, &result)?;
+        self.require_unchanged_control_state(&state)?;
         transaction
             .commit()
             .map_err(|error| self.database_error(error))?;
@@ -1794,7 +2078,14 @@ impl RetrievalStore {
         recent_event_ids: &[String],
         session_filter: Option<&str>,
         config: RetrievalConfig,
+        control: &ControlState,
     ) -> RetrievalResult<RecallResult> {
+        let current = self.get_event_from_connection(connection, current_user_event_id)?;
+        Self::require_active_event(control, &current)?;
+        for event_id in recent_event_ids {
+            let event = self.get_event_from_connection(connection, event_id)?;
+            Self::require_active_event(control, &event)?;
+        }
         config
             .validate()
             .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
@@ -1850,9 +2141,10 @@ impl RetrievalStore {
         let mut used_events = HashSet::new();
         let mut used_hashes = HashSet::new();
         let mut core_chars = 0usize;
+        let mut active_rank = 0usize;
         // Keep the entire deterministic overfetch in the trace. Exclusions
         // must not consume the usable candidate pool.
-        for (idx, row) in rows.enumerate() {
+        for row in rows {
             let row = row.map_err(|error| self.database_error(error))?;
             let (
                 document_id,
@@ -1872,8 +2164,12 @@ impl RetrievalStore {
                 start_char: start,
                 end_char: end,
             };
+            let active = control.allows_event(&session_id, &event_id_value);
+            if active {
+                active_rank += 1;
+            }
             let mut candidate = RankedCandidate {
-                raw_rank: idx + 1,
+                raw_rank: if active { active_rank } else { 0 },
                 document_id,
                 granularity: if granularity == "fragment" {
                     RetrievalDocumentGranularity::Fragment
@@ -1882,14 +2178,16 @@ impl RetrievalStore {
                 },
                 span: span.clone(),
                 role,
-                session_id,
+                session_id: session_id.clone(),
                 created_at,
                 content_sha256: hash.clone(),
                 bm25_score: score,
                 selected: false,
                 reason: String::new(),
             };
-            if event_id_value == current_user_event_id {
+            if !active {
+                candidate.reason = "control_excluded".into();
+            } else if event_id_value == current_user_event_id {
                 candidate.reason = "current_message".into();
             } else if recent.contains(event_id_value.as_str()) {
                 candidate.reason = "recent_context".into();
@@ -1965,6 +2263,24 @@ impl RetrievalStore {
             evidence.push(RecalledEvidence { selected, content });
         }
         Ok(RecallResult { trace, evidence })
+    }
+
+    fn validate_recall_evidence_active(
+        &self,
+        connection: &Connection,
+        control: &ControlState,
+        result: &RecallResult,
+    ) -> RetrievalResult<()> {
+        for selected in &result.trace.selected_evidence {
+            let event = self.get_event_from_connection(connection, &selected.span.event_id)?;
+            Self::require_active_event(control, &event)?;
+        }
+        for evidence in &result.evidence {
+            let event =
+                self.get_event_from_connection(connection, &evidence.selected.span.event_id)?;
+            Self::require_active_event(control, &event)?;
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2148,18 +2464,8 @@ impl RetrievalStore {
     ) -> RetrievalResult<(Arc<HnswVectorIndex>, Option<PendingVectorIndexCache>)> {
         spec.validate()
             .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
-        let total = if let Some(session_id) = session_filter {
-            connection.query_row(
-                "SELECT count(*) FROM memory_documents WHERE session_id=?1",
-                [session_id],
-                |row| i64_to_usize(row.get(0)?),
-            )
-        } else {
-            connection.query_row("SELECT count(*) FROM memory_documents", [], |row| {
-                i64_to_usize(row.get(0)?)
-            })
-        }
-        .map_err(|error| self.database_error(error))?;
+        let control = self.replay_control_state_under_guard()?;
+        let total = self.active_memory_document_count(connection, &control, session_filter)?;
         let fingerprint = spec
             .fingerprint()
             .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
@@ -2247,6 +2553,7 @@ impl RetrievalStore {
         vector_ms: u64,
     ) -> RetrievalResult<RecallResult> {
         let _guard = self.acquire_root_read()?;
+        let control = self.replay_control_state_under_guard()?;
         let mut connection = self.open_connection()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Deferred)
@@ -2259,8 +2566,10 @@ impl RetrievalStore {
             recent_event_ids,
             session_filter,
             retrieval_config.clone(),
+            &control,
         )?;
         let bm25_ms = elapsed_ms(bm25_started);
+        self.require_current_control_projection(&transaction, &control)?;
         bm25.trace.budget_allocation = memory_budget_trace(&memory_config, bm25.trace.query_kind);
         let (index, pending_vector_cache) =
             self.load_vector_index_from_connection(&transaction, spec, session_filter)?;
@@ -2681,10 +2990,13 @@ impl RetrievalStore {
             &mut expansion_events,
             &mut expansion_hashes,
             session_filter,
+            &control,
         )
         .map_err(|error| {
             HybridRecallFailure::timed(HybridRecallStage::Graph, error, graph_started)
         })?;
+        self.validate_recall_evidence_active(&transaction, &control, &result)?;
+        self.require_unchanged_control_state(&control)?;
         transaction
             .commit()
             .map_err(|error| self.database_error(error))?;
@@ -4502,6 +4814,7 @@ impl RetrievalStore {
         used_events: &mut HashSet<String>,
         used_hashes: &mut HashSet<String>,
         session_filter: Option<&str>,
+        control: &ControlState,
     ) -> RetrievalResult<()> {
         let mut budget = 0usize;
         let cores = evidence.clone();
@@ -4523,6 +4836,9 @@ impl RetrievalStore {
                     continue;
                 }
                 let adjacent = self.get_event_from_connection(connection, &id)?;
+                if !control.allows_event(&adjacent.session_id, &adjacent.id) {
+                    continue;
+                }
                 if session_filter.is_some_and(|scope| adjacent.session_id != scope) {
                     continue;
                 }
@@ -4572,9 +4888,16 @@ impl RetrievalStore {
     }
 
     pub fn answer_context(&self, answer_event_id: &str) -> RetrievalResult<AnswerContext> {
-        let connection = self.open_connection()?;
-        let event = self.get_event_from_connection(&connection, answer_event_id)?;
-        let session = self.get_session_from_connection(&connection, &event.session_id)?;
+        let _guard = self.acquire_root_read()?;
+        let state = self.replay_control_state_under_guard()?;
+        let mut database = self.open_connection()?;
+        let transaction = database
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(|error| self.database_error(error))?;
+        let connection: &Connection = &transaction;
+        let event = self.get_event_from_connection(connection, answer_event_id)?;
+        Self::require_active_event(&state, &event)?;
+        let session = self.get_session_from_connection(connection, &event.session_id)?;
         self.verify_fresh(&session)?;
         verify_event_hash(&event)?;
         let mut answer = connection
@@ -4628,6 +4951,10 @@ impl RetrievalStore {
                     "回答 {answer_event_id} 在原始会话中缺少对应轮次"
                 ))
             })?;
+        let structural_user_id = event_id(&source.session.id, Some(&turn.id), EventRole::User);
+        if !state.allows_event(&source.session.id, &structural_user_id) {
+            return Err(RetrievalError::ExcludedEvent(structural_user_id));
+        }
         answer.retrieval_trace = if let Some(retrieval_trace_json) = retrieval_trace_json {
             let canonical_retrieval_trace = serde_json::to_string(&turn.context_trace.retrieval)
                 .map_err(|error| {
@@ -4762,9 +5089,10 @@ impl RetrievalStore {
                     "回答上下文索引片段与来源 trace 不匹配".into(),
                 ));
             }
-            let source_event = self.get_event_from_connection(&connection, &span.event_id)?;
+            let source_event = self.get_event_from_connection(connection, &span.event_id)?;
+            Self::require_active_event(&state, &source_event)?;
             let source_session =
-                self.get_session_from_connection(&connection, &source_event.session_id)?;
+                self.get_session_from_connection(connection, &source_event.session_id)?;
             self.verify_fresh(&source_session)?;
             verify_event_hash(&source_event)?;
             let is_session_system_prompt = !source.session.system_prompt.is_empty()
@@ -4844,6 +5172,16 @@ impl RetrievalStore {
                 "回答 {answer_event_id} 的整体上下文哈希不匹配"
             )));
         }
+        drop(statement);
+        for selected in &answer.retrieval_trace.selected_evidence {
+            let source_event =
+                self.get_event_from_connection(connection, &selected.span.event_id)?;
+            Self::require_active_event(&state, &source_event)?;
+        }
+        self.require_unchanged_control_state(&state)?;
+        transaction
+            .commit()
+            .map_err(|error| self.database_error(error))?;
         Ok(answer)
     }
 
@@ -4852,7 +5190,9 @@ impl RetrievalStore {
         transaction: &Transaction<'_>,
         source: &SessionSource,
         materialize_answers: bool,
+        control: &ControlState,
     ) -> RetrievalResult<SyncReport> {
+        Self::require_active_session(control, &source.session.id)?;
         let source_file = source_file_name(&self.root, &source.path)?;
         transaction.execute("DELETE FROM retrieval_documents_fts WHERE rowid IN (SELECT rowid FROM retrieval_documents WHERE event_id IN (SELECT event_id FROM events WHERE session_id=?1))", [source.session.id.as_str()]).map_err(|e| self.database_error(e))?;
         transaction.execute("DELETE FROM retrieval_documents WHERE event_id IN (SELECT event_id FROM events WHERE session_id=?1)", [source.session.id.as_str()]).map_err(|e| self.database_error(e))?;
@@ -4886,7 +5226,12 @@ impl RetrievalStore {
             )
             .map_err(|error| self.database_error(error))?;
 
-        let events = derive_events(&source.session);
+        let all_events = derive_events(&source.session);
+        let events = all_events
+            .iter()
+            .filter(|event| control.allows_event(&event.session_id, &event.id))
+            .cloned()
+            .collect::<Vec<_>>();
         let event_by_id = events
             .iter()
             .map(|event| (event.id.clone(), event))
@@ -4901,10 +5246,12 @@ impl RetrievalStore {
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| self.database_error(e))?;
         drop(existing_statement);
-        if existing_ids
-            .iter()
-            .any(|id| !expected_ids.contains(id.as_str()))
-        {
+        if existing_ids.iter().any(|id| {
+            !expected_ids.contains(id.as_str())
+                && !all_events.iter().any(|event| {
+                    event.id == *id && !control.allows_event(&event.session_id, &event.id)
+                })
+        }) {
             return Err(RetrievalError::InvalidSource {
                 path: source.path.clone(),
                 message: "源会话删除了已索引的不可变事件".into(),
@@ -4954,6 +5301,12 @@ impl RetrievalStore {
         let mut answer_context_count = 0;
         for turn in &source.session.turns {
             let answer_id = event_id(&source.session.id, Some(&turn.id), EventRole::Assistant);
+            let user_id = event_id(&source.session.id, Some(&turn.id), EventRole::User);
+            if !control.allows_event(&source.session.id, &answer_id)
+                || !control.allows_event(&source.session.id, &user_id)
+            {
+                continue;
+            }
             if !event_by_id.contains_key(&answer_id) {
                 continue;
             }
@@ -5031,6 +5384,9 @@ impl RetrievalStore {
                                 turn.id, item.span.event_id
                             ),
                         })?;
+                if !control.allows_event(&event.session_id, &event.id) {
+                    return Err(RetrievalError::ExcludedEvent(event.id.clone()));
+                }
                 let indexed = transaction.query_row("SELECT session_id, title, created_at, updated_at, source_file, source_sha256, source_schema_version FROM indexed_sessions WHERE session_id=?1", [&event.session_id], map_session).map_err(|e| self.database_error(e))?;
                 self.verify_fresh(&indexed)?;
                 verify_event_hash(event)?;
@@ -5343,7 +5699,7 @@ impl RetrievalStore {
         Ok(connection)
     }
 
-    fn get_session_from_connection(
+    pub(crate) fn get_session_from_connection(
         &self,
         connection: &Connection,
         session_id: &str,
@@ -5360,7 +5716,7 @@ impl RetrievalStore {
             .ok_or_else(|| RetrievalError::SessionNotFound(session_id.to_owned()))
     }
 
-    fn get_event_from_connection(
+    pub(crate) fn get_event_from_connection(
         &self,
         connection: &Connection,
         event_id: &str,
@@ -5378,7 +5734,7 @@ impl RetrievalStore {
             .ok_or_else(|| RetrievalError::EventNotFound(event_id.to_owned()))
     }
 
-    fn verify_fresh(&self, session: &IndexedSession) -> RetrievalResult<()> {
+    pub(crate) fn verify_fresh(&self, session: &IndexedSession) -> RetrievalResult<()> {
         if !is_safe_source_file(&session.source_file) {
             return Err(RetrievalError::CorruptIndex(format!(
                 "会话 {} 的源文件名不安全",
@@ -5445,13 +5801,20 @@ impl RetrievalStore {
                 session_id: session_id.to_owned(),
             });
         }
+        let control = self.replay_control_state_under_guard()?;
         let indexed_events = connection.prepare(
             "SELECT event_id, session_id, turn_id, sequence, role, created_at, content, content_sha256,
                     reply_to_event_id, token_count, turn_status, done_reason, error
              FROM events WHERE session_id=?1 ORDER BY sequence",
         ).and_then(|mut statement| statement.query_map([session_id], map_event)?.collect::<rusqlite::Result<Vec<_>>>() )
-            .map_err(|error| self.database_error(error))?;
-        let expected = derive_events(&source);
+            .map_err(|error| self.database_error(error))?
+            .into_iter()
+            .filter(|event| control.allows_event(&event.session_id, &event.id))
+            .collect::<Vec<_>>();
+        let expected = derive_events(&source)
+            .into_iter()
+            .filter(|event| control.allows_event(&event.session_id, &event.id))
+            .collect::<Vec<_>>();
         if indexed_events != expected {
             return Err(RetrievalError::StaleIndex {
                 session_id: session_id.to_owned(),
@@ -6355,7 +6718,12 @@ pub(crate) fn load_leaf_embedding_snapshot(
         &EMBEDDING_CATALOG_ALGORITHM_VERSION.to_be_bytes(),
     );
     hash_string(&mut hasher, &fingerprint);
-    let session_ids = hash_session_catalog(connection, &mut hasher)?;
+    let control = store.replay_control_state_under_guard()?;
+    hash_string(&mut hasher, &control.generation_sha256());
+    let session_ids = hash_session_catalog(connection, &mut hasher)?
+        .into_iter()
+        .filter(|id| control.allows_session(id))
+        .collect::<Vec<_>>();
     for session_id in &session_ids {
         store.verify_indexed_session_source_projection(connection, session_id)?;
     }
@@ -6378,6 +6746,9 @@ pub(crate) fn load_leaf_embedding_snapshot(
         let (event_id, session_id, sequence, role, content, event_hash) = row.map_err(|error| {
             RetrievalError::CorruptIndex(format!("读取 leaf events 失败：{error}"))
         })?;
+        if !control.allows_event(&session_id, &event_id) {
+            continue;
+        }
         if role == "system" || content.trim().is_empty() {
             continue;
         }
@@ -6422,26 +6793,31 @@ pub(crate) fn load_leaf_embedding_snapshot(
         }
     }
     expected.sort_by(|a, b| a.0.cmp(&b.0));
-    let actual_ids = connection.prepare("SELECT document_id FROM retrieval_documents WHERE granularity IN ('message','fragment') ORDER BY document_id")
+    let all_actual_ids = connection.prepare("SELECT document_id FROM retrieval_documents WHERE granularity IN ('message','fragment') ORDER BY document_id")
         .and_then(|mut s| s.query_map([], |r| r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()).map_err(|e| RetrievalError::CorruptIndex(format!("读取 retrieval leaf catalog 失败：{e}")))?;
+    let mut actual_ids = Vec::new();
+    for id in all_actual_ids {
+        if store.memory_document_is_active(connection, &control, &id)? {
+            actual_ids.push(id);
+        }
+    }
     if actual_ids != expected.iter().map(|row| row.0.clone()).collect::<Vec<_>>() {
         return Err(RetrievalError::CorruptIndex(
             "retrieval leaf catalog 集合不规范".into(),
         ));
     }
-    let memory_ids = connection.prepare("SELECT document_id FROM memory_documents WHERE granularity IN ('message','fragment') ORDER BY document_id")
+    let all_memory_ids = connection.prepare("SELECT document_id FROM memory_documents WHERE granularity IN ('message','fragment') ORDER BY document_id")
         .and_then(|mut statement| statement.query_map([], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>())
         .map_err(|error| RetrievalError::CorruptIndex(format!("读取 memory leaf catalog 失败：{error}")))?;
+    let mut memory_ids = Vec::new();
+    for id in all_memory_ids {
+        if store.memory_document_is_active(connection, &control, &id)? {
+            memory_ids.push(id);
+        }
+    }
     if memory_ids != actual_ids {
         return Err(RetrievalError::CorruptIndex(
             "memory leaf catalog 集合不规范".into(),
-        ));
-    }
-    let member_count: i64 = connection.query_row("SELECT count(*) FROM memory_document_members m JOIN memory_documents d ON d.document_id=m.document_id WHERE d.granularity IN ('message','fragment')", [], |row| row.get(0))
-        .map_err(|error| RetrievalError::CorruptIndex(format!("读取 leaf member 集合失败：{error}")))?;
-    if usize::try_from(member_count).ok() != Some(memory_ids.len()) {
-        return Err(RetrievalError::CorruptIndex(
-            "leaf member 集合/数量不规范".into(),
         ));
     }
     let mut documents = Vec::with_capacity(expected.len());
@@ -6516,7 +6892,12 @@ pub(crate) fn load_aggregate_embedding_snapshot(
         &EMBEDDING_CATALOG_ALGORITHM_VERSION.to_be_bytes(),
     );
     hash_string(&mut hasher, &fingerprint);
-    let session_ids = hash_session_catalog(connection, &mut hasher)?;
+    let control = store.replay_control_state_under_guard()?;
+    hash_string(&mut hasher, &control.generation_sha256());
+    let session_ids = hash_session_catalog(connection, &mut hasher)?
+        .into_iter()
+        .filter(|id| control.allows_session(id))
+        .collect::<Vec<_>>();
     let mut documents = Vec::new();
     for session_id in &session_ids {
         store.verify_indexed_session_source_projection(connection, session_id)?;
@@ -6535,6 +6916,9 @@ pub(crate) fn load_aggregate_embedding_snapshot(
         }
         let persisted = load_persisted_aggregate_documents(connection, session_id)?;
         for document in persisted {
+            if !store.memory_document_is_active(connection, &control, &document.document_id)? {
+                continue;
+            }
             let granularity = match document.granularity.as_str() {
                 "episode" => RetrievalDocumentGranularity::Episode,
                 "session" => RetrievalDocumentGranularity::Session,

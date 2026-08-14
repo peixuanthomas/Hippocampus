@@ -63,6 +63,21 @@ pub struct ControlState {
 }
 
 impl ControlState {
+    /// Stable token binding every derived projection to one exact control-log replay.
+    pub fn generation_sha256(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"hippocampus-control-generation-v1\0");
+        hasher.update(self.last_sequence.to_be_bytes());
+        if let Some(hash) = &self.last_record_sha256 {
+            hasher.update(hash.as_bytes());
+        }
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
     pub fn allows_session(&self, session_id: &str) -> bool {
         !self.session_is_excluded(session_id)
     }
