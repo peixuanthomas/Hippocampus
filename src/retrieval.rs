@@ -243,7 +243,6 @@ struct ProjectedVectorCandidate {
     span: SourceSpan,
     role: EventRole,
     session_id: String,
-    created_at: String,
     content_sha256: String,
     content: String,
     episode_id: Option<String>,
@@ -260,15 +259,17 @@ struct FusedRawCandidate {
     span: SourceSpan,
     role: EventRole,
     session_id: String,
-    created_at: String,
     content_sha256: String,
     content: String,
     episode_id: Option<String>,
     source_document_ids: Vec<String>,
     bm25_rank: Option<usize>,
     bm25_score: Option<f64>,
+    bm25_contribution: f64,
     vector_rank: Option<usize>,
     vector_score: Option<f64>,
+    vector_contribution: f64,
+    vector_source_document_id: Option<String>,
     rrf_score: f64,
     protected_exact: bool,
     selected: bool,
@@ -1836,6 +1837,7 @@ impl RetrievalStore {
             )?);
         }
         let mut fused = HashMap::<(String, usize, usize), FusedRawCandidate>::new();
+        let mut excluded_vectors = Vec::new();
         let eligible = ["selected_core", "evidence_budget", "selection_limit"];
         let protected_span = bm25
             .trace
@@ -1860,15 +1862,17 @@ impl RetrievalStore {
                 span: candidate.span.clone(),
                 role: candidate.role,
                 session_id: candidate.session_id.clone(),
-                created_at: candidate.created_at.clone(),
                 content_sha256: candidate.content_sha256.clone(),
                 content,
                 episode_id,
                 source_document_ids: vec![candidate.document_id.clone()],
                 bm25_rank: None,
                 bm25_score: None,
+                bm25_contribution: 0.0,
                 vector_rank: None,
                 vector_score: None,
+                vector_contribution: 0.0,
+                vector_source_document_id: None,
                 rrf_score: 0.0,
                 protected_exact: is_protected,
                 selected: false,
@@ -1877,24 +1881,47 @@ impl RetrievalStore {
                     .vector_for_document(&candidate.document_id)
                     .map(<[f32]>::to_vec),
             });
-            entry.bm25_rank = Some(
-                entry
-                    .bm25_rank
-                    .map_or(candidate.raw_rank, |rank| rank.min(candidate.raw_rank)),
-            );
-            entry.bm25_score = Some(entry.bm25_score.map_or(candidate.bm25_score, |score| {
-                score.min(candidate.bm25_score)
-            }));
-            entry.rrf_score += rrf(memory_config.rrf_k, candidate.raw_rank);
+            entry
+                .source_document_ids
+                .push(candidate.document_id.clone());
+            if entry.bm25_rank.is_none_or(|rank| candidate.raw_rank < rank) {
+                entry.bm25_rank = Some(candidate.raw_rank);
+                entry.bm25_score = Some(candidate.bm25_score);
+                entry.bm25_contribution = rrf(memory_config.rrf_k, candidate.raw_rank);
+            }
             entry.protected_exact |= is_protected;
         }
         for candidate in projected {
-            if candidate.span.event_id == current_user_event_id
-                || recent_event_ids
-                    .iter()
-                    .any(|id| id == &candidate.span.event_id)
-                || candidate.role == EventRole::System
+            let exclusion_reason = if candidate.span.event_id == current_user_event_id {
+                Some("current_message")
+            } else if recent_event_ids
+                .iter()
+                .any(|id| id == &candidate.span.event_id)
             {
+                Some("recent_context")
+            } else if candidate.role == EventRole::System {
+                Some("system_message")
+            } else {
+                None
+            };
+            if let Some(reason) = exclusion_reason {
+                excluded_vectors.push(FusionCandidateTrace {
+                    fused_rank: 0,
+                    document_id: candidate.document_id,
+                    span: candidate.span,
+                    session_id: candidate.session_id,
+                    granularity: candidate.granularity,
+                    source_document_ids: vec![candidate.source_document_id],
+                    episode_id: candidate.episode_id,
+                    bm25_rank: None,
+                    bm25_score: None,
+                    vector_rank: Some(candidate.vector_rank),
+                    vector_score: Some(candidate.similarity),
+                    rrf_score: 0.0,
+                    protected_exact: false,
+                    selected: false,
+                    reason: reason.into(),
+                });
                 continue;
             }
             let key = raw_candidate_key(&candidate.span);
@@ -1904,41 +1931,57 @@ impl RetrievalStore {
                 span: candidate.span.clone(),
                 role: candidate.role,
                 session_id: candidate.session_id.clone(),
-                created_at: candidate.created_at.clone(),
                 content_sha256: candidate.content_sha256.clone(),
                 content: candidate.content.clone(),
                 episode_id: candidate.episode_id.clone(),
                 source_document_ids: Vec::new(),
                 bm25_rank: None,
                 bm25_score: None,
+                bm25_contribution: 0.0,
                 vector_rank: None,
                 vector_score: None,
+                vector_contribution: 0.0,
+                vector_source_document_id: None,
                 rrf_score: 0.0,
                 protected_exact: false,
                 selected: false,
                 reason: String::new(),
                 vector: Some(candidate.vector.clone()),
             });
-            entry.source_document_ids.push(candidate.source_document_id);
-            entry.vector_rank = Some(entry.vector_rank.map_or(candidate.vector_rank, |rank| {
-                rank.min(candidate.vector_rank)
-            }));
-            entry.vector_score = Some(entry.vector_score.map_or(candidate.similarity, |score| {
-                score.max(candidate.similarity)
-            }));
-            entry.rrf_score += rrf(memory_config.rrf_k, candidate.vector_rank)
+            entry
+                .source_document_ids
+                .push(candidate.source_document_id.clone());
+            let contribution = rrf(memory_config.rrf_k, candidate.vector_rank)
                 / candidate.contribution_divisor as f64;
+            let vector_is_better = contribution > entry.vector_contribution
+                || (contribution == entry.vector_contribution
+                    && entry.vector_rank.is_none_or(|rank| {
+                        candidate.vector_rank < rank
+                            || (candidate.vector_rank == rank
+                                && entry.vector_score.is_none_or(|score| {
+                                    candidate.similarity > score
+                                        || (candidate.similarity == score
+                                            && entry.vector_source_document_id.as_ref().is_none_or(
+                                                |source| candidate.source_document_id < *source,
+                                            ))
+                                }))
+                    }));
+            if vector_is_better {
+                entry.vector_rank = Some(candidate.vector_rank);
+                entry.vector_score = Some(candidate.similarity);
+                entry.vector_contribution = contribution;
+                entry.vector_source_document_id = Some(candidate.source_document_id);
+                entry.vector = Some(candidate.vector);
+            }
             if entry.episode_id.is_none() {
                 entry.episode_id = candidate.episode_id;
-            }
-            if entry.vector.is_none() {
-                entry.vector = Some(candidate.vector);
             }
         }
         let mut candidates = fused.into_values().collect::<Vec<_>>();
         for candidate in &mut candidates {
             candidate.source_document_ids.sort();
             candidate.source_document_ids.dedup();
+            candidate.rrf_score = candidate.bm25_contribution + candidate.vector_contribution;
         }
         candidates.sort_by(|left, right| {
             right
@@ -1957,8 +2000,23 @@ impl RetrievalStore {
             {
                 candidates.pop();
                 candidates.push(protected_candidate);
+                candidates.sort_by(|left, right| {
+                    right
+                        .rrf_score
+                        .total_cmp(&left.rrf_score)
+                        .then_with(|| left.document_id.cmp(&right.document_id))
+                });
             }
         }
+        excluded_vectors.sort_by(|left, right| {
+            left.vector_rank
+                .cmp(&right.vector_rank)
+                .then_with(|| left.document_id.cmp(&right.document_id))
+                .then_with(|| left.span.event_id.cmp(&right.span.event_id))
+                .then_with(|| left.span.start_char.cmp(&right.span.start_char))
+                .then_with(|| left.span.end_char.cmp(&right.span.end_char))
+                .then_with(|| left.reason.cmp(&right.reason))
+        });
         self.select_fused_candidates(
             &connection,
             candidates,
@@ -1968,6 +2026,7 @@ impl RetrievalStore {
             retrieval_config,
             bm25_ms,
             vector_ms,
+            excluded_vectors,
         )
     }
 
@@ -2053,7 +2112,10 @@ impl RetrievalStore {
                 .map_err(|error| self.database_error(error))?
                 .ok_or_else(|| RetrievalError::CorruptIndex(format!("聚合文档 {} 的成员缺少直接 message 文档", hit.document_id)))?;
             let Some(vector) = index.vector_for_document(&message_document_id) else {
-                continue;
+                return Err(RetrievalError::CorruptIndex(format!(
+                    "聚合文档 {} 的成员 {} 缺少兼容 message 向量",
+                    hit.document_id, message_document_id
+                )));
             };
             ranked.push((
                 exact_cosine_f64(query_vector, vector)?,
@@ -2132,7 +2194,7 @@ impl RetrievalStore {
             member_hash,
             sequence,
             role,
-            created_at,
+            _created_at,
             event_content,
             event_hash,
             exact_content,
@@ -2140,6 +2202,11 @@ impl RetrievalStore {
             span_hash,
         ) = row;
         let event = self.get_event_from_connection(connection, &event_id)?;
+        if event.session_id != session_id {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "向量文档 {document_id} 的成员事件会话与文档会话不匹配"
+            )));
+        }
         let session = self.get_session_from_connection(connection, &session_id)?;
         self.verify_fresh(&session)?;
         verify_event_hash(&event)?;
@@ -2171,7 +2238,6 @@ impl RetrievalStore {
             span: span.clone(),
             role,
             session_id,
-            created_at,
             content_sha256: actual_hash,
             content,
             episode_id: self.resolve_episode_id(connection, &span.event_id)?,
@@ -2219,6 +2285,7 @@ impl RetrievalStore {
         retrieval_config: RetrievalConfig,
         bm25_ms: u64,
         vector_ms: u64,
+        excluded_vectors: Vec<FusionCandidateTrace>,
     ) -> RetrievalResult<RecallResult> {
         let mut processing_order = (0..candidates.len()).collect::<Vec<_>>();
         processing_order.sort_by_key(|&index| !candidates[index].protected_exact);
@@ -2339,23 +2406,6 @@ impl RetrievalStore {
         bm25.trace.status = "ok".into();
         bm25.trace.config = retrieval_config;
         bm25.trace.selected_evidence = selected_evidence;
-        bm25.trace.candidates = candidates
-            .iter()
-            .enumerate()
-            .map(|(index, candidate)| RankedCandidate {
-                raw_rank: index + 1,
-                document_id: candidate.document_id.clone(),
-                granularity: candidate.granularity,
-                span: candidate.span.clone(),
-                role: candidate.role,
-                session_id: candidate.session_id.clone(),
-                created_at: candidate.created_at.clone(),
-                content_sha256: candidate.content_sha256.clone(),
-                bm25_score: candidate.bm25_score.unwrap_or(0.0),
-                selected: candidate.selected,
-                reason: candidate.reason.clone(),
-            })
-            .collect();
         bm25.trace.fusion_candidates = candidates
             .iter()
             .enumerate()
@@ -2377,26 +2427,25 @@ impl RetrievalStore {
                 reason: candidate.reason.clone(),
             })
             .collect();
+        bm25.trace
+            .fusion_candidates
+            .extend(excluded_vectors.iter().cloned());
         bm25.trace.channels = vec![
             channel_trace(
                 RetrievalChannel::Bm25,
                 "ok",
-                bm25.trace
-                    .candidates
-                    .iter()
-                    .filter(|candidate| candidate.bm25_score != 0.0)
-                    .count(),
+                bm25.trace.candidates.len(),
                 bm25_ms,
                 None,
             ),
             channel_trace(
                 RetrievalChannel::Vector,
                 "ok",
-                bm25.trace
-                    .fusion_candidates
+                candidates
                     .iter()
                     .filter(|candidate| candidate.vector_rank.is_some())
-                    .count(),
+                    .count()
+                    + excluded_vectors.len(),
                 vector_ms,
                 None,
             ),
