@@ -2576,7 +2576,8 @@ impl RetrievalStore {
                  FROM memory_entity_aliases a JOIN memory_entities e ON e.entity_id=a.entity_id
                  WHERE (?1 IS NULL OR a.session_id=?1)
                    AND EXISTS (SELECT 1 FROM memory_entity_mentions m
-                       WHERE m.entity_id=a.entity_id AND m.entity_status='resolved')
+                       WHERE m.entity_id=a.entity_id AND m.entity_status='resolved'
+                         AND m.session_id=a.session_id)
                  ORDER BY a.alias_id",
             )
             .map_err(|error| self.database_error(error))?;
@@ -2658,17 +2659,22 @@ impl RetrievalStore {
                 "当前查询事件角色或会话范围不匹配".into(),
             ));
         }
+        let current_session = self.get_session_from_connection(connection, &current.session_id)?;
+        self.verify_fresh(&current_session)?;
+        verify_event_hash(&current)?;
         let current_reference = DateTime::parse_from_rfc3339(&current.created_at)
             .map_err(|_| RetrievalError::CorruptIndex("当前查询事件时间损坏".into()))?
             .with_timezone(&Utc);
         let (explicit_reference, invalid_date) = explicit_query_date(&normalized_query);
-        let reference = explicit_reference.unwrap_or(current_reference);
+        let visibility_upper = explicit_reference
+            .map(|value| value.min(current_reference))
+            .unwrap_or(current_reference);
+        let reference = visibility_upper;
         let historical = has_historical_cue(&normalized_query);
         let mut warnings = Vec::new();
         if invalid_date {
             warnings.push("查询包含无效日期，已使用时间提示模式".into());
         }
-        let future_reference = explicit_reference.is_some_and(|value| value > current_reference);
         let terms = query_terms(raw_query)
             .into_iter()
             .map(|term| normalize_match(&term))
@@ -2755,6 +2761,12 @@ impl RetrievalStore {
             let mut reason = "eligible".to_owned();
             let lexical = claim_overlap(&terms, &predicate, &relation, &object_text);
             let from = parse_retrieval_time(&valid_from, "claim.valid_from")?;
+            let asserted_time = parse_retrieval_time(&asserted, "claim.asserted_at")?;
+            let claim_reference = parse_retrieval_time(&reference_time, "claim.reference_time")?;
+            let claim_event_time = event_time
+                .as_deref()
+                .map(|value| parse_retrieval_time(value, "claim.event_time"))
+                .transpose()?;
             let to = valid_to
                 .as_deref()
                 .map(|value| parse_retrieval_time(value, "claim.valid_to"))
@@ -2772,8 +2784,12 @@ impl RetrievalStore {
                 reason = "subject_not_selected".into();
             } else if !object_resolved {
                 reason = "pending_object".into();
-            } else if future_reference {
-                reason = "future_reference".into();
+            } else if asserted_time > visibility_upper
+                || claim_reference > visibility_upper
+                || from > visibility_upper
+                || claim_event_time.is_some_and(|value| value > visibility_upper)
+            {
+                reason = "not_yet_visible".into();
             } else if query_kind != QueryKind::TemporalState && lexical == 0 {
                 reason = "no_claim_overlap".into();
             } else if !historical
@@ -2811,7 +2827,8 @@ impl RetrievalStore {
                     connection,
                     &claim_id,
                     query_kind,
-                    current_user_event_id,
+                    &current,
+                    visibility_upper,
                     recent_event_ids,
                     session_filter,
                 )? {
@@ -2872,14 +2889,16 @@ impl RetrievalStore {
         connection: &Connection,
         claim_id: &str,
         query_kind: QueryKind,
-        current_user_event_id: &str,
+        current: &StoredEvent,
+        visibility_upper: DateTime<Utc>,
         recent_event_ids: &[String],
         session_filter: Option<&str>,
     ) -> RetrievalResult<Option<ClaimEvidenceSelection>> {
         let temporal_first = query_kind == QueryKind::TemporalState;
         let mut statement = connection
             .prepare(
-                "SELECT v.evidence_id,v.event_id,v.start_char,v.end_char,v.content_sha256,e.role
+                "SELECT v.evidence_id,v.event_id,v.start_char,v.end_char,v.content_sha256,e.role,
+                        v.created_at,e.session_id,v.sequence
              FROM memory_claim_evidence v JOIN events e ON e.event_id=v.event_id
              WHERE v.claim_id=?1 AND v.role='user' AND (?2 IS NULL OR e.session_id=?2)
              ORDER BY CASE v.kind
@@ -2911,14 +2930,22 @@ impl RetrievalStore {
                         row.get::<_, i64>(3)?,
                         row.get::<_, String>(4)?,
                         row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, i64>(8)?,
                     ))
                 },
             )
             .map_err(|error| self.database_error(error))?;
         for row in rows {
-            let (id, event_id, start, end, stored_hash, role) =
+            let (id, event_id, start, end, stored_hash, role, created_at, event_session, sequence) =
                 row.map_err(|error| self.database_error(error))?;
-            if event_id == current_user_event_id
+            let created = parse_retrieval_time(&created_at, "claim_evidence.created_at")?;
+            if created > visibility_upper
+                || event_session == current.session_id
+                    && i64_to_usize(sequence).map_err(|error| self.database_error(error))?
+                        >= current.sequence
+                || event_id == current.id
                 || recent_event_ids.iter().any(|recent| recent == &event_id)
             {
                 continue;
