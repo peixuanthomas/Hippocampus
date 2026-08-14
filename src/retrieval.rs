@@ -9734,19 +9734,6 @@ fn load_validated_consolidation_watermark(
         .map_err(|error| aggregate_corruption(format!("读取巩固水位失败：{error}")))?;
     let Some((through_sequence, through_event_id, through_event_sha256, updated_at)) = stored
     else {
-        let applied_batches = connection
-            .query_row(
-                "SELECT count(*) FROM consolidation_batches
-                 WHERE session_id=?1 AND status='applied' AND projection_schema_version=4",
-                [session_id],
-                |row| row.get::<_, i64>(0),
-            )
-            .map_err(|error| aggregate_corruption(format!("读取 applied 巩固批次失败：{error}")))?;
-        if applied_batches != 0 {
-            return Err(aggregate_corruption(format!(
-                "会话 {session_id} 已有 applied 巩固批次但缺少水位"
-            )));
-        }
         return Ok(None);
     };
     let through_sequence = i64_to_u64(through_sequence)
@@ -9830,16 +9817,21 @@ fn load_validated_consolidation_watermark(
         )));
     }
 
+    let through_sequence_sql = i64::try_from(through_sequence).map_err(|_| {
+        aggregate_corruption(format!(
+            "会话 {session_id} 的巩固水位序号超出 SQLite INTEGER"
+        ))
+    })?;
     let applied = connection
         .prepare(
             "SELECT through_sequence, input_event_ids, input_event_hashes, completed_at
              FROM consolidation_batches WHERE session_id=?1 AND status='applied'
-               AND projection_schema_version=4
+               AND projection_schema_version=4 AND through_sequence<=?2
              ORDER BY through_sequence DESC, attempt_id",
         )
         .and_then(|mut statement| {
             statement
-                .query_map([session_id], |row| {
+                .query_map(params![session_id, through_sequence_sql], |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
                         row.get::<_, String>(1)?,
@@ -9850,11 +9842,9 @@ fn load_validated_consolidation_watermark(
                 .collect::<std::result::Result<Vec<_>, _>>()
         })
         .map_err(|error| aggregate_corruption(format!("读取 applied 巩固批次失败：{error}")))?;
-    let through_sequence_sql = i64::try_from(through_sequence).map_err(|_| {
-        aggregate_corruption(format!(
-            "会话 {session_id} 的巩固水位序号超出 SQLite INTEGER"
-        ))
-    })?;
+    if applied.is_empty() {
+        return Ok(Some(through_sequence));
+    }
     let matching_latest = applied
         .iter()
         .filter(|row| row.0 == through_sequence_sql)
