@@ -2128,6 +2128,24 @@ struct PreparedReplayAttempt {
     plan: ValidatedPlan,
 }
 
+fn replay_plan_create_ids(plan: &ValidatedPlan) -> (Vec<String>, Vec<String>) {
+    let entities = plan
+        .entities
+        .iter()
+        .filter(|entity| entity.create)
+        .map(|entity| entity.entity_id.clone())
+        .collect();
+    let claims = plan
+        .claims
+        .iter()
+        .filter_map(|claim| match &claim.action {
+            ValidatedClaimAction::Create { claim_id, .. } => Some(claim_id.clone()),
+            ValidatedClaimAction::Confirm { .. } => None,
+        })
+        .collect();
+    (entities, claims)
+}
+
 pub(crate) struct ConsolidationReplayReport {
     pub replayed: usize,
     pub skipped_inactive: usize,
@@ -2479,20 +2497,7 @@ pub(crate) fn prepare_consolidation_replay(
                     .any(|input| input.event_id == event.id)
                 && !control.allows_event(&event.session_id, &event.id)
         });
-        let plan_entity_creates = plan
-            .entities
-            .iter()
-            .filter(|entity| entity.create)
-            .map(|entity| entity.entity_id.clone())
-            .collect::<Vec<_>>();
-        let plan_claim_creates = plan
-            .claims
-            .iter()
-            .filter_map(|claim| match &claim.action {
-                ValidatedClaimAction::Create { claim_id, .. } => Some(claim_id.clone()),
-                ValidatedClaimAction::Confirm { .. } => None,
-            })
-            .collect::<Vec<_>>();
+        let (plan_entity_creates, plan_claim_creates) = replay_plan_create_ids(&plan);
         let skipped = if blocked_sessions.contains(&attempt.session_id) {
             skipped_dependency += 1;
             true
@@ -2634,25 +2639,24 @@ pub(crate) fn replay_prepared_consolidation(
     let mut replayed = 0;
     let mut skipped_dependency = prepared.skipped_dependency;
     let mut replay_blocked_sessions = HashSet::new();
+    let mut unavailable_entity_creates = prepared.unavailable_entity_creates;
+    let mut unavailable_claim_creates = prepared.unavailable_claim_creates;
     loop {
         let mut progress = false;
         let mut deferred = Vec::new();
         let pending_entity_creates = pending
             .iter()
-            .flat_map(|item| item.plan.entities.iter())
-            .filter(|entity| entity.create)
-            .map(|entity| entity.entity_id.clone())
+            .flat_map(|item| replay_plan_create_ids(&item.plan).0)
             .collect::<HashSet<_>>();
         let pending_claim_creates = pending
             .iter()
-            .flat_map(|item| item.plan.claims.iter())
-            .filter_map(|claim| match &claim.action {
-                ValidatedClaimAction::Create { claim_id, .. } => Some(claim_id.clone()),
-                ValidatedClaimAction::Confirm { .. } => None,
-            })
+            .flat_map(|item| replay_plan_create_ids(&item.plan).1)
             .collect::<HashSet<_>>();
         for item in pending {
+            let (item_entity_creates, item_claim_creates) = replay_plan_create_ids(&item.plan);
             if replay_blocked_sessions.contains(&item.batch.session_id) {
+                unavailable_entity_creates.extend(item_entity_creates);
+                unavailable_claim_creates.extend(item_claim_creates);
                 skipped_dependency += 1;
                 continue;
             }
@@ -2732,16 +2736,16 @@ pub(crate) fn replay_prepared_consolidation(
                 let provably_unavailable = exact_intersection
                     && only_missing
                     && (!missing_entities.is_empty() || !missing_claims.is_empty())
-                    && missing_entities.iter().all(|entity| {
-                        prepared
-                            .unavailable_entity_creates
-                            .contains(&entity.entity_id)
-                    })
+                    && missing_entities
+                        .iter()
+                        .all(|entity| unavailable_entity_creates.contains(&entity.entity_id))
                     && missing_claims
                         .iter()
-                        .all(|claim| prepared.unavailable_claim_creates.contains(&claim.claim_id));
+                        .all(|claim| unavailable_claim_creates.contains(&claim.claim_id));
                 if provably_unavailable {
                     replay_blocked_sessions.insert(item.batch.session_id.clone());
+                    unavailable_entity_creates.extend(item_entity_creates);
+                    unavailable_claim_creates.extend(item_claim_creates);
                     skipped_dependency += 1;
                     continue;
                 }

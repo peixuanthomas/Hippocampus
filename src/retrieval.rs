@@ -1863,7 +1863,7 @@ impl RetrievalStore {
                 && is_sha256_hex(&row.document_source_sha256)
                 && is_sha256_hex(&row.index_fingerprint)
                 && DateTime::parse_from_rfc3339(&row.embedded_at).is_ok()
-                && dimensions.is_some_and(|value| value > 0)
+                && dimensions.is_some_and(|value| (32..=4096).contains(&value))
                 && dimensions
                     .and_then(|value| value.checked_mul(4))
                     .is_some_and(|length| length == row.vector_blob.len())
