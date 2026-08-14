@@ -2650,6 +2650,13 @@ impl RetrievalStore {
         let entity_ms = elapsed_ms(entity_started);
         let state_started = Instant::now();
         let current = self.get_event_from_connection(connection, current_user_event_id)?;
+        if current.role != EventRole::User
+            || session_filter.is_some_and(|session_id| current.session_id != session_id)
+        {
+            return Err(RetrievalError::CorruptIndex(
+                "当前查询事件角色或会话范围不匹配".into(),
+            ));
+        }
         let current_reference = DateTime::parse_from_rfc3339(&current.created_at)
             .map_err(|_| RetrievalError::CorruptIndex("当前查询事件时间损坏".into()))?
             .with_timezone(&Utc);
@@ -3109,10 +3116,23 @@ impl RetrievalStore {
             for member in member_indexes {
                 let item = &mut sidecar.candidates[member];
                 let span = item.trace.evidence_span.as_ref().unwrap();
-                if let Some(candidate_index) = candidates
-                    .iter()
-                    .position(|candidate| candidate.span == *span)
-                {
+                if let Some(candidate_index) = candidates.iter().position(|candidate| {
+                    if candidate.span != *span
+                        || !(candidate.reason == "eligible"
+                            || candidate.protected_exact && candidate.selected)
+                    {
+                        return false;
+                    }
+                    if candidate.protected_exact && candidate.selected {
+                        return true;
+                    }
+                    !selected_events.contains(&candidate.span.event_id)
+                        && !selected_hashes.contains(&candidate.content_sha256)
+                        && candidate
+                            .episode_id
+                            .as_ref()
+                            .is_none_or(|episode| !selected_episodes.contains(episode))
+                }) {
                     candidates[candidate_index].selected = true;
                     candidates[candidate_index].reason = "selected_state".into();
                     if !selected.contains(&candidate_index) {
