@@ -867,9 +867,7 @@ impl RetrievalStore {
                 "派生文档 {document_id} 缺少 memory_documents 来源"
             )));
         };
-        if !state.allows_session(&session_id) {
-            return Ok(false);
-        }
+        let mut active = state.allows_session(&session_id);
         let mut statement = connection
             .prepare(
                 "SELECT m.ordinal,m.event_id,m.start_char,m.end_char,m.content_sha256,
@@ -939,10 +937,10 @@ impl RetrievalStore {
         }
         for member in &members {
             if !state.allows_event(&session_id, &member.1) {
-                return Ok(false);
+                active = false;
             }
         }
-        Ok(!members.is_empty())
+        Ok(active && !members.is_empty())
     }
 
     fn document_reference_is_active(
@@ -965,19 +963,17 @@ impl RetrievalStore {
             )
             .optional()
             .map_err(|error| self.database_error(error))?;
+        let mut active = true;
         if let Some((event_id, session_id, _, _, _, _)) = &raw {
-            if control.event_is_excluded(event_id)
-                || session_id
-                    .as_deref()
-                    .is_some_and(|session| !control.allows_session(session))
-            {
-                return Ok(false);
-            }
             if session_id.is_none() {
                 return Err(RetrievalError::CorruptIndex(
                     "派生文档缺少权威来源事件".into(),
                 ));
             }
+            active &= !control.event_is_excluded(event_id)
+                && session_id
+                    .as_deref()
+                    .is_some_and(|session| control.allows_session(session));
         }
         let memory = connection.query_row(
             "SELECT session_id,granularity,source_sha256 FROM memory_documents WHERE document_id=?1",
@@ -989,9 +985,7 @@ impl RetrievalStore {
             ))?;
         match memory.1.as_str() {
             "message" | "fragment" => {
-                if !self.memory_document_is_active(connection, control, document_id)? {
-                    return Ok(false);
-                }
+                active &= self.memory_document_is_active(connection, control, document_id)?;
                 let (event_id, session_id, start, end, granularity, hash) =
                     raw.ok_or_else(|| {
                         RetrievalError::CorruptIndex(
@@ -1029,13 +1023,10 @@ impl RetrievalStore {
             "episode" | "session" => {
                 let aggregate =
                     load_persisted_aggregate_document(connection, document_id, &memory.0)?;
-                if aggregate
-                    .members
-                    .iter()
-                    .any(|member| !control.allows_event(&aggregate.session_id, &member.event_id))
-                {
-                    return Ok(false);
-                }
+                active &= control.allows_session(&aggregate.session_id)
+                    && aggregate.members.iter().all(|member| {
+                        control.allows_event(&aggregate.session_id, &member.event_id)
+                    });
                 if let Some((event_id, session_id, start, end, granularity, hash)) = raw {
                     let member_count: i64 = connection
                         .query_row(
@@ -1069,7 +1060,7 @@ impl RetrievalStore {
                 ));
             }
         }
-        Ok(true)
+        Ok(active)
     }
 
     fn ranked_candidate_document_is_active(
@@ -1083,9 +1074,8 @@ impl RetrievalStore {
                 "BM25 trace 缺少 document_id".into(),
             ));
         }
-        if !self.document_reference_is_active(connection, control, &candidate.document_id)? {
-            return Ok(false);
-        }
+        let active =
+            self.document_reference_is_active(connection, control, &candidate.document_id)?;
         let granularity = match candidate.granularity {
             RetrievalDocumentGranularity::Message => "message",
             RetrievalDocumentGranularity::Fragment => "fragment",
@@ -1121,7 +1111,7 @@ impl RetrievalStore {
                 "BM25 trace 与 canonical retrieval 来源不一致".into(),
             ));
         }
-        Ok(true)
+        Ok(active)
     }
 
     fn active_memory_document_count(
@@ -5504,11 +5494,6 @@ impl RetrievalStore {
         if span.event_id.is_empty() {
             return Ok(true);
         }
-        if control.event_is_excluded(&span.event_id)
-            || expected_session.is_some_and(|session| !control.allows_session(session))
-        {
-            return Ok(false);
-        }
         let event = connection
             .query_row(
                 "SELECT event_id, session_id, turn_id, sequence, role, created_at, content,
@@ -5524,9 +5509,6 @@ impl RetrievalStore {
             return Err(RetrievalError::CorruptIndex(
                 "trace 来源事件属于错误会话".into(),
             ));
-        }
-        if !control.allows_event(&event.session_id, &event.id) {
-            return Ok(false);
         }
         verify_event_hash(&event)?;
         let content = slice_chars(&event.content, span)?;
@@ -5548,7 +5530,8 @@ impl RetrievalStore {
                 "trace 来源片段与权威原文不一致".into(),
             ));
         }
-        Ok(true)
+        Ok(control.allows_event(&event.session_id, &event.id)
+            && expected_session.is_none_or(|session| control.allows_session(session)))
     }
 
     fn retrieval_trace_is_active(
@@ -5557,9 +5540,10 @@ impl RetrievalStore {
         control: &ControlState,
         trace: &RetrievalTrace,
     ) -> RetrievalResult<bool> {
+        let mut active = true;
         if !trace.current_query_event_id.is_empty() {
             if control.event_is_excluded(&trace.current_query_event_id) {
-                return Ok(false);
+                active = false;
             }
             if let Some(event) = connection.query_row(
                 "SELECT event_id, session_id, turn_id, sequence, role, created_at, content,
@@ -5567,8 +5551,8 @@ impl RetrievalStore {
                  FROM events WHERE event_id=?1",
                 [&trace.current_query_event_id], map_event,
             ).optional().map_err(|error| self.database_error(error))? {
-                if !control.allows_event(&event.session_id, &event.id) { return Ok(false); }
                 verify_event_hash(&event)?;
+                active &= control.allows_event(&event.session_id, &event.id);
             }
         }
         for candidate in &trace.candidates {
@@ -5577,17 +5561,15 @@ impl RetrievalStore {
                     "BM25 trace 缺少权威来源".into(),
                 ));
             }
-            if !self.trace_span_is_active(
+            let span_active = self.trace_span_is_active(
                 connection,
                 control,
                 Some(&candidate.session_id),
                 &candidate.span,
-            )? {
-                return Ok(false);
-            }
-            if !self.ranked_candidate_document_is_active(connection, control, candidate)? {
-                return Ok(false);
-            }
+            )?;
+            let document_active =
+                self.ranked_candidate_document_is_active(connection, control, candidate)?;
+            active &= span_active && document_active;
         }
         for candidate in &trace.fusion_candidates {
             let legacy_empty = candidate.span.event_id.is_empty()
@@ -5600,22 +5582,18 @@ impl RetrievalStore {
                     "fusion trace 缺少权威来源".into(),
                 ));
             }
-            if !self.trace_span_is_active(
+            active &= self.trace_span_is_active(
                 connection,
                 control,
                 (!candidate.session_id.is_empty()).then_some(candidate.session_id.as_str()),
                 &candidate.span,
-            )? {
-                return Ok(false);
-            }
+            )?;
             for document_id in std::iter::once(candidate.document_id.as_str())
                 .chain(candidate.source_document_ids.iter().map(String::as_str))
                 .chain(candidate.episode_id.iter().map(String::as_str))
                 .filter(|id| !id.is_empty())
             {
-                if !self.document_reference_is_active(connection, control, document_id)? {
-                    return Ok(false);
-                }
+                active &= self.document_reference_is_active(connection, control, document_id)?;
             }
         }
         for selection in &trace.state_selections {
@@ -5625,9 +5603,7 @@ impl RetrievalStore {
                         "state trace 缺少权威来源".into(),
                     ));
                 }
-                if !self.trace_span_is_active(connection, control, None, span)? {
-                    return Ok(false);
-                }
+                active &= self.trace_span_is_active(connection, control, None, span)?;
             }
         }
         for path in &trace.graph_paths {
@@ -5642,22 +5618,18 @@ impl RetrievalStore {
                         "graph trace 缺少权威来源".into(),
                     ));
                 }
-                if !self.trace_span_is_active(
+                active &= self.trace_span_is_active(
                     connection,
                     control,
                     (!path.target_session_id.is_empty()).then_some(path.target_session_id.as_str()),
                     span,
-                )? {
-                    return Ok(false);
-                }
+                )?;
             }
             for document_id in [&path.seed_document_id, &path.target_document_id]
                 .into_iter()
                 .filter(|id| !id.is_empty())
             {
-                if !self.document_reference_is_active(connection, control, document_id)? {
-                    return Ok(false);
-                }
+                active &= self.document_reference_is_active(connection, control, document_id)?;
             }
         }
         for selected in &trace.selected_evidence {
@@ -5666,11 +5638,9 @@ impl RetrievalStore {
                     "selected evidence 缺少权威来源".into(),
                 ));
             }
-            if !self.trace_span_is_active(connection, control, None, &selected.span)? {
-                return Ok(false);
-            }
+            active &= self.trace_span_is_active(connection, control, None, &selected.span)?;
         }
-        Ok(true)
+        Ok(active)
     }
 
     fn write_session(
