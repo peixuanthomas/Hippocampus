@@ -273,7 +273,7 @@ impl ControlLog {
                 .directory
                 .join(format!(".control-{}.tmp", Uuid::new_v4().simple()));
             let final_path = self.directory.join(segment_name(record.sequence));
-            let publication = (|| -> ControlResult<()> {
+            let preparation = (|| -> ControlResult<()> {
                 let mut file = OpenOptions::new()
                     .write(true)
                     .create_new(true)
@@ -284,22 +284,29 @@ impl ControlLog {
                 file.flush().map_err(|source| self.io(&temporary, source))?;
                 file.sync_all()
                     .map_err(|source| self.io(&temporary, source))?;
-                fs::hard_link(&temporary, &final_path)
-                    .map_err(|source| self.io(&final_path, source))?;
-                sync_directory(&self.directory)
-                    .map_err(|source| self.io(&self.directory, source))?;
                 Ok(())
             })();
-            if publication.is_ok() {
+            if let Err(error) = preparation {
                 let _ = fs::remove_file(&temporary);
-                return Ok(record);
+                return Err(error);
             }
-            let collision = final_path.exists();
-            let _ = fs::remove_file(&temporary);
-            if collision {
-                continue;
+            match fs::hard_link(&temporary, &final_path) {
+                Ok(()) => {
+                    let durability = sync_directory(&self.directory)
+                        .map_err(|source| self.io(&self.directory, source));
+                    let _ = fs::remove_file(&temporary);
+                    durability?;
+                    return Ok(record);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let _ = fs::remove_file(&temporary);
+                    continue;
+                }
+                Err(source) => {
+                    let _ = fs::remove_file(&temporary);
+                    return Err(self.io(&final_path, source));
+                }
             }
-            publication?;
         }
         Err(ControlError::InvalidTransition(
             "control log changed too often while appending".into(),
