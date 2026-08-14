@@ -1634,6 +1634,7 @@ mod tests {
                 exact_input_tokens: Some(40),
                 input_budget: session.budget.input_budget(),
                 identity_instruction: String::new(),
+                untrusted_history_wrapped: false,
                 retrieval_trace: Default::default(),
                 evidence: Vec::new(),
                 knowledge_trace: Default::default(),

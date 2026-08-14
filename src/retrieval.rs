@@ -12,7 +12,7 @@ use thiserror::Error;
 
 use crate::config::MemoryConfig;
 use crate::consolidation::{normalize_match, validate_full_derived_integrity};
-use crate::context::matches_wrapped_history_item;
+use crate::context::WrappedHistoryCursor;
 use crate::episode::{
     EMBEDDING_COSINE_SIMILARITY_THRESHOLD, EPISODE_ALGORITHM_VERSION, EpisodeBoundaryDecision,
     EpisodeBoundarySuggestion, EpisodeDocument, EpisodeInputMessage, EpisodeMaterializationReport,
@@ -2814,6 +2814,12 @@ impl RetrievalStore {
             .map_err(|source| self.database_error(source))?;
         let mut messages = Vec::new();
         let mut inserted_generated = false;
+        let mut wrapped_history = WrappedHistoryCursor::new(
+            turn.context_trace.untrusted_history_wrapped,
+            &turn.context_trace.retrieval.selected_evidence,
+        )
+        .map_err(|message| RetrievalError::CorruptIndex(message.into()))?;
+        let session_system_event_id = event_id(&session.id, None, EventRole::System);
         for row in rows {
             let (ordinal, role, span, expected_hash, content) =
                 row.map_err(|source| self.database_error(source))?;
@@ -2822,20 +2828,17 @@ impl RetrievalStore {
                 self.get_session_from_connection(&connection, &source_event.session_id)?;
             self.verify_fresh(&source_session)?;
             verify_event_hash(&source_event)?;
-            let wrapped_source_role = turn
-                .context_trace
-                .untrusted_history_wrapped
-                .then(|| {
-                    matches_wrapped_history_item(
-                        &ContextItemTrace {
-                            role,
-                            span: span.clone(),
-                            content_sha256: expected_hash.clone(),
-                        },
-                        &turn.context_trace.retrieval.selected_evidence,
-                    )
-                })
-                .flatten();
+            let is_session_system_prompt = ordinal == 0 && span.event_id == session_system_event_id;
+            let wrapped_source_role = wrapped_history
+                .consume(
+                    &ContextItemTrace {
+                        role,
+                        span: span.clone(),
+                        content_sha256: expected_hash.clone(),
+                    },
+                    is_session_system_prompt,
+                )
+                .map_err(|message| RetrievalError::CorruptIndex(message.into()))?;
             if source_event.role != role && wrapped_source_role != Some(source_event.role) {
                 return Err(RetrievalError::CorruptIndex(
                     "回答上下文角色与原始事件不匹配".into(),
@@ -2880,6 +2883,9 @@ impl RetrievalStore {
                 },
             });
         }
+        wrapped_history
+            .finish()
+            .map_err(|message| RetrievalError::CorruptIndex(message.into()))?;
         if context_sha256(&messages) != answer.context_sha256 {
             return Err(RetrievalError::CorruptIndex(format!(
                 "回答 {answer_event_id} 的整体上下文哈希不匹配"
@@ -3032,6 +3038,15 @@ impl RetrievalStore {
                 })?;
             let mut context_messages = Vec::with_capacity(derived.items.len() + 2);
             let mut inserted_generated = false;
+            let mut wrapped_history = WrappedHistoryCursor::new(
+                derived.untrusted_history_wrapped,
+                &turn.context_trace.retrieval.selected_evidence,
+            )
+            .map_err(|message| RetrievalError::InvalidSource {
+                path: source.path.clone(),
+                message: message.into(),
+            })?;
+            let session_system_event_id = event_id(&source.session.id, None, EventRole::System);
             for (ordinal, item) in derived.items.iter().enumerate() {
                 let local = event_by_id.get(&item.span.event_id).copied();
                 let external = if local.is_none() {
@@ -3052,15 +3067,14 @@ impl RetrievalStore {
                 let indexed = transaction.query_row("SELECT session_id, title, created_at, updated_at, source_file, source_sha256, source_schema_version FROM indexed_sessions WHERE session_id=?1", [&event.session_id], map_session).map_err(|e| self.database_error(e))?;
                 self.verify_fresh(&indexed)?;
                 verify_event_hash(event)?;
-                let wrapped_source_role = derived
-                    .untrusted_history_wrapped
-                    .then(|| {
-                        matches_wrapped_history_item(
-                            item,
-                            &turn.context_trace.retrieval.selected_evidence,
-                        )
-                    })
-                    .flatten();
+                let is_session_system_prompt =
+                    ordinal == 0 && item.span.event_id == session_system_event_id;
+                let wrapped_source_role = wrapped_history
+                    .consume(item, is_session_system_prompt)
+                    .map_err(|message| RetrievalError::InvalidSource {
+                    path: source.path.clone(),
+                    message: message.into(),
+                })?;
                 if item.role != event.role && wrapped_source_role != Some(event.role) {
                     return Err(RetrievalError::InvalidSource {
                         path: source.path.clone(),
@@ -3132,6 +3146,12 @@ impl RetrievalStore {
                     )
                     .map_err(|error| self.database_error(error))?;
             }
+            wrapped_history
+                .finish()
+                .map_err(|message| RetrievalError::InvalidSource {
+                    path: source.path.clone(),
+                    message: message.into(),
+                })?;
             if context_sha256(&context_messages) != derived.context_sha256 {
                 return Err(RetrievalError::InvalidSource {
                     path: source.path.clone(),
@@ -10412,6 +10432,7 @@ CREATE INDEX memory_boundary_suggestions_session_event
             active_context_start_after: session.active_context_start_index,
             context_items: plan.context_items,
             context_sha256: Some(plan.context_sha256),
+            untrusted_history_wrapped: plan.untrusted_history_wrapped,
             request: Some(ModelRequestTrace {
                 model: session.model.clone(),
                 think: session.think,

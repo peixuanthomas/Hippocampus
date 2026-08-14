@@ -220,18 +220,52 @@ fn append_untrusted_history_notice(
     }
 }
 
-pub(crate) fn matches_wrapped_history_item(
-    item: &ContextItemTrace,
-    evidence: &[SelectedEvidence],
-) -> Option<EventRole> {
-    (item.role == EventRole::System)
-        .then(|| {
-            evidence.iter().find(|selected| {
-                selected.span == item.span && selected.content_sha256 == item.content_sha256
-            })
+pub(crate) struct WrappedHistoryCursor<'a> {
+    evidence: &'a [SelectedEvidence],
+    next: usize,
+    enabled: bool,
+}
+
+impl<'a> WrappedHistoryCursor<'a> {
+    pub(crate) fn new(
+        enabled: bool,
+        evidence: &'a [SelectedEvidence],
+    ) -> Result<Self, &'static str> {
+        if enabled && evidence.is_empty() {
+            return Err("不可信历史标记缺少检索证据");
+        }
+        Ok(Self {
+            evidence,
+            next: 0,
+            enabled,
         })
-        .flatten()
-        .map(|selected| selected.role)
+    }
+
+    pub(crate) fn consume(
+        &mut self,
+        item: &ContextItemTrace,
+        is_session_system_prompt: bool,
+    ) -> Result<Option<EventRole>, &'static str> {
+        if !self.enabled || item.role != EventRole::System || is_session_system_prompt {
+            return Ok(None);
+        }
+        let selected = self
+            .evidence
+            .get(self.next)
+            .ok_or("不可信历史上下文包含多余片段")?;
+        if selected.span != item.span || selected.content_sha256 != item.content_sha256 {
+            return Err("不可信历史上下文未按检索证据顺序匹配");
+        }
+        self.next += 1;
+        Ok(Some(selected.role))
+    }
+
+    pub(crate) fn finish(self) -> Result<(), &'static str> {
+        if self.enabled && self.next != self.evidence.len() {
+            return Err("不可信历史上下文缺少检索证据片段");
+        }
+        Ok(())
+    }
 }
 
 fn push_message(
