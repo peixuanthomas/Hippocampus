@@ -229,6 +229,8 @@ pub enum RetrievalError {
     UnsupportedIndexVersion(i64),
     #[error("记忆派生状态版本不受支持：{0}")]
     UnsupportedMemoryStateVersion(i64),
+    #[error("记忆图版本不受支持：{0}")]
+    UnsupportedGraphSchemaVersion(i64),
     #[error("索引中找不到会话 {0}")]
     SessionNotFound(String),
     #[error("索引中找不到事件 {0}")]
@@ -699,6 +701,13 @@ impl RetrievalStore {
         self.rebuild_under_root_write()
     }
 
+    pub fn refresh_graph(
+        &self,
+        config: &MemoryConfig,
+    ) -> RetrievalResult<crate::graph::GraphMaterializationReport> {
+        crate::graph::refresh_graph(self, config)
+    }
+
     fn rebuild_under_root_write(&self) -> RetrievalResult<SyncReport> {
         let sources = self.load_all_sources()?;
         let mut connection = self.open_connection()?;
@@ -707,7 +716,10 @@ impl RetrievalStore {
             .map_err(|source| self.database_error(source))?;
         transaction
             .execute_batch(
-                "DELETE FROM memory_documents;
+                "DELETE FROM memory_graph_edges;
+                 DELETE FROM memory_graph_nodes;
+                 DELETE FROM memory_graph_materializations;
+                 DELETE FROM memory_documents;
                  DELETE FROM retrieval_documents_fts;
                  DELETE FROM retrieval_documents;
                  DELETE FROM retrieval_runs;
@@ -1178,7 +1190,7 @@ impl RetrievalStore {
         })
     }
 
-    fn compatible_embeddings_from_connection(
+    pub(crate) fn compatible_embeddings_from_connection(
         &self,
         connection: &Connection,
         spec: &VectorIndexSpec,
@@ -4481,6 +4493,13 @@ impl RetrievalStore {
                 existing_memory_version.expect("checked as some"),
             ));
         }
+        let existing_graph_version = read_existing_graph_schema_version(&connection)
+            .map_err(|source| self.database_error(source))?;
+        if existing_graph_version.is_some_and(|value| value != crate::graph::GRAPH_SCHEMA_VERSION) {
+            return Err(RetrievalError::UnsupportedGraphSchemaVersion(
+                existing_graph_version.expect("checked as some"),
+            ));
+        }
         connection
             .execute_batch(
                 "PRAGMA foreign_keys = ON;
@@ -4498,6 +4517,8 @@ impl RetrievalStore {
                 .execute_batch(SCHEMA_SQL)
                 .map_err(|e| self.database_error(e))?;
             prepare_memory_state_schema(&transaction, existing_memory_version)
+                .map_err(|e| self.database_error(e))?;
+            prepare_graph_schema(&transaction, existing_graph_version)
                 .map_err(|e| self.database_error(e))?;
             if !table_has_column(&transaction, "answer_contexts", "identity_instruction")
                 .map_err(|e| self.database_error(e))?
@@ -4560,6 +4581,8 @@ impl RetrievalStore {
                 .map_err(|e| self.database_error(e))?;
             prepare_memory_state_schema(&transaction, existing_memory_version)
                 .map_err(|e| self.database_error(e))?;
+            prepare_graph_schema(&transaction, existing_graph_version)
+                .map_err(|e| self.database_error(e))?;
             if matches!(version, 3 | 4) {
                 backfill_memory_documents(&transaction).map_err(|e| self.database_error(e))?;
             }
@@ -4575,6 +4598,8 @@ impl RetrievalStore {
                 .execute_batch(SCHEMA_SQL)
                 .map_err(|source| self.database_error(source))?;
             prepare_memory_state_schema(&transaction, existing_memory_version)
+                .map_err(|e| self.database_error(e))?;
+            prepare_graph_schema(&transaction, existing_graph_version)
                 .map_err(|e| self.database_error(e))?;
             transaction
                 .pragma_update(None, "user_version", INDEX_SCHEMA_VERSION)
@@ -4706,6 +4731,70 @@ impl RetrievalStore {
             path: self.index_path.clone(),
             source,
         }
+    }
+
+    pub(crate) fn validated_retrieval_runs_from_connection(
+        &self,
+        connection: &Connection,
+    ) -> RetrievalResult<Vec<(String, RetrievalTrace)>> {
+        let mut expected = BTreeMap::new();
+        for source in self.load_all_sources()? {
+            self.verify_indexed_session_source_projection(connection, &source.session.id)?;
+            for turn in &source.session.turns {
+                if !has_assistant_event(&source.session, turn) {
+                    continue;
+                }
+                let answer_event_id =
+                    event_id(&source.session.id, Some(&turn.id), EventRole::Assistant);
+                if expected
+                    .insert(
+                        answer_event_id.clone(),
+                        turn.context_trace.retrieval.clone(),
+                    )
+                    .is_some()
+                {
+                    return Err(RetrievalError::CorruptIndex(format!(
+                        "原始 retrieval run {answer_event_id} 重复"
+                    )));
+                }
+            }
+        }
+        let mut statement = connection
+            .prepare(
+                "SELECT answer_event_id,trace_json FROM retrieval_runs ORDER BY answer_event_id",
+            )
+            .map_err(|error| self.database_error(error))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| self.database_error(error))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| self.database_error(error))?;
+        if rows.len() != expected.len() {
+            return Err(RetrievalError::CorruptIndex(
+                "retrieval_runs 与原始回答集合数量不一致".into(),
+            ));
+        }
+        for (answer_event_id, json) in rows {
+            let actual: RetrievalTrace = serde_json::from_str(&json).map_err(|error| {
+                RetrievalError::CorruptIndex(format!(
+                    "retrieval run {answer_event_id} JSON 无效：{error}"
+                ))
+            })?;
+            let wanted = expected.remove(&answer_event_id).ok_or_else(|| {
+                RetrievalError::CorruptIndex(format!(
+                    "retrieval run {answer_event_id} 未绑定原始 assistant 回答"
+                ))
+            })?;
+            if actual != wanted {
+                return Err(RetrievalError::CorruptIndex(format!(
+                    "retrieval run {answer_event_id} 与原始 trace 不一致"
+                )));
+            }
+            expected.insert(answer_event_id, actual);
+        }
+        Ok(expected.into_iter().collect())
     }
 }
 
@@ -5513,7 +5602,7 @@ fn hash_embedding_rows(
     Ok(())
 }
 
-fn load_leaf_embedding_snapshot(
+pub(crate) fn load_leaf_embedding_snapshot(
     store: &RetrievalStore,
     connection: &Connection,
     spec: &VectorIndexSpec,
@@ -5674,7 +5763,7 @@ fn load_leaf_embedding_snapshot(
     })
 }
 
-fn load_aggregate_embedding_snapshot(
+pub(crate) fn load_aggregate_embedding_snapshot(
     store: &RetrievalStore,
     connection: &Connection,
     spec: &VectorIndexSpec,
@@ -7597,6 +7686,44 @@ fn read_existing_memory_state_version(connection: &Connection) -> rusqlite::Resu
         .optional()
 }
 
+fn read_existing_graph_schema_version(connection: &Connection) -> rusqlite::Result<Option<i64>> {
+    let exists = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master
+                       WHERE type = 'table' AND name = 'memory_schema_meta')",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !exists {
+        return Ok(None);
+    }
+    connection
+        .query_row(
+            "SELECT value FROM memory_schema_meta WHERE key = 'graph_schema_version'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+}
+
+fn prepare_graph_schema(
+    connection: &Connection,
+    existing_version: Option<i64>,
+) -> rusqlite::Result<()> {
+    if existing_version.is_none() {
+        connection.execute_batch(
+            "DELETE FROM memory_graph_edges;
+             DELETE FROM memory_graph_nodes;
+             DELETE FROM memory_graph_materializations;",
+        )?;
+    }
+    connection.execute(
+        "INSERT INTO memory_schema_meta(key,value) VALUES('graph_schema_version',1)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        [],
+    )?;
+    Ok(())
+}
+
 fn prepare_memory_state_schema(
     connection: &Connection,
     existing_version: Option<i64>,
@@ -7616,7 +7743,11 @@ fn prepare_memory_state_schema(
         // They cannot be upgraded row by row without trusting the old derived state, so discard
         // only the replayable projection and retain raw events plus the immutable attempt ledger.
         connection.execute_batch(
-            "DELETE FROM memory_embeddings
+            "DELETE FROM memory_graph_edges;
+             DELETE FROM memory_graph_nodes;
+             DELETE FROM memory_graph_materializations;
+             DELETE FROM memory_schema_meta WHERE key='graph_schema_version';
+             DELETE FROM memory_embeddings
                WHERE document_id IN (SELECT document_id FROM memory_documents
                                      WHERE granularity IN ('episode','session'));
              DELETE FROM memory_episode_materializations;
@@ -8136,6 +8267,104 @@ CREATE TABLE IF NOT EXISTS memory_boundary_suggestions (
 );
 CREATE INDEX IF NOT EXISTS memory_boundary_suggestions_session_event
     ON memory_boundary_suggestions(session_id, before_event_id, boundary_id);
+
+CREATE TABLE IF NOT EXISTS memory_graph_nodes (
+    node_id TEXT PRIMARY KEY,
+    node_kind TEXT NOT NULL CHECK(node_kind IN ('document','entity','claim')),
+    source_id TEXT NOT NULL,
+    session_id TEXT,
+    granularity TEXT CHECK(granularity IS NULL OR granularity IN ('message','fragment','episode','session')),
+    source_sha256 TEXT NOT NULL CHECK(length(source_sha256)=64 AND source_sha256 NOT GLOB '*[^0-9a-f]*'),
+    UNIQUE(node_kind,source_id),
+    CHECK((node_kind='document' AND session_id IS NOT NULL AND granularity IS NOT NULL)
+       OR (node_kind='entity' AND session_id IS NULL AND granularity IS NULL)
+       OR (node_kind='claim' AND session_id IS NOT NULL AND granularity IS NULL))
+);
+CREATE INDEX IF NOT EXISTS memory_graph_nodes_kind_source
+    ON memory_graph_nodes(node_kind,source_id);
+
+CREATE TABLE IF NOT EXISTS memory_graph_edges (
+    edge_id TEXT PRIMARY KEY,
+    edge_type TEXT NOT NULL CHECK(edge_type IN ('reply','adjacent','episode_member','entity_mention','shared_entity','keyword_cooccurrence','embedding_mutual_top_k','common_recall','support','conflict','replacement')),
+    source_node_id TEXT NOT NULL REFERENCES memory_graph_nodes(node_id) ON DELETE CASCADE,
+    target_node_id TEXT NOT NULL REFERENCES memory_graph_nodes(node_id) ON DELETE CASCADE,
+    weight REAL NOT NULL CHECK(weight>0),
+    directed INTEGER NOT NULL CHECK(directed IN (0,1)),
+    provenance_json TEXT NOT NULL CHECK(length(provenance_json)>0),
+    provenance_sha256 TEXT NOT NULL CHECK(length(provenance_sha256)=64 AND provenance_sha256 NOT GLOB '*[^0-9a-f]*'),
+    CHECK(source_node_id<>target_node_id),
+    CHECK((edge_type='replacement' AND directed=1) OR (edge_type<>'replacement' AND directed=0)),
+    CHECK(directed=1 OR source_node_id<target_node_id),
+    UNIQUE(edge_type,source_node_id,target_node_id)
+);
+CREATE INDEX IF NOT EXISTS memory_graph_edges_source_type
+    ON memory_graph_edges(source_node_id,edge_type,target_node_id);
+CREATE INDEX IF NOT EXISTS memory_graph_edges_target_type
+    ON memory_graph_edges(target_node_id,edge_type,source_node_id);
+
+CREATE TABLE IF NOT EXISTS memory_graph_materializations (
+    singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+    algorithm_version INTEGER NOT NULL CHECK(algorithm_version=1),
+    vector_index_fingerprint TEXT NOT NULL CHECK(length(vector_index_fingerprint)=64),
+    config_sha256 TEXT NOT NULL CHECK(length(config_sha256)=64),
+    source_sha256 TEXT NOT NULL CHECK(length(source_sha256)=64),
+    catalog_sha256 TEXT NOT NULL CHECK(length(catalog_sha256)=64),
+    node_count INTEGER NOT NULL CHECK(node_count>=0),
+    edge_count INTEGER NOT NULL CHECK(edge_count>=0),
+    materialized_at TEXT NOT NULL CHECK(length(materialized_at)>0)
+);
+
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_indexed_sessions_insert AFTER INSERT ON indexed_sessions BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_indexed_sessions_update AFTER UPDATE ON indexed_sessions BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_indexed_sessions_delete AFTER DELETE ON indexed_sessions BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_events_insert AFTER INSERT ON events BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_events_update AFTER UPDATE ON events BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_events_delete AFTER DELETE ON events BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_source_spans_insert AFTER INSERT ON source_spans BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_source_spans_update AFTER UPDATE ON source_spans BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_source_spans_delete AFTER DELETE ON source_spans BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_retrieval_runs_insert AFTER INSERT ON retrieval_runs BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_retrieval_runs_update AFTER UPDATE ON retrieval_runs BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_retrieval_runs_delete AFTER DELETE ON retrieval_runs BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_retrieval_documents_insert AFTER INSERT ON retrieval_documents BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_retrieval_documents_update AFTER UPDATE ON retrieval_documents BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_retrieval_documents_delete AFTER DELETE ON retrieval_documents BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_documents_insert AFTER INSERT ON memory_documents BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_documents_update AFTER UPDATE ON memory_documents BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_documents_delete AFTER DELETE ON memory_documents BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_document_members_insert AFTER INSERT ON memory_document_members BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_document_members_update AFTER UPDATE ON memory_document_members BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_document_members_delete AFTER DELETE ON memory_document_members BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_embeddings_insert AFTER INSERT ON memory_embeddings BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_embeddings_update AFTER UPDATE ON memory_embeddings BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_embeddings_delete AFTER DELETE ON memory_embeddings BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_episode_boundaries_insert AFTER INSERT ON memory_episode_boundaries BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_episode_boundaries_update AFTER UPDATE ON memory_episode_boundaries BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_episode_boundaries_delete AFTER DELETE ON memory_episode_boundaries BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_episode_materializations_insert AFTER INSERT ON memory_episode_materializations BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_episode_materializations_update AFTER UPDATE ON memory_episode_materializations BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_episode_materializations_delete AFTER DELETE ON memory_episode_materializations BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_consolidation_watermarks_insert AFTER INSERT ON consolidation_watermarks BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_consolidation_watermarks_update AFTER UPDATE ON consolidation_watermarks BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_consolidation_watermarks_delete AFTER DELETE ON consolidation_watermarks BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_entities_insert AFTER INSERT ON memory_entities BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_entities_update AFTER UPDATE ON memory_entities BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_entities_delete AFTER DELETE ON memory_entities BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_entity_mentions_insert AFTER INSERT ON memory_entity_mentions BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_entity_mentions_update AFTER UPDATE ON memory_entity_mentions BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_entity_mentions_delete AFTER DELETE ON memory_entity_mentions BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_claims_insert AFTER INSERT ON memory_claims BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_claims_update AFTER UPDATE ON memory_claims BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_claims_delete AFTER DELETE ON memory_claims BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_claim_evidence_insert AFTER INSERT ON memory_claim_evidence BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_claim_evidence_update AFTER UPDATE ON memory_claim_evidence BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_claim_evidence_delete AFTER DELETE ON memory_claim_evidence BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_claim_transitions_insert AFTER INSERT ON memory_claim_transitions BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_claim_transitions_update AFTER UPDATE ON memory_claim_transitions BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_claim_transitions_delete AFTER DELETE ON memory_claim_transitions BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_boundary_suggestions_insert AFTER INSERT ON memory_boundary_suggestions BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_boundary_suggestions_update AFTER UPDATE ON memory_boundary_suggestions BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_boundary_suggestions_delete AFTER DELETE ON memory_boundary_suggestions BEGIN DELETE FROM memory_graph_materializations; END;
 "#;
 
 fn elapsed_ms(started: Instant) -> u64 {

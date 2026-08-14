@@ -3,6 +3,7 @@ pub mod consolidation;
 pub mod context;
 pub mod engine;
 pub mod episode;
+pub mod graph;
 pub mod knowledge;
 pub mod model;
 pub mod ollama;
@@ -39,6 +40,10 @@ pub use episode::{
     EPISODE_ALGORITHM_VERSION, EpisodeBoundaryDecision, EpisodeDocument, EpisodeGapState,
     EpisodeMaterializationReport, EpisodeMember, EpisodeSignal, EpisodeSignalState,
     SOFT_BOUNDARY_VOTE_THRESHOLD,
+};
+pub use graph::{
+    GRAPH_ALGORITHM_VERSION, GRAPH_SCHEMA_VERSION, GraphEdgeType, GraphMaterializationReport,
+    GraphNodeKind,
 };
 pub use knowledge::{KnowledgeRecall, KnowledgeStore, KnowledgeSyncReport, KnowledgeTrace};
 pub use model::{
