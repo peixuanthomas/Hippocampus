@@ -2129,6 +2129,67 @@ fn validate_applied_mention_projection(connection: &Connection) -> RetrievalResu
     Ok(())
 }
 
+pub(crate) fn original_claim_valid_to_by_id(
+    connection: &Connection,
+) -> RetrievalResult<BTreeMap<String, Option<String>>> {
+    let mut statement = connection.prepare(
+        "SELECT attempt_id, batch_key, session_id, from_sequence, through_sequence, trigger, model,
+                request_json, request_sha256, input_event_ids, input_event_hashes, response_json,
+                response_sha256, status, input_tokens, output_tokens, latency_ms, started_at,
+                completed_at, validation_json, error_json
+         FROM consolidation_batches WHERE status='applied' AND projection_schema_version=4
+         ORDER BY attempt_id",
+    ).map_err(candidate_database_error)?;
+    let records = statement
+        .query_map([], map_stored_attempt)
+        .map_err(candidate_database_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(candidate_database_error)?;
+    let mut originals = BTreeMap::new();
+    for stored in records {
+        let attempt = decode_stored_attempt(stored)?;
+        let request: StructuredChatRequest =
+            serde_json::from_str(&attempt.request_json).map_err(|error| {
+                RetrievalError::CorruptIndex(format!("applied 请求解析失败：{error}"))
+            })?;
+        let payload: ConsolidationRequestPayload = serde_json::from_str(
+            request
+                .messages
+                .get(1)
+                .map(|message| message.content.as_str())
+                .unwrap_or(""),
+        )
+        .map_err(|error| {
+            RetrievalError::CorruptIndex(format!("applied 请求载荷解析失败：{error}"))
+        })?;
+        validate_applied_attempt(&payload.batch, &payload.candidate_snapshot, &attempt).map_err(
+            |error| RetrievalError::CorruptIndex(format!("applied 请求契约损坏：{error}")),
+        )?;
+        let response = attempt
+            .response_json
+            .as_deref()
+            .ok_or_else(|| RetrievalError::CorruptIndex("applied 响应缺失".into()))?;
+        let output: StructuredConsolidationOutput =
+            serde_json::from_str(response).map_err(|error| {
+                RetrievalError::CorruptIndex(format!("applied 响应解析失败：{error}"))
+            })?;
+        let plan = validate_structured_output(&payload.batch, &payload.candidate_snapshot, &output)
+            .map_err(|error| {
+                RetrievalError::CorruptIndex(format!("applied 输出重放失败：{error}"))
+            })?;
+        for claim in plan.claims {
+            if let ValidatedClaimAction::Create { claim_id, .. } = claim.action
+                && originals.insert(claim_id.clone(), claim.valid_to).is_some()
+            {
+                return Err(RetrievalError::CorruptIndex(format!(
+                    "applied 账本重复创建声明 {claim_id}"
+                )));
+            }
+        }
+    }
+    Ok(originals)
+}
+
 fn global_stable_identifier_owners(
     connection: &Connection,
 ) -> RetrievalResult<HashMap<(String, String), HashSet<String>>> {

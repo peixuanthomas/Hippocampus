@@ -11,7 +11,9 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::config::MemoryConfig;
-use crate::consolidation::{normalize_match, validate_full_derived_integrity};
+use crate::consolidation::{
+    normalize_match, original_claim_valid_to_by_id, validate_full_derived_integrity,
+};
 use crate::context::{WrappedHistoryCursor, wrapped_history_identity};
 use crate::episode::{
     EMBEDDING_COSINE_SIMILARITY_THRESHOLD, EPISODE_ALGORITHM_VERSION, EpisodeBoundaryDecision,
@@ -472,6 +474,20 @@ struct ClaimEvidenceSelection {
     role: EventRole,
     content: String,
     content_sha256: String,
+}
+
+struct RecallTransition {
+    to_state: String,
+    reason: String,
+    related_claim_id: Option<String>,
+    created_at: DateTime<Utc>,
+}
+
+struct ClaimSnapshot {
+    state: String,
+    certainty: String,
+    valid_to: Option<String>,
+    related_claim_ids: Vec<String>,
 }
 
 #[cfg(test)]
@@ -2537,6 +2553,7 @@ impl RetrievalStore {
     ) -> RetrievalResult<StateSidecar> {
         let entity_started = Instant::now();
         validate_full_derived_integrity(connection)?;
+        let original_valid_to = original_claim_valid_to_by_id(connection)?;
         let normalized_query = normalize_match(raw_query);
         let mut groups = BTreeMap::<String, (BTreeSet<String>, BTreeSet<(u8, String)>)>::new();
         let mut statement = connection
@@ -2680,12 +2697,59 @@ impl RetrievalStore {
             .map(|term| normalize_match(&term))
             .filter(|term| !term.is_empty())
             .collect::<BTreeSet<_>>();
-        let mut related = BTreeMap::<String, BTreeSet<String>>::new();
-        let mut conflicts = BTreeMap::<String, BTreeSet<String>>::new();
+        let mut transitions = BTreeMap::<String, Vec<RecallTransition>>::new();
         let mut statement = connection
             .prepare(
-                "SELECT claim_id,related_claim_id,reason FROM memory_claim_transitions
-                 WHERE related_claim_id IS NOT NULL ORDER BY claim_id,ordinal,related_claim_id",
+                "SELECT claim_id,to_state,reason,related_claim_id,created_at
+                 FROM memory_claim_transitions ORDER BY claim_id,ordinal,created_at,transition_id",
+            )
+            .map_err(|error| self.database_error(error))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })
+            .map_err(|error| self.database_error(error))?;
+        for row in rows {
+            let (claim, to_state, reason, related_claim_id, created_at) =
+                row.map_err(|error| self.database_error(error))?;
+            if !matches!(
+                to_state.as_str(),
+                "active" | "superseded" | "conflicted" | "uncertain"
+            ) || !matches!(
+                reason.as_str(),
+                "created"
+                    | "confirmed"
+                    | "certainty_upgraded"
+                    | "conflicted"
+                    | "corrected"
+                    | "replaced"
+            ) {
+                return Err(RetrievalError::CorruptIndex(format!(
+                    "声明 {claim} 的迁移状态损坏"
+                )));
+            }
+            transitions
+                .entry(claim)
+                .or_default()
+                .push(RecallTransition {
+                    to_state,
+                    reason,
+                    related_claim_id,
+                    created_at: parse_retrieval_time(&created_at, "transition.created_at")?,
+                });
+        }
+        drop(statement);
+        let mut claim_metadata = BTreeMap::<String, (String, String)>::new();
+        let mut statement = connection
+            .prepare(
+                "SELECT c.claim_id,c.certainty,c.valid_from
+                 FROM memory_claims c ORDER BY c.claim_id",
             )
             .map_err(|error| self.database_error(error))?;
         let rows = statement
@@ -2698,20 +2762,107 @@ impl RetrievalStore {
             })
             .map_err(|error| self.database_error(error))?;
         for row in rows {
-            let (claim, other, reason) = row.map_err(|error| self.database_error(error))?;
-            related
-                .entry(claim.clone())
-                .or_default()
-                .insert(other.clone());
-            if reason == "conflicted" {
-                conflicts
-                    .entry(claim.clone())
-                    .or_default()
-                    .insert(other.clone());
-                conflicts.entry(other).or_default().insert(claim);
-            }
+            let (claim, certainty, valid_from) = row.map_err(|error| self.database_error(error))?;
+            claim_metadata.insert(claim, (certainty, valid_from));
         }
         drop(statement);
+        if claim_metadata.len() != original_valid_to.len()
+            || claim_metadata
+                .keys()
+                .any(|claim| !original_valid_to.contains_key(claim))
+        {
+            return Err(RetrievalError::CorruptIndex(
+                "当前声明与 applied 创建账本不一致".into(),
+            ));
+        }
+        let mut snapshots = BTreeMap::<String, ClaimSnapshot>::new();
+        for (claim, (current_certainty, _)) in &claim_metadata {
+            let original_end = original_valid_to.get(claim).ok_or_else(|| {
+                RetrievalError::CorruptIndex(format!("声明 {claim} 缺少 applied 创建账本"))
+            })?;
+            let Some(history) = transitions.get(claim) else {
+                continue;
+            };
+            let visible = history
+                .iter()
+                .filter(|transition| transition.created_at <= visibility_upper)
+                .collect::<Vec<_>>();
+            if !visible
+                .iter()
+                .any(|transition| transition.reason == "created")
+            {
+                continue;
+            }
+            let state = visible.last().unwrap().to_state.clone();
+            let certainty = if history.iter().any(|transition| {
+                transition.reason == "certainty_upgraded"
+                    && transition.created_at > visibility_upper
+            }) {
+                "uncertain".into()
+            } else {
+                current_certainty.clone()
+            };
+            let valid_to = if original_end.is_some() {
+                original_end.clone()
+            } else {
+                visible.iter().find_map(|transition| {
+                    matches!(transition.reason.as_str(), "corrected" | "replaced")
+                        .then(|| transition.related_claim_id.as_ref())
+                        .flatten()
+                        .filter(|related| {
+                            transitions.get(*related).is_some_and(|history| {
+                                history.iter().any(|transition| {
+                                    transition.reason == "created"
+                                        && transition.created_at <= visibility_upper
+                                })
+                            })
+                        })
+                        .and_then(|related| claim_metadata.get(related))
+                        .map(|(_, related_from)| related_from.clone())
+                })
+            };
+            let related_claim_ids = visible
+                .iter()
+                .filter_map(|transition| transition.related_claim_id.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            snapshots.insert(
+                claim.clone(),
+                ClaimSnapshot {
+                    state,
+                    certainty,
+                    valid_to,
+                    related_claim_ids,
+                },
+            );
+        }
+        let mut conflicts = BTreeMap::<String, BTreeSet<String>>::new();
+        for (claim, history) in &transitions {
+            for transition in history.iter().filter(|transition| {
+                transition.created_at <= visibility_upper && transition.reason == "conflicted"
+            }) {
+                let Some(related) = transition.related_claim_id.as_ref() else {
+                    continue;
+                };
+                if snapshots
+                    .get(claim)
+                    .is_some_and(|snapshot| snapshot.state == "conflicted")
+                    && snapshots
+                        .get(related)
+                        .is_some_and(|snapshot| snapshot.state == "conflicted")
+                {
+                    conflicts
+                        .entry(claim.clone())
+                        .or_default()
+                        .insert(related.clone());
+                    conflicts
+                        .entry(related.clone())
+                        .or_default()
+                        .insert(claim.clone());
+                }
+            }
+        }
         let mut statement = connection
             .prepare(
                 "SELECT c.claim_id,c.subject_entity_id,c.object_entity_id,c.predicate_key,
@@ -2750,14 +2901,20 @@ impl RetrievalStore {
                 relation,
                 object_text,
                 object_kind,
-                state,
-                certainty,
+                _current_state,
+                _current_certainty,
                 asserted,
                 event_time,
                 valid_from,
-                valid_to,
+                _current_valid_to,
                 reference_time,
             ) = row.map_err(|error| self.database_error(error))?;
+            let Some(snapshot) = snapshots.get(&claim_id) else {
+                continue;
+            };
+            let state = snapshot.state.clone();
+            let certainty = snapshot.certainty.clone();
+            let valid_to = snapshot.valid_to.clone();
             let mut reason = "eligible".to_owned();
             let lexical = claim_overlap(&terms, &predicate, &relation, &object_text);
             let from = parse_retrieval_time(&valid_from, "claim.valid_from")?;
@@ -2799,10 +2956,7 @@ impl RetrievalStore {
             {
                 reason = "not_applicable".into();
             }
-            let related_ids: Vec<String> = related
-                .get(&claim_id)
-                .map(|ids| ids.iter().cloned().collect())
-                .unwrap_or_default();
+            let related_ids = snapshot.related_claim_ids.clone();
             let mut trace = StateSelectionTrace {
                 claim_id: claim_id.clone(),
                 subject_entity_id: subject,
@@ -8085,6 +8239,7 @@ fn query_contains_match(query: &str, term: &str) -> bool {
 fn explicit_query_date(query: &str) -> (Option<DateTime<Utc>>, bool) {
     let bytes = query.as_bytes();
     let mut invalid = false;
+    let mut first_valid = None;
     for start in 0..bytes.len().saturating_sub(9) {
         let value = &bytes[start..start + 10];
         if !(value[0..4].iter().all(u8::is_ascii_digit)
@@ -8105,11 +8260,14 @@ fn explicit_query_date(query: &str) -> (Option<DateTime<Utc>>, bool) {
             let next = date.succ_opt().unwrap_or(date);
             let instant = Utc.from_utc_datetime(&next.and_hms_opt(0, 0, 0).unwrap())
                 - chrono::Duration::nanoseconds(1);
-            return (Some(instant), invalid);
+            if first_valid.is_none() {
+                first_valid = Some(instant);
+            }
+        } else {
+            invalid = true;
         }
-        invalid = true;
     }
-    (None, invalid)
+    (first_valid, invalid)
 }
 
 fn has_historical_cue(query: &str) -> bool {
