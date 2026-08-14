@@ -478,9 +478,6 @@ pub(crate) fn recall_graph_from_connection(
     config
         .validate()
         .map_err(|error| RetrievalError::CorruptIndex(format!("memory 配置无效：{error}")))?;
-    if seeds.is_empty() {
-        return Ok(GraphRecallResult::default());
-    }
     if seeds
         .iter()
         .any(|seed| seed.rank == 0 || !seed.score.is_finite())
@@ -550,6 +547,9 @@ pub(crate) fn recall_graph_from_connection(
 
     let nodes = read_nodes(connection)?;
     let edges = read_edges(connection)?;
+    if seeds.is_empty() {
+        return Ok(GraphRecallResult::default());
+    }
     let by_id = nodes
         .iter()
         .map(|node| (node.id.as_str(), node))

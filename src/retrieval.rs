@@ -506,6 +506,20 @@ struct StateSidecar {
     state_ms: u64,
 }
 
+struct GraphEvidenceCandidate {
+    path_index: usize,
+    raw: ProjectedVectorCandidate,
+}
+
+struct GraphSidecar {
+    paths: Vec<crate::model::GraphPathTrace>,
+    candidates: Vec<GraphEvidenceCandidate>,
+    candidate_count: usize,
+    aggregate_source_count: usize,
+    elapsed_ms: u64,
+    warning: Option<String>,
+}
+
 struct ClaimEvidenceSelection {
     evidence_id: String,
     span: SourceSpan,
@@ -2510,6 +2524,23 @@ impl RetrievalStore {
             episode_percent: selected_budget.episode,
             graph_percent: selected_budget.graph,
         };
+        let graph_sidecar = self
+            .prepare_graph_candidates(
+                &transaction,
+                &index,
+                &query_vector,
+                current_user_event_id,
+                recent_event_ids,
+                session_filter,
+                &memory_config,
+                &graph_seed_documents,
+                &vector_aggregate_sources,
+                graph,
+                graph_ms,
+            )
+            .map_err(|error| {
+                HybridRecallFailure::timed(HybridRecallStage::Graph, error, graph_started)
+            })?;
         let mut result = self
             .select_fused_candidates(
                 &transaction,
@@ -2522,26 +2553,9 @@ impl RetrievalStore {
                 capped_candidates,
                 excluded_vectors,
                 sidecar,
+                graph_sidecar,
             )
             .map_err(|error| HybridRecallFailure::new(HybridRecallStage::EntityState, error))?;
-        self.inject_graph_candidates(
-            &transaction,
-            &index,
-            &query_vector,
-            current_user_event_id,
-            recent_event_ids,
-            session_filter,
-            &retrieval_config,
-            &memory_config,
-            &graph_seed_documents,
-            &vector_aggregate_sources,
-            graph,
-            graph_ms,
-            &mut result,
-        )
-        .map_err(|error| {
-            HybridRecallFailure::timed(HybridRecallStage::Graph, error, graph_started)
-        })?;
         let recent = recent_event_ids.iter().map(String::as_str).collect();
         let mut expansion_events = result
             .evidence
@@ -2573,7 +2587,7 @@ impl RetrievalStore {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn inject_graph_candidates(
+    fn prepare_graph_candidates(
         &self,
         connection: &Connection,
         index: &HnswVectorIndex,
@@ -2581,77 +2595,21 @@ impl RetrievalStore {
         current_user_event_id: &str,
         recent_event_ids: &[String],
         session_filter: Option<&str>,
-        retrieval_config: &RetrievalConfig,
         memory_config: &MemoryConfig,
         seed_documents: &BTreeSet<String>,
         vector_aggregate_sources: &BTreeSet<String>,
         mut graph: crate::graph::GraphRecallResult,
         graph_ms: u64,
-        result: &mut RecallResult,
-    ) -> RetrievalResult<()> {
+    ) -> RetrievalResult<GraphSidecar> {
         let candidate_count = graph.paths.len();
-        if let Some(warning) = graph.warning.take() {
-            result.trace.warnings.push(warning);
-        }
-        result.trace.config = retrieval_config.clone();
-        let budget = memory_budget_for_query(memory_config, result.trace.query_kind);
-        result.trace.budget_allocation = BudgetAllocationTrace {
-            query_kind: result.trace.query_kind,
-            recent_history_percent: budget.recent_history,
-            exact_or_state_percent: budget.exact_or_state,
-            episode_percent: budget.episode,
-            graph_percent: budget.graph,
-        };
         let recent = recent_event_ids
             .iter()
             .map(String::as_str)
             .collect::<HashSet<_>>();
-        let mut used_events = result
-            .evidence
-            .iter()
-            .filter(|item| item.selected.kind == EvidenceKind::Core)
-            .map(|item| item.selected.span.event_id.clone())
-            .collect::<HashSet<_>>();
-        let mut used_hashes = result
-            .evidence
-            .iter()
-            .filter(|item| item.selected.kind == EvidenceKind::Core)
-            .map(|item| item.selected.content_sha256.clone())
-            .collect::<HashSet<_>>();
-        let mut used_episodes = BTreeSet::new();
-        for evidence in &result.evidence {
-            if evidence.selected.kind == EvidenceKind::Core
-                && let Some(episode) =
-                    self.resolve_episode_id(connection, &evidence.selected.span.event_id)?
-            {
-                used_episodes.insert(episode);
-            }
-        }
-        let mut slots = result
-            .evidence
-            .iter()
-            .filter(|item| item.selected.kind == EvidenceKind::Core)
-            .count();
-        let mut chars = result
-            .evidence
-            .iter()
-            .filter(|item| item.selected.kind == EvidenceKind::Core)
-            .map(|item| item.content.chars().count())
-            .sum::<usize>();
-        let graph_slot_budget = if budget.graph == 0 {
-            0
-        } else {
-            (retrieval_config.max_selected * usize::from(budget.graph))
-                .div_ceil(100)
-                .max(1)
-        };
-        let graph_char_budget =
-            (retrieval_config.evidence_char_budget * usize::from(budget.graph)).div_ceil(100);
-        let mut graph_slots = 0usize;
-        let mut graph_chars = 0usize;
         let mut eligible = 0usize;
         let mut aggregate_sources = vector_aggregate_sources.clone();
-        for path in &mut graph.paths {
+        let mut candidates = Vec::new();
+        for (path_index, path) in graph.paths.iter_mut().enumerate() {
             if seed_documents.contains(&path.target_document_id) {
                 path.reason = "seed_document".into();
                 continue;
@@ -2711,175 +2669,16 @@ impl RetrievalStore {
                 path.reason = "candidate_limit".into();
                 continue;
             }
-            if let Some(existing) = result.evidence.iter().position(|item| {
-                item.selected.kind == EvidenceKind::Core && item.selected.span == raw.span
-            }) {
-                path.selected = true;
-                path.reason = "selected_coalesced".into();
-                if let Some(fused) = result
-                    .trace
-                    .fusion_candidates
-                    .iter_mut()
-                    .find(|candidate| candidate.span == raw.span)
-                {
-                    fused.selected = true;
-                }
-                let _ = existing;
-                continue;
-            }
-            let raw_chars = raw.content.chars().count();
-            if graph_slots >= graph_slot_budget {
-                path.reason = "graph_slot_limit".into();
-                continue;
-            }
-            if graph_chars + raw_chars > graph_char_budget {
-                path.reason = "graph_evidence_budget".into();
-                continue;
-            }
-            let mut conflicting = result.evidence.iter().position(|item| {
-                item.selected.kind == EvidenceKind::Core
-                    && (item.selected.span.event_id == raw.span.event_id
-                        || item.selected.content_sha256 == raw.content_sha256)
-            });
-            if conflicting.is_none()
-                && let Some(target_episode) = &raw.episode_id
-            {
-                for (index, item) in result.evidence.iter().enumerate() {
-                    if item.selected.kind == EvidenceKind::Core
-                        && self
-                            .resolve_episode_id(connection, &item.selected.span.event_id)?
-                            .as_ref()
-                            == Some(target_episode)
-                    {
-                        conflicting = Some(index);
-                        break;
-                    }
-                }
-            }
-            let displacement = conflicting.or_else(|| {
-                (slots >= retrieval_config.max_selected
-                    || chars + raw_chars > retrieval_config.evidence_char_budget)
-                    .then(|| {
-                        result
-                            .evidence
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, item)| {
-                                item.selected.kind == EvidenceKind::Core
-                                    && item.selected.reason == "selected_mmr"
-                            })
-                            .max_by_key(|(_, item)| item.selected.originating_candidate_rank)
-                            .map(|(index, _)| index)
-                    })
-                    .flatten()
-            });
-            if let Some(index) = displacement {
-                let displaced = &result.evidence[index];
-                let can_displace = displaced.selected.reason == "selected_mmr"
-                    && result
-                        .trace
-                        .fusion_candidates
-                        .iter()
-                        .find(|candidate| candidate.span == displaced.selected.span)
-                        .is_none_or(|candidate| !candidate.protected_exact);
-                if !can_displace {
-                    path.reason = if conflicting.is_some() {
-                        "duplicate_protected_or_state"
-                    } else {
-                        "selection_limit"
-                    }
-                    .into();
-                    continue;
-                }
-                let displaced = result.evidence.remove(index);
-                result
-                    .trace
-                    .selected_evidence
-                    .retain(|selected| selected.span != displaced.selected.span);
-                if let Some(candidate) = result
-                    .trace
-                    .fusion_candidates
-                    .iter_mut()
-                    .find(|candidate| candidate.span == displaced.selected.span)
-                {
-                    candidate.selected = false;
-                    candidate.reason = "displaced_by_graph".into();
-                }
-                slots -= 1;
-                chars -= displaced.content.chars().count();
-                used_events.remove(&displaced.selected.span.event_id);
-                used_hashes.remove(&displaced.selected.content_sha256);
-                if let Some(episode) =
-                    self.resolve_episode_id(connection, &displaced.selected.span.event_id)?
-                {
-                    used_episodes.remove(&episode);
-                }
-            } else if conflicting.is_some() {
-                path.reason = "duplicate_protected_or_state".into();
-                continue;
-            }
-            if slots >= retrieval_config.max_selected
-                || chars + raw_chars > retrieval_config.evidence_char_budget
-            {
-                path.reason = if slots >= retrieval_config.max_selected {
-                    "selection_limit"
-                } else {
-                    "evidence_budget"
-                }
-                .into();
-                continue;
-            }
-            let selected = SelectedEvidence {
-                span: raw.span.clone(),
-                content_sha256: raw.content_sha256.clone(),
-                role: raw.role,
-                kind: EvidenceKind::Core,
-                originating_candidate_rank: None,
-                reason: "selected_graph".into(),
-            };
-            result.trace.selected_evidence.push(selected.clone());
-            result.evidence.push(RecalledEvidence {
-                selected,
-                content: raw.content,
-            });
-            used_events.insert(raw.span.event_id);
-            used_hashes.insert(raw.content_sha256);
-            if let Some(episode) = raw.episode_id {
-                used_episodes.insert(episode);
-            }
-            slots += 1;
-            chars += raw_chars;
-            graph_slots += 1;
-            graph_chars += raw_chars;
-            path.selected = true;
-            path.reason = "selected_graph".into();
+            candidates.push(GraphEvidenceCandidate { path_index, raw });
         }
-        result.trace.graph_paths = graph.paths;
-        result.trace.channels.retain(|channel| {
-            !matches!(
-                channel.channel,
-                RetrievalChannel::Episode | RetrievalChannel::Graph
-            )
-        });
-        result.trace.channels.push(channel_trace(
-            RetrievalChannel::Episode,
-            if aggregate_sources.is_empty() {
-                "empty"
-            } else {
-                "ok"
-            },
-            aggregate_sources.len(),
-            0,
-            None,
-        ));
-        result.trace.channels.push(channel_trace(
-            RetrievalChannel::Graph,
-            if candidate_count == 0 { "empty" } else { "ok" },
+        Ok(GraphSidecar {
+            paths: graph.paths,
+            candidates,
             candidate_count,
-            graph_ms,
-            None,
-        ));
-        Ok(())
+            aggregate_source_count: aggregate_sources.len(),
+            elapsed_ms: graph_ms,
+            warning: graph.warning,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3879,6 +3678,7 @@ impl RetrievalStore {
         capped_candidates: Vec<FusedRawCandidate>,
         excluded_vectors: Vec<FusionCandidateTrace>,
         mut sidecar: StateSidecar,
+        mut graph: GraphSidecar,
     ) -> RetrievalResult<RecallResult> {
         let mut processing_order = (0..candidates.len()).collect::<Vec<_>>();
         processing_order.sort_by_key(|&index| !candidates[index].protected_exact);
@@ -4085,6 +3885,100 @@ impl RetrievalStore {
                 }
             }
         }
+        let graph_slot_budget = if bm25.trace.budget_allocation.graph_percent == 0 {
+            0
+        } else {
+            (retrieval_config.max_selected
+                * usize::from(bm25.trace.budget_allocation.graph_percent))
+            .div_ceil(100)
+            .max(1)
+        };
+        let graph_char_budget = (retrieval_config.evidence_char_budget
+            * usize::from(bm25.trace.budget_allocation.graph_percent))
+        .div_ceil(100);
+        let mut graph_only = Vec::new();
+        let mut graph_slots = 0usize;
+        let mut graph_chars = 0usize;
+        for graph_index in 0..graph.candidates.len() {
+            let item = &graph.candidates[graph_index];
+            let path = &mut graph.paths[item.path_index];
+            let raw = &item.raw;
+            if let Some(candidate_index) = candidates
+                .iter()
+                .position(|candidate| candidate.span == raw.span && candidate.selected)
+            {
+                path.selected = true;
+                path.reason = "selected_coalesced".into();
+                candidates[candidate_index].selected = true;
+                continue;
+            }
+            if sidecar.candidates.iter().any(|state| {
+                state.trace.selected && state.trace.evidence_span.as_ref() == Some(&raw.span)
+            }) {
+                path.selected = true;
+                path.reason = "selected_coalesced".into();
+                continue;
+            }
+            let duplicate_reason = if selected_events.contains(&raw.span.event_id) {
+                Some("duplicate_event")
+            } else if selected_hashes.contains(&raw.content_sha256) {
+                Some("duplicate_content")
+            } else if raw
+                .episode_id
+                .as_ref()
+                .is_some_and(|episode| selected_episodes.contains(episode))
+            {
+                Some("duplicate_episode")
+            } else {
+                None
+            };
+            if let Some(reason) = duplicate_reason {
+                path.reason = reason.into();
+                continue;
+            }
+            let raw_chars = raw.content.chars().count();
+            if graph_slots >= graph_slot_budget {
+                path.reason = "graph_slot_limit".into();
+                continue;
+            }
+            if graph_chars + raw_chars > graph_char_budget {
+                path.reason = "graph_evidence_budget".into();
+                continue;
+            }
+            if selected.len() + state_only.len() + graph_only.len() >= retrieval_config.max_selected
+            {
+                path.reason = "selection_limit".into();
+                continue;
+            }
+            if selected_chars + raw_chars > retrieval_config.evidence_char_budget {
+                path.reason = "evidence_budget".into();
+                continue;
+            }
+            if let Some(candidate_index) = candidates
+                .iter()
+                .position(|candidate| candidate.span == raw.span && candidate.reason == "eligible")
+            {
+                candidates[candidate_index].selected = true;
+                candidates[candidate_index].reason = "selected_graph".into();
+                selected.push(candidate_index);
+                if let Some(position) = eligible.iter().position(|value| *value == candidate_index)
+                {
+                    eligible.remove(position);
+                }
+            } else {
+                graph_only.push(graph_index);
+            }
+            selected_events.insert(raw.span.event_id.clone());
+            selected_hashes.insert(raw.content_sha256.clone());
+            if let Some(episode) = &raw.episode_id {
+                selected_episodes.insert(episode.clone());
+            }
+            selected_chars += raw_chars;
+            graph_slots += 1;
+            graph_chars += raw_chars;
+            path.selected = true;
+            path.reason = "selected_graph".into();
+        }
         eligible.retain(|&index| {
             let candidate = &mut candidates[index];
             if selected_events.contains(&candidate.span.event_id) {
@@ -4104,7 +3998,7 @@ impl RetrievalStore {
                 true
             }
         });
-        while selected.len() + state_only.len() < retrieval_config.max_selected
+        while selected.len() + state_only.len() + graph_only.len() < retrieval_config.max_selected
             && !eligible.is_empty()
         {
             let best_position = eligible
@@ -4181,6 +4075,25 @@ impl RetrievalStore {
                 content: candidate.content.clone(),
             });
         }
+        for graph_index in graph_only {
+            let item = &graph.candidates[graph_index];
+            let raw = &item.raw;
+            let selected_item = SelectedEvidence {
+                span: raw.span.clone(),
+                content_sha256: raw.content_sha256.clone(),
+                role: raw.role,
+                kind: EvidenceKind::Core,
+                originating_candidate_rank: None,
+                reason: "selected_graph".into(),
+            };
+            expansion_events.insert(raw.span.event_id.clone());
+            expansion_hashes.insert(raw.content_sha256.clone());
+            selected_evidence.push(selected_item.clone());
+            evidence.push(RecalledEvidence {
+                selected: selected_item,
+                content: raw.content.clone(),
+            });
+        }
         bm25.trace.status = "ok".into();
         bm25.trace.config = retrieval_config;
         bm25.trace.selected_evidence = selected_evidence;
@@ -4250,7 +4163,33 @@ impl RetrievalStore {
                 sidecar.state_ms,
                 None,
             ),
+            channel_trace(
+                RetrievalChannel::Episode,
+                if graph.aggregate_source_count == 0 {
+                    "empty"
+                } else {
+                    "ok"
+                },
+                graph.aggregate_source_count,
+                0,
+                None,
+            ),
+            channel_trace(
+                RetrievalChannel::Graph,
+                if graph.candidate_count == 0 {
+                    "empty"
+                } else {
+                    "ok"
+                },
+                graph.candidate_count,
+                graph.elapsed_ms,
+                None,
+            ),
         ];
+        if let Some(warning) = graph.warning {
+            bm25.trace.warnings.push(warning);
+        }
+        bm25.trace.graph_paths = graph.paths;
         let mut emitted_events = evidence
             .iter()
             .map(|item| item.selected.span.event_id.clone())
