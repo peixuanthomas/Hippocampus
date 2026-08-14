@@ -831,6 +831,10 @@ impl RetrievalStore {
                         "轮次 {turn_id} 的事件元数据不一致"
                     )));
                 }
+                if !control.allows_turn(&session_id, turn_id) {
+                    cursor = turn_end;
+                    continue;
+                }
                 if status != TurnStatus::Pending {
                     pending = pending
                         .checked_add(turn.len())

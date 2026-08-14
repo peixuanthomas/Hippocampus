@@ -255,6 +255,7 @@ fn is_status_validation_error(error: &RetrievalError) -> bool {
 }
 
 fn scoped_entity_count(
+    store: &RetrievalStore,
     connection: &Connection,
     session_id: Option<&str>,
 ) -> RetrievalResult<usize> {
@@ -269,12 +270,13 @@ fn scoped_entity_count(
             [session_id],
             |row| row.get(0),
         )
-        .map_err(|error| RetrievalError::CorruptIndex(format!("读取 entity status 失败：{error}")))?;
+        .map_err(|error| store.database_error(error))?;
     usize::try_from(count)
         .map_err(|_| RetrievalError::CorruptIndex("entity count 不是非负整数".into()))
 }
 
 fn scoped_episode_count(
+    store: &RetrievalStore,
     connection: &Connection,
     session_id: Option<&str>,
 ) -> RetrievalResult<usize> {
@@ -287,9 +289,7 @@ fn scoped_episode_count(
             [session_id],
             |row| row.get(0),
         )
-        .map_err(|error| {
-            RetrievalError::CorruptIndex(format!("读取 episode status 失败：{error}"))
-        })?;
+        .map_err(|error| store.database_error(error))?;
     usize::try_from(count)
         .map_err(|_| RetrievalError::CorruptIndex("episode count 不是非负整数".into()))
 }
@@ -984,7 +984,11 @@ impl RetrievalStore {
                 validate_full_derived_integrity(&transaction)?;
                 if let Some(scope) = session_id {
                     Self::require_active_session(&control, scope)?;
-                    self.verify_indexed_session_source_projection(&transaction, scope)?;
+                    self.verify_indexed_session_source_projection_with_control(
+                        &transaction,
+                        scope,
+                        &control,
+                    )?;
                 }
                 let mut active_sessions = 0usize;
                 let mut active_events = 0usize;
@@ -1024,11 +1028,12 @@ impl RetrievalStore {
                 let embedding_total =
                     self.active_memory_document_count(&transaction, &control, session_id)?;
                 let embedding_compatible = self
-                    .compatible_embeddings_from_connection(
+                    .compatible_embeddings_from_connection_with_control(
                         &transaction,
                         &spec,
                         &fingerprint,
                         session_id,
+                        &control,
                     )?
                     .len();
                 let embedding_stale = embedding_total
@@ -1044,14 +1049,15 @@ impl RetrievalStore {
                         &control,
                         session_id,
                     )?;
-                let entity_count = scoped_entity_count(&transaction, session_id)?;
-                let episode_count = scoped_episode_count(&transaction, session_id)?;
+                let entity_count = scoped_entity_count(self, &transaction, session_id)?;
+                let episode_count = scoped_episode_count(self, &transaction, session_id)?;
                 let graph_active_documents =
                     self.active_memory_document_count(&transaction, &control, None)?;
                 let graph = crate::graph::graph_status_from_connection(
                     self,
                     &transaction,
                     memory,
+                    &control,
                     graph_active_documents,
                     session_id,
                 )?;
@@ -1083,8 +1089,8 @@ impl RetrievalStore {
                 let mut retrieval_latencies = Vec::new();
                 let mut retrieval_failures = 0usize;
                 let mut retrieval_runs = 0usize;
-                for (answer_event_id, trace) in
-                    self.validated_retrieval_runs_from_connection(&transaction)?
+                for (answer_event_id, trace) in self
+                    .validated_retrieval_runs_from_connection_with_control(&transaction, &control)?
                 {
                     if let Some(scope) = session_id {
                         let answer_session: String = transaction
@@ -2784,6 +2790,24 @@ impl RetrievalStore {
         fingerprint: &str,
         session_filter: Option<&str>,
     ) -> RetrievalResult<Vec<StoredEmbedding>> {
+        let control = self.replay_control_state_under_guard()?;
+        self.compatible_embeddings_from_connection_with_control(
+            connection,
+            spec,
+            fingerprint,
+            session_filter,
+            &control,
+        )
+    }
+
+    pub(crate) fn compatible_embeddings_from_connection_with_control(
+        &self,
+        connection: &Connection,
+        spec: &VectorIndexSpec,
+        fingerprint: &str,
+        session_filter: Option<&str>,
+        control: &ControlState,
+    ) -> RetrievalResult<Vec<StoredEmbedding>> {
         let scope_clause = if session_filter.is_some() {
             " AND d.session_id=?4"
         } else {
@@ -2827,10 +2851,9 @@ impl RetrievalStore {
             .map_err(|error| self.database_error(error))?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|error| self.database_error(error))?;
-        let control = self.replay_control_state_under_guard()?;
         let mut active_rows = Vec::with_capacity(rows.len());
         for row in rows {
-            if self.memory_document_is_active(connection, &control, &row.0)? {
+            if self.memory_document_is_active(connection, control, &row.0)? {
                 active_rows.push(row);
             }
         }
@@ -8189,6 +8212,16 @@ impl RetrievalStore {
         connection: &Connection,
         session_id: &str,
     ) -> RetrievalResult<()> {
+        let control = self.replay_control_state_under_guard()?;
+        self.verify_indexed_session_source_projection_with_control(connection, session_id, &control)
+    }
+
+    pub(crate) fn verify_indexed_session_source_projection_with_control(
+        &self,
+        connection: &Connection,
+        session_id: &str,
+        control: &ControlState,
+    ) -> RetrievalResult<()> {
         let indexed = self.get_session_from_connection(connection, session_id)?;
         if indexed.source_file != format!("{session_id}.json")
             || indexed.source_sha256.len() != 64
@@ -8227,7 +8260,6 @@ impl RetrievalStore {
                 session_id: session_id.to_owned(),
             });
         }
-        let control = self.replay_control_state_under_guard()?;
         let indexed_events = connection.prepare(
             "SELECT event_id, session_id, turn_id, sequence, role, created_at, content, content_sha256,
                     reply_to_event_id, token_count, turn_status, done_reason, error
@@ -8261,6 +8293,14 @@ impl RetrievalStore {
         connection: &Connection,
     ) -> RetrievalResult<Vec<(String, RetrievalTrace)>> {
         let control = self.replay_control_state_under_guard()?;
+        self.validated_retrieval_runs_from_connection_with_control(connection, &control)
+    }
+
+    pub(crate) fn validated_retrieval_runs_from_connection_with_control(
+        &self,
+        connection: &Connection,
+        control: &ControlState,
+    ) -> RetrievalResult<Vec<(String, RetrievalTrace)>> {
         let mut statement = connection
             .prepare(
                 "SELECT answer_event_id,trace_json FROM retrieval_runs ORDER BY answer_event_id",
@@ -8279,7 +8319,11 @@ impl RetrievalStore {
             if !control.allows_session(&source.session.id) {
                 continue;
             }
-            self.verify_indexed_session_source_projection(connection, &source.session.id)?;
+            self.verify_indexed_session_source_projection_with_control(
+                connection,
+                &source.session.id,
+                control,
+            )?;
             for turn in &source.session.turns {
                 if !has_assistant_event(&source.session, turn) {
                     continue;
@@ -8306,7 +8350,7 @@ impl RetrievalStore {
                 }
                 if !self.retrieval_trace_is_active(
                     connection,
-                    &control,
+                    control,
                     &turn.context_trace.retrieval,
                 )? {
                     if json.is_some() {
@@ -9069,11 +9113,12 @@ fn hash_usize(hasher: &mut Sha256, value: usize) {
 }
 
 fn hash_session_catalog(
+    store: &RetrievalStore,
     connection: &Connection,
     hasher: &mut Sha256,
 ) -> RetrievalResult<Vec<String>> {
     let mut statement = connection.prepare("SELECT session_id,title,created_at,updated_at,source_file,source_sha256,source_schema_version FROM indexed_sessions ORDER BY session_id")
-        .map_err(|error| RetrievalError::CorruptIndex(format!("读取 session catalog 失败：{error}")))?;
+        .map_err(|error| store.database_error(error))?;
     let rows = statement
         .query_map([], |row| {
             Ok((
@@ -9086,14 +9131,11 @@ fn hash_session_catalog(
                 row.get::<_, i64>(6)?,
             ))
         })
-        .map_err(|error| {
-            RetrievalError::CorruptIndex(format!("读取 session catalog 失败：{error}"))
-        })?;
+        .map_err(|error| store.database_error(error))?;
     let mut ids = Vec::new();
     for row in rows {
-        let (id, title, created, updated, file, source, version) = row.map_err(|error| {
-            RetrievalError::CorruptIndex(format!("读取 session catalog 失败：{error}"))
-        })?;
+        let (id, title, created, updated, file, source, version) =
+            row.map_err(|error| store.database_error(error))?;
         for value in [&id, &title, &created, &updated, &file, &source] {
             hash_string(hasher, value);
         }
@@ -9104,6 +9146,7 @@ fn hash_session_catalog(
 }
 
 fn hash_embedding_rows(
+    store: &RetrievalStore,
     connection: &Connection,
     hasher: &mut Sha256,
     granularities: &str,
@@ -9111,9 +9154,9 @@ fn hash_embedding_rows(
     let sql = format!("SELECT e.document_id,e.model,e.dimensions,e.source_sha256,e.index_fingerprint,e.vector_blob,e.embedded_at
         FROM memory_embeddings e JOIN memory_documents d ON d.document_id=e.document_id
         WHERE d.granularity IN ({granularities}) ORDER BY e.document_id");
-    let mut statement = connection.prepare(&sql).map_err(|error| {
-        RetrievalError::CorruptIndex(format!("读取 embedding CAS state 失败：{error}"))
-    })?;
+    let mut statement = connection
+        .prepare(&sql)
+        .map_err(|error| store.database_error(error))?;
     let rows = statement
         .query_map([], |row| {
             Ok((
@@ -9126,13 +9169,10 @@ fn hash_embedding_rows(
                 row.get::<_, String>(6)?,
             ))
         })
-        .map_err(|error| {
-            RetrievalError::CorruptIndex(format!("读取 embedding CAS state 失败：{error}"))
-        })?;
+        .map_err(|error| store.database_error(error))?;
     for row in rows {
-        let (id, model, dim, source, fingerprint, blob, time) = row.map_err(|error| {
-            RetrievalError::CorruptIndex(format!("读取 embedding CAS state 失败：{error}"))
-        })?;
+        let (id, model, dim, source, fingerprint, blob, time) =
+            row.map_err(|error| store.database_error(error))?;
         for value in [&id, &model, &source, &fingerprint] {
             hash_string(hasher, value);
         }
@@ -9152,7 +9192,7 @@ pub(crate) fn load_leaf_embedding_snapshot(
     load_leaf_embedding_snapshot_with_control(store, connection, spec, &control)
 }
 
-fn load_leaf_embedding_snapshot_with_control(
+pub(crate) fn load_leaf_embedding_snapshot_with_control(
     store: &RetrievalStore,
     connection: &Connection,
     spec: &VectorIndexSpec,
@@ -9168,16 +9208,18 @@ fn load_leaf_embedding_snapshot_with_control(
     hash_string(&mut hasher, &fingerprint);
     let control_generation_sha256 = control.generation_sha256();
     hash_string(&mut hasher, &control_generation_sha256);
-    let session_ids = hash_session_catalog(connection, &mut hasher)?
+    let session_ids = hash_session_catalog(store, connection, &mut hasher)?
         .into_iter()
         .filter(|id| control.allows_session(id))
         .collect::<Vec<_>>();
     for session_id in &session_ids {
-        store.verify_indexed_session_source_projection(connection, session_id)?;
+        store.verify_indexed_session_source_projection_with_control(
+            connection, session_id, control,
+        )?;
     }
     let mut expected = Vec::new();
     let mut events = connection.prepare("SELECT event_id,session_id,sequence,role,content,content_sha256 FROM events ORDER BY session_id,sequence,event_id")
-        .map_err(|error| RetrievalError::CorruptIndex(format!("读取 leaf events 失败：{error}")))?;
+        .map_err(|error| store.database_error(error))?;
     let rows = events
         .query_map([], |row| {
             Ok((
@@ -9189,11 +9231,10 @@ fn load_leaf_embedding_snapshot_with_control(
                 row.get::<_, String>(5)?,
             ))
         })
-        .map_err(|error| RetrievalError::CorruptIndex(format!("读取 leaf events 失败：{error}")))?;
+        .map_err(|error| store.database_error(error))?;
     for row in rows {
-        let (event_id, session_id, sequence, role, content, event_hash) = row.map_err(|error| {
-            RetrievalError::CorruptIndex(format!("读取 leaf events 失败：{error}"))
-        })?;
+        let (event_id, session_id, sequence, role, content, event_hash) =
+            row.map_err(|error| store.database_error(error))?;
         if !control.allows_event(&session_id, &event_id) {
             continue;
         }
@@ -9258,9 +9299,7 @@ fn load_leaf_embedding_snapshot_with_control(
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()
         })
-        .map_err(|error| {
-            RetrievalError::CorruptIndex(format!("读取 retrieval leaf catalog 失败：{error}"))
-        })?;
+        .map_err(|error| store.database_error(error))?;
     let mut actual_ids = Vec::new();
     for (id, session_id, event_id) in all_actual_ids {
         if control.event_is_excluded(&event_id)
@@ -9287,7 +9326,7 @@ fn load_leaf_embedding_snapshot_with_control(
     }
     let all_memory_ids = connection.prepare("SELECT document_id FROM memory_documents WHERE granularity IN ('message','fragment') ORDER BY document_id")
         .and_then(|mut statement| statement.query_map([], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>())
-        .map_err(|error| RetrievalError::CorruptIndex(format!("读取 memory leaf catalog 失败：{error}")))?;
+        .map_err(|error| store.database_error(error))?;
     let mut memory_ids = Vec::new();
     for id in all_memory_ids {
         if store.memory_document_is_active(connection, control, &id)? {
@@ -9350,7 +9389,7 @@ fn load_leaf_embedding_snapshot_with_control(
             reusable_vector,
         });
     }
-    hash_embedding_rows(connection, &mut hasher, "'message','fragment'")?;
+    hash_embedding_rows(store, connection, &mut hasher, "'message','fragment'")?;
     Ok(LeafEmbeddingSnapshot {
         catalog_sha256: format!("{:x}", hasher.finalize()),
         control_generation_sha256,
@@ -9368,7 +9407,7 @@ pub(crate) fn load_aggregate_embedding_snapshot(
     load_aggregate_embedding_snapshot_with_control(store, connection, spec, &control)
 }
 
-fn load_aggregate_embedding_snapshot_with_control(
+pub(crate) fn load_aggregate_embedding_snapshot_with_control(
     store: &RetrievalStore,
     connection: &Connection,
     spec: &VectorIndexSpec,
@@ -9384,13 +9423,15 @@ fn load_aggregate_embedding_snapshot_with_control(
     hash_string(&mut hasher, &fingerprint);
     let control_generation_sha256 = control.generation_sha256();
     hash_string(&mut hasher, &control_generation_sha256);
-    let session_ids = hash_session_catalog(connection, &mut hasher)?
+    let session_ids = hash_session_catalog(store, connection, &mut hasher)?
         .into_iter()
         .filter(|id| control.allows_session(id))
         .collect::<Vec<_>>();
     let mut documents = Vec::new();
     for session_id in &session_ids {
-        store.verify_indexed_session_source_projection(connection, session_id)?;
+        store.verify_indexed_session_source_projection_with_control(
+            connection, session_id, control,
+        )?;
         let audit = validate_episode_materialization(
             connection,
             &store.root,
@@ -9503,9 +9544,9 @@ fn load_aggregate_embedding_snapshot_with_control(
         }
     }
     documents.sort_by(|a, b| a.document_id.cmp(&b.document_id));
-    hash_aggregate_freshness(connection, &mut hasher)?;
-    hash_embedding_rows(connection, &mut hasher, "'message'")?;
-    hash_embedding_rows(connection, &mut hasher, "'episode','session'")?;
+    hash_aggregate_freshness(store, connection, &mut hasher)?;
+    hash_embedding_rows(store, connection, &mut hasher, "'message'")?;
+    hash_embedding_rows(store, connection, &mut hasher, "'episode','session'")?;
     Ok(AggregateEmbeddingSnapshot {
         catalog_sha256: format!("{:x}", hasher.finalize()),
         control_generation_sha256,
@@ -9513,9 +9554,13 @@ fn load_aggregate_embedding_snapshot_with_control(
     })
 }
 
-fn hash_aggregate_freshness(connection: &Connection, hasher: &mut Sha256) -> RetrievalResult<()> {
+fn hash_aggregate_freshness(
+    store: &RetrievalStore,
+    connection: &Connection,
+    hasher: &mut Sha256,
+) -> RetrievalResult<()> {
     let mut statement=connection.prepare("SELECT session_id,source_session_sha256,ledger_snapshot_sha256,vector_index_fingerprint,plan_input_sha256,algorithm_version,gap_minutes,topic_similarity_threshold,episode_count,boundary_count,materialized_at FROM memory_episode_materializations ORDER BY session_id")
-        .map_err(|e|RetrievalError::CorruptIndex(format!("读取 materialization CAS state 失败：{e}")))?;
+        .map_err(|error| store.database_error(error))?;
     let rows = statement
         .query_map([], |r| {
             Ok((
@@ -9532,13 +9577,9 @@ fn hash_aggregate_freshness(connection: &Connection, hasher: &mut Sha256) -> Ret
                 r.get::<_, String>(10)?,
             ))
         })
-        .map_err(|e| {
-            RetrievalError::CorruptIndex(format!("读取 materialization CAS state 失败：{e}"))
-        })?;
+        .map_err(|error| store.database_error(error))?;
     for row in rows {
-        let (a, b, c, d, e, f, g, h, i, j, k) = row.map_err(|e| {
-            RetrievalError::CorruptIndex(format!("读取 materialization CAS state 失败：{e}"))
-        })?;
+        let (a, b, c, d, e, f, g, h, i, j, k) = row.map_err(|error| store.database_error(error))?;
         for v in [&a, &b, &c, &d, &e, &k] {
             hash_string(hasher, v);
         }

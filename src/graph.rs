@@ -7,13 +7,15 @@ use sha2::{Digest, Sha256};
 
 use crate::config::MemoryConfig;
 use crate::consolidation::{normalize_match, validate_full_derived_integrity};
+use crate::control::ControlState;
 use crate::model::{
     EventRole, EvidenceKind, GraphPathTrace, RetrievalChannel, RetrievalDocumentGranularity,
     TurnStatus,
 };
 use crate::retrieval::{
     RetrievalError, RetrievalResult, RetrievalStore, load_aggregate_embedding_snapshot,
-    load_leaf_embedding_snapshot, parse_status, query_terms,
+    load_aggregate_embedding_snapshot_with_control, load_leaf_embedding_snapshot,
+    load_leaf_embedding_snapshot_with_control, parse_status, query_terms,
 };
 use crate::vector::{StoredEmbedding, VectorIndexSpec};
 
@@ -127,14 +129,15 @@ pub(crate) fn graph_status_from_connection(
     store: &RetrievalStore,
     connection: &Connection,
     config: &MemoryConfig,
+    control: &ControlState,
     active_document_count: usize,
     session_filter: Option<&str>,
 ) -> RetrievalResult<GraphStatusSnapshot> {
     config
         .validate()
         .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
-    let persisted_nodes = read_nodes(connection)?;
-    let persisted_edges = read_edges(connection)?;
+    let persisted_nodes = read_nodes(store, connection)?;
+    let persisted_edges = read_edges(store, connection)?;
     if active_document_count == 0 {
         let materializations: i64 = connection
             .query_row(
@@ -145,22 +148,24 @@ pub(crate) fn graph_status_from_connection(
             .map_err(|error| store.database_error(error))?;
         if persisted_nodes.is_empty() && persisted_edges.is_empty() && materializations == 0 {
             return Ok(GraphStatusSnapshot {
-                current: true,
-                node_count: Some(0),
-                edge_count: Some(0),
+                current: false,
+                node_count: None,
+                edge_count: None,
             });
         }
-        return Err(RetrievalError::CorruptIndex(
-            "无 active document 时图投影必须为空".into(),
-        ));
     }
     let spec = VectorIndexSpec::from_config(config)
         .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
     let fingerprint = spec
         .fingerprint()
         .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
-    let embeddings =
-        store.compatible_embeddings_from_connection(connection, &spec, &fingerprint, None)?;
+    let embeddings = store.compatible_embeddings_from_connection_with_control(
+        connection,
+        &spec,
+        &fingerprint,
+        None,
+        control,
+    )?;
     validate_graph_embeddings(&embeddings)?;
     let document_count: i64 = connection
         .query_row("SELECT count(*) FROM memory_documents", [], |row| {
@@ -174,14 +179,16 @@ pub(crate) fn graph_status_from_connection(
             edge_count: None,
         });
     }
-    let leaf = load_leaf_embedding_snapshot(store, connection, &spec)?;
-    let aggregate = load_aggregate_embedding_snapshot(store, connection, &spec)?;
+    let leaf = load_leaf_embedding_snapshot_with_control(store, connection, &spec, control)?;
+    let aggregate =
+        load_aggregate_embedding_snapshot_with_control(store, connection, &spec, control)?;
     if leaf.control_generation_sha256 != aggregate.control_generation_sha256 {
         return Err(RetrievalError::ControlStateChanged);
     }
-    let runs = store.validated_retrieval_runs_from_connection(connection)?;
-    let (nodes, leaves, event_rows) = build_nodes(connection, &leaf, &aggregate)?;
+    let runs = store.validated_retrieval_runs_from_connection_with_control(connection, control)?;
+    let (nodes, leaves, event_rows) = build_nodes(store, connection, &leaf, &aggregate)?;
     let edges = build_edges(
+        store,
         connection,
         config,
         &nodes,
@@ -192,6 +199,7 @@ pub(crate) fn graph_status_from_connection(
     )?;
     let config_sha256 = config_hash(config, &fingerprint);
     let source_sha256 = source_hash(
+        store,
         connection,
         &leaf.control_generation_sha256,
         &leaf.catalog_sha256,
@@ -202,6 +210,7 @@ pub(crate) fn graph_status_from_connection(
     )?;
     let catalog_sha256 = catalog_hash(&nodes, &edges);
     let current = exact_existing_catalog(
+        store,
         connection,
         &nodes,
         &edges,
@@ -212,7 +221,7 @@ pub(crate) fn graph_status_from_connection(
     )?
     .is_some();
     Ok(if current {
-        let scoped = scoped_graph_counts(connection, &nodes, &edges, session_filter)?;
+        let scoped = scoped_graph_counts(store, connection, &nodes, &edges, session_filter)?;
         GraphStatusSnapshot {
             current: true,
             node_count: Some(scoped.0),
@@ -228,6 +237,7 @@ pub(crate) fn graph_status_from_connection(
 }
 
 fn scoped_graph_counts(
+    store: &RetrievalStore,
     connection: &Connection,
     nodes: &[Node],
     edges: &[Edge],
@@ -238,38 +248,27 @@ fn scoped_graph_counts(
     };
     let mut entity_ids = BTreeSet::new();
     let mut statement = connection.prepare(
-        "SELECT DISTINCT entity_id FROM memory_entity_mentions WHERE session_id=?1
+        "SELECT DISTINCT entity_id FROM memory_entities WHERE created_session_id=?1
+         UNION SELECT DISTINCT entity_id FROM memory_entity_mentions WHERE session_id=?1
          UNION SELECT DISTINCT entity_id FROM memory_entity_aliases WHERE session_id=?1
          UNION SELECT DISTINCT c.subject_entity_id FROM memory_claims c JOIN memory_claim_evidence e ON e.claim_id=c.claim_id WHERE e.session_id=?1
          UNION SELECT DISTINCT c.object_entity_id FROM memory_claims c JOIN memory_claim_evidence e ON e.claim_id=c.claim_id WHERE e.session_id=?1 AND c.object_entity_id IS NOT NULL"
-    ).map_err(|error| RetrievalError::CorruptIndex(format!("读取 scoped graph entity provenance 失败：{error}")))?;
+    ).map_err(|error| store.database_error(error))?;
     for row in statement
         .query_map([scope], |row| row.get::<_, String>(0))
-        .map_err(|error| {
-            RetrievalError::CorruptIndex(format!(
-                "读取 scoped graph entity provenance 失败：{error}"
-            ))
-        })?
+        .map_err(|error| store.database_error(error))?
     {
-        entity_ids.insert(row.map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?);
+        entity_ids.insert(row.map_err(|error| store.database_error(error))?);
     }
     let mut claim_ids = BTreeSet::new();
     let mut statement = connection
         .prepare("SELECT DISTINCT claim_id FROM memory_claim_evidence WHERE session_id=?1")
-        .map_err(|error| {
-            RetrievalError::CorruptIndex(format!(
-                "读取 scoped graph claim provenance 失败：{error}"
-            ))
-        })?;
+        .map_err(|error| store.database_error(error))?;
     for row in statement
         .query_map([scope], |row| row.get::<_, String>(0))
-        .map_err(|error| {
-            RetrievalError::CorruptIndex(format!(
-                "读取 scoped graph claim provenance 失败：{error}"
-            ))
-        })?
+        .map_err(|error| store.database_error(error))?
     {
-        claim_ids.insert(row.map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?);
+        claim_ids.insert(row.map_err(|error| store.database_error(error))?);
     }
     let scoped_nodes = nodes
         .iter()
@@ -578,8 +577,9 @@ pub(crate) fn refresh_graph(
     }
     let runs = store.validated_retrieval_runs_from_connection(&transaction)?;
     let (nodes, leaves, event_rows) =
-        build_nodes(&transaction, &leaf_snapshot, &aggregate_snapshot)?;
+        build_nodes(store, &transaction, &leaf_snapshot, &aggregate_snapshot)?;
     let edges = build_edges(
+        store,
         &transaction,
         config,
         &nodes,
@@ -590,6 +590,7 @@ pub(crate) fn refresh_graph(
     )?;
     let config_sha256 = config_hash(config, &fingerprint);
     let source_sha256 = source_hash(
+        store,
         &transaction,
         &control_generation_sha256,
         &leaf_snapshot.catalog_sha256,
@@ -600,6 +601,7 @@ pub(crate) fn refresh_graph(
     )?;
     let catalog_sha256 = catalog_hash(&nodes, &edges);
     let existing_time = exact_existing_catalog(
+        store,
         &transaction,
         &nodes,
         &edges,
@@ -625,6 +627,7 @@ pub(crate) fn refresh_graph(
             &time,
         )?;
         let audited = exact_existing_catalog(
+            store,
             &transaction,
             &nodes,
             &edges,
@@ -697,8 +700,9 @@ pub(crate) fn recall_graph_from_connection(
     }
     let runs = store.validated_retrieval_runs_from_connection(connection)?;
     let (expected_nodes, leaves, event_rows) =
-        build_nodes(connection, &leaf_snapshot, &aggregate_snapshot)?;
+        build_nodes(store, connection, &leaf_snapshot, &aggregate_snapshot)?;
     let expected_edges = build_edges(
+        store,
         connection,
         config,
         &expected_nodes,
@@ -709,6 +713,7 @@ pub(crate) fn recall_graph_from_connection(
     )?;
     let config_sha256 = config_hash(config, &fingerprint);
     let source_sha256 = source_hash(
+        store,
         connection,
         &leaf_snapshot.control_generation_sha256,
         &leaf_snapshot.catalog_sha256,
@@ -719,6 +724,7 @@ pub(crate) fn recall_graph_from_connection(
     )?;
     let catalog_sha256 = catalog_hash(&expected_nodes, &expected_edges);
     if exact_existing_catalog(
+        store,
         connection,
         &expected_nodes,
         &expected_edges,
@@ -734,8 +740,8 @@ pub(crate) fn recall_graph_from_connection(
         ));
     }
 
-    let nodes = read_nodes(connection)?;
-    let edges = read_edges(connection)?;
+    let nodes = read_nodes(store, connection)?;
+    let edges = read_edges(store, connection)?;
     if seeds.is_empty() {
         return Ok(GraphRecallResult::default());
     }
@@ -1081,13 +1087,14 @@ type EventRow = (
 type EventRows = BTreeMap<String, EventRow>;
 
 fn build_nodes(
+    store: &RetrievalStore,
     connection: &Connection,
     leaf_snapshot: &crate::retrieval::LeafEmbeddingSnapshot,
     aggregate_snapshot: &crate::retrieval::AggregateEmbeddingSnapshot,
 ) -> RetrievalResult<(Vec<Node>, Vec<Leaf>, EventRows)> {
     let mut events = BTreeMap::new();
     let mut statement = connection.prepare("SELECT event_id,session_id,sequence,role,content,content_sha256,reply_to_event_id,turn_status FROM events ORDER BY event_id")
-        .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+        .map_err(|error| store.database_error(error))?;
     let rows = statement
         .query_map([], |row| {
             Ok((
@@ -1101,10 +1108,10 @@ fn build_nodes(
                 row.get::<_, Option<String>>(7)?,
             ))
         })
-        .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+        .map_err(|error| store.database_error(error))?;
     for row in rows {
         let (id, session, sequence, role, content, hash, reply, turn_status) =
-            row.map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+            row.map_err(|error| store.database_error(error))?;
         if hash != crate::model::content_sha256(&content) {
             return Err(RetrievalError::CorruptIndex(format!("事件 {id} hash 损坏")));
         }
@@ -1167,8 +1174,8 @@ fn build_nodes(
             source_sha256: document.source_sha256.clone(),
         });
     }
-    append_sql_nodes(connection, &mut nodes, GraphNodeKind::Entity)?;
-    append_sql_nodes(connection, &mut nodes, GraphNodeKind::Claim)?;
+    append_sql_nodes(store, connection, &mut nodes, GraphNodeKind::Entity)?;
+    append_sql_nodes(store, connection, &mut nodes, GraphNodeKind::Claim)?;
     nodes.sort_by(|a, b| a.id.cmp(&b.id));
     let mut ids = BTreeSet::new();
     if nodes.iter().any(|node| !ids.insert(node.id.clone())) {
@@ -1178,6 +1185,7 @@ fn build_nodes(
 }
 
 fn append_sql_nodes(
+    store: &RetrievalStore,
     connection: &Connection,
     nodes: &mut Vec<Node>,
     kind: GraphNodeKind,
@@ -1193,7 +1201,7 @@ fn append_sql_nodes(
     };
     let mut statement = connection
         .prepare(sql)
-        .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+        .map_err(|error| store.database_error(error))?;
     let column_count = statement.column_count();
     let rows = statement
         .query_map([], |row| {
@@ -1213,10 +1221,9 @@ fn append_sql_nodes(
             }
             Ok((source, session, fields))
         })
-        .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+        .map_err(|error| store.database_error(error))?;
     for row in rows {
-        let (source, session, fields) =
-            row.map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+        let (source, session, fields) = row.map_err(|error| store.database_error(error))?;
         let mut bound_fields = vec![source.as_bytes().to_vec()];
         bound_fields.push(session.as_deref().unwrap_or("").as_bytes().to_vec());
         bound_fields.extend(fields);
@@ -1241,7 +1248,9 @@ fn append_sql_nodes(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_edges(
+    store: &RetrievalStore,
     connection: &Connection,
     config: &MemoryConfig,
     nodes: &[Node],
@@ -1340,25 +1349,33 @@ fn build_edges(
             )?;
         }
     }
-    add_episode_edges(connection, &node_by_source, &message_by_event, &mut acc)?;
-    let chosen_mentions = add_entity_edges(connection, config, &node_by_source, leaves, &mut acc)?;
+    add_episode_edges(
+        store,
+        connection,
+        &node_by_source,
+        &message_by_event,
+        &mut acc,
+    )?;
+    let chosen_mentions =
+        add_entity_edges(store, connection, config, &node_by_source, leaves, &mut acc)?;
     add_shared_edges(config, &chosen_mentions, &mut acc)?;
     add_keyword_edges(config, leaves, &mut acc)?;
     add_embedding_edges(&node_by_source, embeddings, &mut acc)?;
     add_recall_edges(runs, leaves, &mut acc)?;
-    add_claim_edges(connection, &node_by_source, leaves, &mut acc)?;
+    add_claim_edges(store, connection, &node_by_source, leaves, &mut acc)?;
     finish_edges(acc)
 }
 
 type Acc = BTreeMap<(GraphEdgeType, String, String), EdgeAccumulator>;
 
 fn add_episode_edges(
+    store: &RetrievalStore,
     connection: &Connection,
     nodes: &BTreeMap<(GraphNodeKind, &str), &str>,
     messages: &BTreeMap<&str, &Leaf>,
     acc: &mut Acc,
 ) -> RetrievalResult<()> {
-    let mut statement=connection.prepare("SELECT d.document_id,m.event_id,m.start_char,m.end_char,m.content_sha256,e.session_id,e.role FROM memory_documents d JOIN memory_document_members m ON m.document_id=d.document_id JOIN events e ON e.event_id=m.event_id WHERE d.granularity='episode' ORDER BY d.document_id,m.ordinal").map_err(|e|RetrievalError::CorruptIndex(e.to_string()))?;
+    let mut statement=connection.prepare("SELECT d.document_id,m.event_id,m.start_char,m.end_char,m.content_sha256,e.session_id,e.role FROM memory_documents d JOIN memory_document_members m ON m.document_id=d.document_id JOIN events e ON e.event_id=m.event_id WHERE d.granularity='episode' ORDER BY d.document_id,m.ordinal").map_err(|error|store.database_error(error))?;
     let rows = statement
         .query_map([], |r| {
             Ok((
@@ -1371,10 +1388,10 @@ fn add_episode_edges(
                 r.get::<_, String>(6)?,
             ))
         })
-        .map_err(|e| RetrievalError::CorruptIndex(e.to_string()))?;
+        .map_err(|error| store.database_error(error))?;
     for row in rows {
         let (doc, event, start, end, hash, session, role) =
-            row.map_err(|e| RetrievalError::CorruptIndex(e.to_string()))?;
+            row.map_err(|error| store.database_error(error))?;
         let episode = *nodes
             .get(&(GraphNodeKind::Document, doc.as_str()))
             .ok_or_else(|| RetrievalError::CorruptIndex("episode node缺失".into()))?;
@@ -1415,6 +1432,7 @@ struct MentionLink {
     mention: String,
 }
 fn add_entity_edges(
+    store: &RetrievalStore,
     connection: &Connection,
     _config: &MemoryConfig,
     nodes: &BTreeMap<(GraphNodeKind, &str), &str>,
@@ -1422,7 +1440,7 @@ fn add_entity_edges(
     acc: &mut Acc,
 ) -> RetrievalResult<Vec<MentionLink>> {
     let mut out = Vec::new();
-    let mut statement=connection.prepare("SELECT mention_id,entity_id,event_id,start_char,end_char,content_sha256,session_id,role,mention_kind FROM memory_entity_mentions WHERE entity_status='resolved' ORDER BY mention_id").map_err(|e|RetrievalError::CorruptIndex(e.to_string()))?;
+    let mut statement=connection.prepare("SELECT mention_id,entity_id,event_id,start_char,end_char,content_sha256,session_id,role,mention_kind FROM memory_entity_mentions WHERE entity_status='resolved' ORDER BY mention_id").map_err(|error|store.database_error(error))?;
     let rows = statement
         .query_map([], |r| {
             Ok((
@@ -1437,10 +1455,10 @@ fn add_entity_edges(
                 r.get::<_, String>(8)?,
             ))
         })
-        .map_err(|e| RetrievalError::CorruptIndex(e.to_string()))?;
+        .map_err(|error| store.database_error(error))?;
     for row in rows {
         let (mention, entity, event, start, end, hash, session, role, reason) =
-            row.map_err(|e| RetrievalError::CorruptIndex(e.to_string()))?;
+            row.map_err(|error| store.database_error(error))?;
         let start = usize::try_from(start)
             .map_err(|_| RetrievalError::CorruptIndex("mention span无效".into()))?;
         let end = usize::try_from(end)
@@ -1715,12 +1733,13 @@ fn add_recall_edges(
 }
 
 fn add_claim_edges(
+    store: &RetrievalStore,
     connection: &Connection,
     nodes: &BTreeMap<(GraphNodeKind, &str), &str>,
     leaves: &[Leaf],
     acc: &mut Acc,
 ) -> RetrievalResult<()> {
-    let mut statement=connection.prepare("SELECT evidence_id,claim_id,event_id,start_char,end_char,content_sha256,session_id,role,kind FROM memory_claim_evidence ORDER BY evidence_id").map_err(|e|RetrievalError::CorruptIndex(e.to_string()))?;
+    let mut statement=connection.prepare("SELECT evidence_id,claim_id,event_id,start_char,end_char,content_sha256,session_id,role,kind FROM memory_claim_evidence ORDER BY evidence_id").map_err(|error|store.database_error(error))?;
     let rows = statement
         .query_map([], |r| {
             Ok((
@@ -1735,10 +1754,10 @@ fn add_claim_edges(
                 r.get::<_, String>(8)?,
             ))
         })
-        .map_err(|e| RetrievalError::CorruptIndex(e.to_string()))?;
+        .map_err(|error| store.database_error(error))?;
     for row in rows {
         let (id, claim, event, start, end, hash, session, role, reason) =
-            row.map_err(|e| RetrievalError::CorruptIndex(e.to_string()))?;
+            row.map_err(|error| store.database_error(error))?;
         let start = usize::try_from(start)
             .map_err(|_| RetrievalError::CorruptIndex("evidence span无效".into()))?;
         let end = usize::try_from(end)
@@ -1766,7 +1785,7 @@ fn add_claim_edges(
             },
         )?;
     }
-    let mut statement=connection.prepare("SELECT transition_id,claim_id,reason,related_claim_id FROM memory_claim_transitions WHERE related_claim_id IS NOT NULL AND reason IN ('conflicted','corrected','replaced') ORDER BY transition_id").map_err(|e|RetrievalError::CorruptIndex(e.to_string()))?;
+    let mut statement=connection.prepare("SELECT transition_id,claim_id,reason,related_claim_id FROM memory_claim_transitions WHERE related_claim_id IS NOT NULL AND reason IN ('conflicted','corrected','replaced') ORDER BY transition_id").map_err(|error|store.database_error(error))?;
     let rows = statement
         .query_map([], |r| {
             Ok((
@@ -1776,10 +1795,9 @@ fn add_claim_edges(
                 r.get::<_, String>(3)?,
             ))
         })
-        .map_err(|e| RetrievalError::CorruptIndex(e.to_string()))?;
+        .map_err(|error| store.database_error(error))?;
     for row in rows {
-        let (id, old, reason, new) =
-            row.map_err(|e| RetrievalError::CorruptIndex(e.to_string()))?;
+        let (id, old, reason, new) = row.map_err(|error| store.database_error(error))?;
         let old_node = *nodes
             .get(&(GraphNodeKind::Claim, old.as_str()))
             .ok_or_else(|| RetrievalError::CorruptIndex("transition old claim缺失".into()))?;
@@ -1831,7 +1849,9 @@ fn config_hash(config: &MemoryConfig, fingerprint: &str) -> String {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn source_hash(
+    store: &RetrievalStore,
     connection: &Connection,
     control_generation_sha256: &str,
     leaf: &str,
@@ -1872,7 +1892,7 @@ fn source_hash(
     ] {
         let mut statement = connection
             .prepare(&format!("SELECT * FROM {table} ORDER BY 1"))
-            .map_err(|e| RetrievalError::CorruptIndex(e.to_string()))?;
+            .map_err(|error| store.database_error(error))?;
         let count = statement.column_count();
         let rows = statement
             .query_map([], |row| {
@@ -1890,9 +1910,9 @@ fn source_hash(
                 }
                 Ok(values)
             })
-            .map_err(|e| RetrievalError::CorruptIndex(e.to_string()))?;
+            .map_err(|error| store.database_error(error))?;
         for row in rows {
-            fields.extend(row.map_err(|e| RetrievalError::CorruptIndex(e.to_string()))?);
+            fields.extend(row.map_err(|error| store.database_error(error))?);
         }
     }
     let refs = fields.iter().map(Vec::as_slice).collect::<Vec<_>>();
@@ -1931,7 +1951,9 @@ fn catalog_hash(nodes: &[Node], edges: &[Edge]) -> String {
     hash_parts("hippocampus.graph.catalog.v1", &refs)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn exact_existing_catalog(
+    store: &RetrievalStore,
     c: &Connection,
     nodes: &[Node],
     edges: &[Edge],
@@ -1940,7 +1962,7 @@ fn exact_existing_catalog(
     source: &str,
     catalog: &str,
 ) -> RetrievalResult<Option<String>> {
-    let meta=c.query_row("SELECT algorithm_version,vector_index_fingerprint,config_sha256,source_sha256,catalog_sha256,node_count,edge_count,materialized_at FROM memory_graph_materializations WHERE singleton=1",[],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,i64>(5)?,r.get::<_,i64>(6)?,r.get::<_,String>(7)?))).optional().map_err(|e|RetrievalError::CorruptIndex(format!("读取图 materialization 失败：{e}")))?;
+    let meta=c.query_row("SELECT algorithm_version,vector_index_fingerprint,config_sha256,source_sha256,catalog_sha256,node_count,edge_count,materialized_at FROM memory_graph_materializations WHERE singleton=1",[],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,i64>(5)?,r.get::<_,i64>(6)?,r.get::<_,String>(7)?))).optional().map_err(|error|store.database_error(error))?;
     let Some(meta) = meta else { return Ok(None) };
     if meta.1 != fingerprint || meta.2 != config || meta.3 != source {
         return Ok(None);
@@ -1959,8 +1981,8 @@ fn exact_existing_catalog(
             "图 materialization catalog 或计数损坏".into(),
         ));
     }
-    let actual_nodes = read_nodes(c)?;
-    let actual_edges = read_edges(c)?;
+    let actual_nodes = read_nodes(store, c)?;
+    let actual_edges = read_edges(store, c)?;
     if actual_nodes != nodes || actual_edges != edges {
         return Err(RetrievalError::CorruptIndex(
             "持久化图节点或边与当前来源不一致".into(),
@@ -1979,38 +2001,61 @@ fn exact_existing_catalog(
     Ok(Some(meta.7))
 }
 
-fn read_nodes(c: &Connection) -> RetrievalResult<Vec<Node>> {
-    let mut s=c.prepare("SELECT node_id,node_kind,source_id,session_id,granularity,source_sha256 FROM memory_graph_nodes ORDER BY node_id").map_err(|e|RetrievalError::CorruptIndex(e.to_string()))?;
-    s.query_map([], |r| {
-        let kind = match r.get::<_, String>(1)?.as_str() {
+fn read_nodes(store: &RetrievalStore, c: &Connection) -> RetrievalResult<Vec<Node>> {
+    let mut statement = c
+        .prepare("SELECT node_id,node_kind,source_id,session_id,granularity,source_sha256 FROM memory_graph_nodes ORDER BY node_id")
+        .map_err(|error| store.database_error(error))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })
+        .map_err(|error| store.database_error(error))?;
+    let mut nodes = Vec::new();
+    for row in rows {
+        let (id, kind, source_id, session_id, granularity, source_sha256) =
+            row.map_err(|error| store.database_error(error))?;
+        let kind = match kind.as_str() {
             "document" => GraphNodeKind::Document,
             "entity" => GraphNodeKind::Entity,
             "claim" => GraphNodeKind::Claim,
-            _ => return Err(rusqlite::Error::InvalidQuery),
+            value => {
+                return Err(RetrievalError::CorruptIndex(format!(
+                    "图节点 {id} 包含未知类型 {value}"
+                )));
+            }
         };
-        let granularity = match r.get::<_, Option<String>>(4)?.as_deref() {
+        let granularity = match granularity.as_deref() {
             None => None,
             Some("message") => Some(RetrievalDocumentGranularity::Message),
             Some("fragment") => Some(RetrievalDocumentGranularity::Fragment),
             Some("episode") => Some(RetrievalDocumentGranularity::Episode),
             Some("session") => Some(RetrievalDocumentGranularity::Session),
-            _ => return Err(rusqlite::Error::InvalidQuery),
+            Some(value) => {
+                return Err(RetrievalError::CorruptIndex(format!(
+                    "图节点 {id} 包含未知 granularity {value}"
+                )));
+            }
         };
-        Ok(Node {
-            id: r.get(0)?,
+        nodes.push(Node {
+            id,
             kind,
-            source_id: r.get(2)?,
-            session_id: r.get(3)?,
+            source_id,
+            session_id,
             granularity,
-            source_sha256: r.get(5)?,
-        })
-    })
-    .map_err(|e| RetrievalError::CorruptIndex(e.to_string()))?
-    .collect::<rusqlite::Result<Vec<_>>>()
-    .map_err(|e| RetrievalError::CorruptIndex(e.to_string()))
+            source_sha256,
+        });
+    }
+    Ok(nodes)
 }
-fn read_edges(c: &Connection) -> RetrievalResult<Vec<Edge>> {
-    let mut s=c.prepare("SELECT edge_id,edge_type,source_node_id,target_node_id,weight,directed,provenance_json,provenance_sha256 FROM memory_graph_edges").map_err(|e|RetrievalError::CorruptIndex(e.to_string()))?;
+fn read_edges(store: &RetrievalStore, c: &Connection) -> RetrievalResult<Vec<Edge>> {
+    let mut s=c.prepare("SELECT edge_id,edge_type,source_node_id,target_node_id,weight,directed,provenance_json,provenance_sha256 FROM memory_graph_edges").map_err(|error|store.database_error(error))?;
     let mut out = Vec::new();
     let rows = s
         .query_map([], |r| {
@@ -2025,10 +2070,10 @@ fn read_edges(c: &Connection) -> RetrievalResult<Vec<Edge>> {
                 r.get::<_, String>(7)?,
             ))
         })
-        .map_err(|e| RetrievalError::CorruptIndex(e.to_string()))?;
+        .map_err(|error| store.database_error(error))?;
     for row in rows {
         let (id, name, source, target, weight, directed_raw, json, hash) =
-            row.map_err(|e| RetrievalError::CorruptIndex(e.to_string()))?;
+            row.map_err(|error| store.database_error(error))?;
         let kind = parse_edge(&name)?;
         if !weight.is_finite() || weight <= 0.0 {
             return Err(RetrievalError::CorruptIndex(format!(
