@@ -4592,7 +4592,7 @@ impl RetrievalStore {
             .ok_or_else(|| {
                 RetrievalError::AnswerContextNotFound(answer_event_id.to_owned())
             })?;
-        answer.retrieval_trace = connection
+        let retrieval_trace_json = connection
             .query_row(
                 "SELECT trace_json FROM retrieval_runs WHERE answer_event_id=?1",
                 [answer_event_id],
@@ -4600,14 +4600,9 @@ impl RetrievalStore {
             )
             .optional()
             .map_err(|e| self.database_error(e))?
-            .map(|json| {
-                let mut trace: RetrievalTrace = serde_json::from_str(&json)
-                    .map_err(|e| RetrievalError::CorruptIndex(e.to_string()))?;
-                trace.normalize_usage();
-                Ok::<RetrievalTrace, RetrievalError>(trace)
-            })
-            .transpose()?
-            .unwrap_or_default();
+            .ok_or_else(|| {
+                RetrievalError::CorruptIndex(format!("回答 {answer_event_id} 缺少 retrieval run"))
+            })?;
         let source = self.read_source(&self.root.join(&session.source_file))?;
         let event_turn_id = event
             .turn_id
@@ -4636,6 +4631,23 @@ impl RetrievalStore {
                     "回答 {answer_event_id} 在原始会话中缺少对应轮次"
                 ))
             })?;
+        let canonical_retrieval_trace = serde_json::to_string(&turn.context_trace.retrieval)
+            .map_err(|error| {
+                RetrievalError::CorruptIndex(format!(
+                    "回答 {answer_event_id} 的来源 retrieval trace 无法规范序列化：{error}"
+                ))
+            })?;
+        if retrieval_trace_json != canonical_retrieval_trace {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "回答 {answer_event_id} 的 retrieval run 与来源 trace 原始字节不一致"
+            )));
+        }
+        answer.retrieval_trace = serde_json::from_str(&retrieval_trace_json).map_err(|error| {
+            RetrievalError::CorruptIndex(format!(
+                "回答 {answer_event_id} 的 retrieval run JSON 无效：{error}"
+            ))
+        })?;
+        answer.retrieval_trace.normalize_usage();
         let source_events = derive_events(&source.session);
         let source_event_by_id = source_events
             .iter()

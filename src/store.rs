@@ -219,11 +219,12 @@ impl SessionStore {
 
 fn load_session_snapshot(path: &Path) -> Result<Session> {
     let raw = fs::read(path).with_context(|| format!("无法读取已有会话文件 {}", path.display()))?;
-    let session: Session = serde_json::from_slice(&raw)
+    let mut session: Session = serde_json::from_slice(&raw)
         .map_err(|error| anyhow!("已有会话文件损坏，拒绝覆盖: {}: {error}", path.display()))?;
     session
         .validate()
         .map_err(|error| anyhow!("已有会话文件无效，拒绝覆盖: {}: {error}", path.display()))?;
+    session.refresh_cumulative_usage();
     Ok(session)
 }
 
