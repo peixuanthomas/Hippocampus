@@ -2134,6 +2134,15 @@ pub(crate) struct ConsolidationReplayReport {
     pub skipped_dependency: usize,
 }
 
+#[derive(Debug)]
+pub(crate) struct CompatibleLegacyWatermark {
+    session_id: String,
+    through_sequence: usize,
+    through_event_id: String,
+    through_event_sha256: String,
+    updated_at: String,
+}
+
 pub(crate) fn consolidation_ledger_snapshot(
     connection: &Connection,
 ) -> RetrievalResult<ConsolidationLedgerSnapshot> {
@@ -2179,6 +2188,163 @@ pub(crate) fn consolidation_ledger_snapshot(
         row_count,
         digest_sha256: format!("{:x}", hasher.finalize()),
     })
+}
+
+pub(crate) fn snapshot_compatible_legacy_watermarks(
+    connection: &Connection,
+    control: &ControlState,
+    raw_events: &[StoredEvent],
+) -> RetrievalResult<Vec<CompatibleLegacyWatermark>> {
+    let applied_v4_sessions = connection
+        .prepare(
+            "SELECT DISTINCT session_id FROM consolidation_batches
+             WHERE status='applied' AND projection_schema_version=4
+             ORDER BY session_id",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<HashSet<_>>>()
+        })
+        .map_err(candidate_database_error)?;
+    let stored = connection
+        .prepare(
+            "SELECT session_id,through_sequence,through_event_id,through_event_sha256,updated_at
+             FROM consolidation_watermarks ORDER BY session_id",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .map_err(|error| {
+            RetrievalError::CorruptIndex(format!(
+                "legacy watermark 字段或 SQLite 类型损坏：{error}"
+            ))
+        })?;
+    let mut compatible = Vec::new();
+    for (session_id, through_sequence, event_id, event_hash, updated_at) in stored {
+        if session_id.trim().is_empty() {
+            return Err(RetrievalError::CorruptIndex(
+                "legacy watermark session_id 为空".into(),
+            ));
+        }
+        let through_sequence = nonnegative_usize(through_sequence, "watermark.through_sequence")?;
+        if through_sequence == 0 {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "会话 {session_id} 的零 watermark 必须由缺失记录表示"
+            )));
+        }
+        let event_id = event_id.ok_or_else(|| {
+            RetrievalError::CorruptIndex(format!("会话 {session_id} 的 watermark 缺少 event ID"))
+        })?;
+        let event_hash = event_hash.ok_or_else(|| {
+            RetrievalError::CorruptIndex(format!("会话 {session_id} 的 watermark 缺少 event hash"))
+        })?;
+        let updated_at = updated_at.ok_or_else(|| {
+            RetrievalError::CorruptIndex(format!("会话 {session_id} 的 watermark 缺少 updated_at"))
+        })?;
+        if !is_lower_sha256(&event_hash) {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "会话 {session_id} 的 watermark event hash 损坏"
+            )));
+        }
+        parse_stored_time(&updated_at, "watermark.updated_at")?;
+        let session_events = raw_events
+            .iter()
+            .filter(|event| event.session_id == session_id)
+            .collect::<Vec<_>>();
+        if session_events.is_empty() {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "会话 {session_id} 的 watermark 缺少权威 raw session"
+            )));
+        }
+        let through_event = session_events
+            .iter()
+            .find(|event| event.sequence == through_sequence)
+            .ok_or_else(|| {
+                RetrievalError::CorruptIndex(format!(
+                    "会话 {session_id} 的 watermark sequence 未绑定权威 raw event"
+                ))
+            })?;
+        if through_event.id != event_id || through_event.content_sha256 != event_hash {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "会话 {session_id} 的 watermark tuple 与权威 raw event 不一致"
+            )));
+        }
+        if !matches!(through_event.role, EventRole::User | EventRole::Assistant)
+            || through_event.turn_id.is_none()
+            || session_events.iter().any(|event| {
+                event.sequence > through_sequence && event.turn_id == through_event.turn_id
+            })
+        {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "会话 {session_id} 的 watermark 未落在完整轮次边界"
+            )));
+        }
+        let active = control.allows_session(&session_id)
+            && control.allows_event(&session_id, &through_event.id)
+            && through_event
+                .turn_id
+                .as_deref()
+                .is_none_or(|turn_id| control.allows_turn(&session_id, turn_id))
+            && session_events.iter().all(|event| {
+                event.sequence > through_sequence
+                    || (control.allows_event(&session_id, &event.id)
+                        && event
+                            .turn_id
+                            .as_deref()
+                            .is_none_or(|turn_id| control.allows_turn(&session_id, turn_id)))
+            });
+        if active && !applied_v4_sessions.contains(&session_id) {
+            compatible.push(CompatibleLegacyWatermark {
+                session_id,
+                through_sequence,
+                through_event_id: event_id,
+                through_event_sha256: event_hash,
+                updated_at,
+            });
+        }
+    }
+    Ok(compatible)
+}
+
+pub(crate) fn restore_compatible_legacy_watermarks(
+    transaction: &Transaction<'_>,
+    watermarks: &[CompatibleLegacyWatermark],
+) -> RetrievalResult<()> {
+    for watermark in watermarks {
+        transaction
+            .execute(
+                "INSERT INTO consolidation_watermarks
+                 (session_id,through_sequence,through_event_id,through_event_sha256,updated_at)
+                 SELECT ?1,?2,?3,?4,?5
+                 WHERE NOT EXISTS (
+                    SELECT 1 FROM consolidation_watermarks WHERE session_id=?1
+                 )",
+                params![
+                    watermark.session_id,
+                    i64::try_from(watermark.through_sequence).map_err(|_| {
+                        RetrievalError::CorruptIndex(
+                            "legacy watermark sequence 超出 SQLite INTEGER".into(),
+                        )
+                    })?,
+                    watermark.through_event_id,
+                    watermark.through_event_sha256,
+                    watermark.updated_at,
+                ],
+            )
+            .map_err(candidate_database_error)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn prepare_consolidation_replay(

@@ -5,7 +5,9 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard,
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OptionalExtension, Transaction, TransactionBehavior, params, types::ValueRef,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -13,7 +15,9 @@ use thiserror::Error;
 use crate::config::{MemoryBudgetConfig, MemoryConfig};
 use crate::consolidation::{
     consolidation_ledger_snapshot, normalize_match, original_claim_valid_to_by_id,
-    prepare_consolidation_replay, replay_prepared_consolidation, validate_full_derived_integrity,
+    prepare_consolidation_replay, replay_prepared_consolidation,
+    restore_compatible_legacy_watermarks, snapshot_compatible_legacy_watermarks,
+    validate_full_derived_integrity,
 };
 use crate::context::{WrappedHistoryCursor, wrapped_history_identity};
 use crate::control::{ControlLog, ControlState};
@@ -418,6 +422,27 @@ struct ReusableLeafEmbedding {
     index_fingerprint: String,
     vector_blob: Vec<u8>,
     embedded_at: String,
+}
+
+fn repair_row_text(row: &rusqlite::Row<'_>, index: usize) -> Option<String> {
+    match row.get_ref(index).ok()? {
+        ValueRef::Text(bytes) => std::str::from_utf8(bytes).ok().map(ToOwned::to_owned),
+        _ => None,
+    }
+}
+
+fn repair_row_i64(row: &rusqlite::Row<'_>, index: usize) -> Option<i64> {
+    match row.get_ref(index).ok()? {
+        ValueRef::Integer(value) => Some(value),
+        _ => None,
+    }
+}
+
+fn repair_row_blob(row: &rusqlite::Row<'_>, index: usize) -> Option<Vec<u8>> {
+    match row.get_ref(index).ok()? {
+        ValueRef::Blob(bytes) => Some(bytes.to_vec()),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1665,6 +1690,8 @@ impl RetrievalStore {
             .map_err(|source| self.database_error(source))?;
         let ledger_before = consolidation_ledger_snapshot(&transaction)?;
         let replay = prepare_consolidation_replay(&transaction, &state, &all_events)?;
+        let legacy_watermarks =
+            snapshot_compatible_legacy_watermarks(&transaction, &state, &all_events)?;
         let reusable_embeddings = if options.reuse_compatible_embeddings {
             self.snapshot_reusable_leaf_embeddings(&transaction, &state)?
         } else {
@@ -1713,6 +1740,7 @@ impl RetrievalStore {
             total.answer_contexts += report.answer_contexts;
         }
         let replay_report = replay_prepared_consolidation(&transaction, &state, replay)?;
+        restore_compatible_legacy_watermarks(&transaction, &legacy_watermarks)?;
         let embeddings_reused =
             self.restore_reusable_leaf_embeddings(&transaction, &state, &reusable_embeddings)?;
         transaction
@@ -1807,25 +1835,27 @@ impl RetrievalStore {
                  ORDER BY d.document_id",
             )
             .map_err(|error| self.database_error(error))?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok(ReusableLeafEmbedding {
-                    document_id: row.get(0)?,
-                    session_id: row.get(1)?,
-                    granularity: row.get(2)?,
-                    document_source_sha256: row.get(3)?,
-                    model: row.get(4)?,
-                    dimensions: row.get(5)?,
-                    embedding_source_sha256: row.get(6)?,
-                    index_fingerprint: row.get(7)?,
-                    vector_blob: row.get(8)?,
-                    embedded_at: row.get(9)?,
-                })
-            })
+        let mut rows = statement
+            .query([])
             .map_err(|error| self.database_error(error))?;
         let mut reusable = Vec::new();
-        for row in rows {
-            let row = row.map_err(|error| self.database_error(error))?;
+        while let Some(row) = rows.next().map_err(|error| self.database_error(error))? {
+            let Some(row) = (|| {
+                Some(ReusableLeafEmbedding {
+                    document_id: repair_row_text(row, 0)?,
+                    session_id: repair_row_text(row, 1)?,
+                    granularity: repair_row_text(row, 2)?,
+                    document_source_sha256: repair_row_text(row, 3)?,
+                    model: repair_row_text(row, 4)?,
+                    dimensions: repair_row_i64(row, 5)?,
+                    embedding_source_sha256: repair_row_text(row, 6)?,
+                    index_fingerprint: repair_row_text(row, 7)?,
+                    vector_blob: repair_row_blob(row, 8)?,
+                    embedded_at: repair_row_text(row, 9)?,
+                })
+            })() else {
+                continue;
+            };
             let dimensions = usize::try_from(row.dimensions).ok();
             let valid = state.allows_session(&row.session_id)
                 && row.document_source_sha256 == row.embedding_source_sha256
