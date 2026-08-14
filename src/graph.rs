@@ -372,13 +372,22 @@ pub(crate) fn refresh_graph(
         .fingerprint()
         .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
     let _guard = store.acquire_root_write()?;
+    let control = store.replay_control_state_under_guard()?;
     let mut connection = store.open_connection()?;
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| store.database_error(error))?;
+    store.require_current_control_projection(&transaction, &control)?;
 
     let leaf_snapshot = load_leaf_embedding_snapshot(store, &transaction, &spec)?;
     let aggregate_snapshot = load_aggregate_embedding_snapshot(store, &transaction, &spec)?;
+    let control_generation_sha256 = control.generation_sha256();
+    if leaf_snapshot.control_generation_sha256 != control_generation_sha256
+        || aggregate_snapshot.control_generation_sha256 != control_generation_sha256
+        || leaf_snapshot.control_generation_sha256 != aggregate_snapshot.control_generation_sha256
+    {
+        return Err(RetrievalError::ControlStateChanged);
+    }
     validate_full_derived_integrity(&transaction)?;
     let embeddings =
         store.compatible_embeddings_from_connection(&transaction, &spec, &fingerprint, None)?;
@@ -408,6 +417,7 @@ pub(crate) fn refresh_graph(
     let config_sha256 = config_hash(config, &fingerprint);
     let source_sha256 = source_hash(
         &transaction,
+        &control_generation_sha256,
         &leaf_snapshot.catalog_sha256,
         &aggregate_snapshot.catalog_sha256,
         &fingerprint,
@@ -454,6 +464,7 @@ pub(crate) fn refresh_graph(
         }
         (true, time)
     };
+    store.require_unchanged_control_state(&control)?;
     transaction
         .commit()
         .map_err(|error| store.database_error(error))?;
@@ -493,6 +504,9 @@ pub(crate) fn recall_graph_from_connection(
         .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
     let leaf_snapshot = load_leaf_embedding_snapshot(store, connection, &spec)?;
     let aggregate_snapshot = load_aggregate_embedding_snapshot(store, connection, &spec)?;
+    if leaf_snapshot.control_generation_sha256 != aggregate_snapshot.control_generation_sha256 {
+        return Err(RetrievalError::ControlStateChanged);
+    }
     validate_full_derived_integrity(connection)?;
     let embeddings =
         store.compatible_embeddings_from_connection(connection, &spec, &fingerprint, None)?;
@@ -522,6 +536,7 @@ pub(crate) fn recall_graph_from_connection(
     let config_sha256 = config_hash(config, &fingerprint);
     let source_sha256 = source_hash(
         connection,
+        &leaf_snapshot.control_generation_sha256,
         &leaf_snapshot.catalog_sha256,
         &aggregate_snapshot.catalog_sha256,
         &fingerprint,
@@ -1644,6 +1659,7 @@ fn config_hash(config: &MemoryConfig, fingerprint: &str) -> String {
 
 fn source_hash(
     connection: &Connection,
+    control_generation_sha256: &str,
     leaf: &str,
     aggregate: &str,
     fingerprint: &str,
@@ -1651,6 +1667,7 @@ fn source_hash(
     runs: &[(String, crate::model::RetrievalTrace)],
 ) -> RetrievalResult<String> {
     let mut fields = vec![
+        control_generation_sha256.as_bytes().to_vec(),
         leaf.as_bytes().to_vec(),
         aggregate.as_bytes().to_vec(),
         fingerprint.as_bytes().to_vec(),

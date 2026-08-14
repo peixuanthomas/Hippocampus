@@ -1683,12 +1683,6 @@ impl RetrievalStore {
         &self,
         config: &MemoryConfig,
     ) -> RetrievalResult<crate::graph::GraphMaterializationReport> {
-        let _guard = self.acquire_root_read()?;
-        let state = self.replay_control_state_under_guard()?;
-        let connection = self.open_connection()?;
-        self.require_current_control_projection(&connection, &state)?;
-        drop(connection);
-        drop(_guard);
         crate::graph::refresh_graph(self, config)
     }
 
