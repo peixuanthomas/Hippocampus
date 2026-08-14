@@ -7,10 +7,10 @@ use sha2::{Digest, Sha256};
 
 use crate::config::MemoryConfig;
 use crate::consolidation::{normalize_match, validate_full_derived_integrity};
-use crate::model::{EventRole, EvidenceKind, RetrievalDocumentGranularity};
+use crate::model::{EventRole, EvidenceKind, RetrievalDocumentGranularity, TurnStatus};
 use crate::retrieval::{
     RetrievalError, RetrievalResult, RetrievalStore, load_aggregate_embedding_snapshot,
-    load_leaf_embedding_snapshot, query_terms,
+    load_leaf_embedding_snapshot, parse_status, query_terms,
 };
 use crate::vector::{StoredEmbedding, VectorIndexSpec};
 
@@ -436,7 +436,16 @@ pub(crate) fn refresh_graph(
     ))
 }
 
-type EventRows = BTreeMap<String, (String, usize, EventRole, String, String, Option<String>)>;
+type EventRow = (
+    String,
+    usize,
+    EventRole,
+    String,
+    String,
+    Option<String>,
+    Option<TurnStatus>,
+);
+type EventRows = BTreeMap<String, EventRow>;
 
 fn build_nodes(
     connection: &Connection,
@@ -444,7 +453,7 @@ fn build_nodes(
     aggregate_snapshot: &crate::retrieval::AggregateEmbeddingSnapshot,
 ) -> RetrievalResult<(Vec<Node>, Vec<Leaf>, EventRows)> {
     let mut events = BTreeMap::new();
-    let mut statement = connection.prepare("SELECT event_id,session_id,sequence,role,content,content_sha256,reply_to_event_id FROM events ORDER BY event_id")
+    let mut statement = connection.prepare("SELECT event_id,session_id,sequence,role,content,content_sha256,reply_to_event_id,turn_status FROM events ORDER BY event_id")
         .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
     let rows = statement
         .query_map([], |row| {
@@ -456,11 +465,12 @@ fn build_nodes(
                 row.get::<_, String>(4)?,
                 row.get::<_, String>(5)?,
                 row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
             ))
         })
         .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
     for row in rows {
-        let (id, session, sequence, role, content, hash, reply) =
+        let (id, session, sequence, role, content, hash, reply, turn_status) =
             row.map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
         if hash != crate::model::content_sha256(&content) {
             return Err(RetrievalError::CorruptIndex(format!("事件 {id} hash 损坏")));
@@ -475,6 +485,11 @@ fn build_nodes(
                 content,
                 hash,
                 reply,
+                turn_status
+                    .as_deref()
+                    .map(parse_status)
+                    .transpose()
+                    .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?,
             ),
         );
     }
@@ -612,13 +627,7 @@ fn build_edges(
         .map(|leaf| (leaf.event_id.as_str(), leaf))
         .collect::<BTreeMap<_, _>>();
     let mut acc = BTreeMap::new();
-    let mut by_session = BTreeMap::<
-        &str,
-        Vec<(
-            &String,
-            &(String, usize, EventRole, String, String, Option<String>),
-        )>,
-    >::new();
+    let mut by_session = BTreeMap::<&str, Vec<(&String, &EventRow)>>::new();
     for row in events {
         if row.1.2 != EventRole::System && !row.1.3.trim().is_empty() {
             by_session.entry(&row.1.0).or_default().push(row);
@@ -667,7 +676,12 @@ fn build_edges(
                 )));
             }
             if target.3.trim().is_empty() {
-                continue;
+                if target.2 == EventRole::Assistant && target.6 == Some(TurnStatus::Failed) {
+                    continue;
+                }
+                return Err(RetrievalError::CorruptIndex(format!(
+                    "回复 {id} 指向非失败状态的空消息"
+                )));
             }
             let left = message_by_event
                 .get(id.as_str())
@@ -1291,33 +1305,43 @@ fn exact_existing_catalog(
     source: &str,
     catalog: &str,
 ) -> RetrievalResult<Option<String>> {
-    let meta=c.query_row("SELECT vector_index_fingerprint,config_sha256,source_sha256,catalog_sha256,node_count,edge_count,materialized_at FROM memory_graph_materializations WHERE singleton=1 AND algorithm_version=1",[],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,i64>(4)?,r.get::<_,i64>(5)?,r.get::<_,String>(6)?))).optional().map_err(|e|RetrievalError::CorruptIndex(e.to_string()))?;
+    let meta=c.query_row("SELECT algorithm_version,vector_index_fingerprint,config_sha256,source_sha256,catalog_sha256,node_count,edge_count,materialized_at FROM memory_graph_materializations WHERE singleton=1",[],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,i64>(5)?,r.get::<_,i64>(6)?,r.get::<_,String>(7)?))).optional().map_err(|e|RetrievalError::CorruptIndex(format!("读取图 materialization 失败：{e}")))?;
     let Some(meta) = meta else { return Ok(None) };
-    if meta.0 != fingerprint
-        || meta.1 != config
-        || meta.2 != source
-        || meta.3 != catalog
-        || usize::try_from(meta.4).ok() != Some(nodes.len())
-        || usize::try_from(meta.5).ok() != Some(edges.len())
+    if meta.1 != fingerprint || meta.2 != config || meta.3 != source {
+        return Ok(None);
+    }
+    if meta.0 != GRAPH_ALGORITHM_VERSION {
+        return Err(RetrievalError::CorruptIndex(format!(
+            "图 materialization algorithm_version 异常：{}",
+            meta.0
+        )));
+    }
+    if meta.4 != catalog
+        || usize::try_from(meta.5).ok() != Some(nodes.len())
+        || usize::try_from(meta.6).ok() != Some(edges.len())
     {
-        return Ok(None);
-    };
-    let Ok(actual_nodes) = read_nodes(c) else {
-        return Ok(None);
-    };
-    let Ok(actual_edges) = read_edges(c) else {
-        return Ok(None);
-    };
+        return Err(RetrievalError::CorruptIndex(
+            "图 materialization catalog 或计数损坏".into(),
+        ));
+    }
+    let actual_nodes = read_nodes(c)?;
+    let actual_edges = read_edges(c)?;
     if actual_nodes != nodes || actual_edges != edges {
-        return Ok(None);
+        return Err(RetrievalError::CorruptIndex(
+            "持久化图节点或边与当前来源不一致".into(),
+        ));
     }
     if catalog_hash(&actual_nodes, &actual_edges) != catalog {
-        return Ok(None);
+        return Err(RetrievalError::CorruptIndex(
+            "持久化图 catalog hash 损坏".into(),
+        ));
     }
-    if DateTime::parse_from_rfc3339(&meta.6).is_err() {
-        return Ok(None);
+    if DateTime::parse_from_rfc3339(&meta.7).is_err() {
+        return Err(RetrievalError::CorruptIndex(
+            "图 materialized_at 不是 RFC3339 时间".into(),
+        ));
     }
-    Ok(Some(meta.6))
+    Ok(Some(meta.7))
 }
 
 fn read_nodes(c: &Connection) -> RetrievalResult<Vec<Node>> {
@@ -1361,22 +1385,65 @@ fn read_edges(c: &Connection) -> RetrievalResult<Vec<Edge>> {
                 r.get::<_, String>(2)?,
                 r.get::<_, String>(3)?,
                 r.get::<_, f64>(4)?,
-                r.get::<_, bool>(5)?,
+                r.get::<_, i64>(5)?,
                 r.get::<_, String>(6)?,
                 r.get::<_, String>(7)?,
             ))
         })
         .map_err(|e| RetrievalError::CorruptIndex(e.to_string()))?;
     for row in rows {
-        let (id, name, source, target, weight, directed, json, hash) =
+        let (id, name, source, target, weight, directed_raw, json, hash) =
             row.map_err(|e| RetrievalError::CorruptIndex(e.to_string()))?;
         let kind = parse_edge(&name)?;
+        if !weight.is_finite() || weight <= 0.0 {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "图边 {id} 权重不是有限正数"
+            )));
+        }
+        if source == target {
+            return Err(RetrievalError::CorruptIndex(format!("图边 {id} 包含自环")));
+        }
+        let directed = match directed_raw {
+            0 => false,
+            1 => true,
+            _ => {
+                return Err(RetrievalError::CorruptIndex(format!(
+                    "图边 {id} directed 值无效"
+                )));
+            }
+        };
+        if directed != (kind == GraphEdgeType::Replacement) {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "图边 {id} directed 与边类型不匹配"
+            )));
+        }
+        if !directed && source >= target {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "无向图边 {id} 端点未规范排序"
+            )));
+        }
         let _: Provenance =
             serde_json::from_str(&json).map_err(|e| RetrievalError::CorruptIndex(e.to_string()))?;
         if hash != bytes_sha256(json.as_bytes()) {
             return Err(RetrievalError::CorruptIndex(
                 "图 provenance hash损坏".into(),
             ));
+        }
+        let expected_id = format!(
+            "gedge_{}",
+            hash_parts(
+                "hippocampus.graph.edge-id.v1",
+                &[
+                    edge_name(kind).as_bytes(),
+                    source.as_bytes(),
+                    target.as_bytes(),
+                ],
+            )
+        );
+        if id != expected_id {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "图边 {id} 的确定性 ID 损坏"
+            )));
         }
         out.push(Edge {
             id,

@@ -1305,6 +1305,11 @@ impl RetrievalStore {
             let vector = decode_f32_le(&bytes, dimensions).map_err(|error| {
                 RetrievalError::CorruptIndex(format!("文档 {document_id} 的兼容向量损坏：{error}"))
             })?;
+            if !is_unit_vector(&vector) {
+                return Err(RetrievalError::CorruptIndex(format!(
+                    "文档 {document_id} 的兼容向量不是有限单位向量"
+                )));
+            }
             compatible.push(StoredEmbedding {
                 document_id,
                 session_id,
@@ -7623,7 +7628,7 @@ fn parse_role(value: &str) -> rusqlite::Result<EventRole> {
     }
 }
 
-fn parse_status(value: &str) -> rusqlite::Result<TurnStatus> {
+pub(crate) fn parse_status(value: &str) -> rusqlite::Result<TurnStatus> {
     match value {
         "pending" => Ok(TurnStatus::Pending),
         "complete" => Ok(TurnStatus::Complete),
