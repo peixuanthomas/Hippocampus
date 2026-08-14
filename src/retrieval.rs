@@ -1152,7 +1152,7 @@ impl RetrievalStore {
         let fingerprint = spec
             .fingerprint()
             .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
-        self.compatible_embeddings_from_connection(&connection, spec, &fingerprint)
+        self.compatible_embeddings_from_connection(&connection, spec, &fingerprint, None)
     }
 
     pub fn embedding_coverage(&self, spec: &VectorIndexSpec) -> RetrievalResult<EmbeddingCoverage> {
@@ -1169,7 +1169,7 @@ impl RetrievalStore {
             .fingerprint()
             .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
         let compatible = self
-            .compatible_embeddings_from_connection(&connection, spec, &fingerprint)?
+            .compatible_embeddings_from_connection(&connection, spec, &fingerprint, None)?
             .len();
         Ok(EmbeddingCoverage {
             total,
@@ -1183,39 +1183,48 @@ impl RetrievalStore {
         connection: &Connection,
         spec: &VectorIndexSpec,
         fingerprint: &str,
+        session_filter: Option<&str>,
     ) -> RetrievalResult<Vec<StoredEmbedding>> {
+        let scope_clause = if session_filter.is_some() {
+            " AND d.session_id=?4"
+        } else {
+            ""
+        };
         let mut statement = connection
-            .prepare(
+            .prepare(&format!(
                 "SELECT d.document_id, d.session_id, d.granularity, d.source_sha256,
                         e.source_sha256, e.model, e.dimensions, e.index_fingerprint,
                         e.vector_blob, e.embedded_at
                  FROM memory_documents d JOIN memory_embeddings e ON e.document_id=d.document_id
-                 WHERE e.model=?1 AND e.dimensions=?2 AND e.index_fingerprint=?3
-                 ORDER BY d.document_id ASC",
-            )
+                 WHERE e.model=?1 AND e.dimensions=?2 AND e.index_fingerprint=?3{scope_clause}
+                 ORDER BY d.document_id ASC"
+            ))
             .map_err(|error| self.database_error(error))?;
+        let dimensions =
+            usize_to_i64(spec.dimensions).map_err(|error| self.database_error(error))?;
+        let mut query_params = vec![
+            rusqlite::types::Value::Text(spec.model.clone()),
+            rusqlite::types::Value::Integer(dimensions),
+            rusqlite::types::Value::Text(fingerprint.to_owned()),
+        ];
+        if let Some(session_id) = session_filter {
+            query_params.push(rusqlite::types::Value::Text(session_id.to_owned()));
+        }
         let rows = statement
-            .query_map(
-                params![
-                    spec.model,
-                    usize_to_i64(spec.dimensions).map_err(|error| self.database_error(error))?,
-                    fingerprint,
-                ],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                        i64_to_usize(row.get(6)?)?,
-                        row.get::<_, String>(7)?,
-                        row.get::<_, Vec<u8>>(8)?,
-                        row.get::<_, String>(9)?,
-                    ))
-                },
-            )
+            .query_map(rusqlite::params_from_iter(query_params), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    i64_to_usize(row.get(6)?)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, Vec<u8>>(8)?,
+                    row.get::<_, String>(9)?,
+                ))
+            })
             .map_err(|error| self.database_error(error))?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|error| self.database_error(error))?;
@@ -2001,17 +2010,43 @@ impl RetrievalStore {
         spec: &VectorIndexSpec,
         session_filter: Option<&str>,
     ) -> RetrievalResult<Arc<HnswVectorIndex>> {
-        let mut rows = self.compatible_embeddings(spec)?;
-        if let Some(session_id) = session_filter {
-            rows.retain(|row| row.session_id == session_id);
+        spec.validate()
+            .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+        let _guard = self.acquire_root_read()?;
+        let connection = self.open_connection()?;
+        let total = if let Some(session_id) = session_filter {
+            connection.query_row(
+                "SELECT count(*) FROM memory_documents WHERE session_id=?1",
+                [session_id],
+                |row| i64_to_usize(row.get(0)?),
+            )
+        } else {
+            connection.query_row("SELECT count(*) FROM memory_documents", [], |row| {
+                i64_to_usize(row.get(0)?)
+            })
+        }
+        .map_err(|error| self.database_error(error))?;
+        let fingerprint = spec
+            .fingerprint()
+            .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+        let rows = self.compatible_embeddings_from_connection(
+            &connection,
+            spec,
+            &fingerprint,
+            session_filter,
+        )?;
+        if total != rows.len() {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "向量目录不完整：文档总数 {total}，兼容 embedding 数 {}",
+                rows.len()
+            )));
+        }
+        if session_filter.is_some() {
             return HnswVectorIndex::rebuild(spec.clone(), rows)
                 .map(Arc::new)
                 .map_err(|error| RetrievalError::CorruptIndex(error.to_string()));
         }
         let catalog_sha256 = embedding_catalog_identity(&rows);
-        let fingerprint = spec
-            .fingerprint()
-            .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
         {
             let cache = self
                 .vector_cache

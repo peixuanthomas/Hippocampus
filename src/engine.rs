@@ -16,10 +16,10 @@ use crate::context::ContextAssembler;
 use crate::knowledge::{KnowledgeRecall, KnowledgeTrace};
 use crate::model::{
     AgentChatRequest, AgentMessage, AgentRoundResult, ChatEvent, ChatEventKind, ContextPlan,
-    ContextTrace, ModelRequestTrace, ProvenanceQuality, RetrievalDocumentGranularity, Session,
-    SessionStatus, TokenUsage, ToolCall, ToolDefinition, ToolFunctionDefinition, ToolResultTrace,
-    ToolRoundTrace, Turn, TurnStatus, WebSourceTrace, WebTrace, agent_context_sha256,
-    content_sha256, utc_now,
+    ContextTrace, ModelRequestTrace, ProvenanceQuality, RetrievalChannel,
+    RetrievalDocumentGranularity, Session, SessionStatus, TokenUsage, ToolCall, ToolDefinition,
+    ToolFunctionDefinition, ToolResultTrace, ToolRoundTrace, Turn, TurnStatus, WebSourceTrace,
+    WebTrace, agent_context_sha256, content_sha256, utc_now,
 };
 #[cfg(test)]
 use crate::ollama::StructuredChatRequest;
@@ -1002,18 +1002,79 @@ impl<B: ChatBackend> ChatEngine<B> {
             })
             .collect::<Vec<_>>();
         let recall = if self.config.memory.enabled {
-            self.store
-                .retrieval()
-                .hybrid_recall(
-                    &self.client,
-                    &user_content,
-                    &current_event_id,
-                    &recent_event_ids,
-                    None,
-                    session.retrieval.clone(),
-                    &self.config.memory,
-                )
-                .await
+            let refresh_started = Instant::now();
+            match self.refresh_embeddings(CancellationToken::new()).await {
+                Ok(_) => {
+                    self.store
+                        .retrieval()
+                        .hybrid_recall(
+                            &self.client,
+                            &user_content,
+                            &current_event_id,
+                            &recent_event_ids,
+                            None,
+                            session.retrieval.clone(),
+                            &self.config.memory,
+                        )
+                        .await
+                }
+                Err(error) => {
+                    let refresh_elapsed = elapsed_millis(refresh_started);
+                    let fallback_started = Instant::now();
+                    self.store
+                        .retrieval()
+                        .keyword_recall(
+                            &user_content,
+                            &current_event_id,
+                            &recent_event_ids,
+                            session.retrieval.clone(),
+                        )
+                        .map(|mut recall| {
+                            let bm25_elapsed = elapsed_millis(fallback_started);
+                            let message = format!("embedding refresh failed: {error}");
+                            recall.trace.status = "bm25_fallback".into();
+                            recall.trace.warnings.push(message.clone());
+                            recall.trace.elapsed_ms = refresh_elapsed.saturating_add(bm25_elapsed);
+                            recall.trace.channels = vec![
+                                crate::model::ChannelTrace {
+                                    channel: RetrievalChannel::Bm25,
+                                    status: "ok".into(),
+                                    candidate_count: recall.trace.candidates.len(),
+                                    elapsed_ms: bm25_elapsed,
+                                    error: None,
+                                },
+                                crate::model::ChannelTrace {
+                                    channel: RetrievalChannel::Vector,
+                                    status: "error".into(),
+                                    candidate_count: 0,
+                                    elapsed_ms: refresh_elapsed,
+                                    error: Some(message),
+                                },
+                                crate::model::ChannelTrace {
+                                    channel: RetrievalChannel::Entity,
+                                    status: "skipped".into(),
+                                    ..Default::default()
+                                },
+                                crate::model::ChannelTrace {
+                                    channel: RetrievalChannel::State,
+                                    status: "skipped".into(),
+                                    ..Default::default()
+                                },
+                                crate::model::ChannelTrace {
+                                    channel: RetrievalChannel::Episode,
+                                    status: "skipped".into(),
+                                    ..Default::default()
+                                },
+                                crate::model::ChannelTrace {
+                                    channel: RetrievalChannel::Graph,
+                                    status: "skipped".into(),
+                                    ..Default::default()
+                                },
+                            ];
+                            recall
+                        })
+                }
+            }
         } else {
             self.store.retrieval().keyword_recall(
                 &user_content,
@@ -2237,6 +2298,10 @@ impl<B: ChatBackend> ChatEngine<B> {
             trace: plan.knowledge_trace.clone(),
         })
     }
+}
+
+fn elapsed_millis(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 impl ToolExecution {
