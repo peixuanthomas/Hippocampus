@@ -1,3 +1,7 @@
+use std::collections::HashSet;
+use std::fmt;
+
+use hnsw_rs::prelude::{DistCosine, Hnsw};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -54,6 +58,12 @@ pub enum VectorError {
     InvalidByteLength { expected: usize, actual: usize },
     #[error("向量维度溢出")]
     DimensionOverflow,
+    #[error("持久化向量包含重复文档 ID：{0}")]
+    DuplicateDocumentId(String),
+    #[error("持久化向量与索引不兼容（文档 {document_id}）：{reason}")]
+    IncompatibleStoredEmbedding { document_id: String, reason: String },
+    #[error("HNSW 返回了无效的外部 ID：{0}")]
+    InvalidExternalId(usize),
 }
 
 impl VectorIndexSpec {
@@ -228,6 +238,229 @@ pub fn equal_mean(vectors: &[&[f32]]) -> Result<Vec<f32>, VectorError> {
         .map(|vector| (*vector, 1_usize))
         .collect::<Vec<_>>();
     weighted_pool(&weighted)
+}
+
+const HNSW_MAX_LAYER: usize = 16;
+const UNIT_NORM_TOLERANCE: f64 = 1e-5;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct VectorSearchHit {
+    pub document_id: String,
+    pub session_id: String,
+    pub granularity: RetrievalDocumentGranularity,
+    pub source_sha256: String,
+    pub cosine_similarity: f32,
+    pub cosine_distance: f32,
+}
+
+#[derive(Clone)]
+struct IndexedEmbedding {
+    document_id: String,
+    session_id: String,
+    granularity: RetrievalDocumentGranularity,
+    source_sha256: String,
+    vector: Vec<f32>,
+}
+
+pub struct HnswVectorIndex {
+    spec: VectorIndexSpec,
+    fingerprint: String,
+    embeddings: Vec<IndexedEmbedding>,
+    index: Hnsw<'static, f32, DistCosine>,
+}
+
+impl fmt::Debug for HnswVectorIndex {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HnswVectorIndex")
+            .field("spec", &self.spec)
+            .field("fingerprint", &self.fingerprint)
+            .field("len", &self.len())
+            .finish()
+    }
+}
+
+impl HnswVectorIndex {
+    pub fn rebuild(
+        spec: VectorIndexSpec,
+        mut embeddings: Vec<StoredEmbedding>,
+    ) -> Result<Self, VectorError> {
+        spec.validate()?;
+        let fingerprint = spec.fingerprint()?;
+        embeddings.sort_by(|left, right| left.document_id.cmp(&right.document_id));
+
+        for rows in embeddings.windows(2) {
+            if rows[0].document_id == rows[1].document_id {
+                return Err(VectorError::DuplicateDocumentId(
+                    rows[0].document_id.clone(),
+                ));
+            }
+        }
+
+        let mut retained = Vec::with_capacity(embeddings.len());
+        for row in embeddings {
+            validate_stored_embedding(&spec, &fingerprint, &row)?;
+            retained.push(IndexedEmbedding {
+                document_id: row.document_id,
+                session_id: row.session_id,
+                granularity: row.granularity,
+                source_sha256: row.source_sha256,
+                vector: row.vector,
+            });
+        }
+
+        let mut index = Hnsw::new(
+            spec.hnsw_m,
+            retained.len().max(1),
+            HNSW_MAX_LAYER,
+            spec.hnsw_ef_construction,
+            DistCosine,
+        );
+        for (external_id, embedding) in retained.iter().enumerate() {
+            index.insert((&embedding.vector, external_id));
+        }
+        index.set_searching_mode(true);
+
+        Ok(Self {
+            spec,
+            fingerprint,
+            embeddings: retained,
+            index,
+        })
+    }
+
+    pub fn search(&self, query: &[f32], limit: usize) -> Result<Vec<VectorSearchHit>, VectorError> {
+        if limit == 0 || self.is_empty() {
+            return Ok(Vec::new());
+        }
+        if query.len() != self.spec.dimensions {
+            return Err(VectorError::DimensionMismatch {
+                expected: self.spec.dimensions,
+                actual: query.len(),
+            });
+        }
+        let query = l2_normalize(query)?;
+        let requested = limit.min(self.len());
+        let neighbours = self
+            .index
+            .search(&query, requested, self.spec.hnsw_ef_search);
+        let mut seen = HashSet::with_capacity(neighbours.len());
+        let mut hits = Vec::with_capacity(neighbours.len());
+
+        for neighbour in neighbours {
+            let external_id = neighbour.d_id;
+            let embedding = self
+                .embeddings
+                .get(external_id)
+                .ok_or(VectorError::InvalidExternalId(external_id))?;
+            if !seen.insert(external_id) {
+                continue;
+            }
+            let similarity = exact_cosine(&query, &embedding.vector)?;
+            hits.push(VectorSearchHit {
+                document_id: embedding.document_id.clone(),
+                session_id: embedding.session_id.clone(),
+                granularity: embedding.granularity,
+                source_sha256: embedding.source_sha256.clone(),
+                cosine_similarity: similarity,
+                cosine_distance: 1.0 - similarity,
+            });
+        }
+
+        hits.sort_by(|left, right| {
+            right
+                .cosine_similarity
+                .total_cmp(&left.cosine_similarity)
+                .then_with(|| left.document_id.cmp(&right.document_id))
+        });
+        hits.truncate(requested);
+        Ok(hits)
+    }
+
+    pub fn len(&self) -> usize {
+        self.embeddings.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.embeddings.is_empty()
+    }
+
+    pub fn spec(&self) -> &VectorIndexSpec {
+        &self.spec
+    }
+
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+}
+
+fn validate_stored_embedding(
+    spec: &VectorIndexSpec,
+    fingerprint: &str,
+    row: &StoredEmbedding,
+) -> Result<(), VectorError> {
+    let incompatible = |reason: &str| VectorError::IncompatibleStoredEmbedding {
+        document_id: row.document_id.clone(),
+        reason: reason.to_owned(),
+    };
+    if row.model != spec.model {
+        return Err(incompatible("模型不匹配"));
+    }
+    if row.dimensions != spec.dimensions {
+        return Err(incompatible("声明维度不匹配"));
+    }
+    if row.index_fingerprint != fingerprint {
+        return Err(incompatible("索引指纹不匹配"));
+    }
+    if row.vector.len() != spec.dimensions {
+        return Err(incompatible("向量长度不匹配"));
+    }
+
+    let mut squared_norm = 0.0_f64;
+    for &value in &row.vector {
+        if !value.is_finite() {
+            return Err(incompatible("向量包含非有限值"));
+        }
+        let value = f64::from(value);
+        squared_norm += value * value;
+        if !squared_norm.is_finite() {
+            return Err(incompatible("向量范数计算结果非有限"));
+        }
+    }
+    if squared_norm == 0.0 {
+        return Err(incompatible("向量范数为零"));
+    }
+    let norm = squared_norm.sqrt();
+    if !norm.is_finite() || (norm - 1.0).abs() > UNIT_NORM_TOLERANCE {
+        return Err(incompatible("向量未按单位 L2 范数归一化"));
+    }
+    Ok(())
+}
+
+fn exact_cosine(left: &[f32], right: &[f32]) -> Result<f32, VectorError> {
+    let mut dot = 0.0_f64;
+    let mut left_squared_norm = 0.0_f64;
+    let mut right_squared_norm = 0.0_f64;
+    for (&left, &right) in left.iter().zip(right) {
+        let left = f64::from(left);
+        let right = f64::from(right);
+        dot += left * right;
+        left_squared_norm += left * left;
+        right_squared_norm += right * right;
+        if !dot.is_finite() || !left_squared_norm.is_finite() || !right_squared_norm.is_finite() {
+            return Err(VectorError::NonFiniteComputation);
+        }
+    }
+    let denominator = (left_squared_norm * right_squared_norm).sqrt();
+    if !denominator.is_finite() || denominator == 0.0 {
+        return Err(VectorError::NonFiniteComputation);
+    }
+    let similarity = (dot / denominator).clamp(-1.0, 1.0) as f32;
+    if similarity.is_finite() {
+        Ok(similarity)
+    } else {
+        Err(VectorError::NonFiniteComputation)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
