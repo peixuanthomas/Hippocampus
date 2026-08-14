@@ -228,7 +228,6 @@ fn embedding_catalog_error(stage: EmbeddingRefreshStage, message: String) -> Emb
 fn derive_long_message_vectors(
     snapshot: &LeafEmbeddingSnapshot,
     vectors: &mut [Option<Vec<f32>>],
-    leaf_reused: &mut usize,
     cancellation: &CancellationToken,
 ) -> std::result::Result<(), EmbeddingRefreshError> {
     let mut fragments_by_message: HashMap<&str, Vec<usize>> = HashMap::new();
@@ -294,12 +293,6 @@ fn derive_long_message_vectors(
                 EmbeddingRefreshStage::Planning,
                 format!("长消息 {} 的分片窗口不规范", message.document_id),
             ));
-        }
-        if fragment_indices
-            .iter()
-            .all(|index| snapshot.documents[*index].reusable_vector.is_some())
-        {
-            *leaf_reused += 1;
         }
         let mut covered_end = 0_usize;
         let mut weighted = Vec::with_capacity(fragment_indices.len());
@@ -428,14 +421,12 @@ impl<B: ChatBackend> ChatEngine<B> {
 
         let mut vectors = vec![None; leaf_snapshot.documents.len()];
         let mut pending = Vec::new();
-        let mut leaf_reused = 0_usize;
         for (index, document) in leaf_snapshot.documents.iter().enumerate() {
             check_embedding_cancellation(&cancellation, EmbeddingRefreshStage::Planning, None)?;
             match document.granularity {
                 RetrievalDocumentGranularity::Fragment => {
                     if let Some(vector) = &document.reusable_vector {
                         vectors[index] = Some(vector.clone());
-                        leaf_reused += 1;
                     } else {
                         pending.push((index, document.content.clone()));
                     }
@@ -444,7 +435,6 @@ impl<B: ChatBackend> ChatEngine<B> {
                     if document.content.chars().count() <= 240 {
                         if let Some(vector) = &document.reusable_vector {
                             vectors[index] = Some(vector.clone());
-                            leaf_reused += 1;
                         } else {
                             pending.push((index, document.content.clone()));
                         }
@@ -538,12 +528,7 @@ impl<B: ChatBackend> ChatEngine<B> {
             }
         }
 
-        derive_long_message_vectors(
-            &leaf_snapshot,
-            &mut vectors,
-            &mut leaf_reused,
-            &cancellation,
-        )?;
+        derive_long_message_vectors(&leaf_snapshot, &mut vectors, &cancellation)?;
         let writes = leaf_snapshot
             .documents
             .iter()
@@ -646,7 +631,7 @@ impl<B: ChatBackend> ChatEngine<B> {
 
         Ok(EmbeddingRefreshReport {
             leaf_documents: leaf_snapshot.documents.len(),
-            leaf_reused,
+            leaf_reused: leaf_publish.reused,
             leaf_embedded_inputs: pending.len(),
             backend_batches,
             aggregate_documents,
