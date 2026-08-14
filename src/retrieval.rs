@@ -6017,6 +6017,11 @@ fn canonical_exact_context_items(
     session: &Session,
     turn: &Turn,
 ) -> Result<Vec<ContextItemTrace>, String> {
+    if turn.context_trace.untrusted_history_wrapped
+        != !turn.context_trace.retrieval.selected_evidence.is_empty()
+    {
+        return Err(format!("回答 {} 的不可信历史标记与检索证据不一致", turn.id));
+    }
     let current_index = session
         .turns
         .iter()

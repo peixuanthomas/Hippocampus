@@ -239,6 +239,9 @@ impl<'a> WrappedHistoryCursor<'a> {
         if enabled && evidence.is_empty() {
             return Err("不可信历史标记缺少检索证据");
         }
+        if !enabled && !evidence.is_empty() {
+            return Err("检索证据缺少不可信历史标记");
+        }
         if enabled {
             let mut event_ids = HashSet::new();
             let mut spans = HashSet::new();
