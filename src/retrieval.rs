@@ -1010,6 +1010,45 @@ impl RetrievalStore {
         Ok(authoritative)
     }
 
+    fn authoritative_trace_query_event(
+        &self,
+        connection: &Connection,
+        control: &ControlState,
+        event_id: &str,
+    ) -> RetrievalResult<StoredEvent> {
+        let indexed = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM events WHERE event_id=?1)",
+                [event_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|error| self.database_error(error))?;
+        if indexed {
+            return self.authoritative_indexed_event(connection, event_id);
+        }
+
+        let mut matches = self
+            .load_all_sources()?
+            .into_iter()
+            .flat_map(|source| derive_events(&source.session))
+            .filter(|event| event.id == event_id);
+        let authoritative = matches.next().ok_or_else(|| {
+            RetrievalError::CorruptIndex("entity trace current query 缺少权威 raw event".into())
+        })?;
+        if matches.next().is_some() {
+            return Err(RetrievalError::CorruptIndex(
+                "entity trace current query 未唯一绑定权威 raw event".into(),
+            ));
+        }
+        verify_event_hash(&authoritative)?;
+        if control.allows_event(&authoritative.session_id, &authoritative.id) {
+            return Err(RetrievalError::CorruptIndex(
+                "active entity trace current query 缺少 indexed event".into(),
+            ));
+        }
+        Ok(authoritative)
+    }
+
     fn authoritative_trace_aggregate_document(
         &self,
         connection: &Connection,
@@ -3495,45 +3534,7 @@ impl RetrievalStore {
                 memory_config.candidate_limit,
             )
             .map_err(|error| HybridRecallFailure::new(HybridRecallStage::EntityState, error))?;
-        let entity_seed_rows = sidecar
-            .entity_matches
-            .iter()
-            .filter_map(|matched| {
-                matched.selected_entity_id.as_ref().map(|entity_id| {
-                    let priority = match matched.match_basis.as_str() {
-                        "stable_identifier" => 0,
-                        "explicit_alias" => 1,
-                        "ent_self" => 2,
-                        _ => 3,
-                    };
-                    (priority, matched.normalized_text.clone(), entity_id.clone())
-                })
-            })
-            .collect::<Vec<_>>();
-        let mut entity_best = BTreeMap::<String, (u8, String)>::new();
-        for (priority, normalized, entity_id) in entity_seed_rows {
-            let candidate = (priority, normalized);
-            if entity_best
-                .get(&entity_id)
-                .is_none_or(|old| candidate < *old)
-            {
-                entity_best.insert(entity_id, candidate);
-            }
-        }
-        let mut entity_seeds = entity_best
-            .into_iter()
-            .map(|(entity_id, (priority, normalized))| (priority, normalized, entity_id))
-            .collect::<Vec<_>>();
-        entity_seeds.sort();
-        graph_seeds.extend(entity_seeds.into_iter().enumerate().map(
-            |(index, (_, _, entity_id))| GraphRecallSeed {
-                channel: RetrievalChannel::Entity,
-                source_id: entity_id,
-                document_id: None,
-                rank: index + 1,
-                score: 1.0 / (index + 1) as f64,
-            },
-        ));
+        graph_seeds.extend(entity_graph_seeds(&sidecar.entity_matches));
         let graph_started = Instant::now();
         let graph_seed_documents = graph_seeds
             .iter()
@@ -4238,20 +4239,12 @@ impl RetrievalStore {
         Ok((snapshots, conflicts))
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn load_state_sidecar(
+    fn load_entity_matches(
         &self,
         connection: &Connection,
         raw_query: &str,
-        current_user_event_id: &str,
-        recent_event_ids: &[String],
         session_filter: Option<&str>,
-        query_kind: QueryKind,
-        candidate_limit: usize,
-    ) -> RetrievalResult<StateSidecar> {
-        let entity_started = Instant::now();
-        validate_full_derived_integrity(connection)?;
-        let original_valid_to = original_claim_valid_to_by_id(connection)?;
+    ) -> RetrievalResult<(Vec<EntityMatchTrace>, BTreeSet<String>)> {
         let normalized_query = normalize_match(raw_query);
         let identity_tokens = identity_token_ranges(&normalized_query);
         let mut groups = BTreeMap::<
@@ -4406,6 +4399,26 @@ impl RetrievalStore {
                 .into(),
             });
         }
+        Ok((entity_matches, selected_entities))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn load_state_sidecar(
+        &self,
+        connection: &Connection,
+        raw_query: &str,
+        current_user_event_id: &str,
+        recent_event_ids: &[String],
+        session_filter: Option<&str>,
+        query_kind: QueryKind,
+        candidate_limit: usize,
+    ) -> RetrievalResult<StateSidecar> {
+        let entity_started = Instant::now();
+        validate_full_derived_integrity(connection)?;
+        let original_valid_to = original_claim_valid_to_by_id(connection)?;
+        let normalized_query = normalize_match(raw_query);
+        let (entity_matches, selected_entities) =
+            self.load_entity_matches(connection, raw_query, session_filter)?;
         let entity_ms = elapsed_ms(entity_started);
         let state_started = Instant::now();
         let current = self.get_event_from_connection(connection, current_user_event_id)?;
@@ -6106,6 +6119,112 @@ impl RetrievalStore {
             && expected_session.is_none_or(|session| control.allows_session(session)))
     }
 
+    fn validate_entity_trace_provenance(
+        &self,
+        connection: &Connection,
+        trace: &RetrievalTrace,
+        current: &StoredEvent,
+    ) -> RetrievalResult<()> {
+        if trace
+            .entity_matches
+            .iter()
+            .any(|matched| matched == &EntityMatchTrace::default())
+        {
+            return Err(RetrievalError::CorruptIndex(
+                "entity trace 混入 default-shaped provenance".into(),
+            ));
+        }
+        if trace.entity_matches.windows(2).any(|pair| {
+            pair[0].normalized_text.is_empty() || pair[0].normalized_text >= pair[1].normalized_text
+        }) || trace
+            .entity_matches
+            .last()
+            .is_some_and(|matched| matched.normalized_text.is_empty())
+        {
+            return Err(RetrievalError::CorruptIndex(
+                "entity trace 的 canonical order 或唯一性损坏".into(),
+            ));
+        }
+
+        let (global_matches, _) = self.load_entity_matches(connection, &current.content, None)?;
+        let (session_matches, _) =
+            self.load_entity_matches(connection, &current.content, Some(&current.session_id))?;
+        for stored in &trace.entity_matches {
+            if !global_matches.iter().any(|current| current == stored)
+                && !session_matches.iter().any(|current| current == stored)
+            {
+                return Err(RetrievalError::CorruptIndex(
+                    "entity trace 与 current safe projection matcher 不一致".into(),
+                ));
+            }
+        }
+
+        for matched in &trace.entity_matches {
+            let Some(entity_id) = matched.selected_entity_id.as_ref() else {
+                continue;
+            };
+            if matched.reason != "unique"
+                || matched.candidate_entity_ids.as_slice() != std::slice::from_ref(entity_id)
+            {
+                return Err(RetrievalError::CorruptIndex(
+                    "selected entity trace 未绑定唯一 resolved owner".into(),
+                ));
+            }
+            let resolved_entity = connection
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM memory_entities e
+                         WHERE e.entity_id=?1 AND e.disambiguation='resolved'
+                           AND EXISTS (SELECT 1 FROM memory_entity_mentions m
+                               WHERE m.entity_id=e.entity_id AND m.entity_status='resolved')
+                     )",
+                    [entity_id],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(|error| self.database_error(error))?;
+            if !resolved_entity {
+                return Err(RetrievalError::CorruptIndex(
+                    "selected entity trace 不属于 resolved projection".into(),
+                ));
+            }
+        }
+        let expected_seeds = entity_graph_seeds(&trace.entity_matches)
+            .into_iter()
+            .map(|seed| {
+                let GraphRecallSeed {
+                    source_id,
+                    rank,
+                    score,
+                    ..
+                } = seed;
+                (source_id, (rank, score))
+            })
+            .collect::<BTreeMap<_, _>>();
+        for path in trace
+            .graph_paths
+            .iter()
+            .filter(|path| path.seed_channel == RetrievalChannel::Entity)
+        {
+            let (rank, score) = expected_seeds.get(&path.seed_source_id).ok_or_else(|| {
+                RetrievalError::CorruptIndex(
+                    "graph entity seed 未绑定 selected entity match".into(),
+                )
+            })?;
+            let expected_node = trace_graph_node_id("entity", &path.seed_source_id);
+            if !path.seed_document_id.is_empty()
+                || path.seed_rank != *rank
+                || path.seed_score.to_bits() != score.to_bits()
+                || path.seed_node_id != expected_node
+                || path.node_ids.first() != Some(&expected_node)
+            {
+                return Err(RetrievalError::CorruptIndex(
+                    "graph entity seed 与 canonical entity producer 不一致".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn state_selection_is_active(
         &self,
         connection: &Connection,
@@ -6583,13 +6702,42 @@ impl RetrievalStore {
             };
             active &= span_active && primary_active && sources_active && episode_active;
         }
-        if trace
+        let has_entity_matches = trace
+            .entity_matches
+            .iter()
+            .any(|matched| matched != &EntityMatchTrace::default());
+        let has_entity_seed = trace
+            .graph_paths
+            .iter()
+            .any(|path| path.seed_channel == RetrievalChannel::Entity);
+        let has_state_selections = trace
             .state_selections
             .iter()
-            .any(|selection| selection != &StateSelectionTrace::default())
-        {
+            .any(|selection| selection != &StateSelectionTrace::default());
+        if has_entity_matches || has_entity_seed || has_state_selections {
             self.require_current_control_projection(connection, control)?;
             validate_full_derived_integrity(connection)?;
+        }
+        if has_entity_matches || has_entity_seed {
+            if trace.current_query_event_id.is_empty() {
+                return Err(RetrievalError::CorruptIndex(
+                    "entity trace 缺少 current query event".into(),
+                ));
+            }
+            let current = self.authoritative_trace_query_event(
+                connection,
+                control,
+                &trace.current_query_event_id,
+            )?;
+            if current.role != EventRole::User {
+                return Err(RetrievalError::CorruptIndex(
+                    "entity trace current query 不是 user event".into(),
+                ));
+            }
+            self.validate_entity_trace_provenance(connection, trace, &current)?;
+            active &= control.allows_event(&current.session_id, &current.id);
+        }
+        if has_state_selections {
             if trace.current_query_event_id.is_empty() {
                 return Err(RetrievalError::CorruptIndex(
                     "state trace 缺少 current query event".into(),
@@ -11554,6 +11702,41 @@ fn granularity_name(granularity: RetrievalDocumentGranularity) -> &'static str {
         RetrievalDocumentGranularity::Episode => "episode",
         RetrievalDocumentGranularity::Session => "session",
     }
+}
+
+fn entity_graph_seeds(matches: &[EntityMatchTrace]) -> Vec<GraphRecallSeed> {
+    let mut best = BTreeMap::<String, (u8, String)>::new();
+    for matched in matches {
+        let Some(entity_id) = matched.selected_entity_id.as_ref() else {
+            continue;
+        };
+        let priority = match matched.match_basis.as_str() {
+            "stable_identifier" => 0,
+            "explicit_alias" => 1,
+            "ent_self" => 2,
+            _ => 3,
+        };
+        let candidate = (priority, matched.normalized_text.clone());
+        if best.get(entity_id).is_none_or(|old| candidate < *old) {
+            best.insert(entity_id.clone(), candidate);
+        }
+    }
+    let mut ordered = best
+        .into_iter()
+        .map(|(entity_id, (priority, normalized))| (priority, normalized, entity_id))
+        .collect::<Vec<_>>();
+    ordered.sort();
+    ordered
+        .into_iter()
+        .enumerate()
+        .map(|(index, (_, _, entity_id))| GraphRecallSeed {
+            channel: RetrievalChannel::Entity,
+            source_id: entity_id,
+            document_id: None,
+            rank: index + 1,
+            score: 1.0 / (index + 1) as f64,
+        })
+        .collect()
 }
 
 fn trace_graph_hash_parts(domain: &str, parts: &[&[u8]]) -> String {
