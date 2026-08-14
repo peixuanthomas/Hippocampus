@@ -2555,7 +2555,15 @@ impl RetrievalStore {
         validate_full_derived_integrity(connection)?;
         let original_valid_to = original_claim_valid_to_by_id(connection)?;
         let normalized_query = normalize_match(raw_query);
-        let mut groups = BTreeMap::<String, (BTreeSet<String>, BTreeSet<(u8, String)>)>::new();
+        let identity_tokens = identity_token_ranges(&normalized_query);
+        let mut groups = BTreeMap::<
+            String,
+            (
+                BTreeSet<String>,
+                BTreeSet<(u8, String)>,
+                Vec<(usize, usize)>,
+            ),
+        >::new();
         let mut statement = connection
             .prepare(
                 "SELECT e.entity_id,e.canonical_name,e.normalized_name
@@ -2577,13 +2585,13 @@ impl RetrievalStore {
             .map_err(|error| self.database_error(error))?;
         for row in rows {
             let (id, text, normalized) = row.map_err(|error| self.database_error(error))?;
-            if id != "ent_self"
-                && !is_generic_pronoun(&normalized)
-                && query_contains_match(&normalized_query, &normalized)
-            {
+            let occurrences =
+                identity_match_ranges(&normalized_query, &normalized, &identity_tokens);
+            if id != "ent_self" && !is_generic_pronoun(&normalized) && !occurrences.is_empty() {
                 let group = groups.entry(normalized).or_default();
                 group.0.insert(id);
                 group.1.insert((3, text));
+                group.2.extend(occurrences);
             }
         }
         drop(statement);
@@ -2610,13 +2618,14 @@ impl RetrievalStore {
             .map_err(|error| self.database_error(error))?;
         for row in rows {
             let (id, text, normalized, basis) = row.map_err(|error| self.database_error(error))?;
-            if !is_generic_pronoun(&normalized)
-                && query_contains_match(&normalized_query, &normalized)
-            {
+            let occurrences =
+                identity_match_ranges(&normalized_query, &normalized, &identity_tokens);
+            if !is_generic_pronoun(&normalized) && !occurrences.is_empty() {
                 let priority = if basis == "stable_identifier" { 0 } else { 1 };
                 let group = groups.entry(normalized).or_default();
                 group.0.insert(id);
                 group.1.insert((priority, text));
+                group.2.extend(occurrences);
             }
         }
         drop(statement);
@@ -2630,18 +2639,49 @@ impl RetrievalStore {
             .map_err(|error| self.database_error(error))?;
         if self_eligible {
             for pronoun in ["我", "本人", "i", "me", "my"] {
-                if query_contains_match(&normalized_query, pronoun) {
+                let occurrences =
+                    identity_match_ranges(&normalized_query, pronoun, &identity_tokens);
+                if !occurrences.is_empty() {
                     let group = groups.entry(pronoun.into()).or_default();
                     group.0.insert("ent_self".into());
                     group.1.insert((2, pronoun.into()));
+                    group.2.extend(occurrences);
                 }
             }
         }
+        for (_, _, occurrences) in groups.values_mut() {
+            occurrences.sort_unstable();
+            occurrences.dedup();
+        }
+        let occurrence_catalog = groups
+            .iter()
+            .map(|(surface, (_, _, occurrences))| {
+                (
+                    surface.clone(),
+                    surface.chars().count(),
+                    occurrences.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
         let mut selected_entities = BTreeSet::new();
         let mut entity_matches = Vec::new();
-        for (normalized, (owners, surfaces)) in groups {
+        for (normalized, (owners, surfaces, occurrences)) in groups {
             let candidates = owners.into_iter().collect::<Vec<_>>();
-            let selected = (candidates.len() == 1).then(|| candidates[0].clone());
+            let surface_chars = normalized.chars().count();
+            let shadowed = occurrences.iter().all(|&(start, end)| {
+                occurrence_catalog
+                    .iter()
+                    .any(|(other, other_chars, ranges)| {
+                        other != &normalized
+                            && *other_chars > surface_chars
+                            && ranges.iter().any(|&(other_start, other_end)| {
+                                other_start <= start
+                                    && end <= other_end
+                                    && (other_start < start || end < other_end)
+                            })
+                    })
+            });
+            let selected = (!shadowed && candidates.len() == 1).then(|| candidates[0].clone());
             let (priority, matched_text) = surfaces.into_iter().next().unwrap_or_default();
             if let Some(id) = &selected {
                 selected_entities.insert(id.clone());
@@ -2658,7 +2698,9 @@ impl RetrievalStore {
                 .into(),
                 candidate_entity_ids: candidates,
                 selected_entity_id: selected.clone(),
-                reason: if selected.is_some() {
+                reason: if shadowed {
+                    "shadowed_by_longer_match"
+                } else if selected.is_some() {
                     "unique"
                 } else {
                     "ambiguous"
@@ -8234,6 +8276,61 @@ fn query_contains_match(query: &str, term: &str) -> bool {
     } else {
         query.contains(term)
     }
+}
+
+fn identity_match_ranges(
+    query: &str,
+    surface: &str,
+    query_tokens: &BTreeMap<String, Vec<(usize, usize)>>,
+) -> Vec<(usize, usize)> {
+    if surface.trim().is_empty() {
+        return Vec::new();
+    }
+    if surface.is_ascii() {
+        return query
+            .match_indices(surface)
+            .filter_map(|(start, _)| {
+                let before = query[..start].chars().next_back();
+                let end = start + surface.len();
+                let after = query[end..].chars().next();
+                (!before
+                    .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_')
+                    && !after.is_some_and(|character| {
+                        character.is_ascii_alphanumeric() || character == '_'
+                    }))
+                .then_some((start, end))
+            })
+            .collect();
+    }
+    let has_cjk = surface.chars().any(is_cjk);
+    if has_cjk && (surface.chars().count() == 1 || is_generic_pronoun(surface)) {
+        return query_tokens.get(surface).cloned().unwrap_or_default();
+    }
+    query
+        .match_indices(surface)
+        .map(|(start, _)| (start, start + surface.len()))
+        .collect()
+}
+
+fn identity_token_ranges(query: &str) -> BTreeMap<String, Vec<(usize, usize)>> {
+    let mut ranges = BTreeMap::<String, Vec<(usize, usize)>>::new();
+    let mut cursor = 0usize;
+    for token in jieba().cut(query, false) {
+        if token.word.is_empty() {
+            continue;
+        }
+        let Some(relative) = query[cursor..].find(token.word) else {
+            continue;
+        };
+        let start = cursor + relative;
+        let end = start + token.word.len();
+        let normalized = normalize_match(token.word);
+        if !normalized.is_empty() {
+            ranges.entry(normalized).or_default().push((start, end));
+        }
+        cursor = end;
+    }
+    ranges
 }
 
 fn explicit_query_date(query: &str) -> (Option<DateTime<Utc>>, bool) {
