@@ -110,6 +110,8 @@ pub enum ControlError {
     InvalidTransition(String),
     #[error("control serialization failed: {0}")]
     Serialization(#[from] serde_json::Error),
+    #[error("canonical control record is too large: {size} bytes exceeds {max} bytes")]
+    RecordTooLarge { size: usize, max: u64 },
     #[error("could not lock the session root: {0}")]
     Locking(String),
 }
@@ -139,20 +141,25 @@ impl ControlLog {
 
     pub fn replay(&self) -> ControlResult<ControlState> {
         let mut state = ControlState::default();
-        if !self.directory.exists() {
-            return Ok(state);
-        }
-        if !self.directory.is_dir() {
-            return Err(ControlError::CorruptLog(format!(
-                "{} is not a directory",
-                self.directory.display()
-            )));
+        match fs::symlink_metadata(&self.directory) {
+            Ok(metadata) if metadata.file_type().is_dir() => {}
+            Ok(_) => {
+                return Err(ControlError::CorruptLog(format!(
+                    "{} is not a real directory",
+                    self.directory.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(state),
+            Err(source) => return Err(self.io(&self.directory, source)),
         }
         let mut segments = Vec::new();
         for entry in
             fs::read_dir(&self.directory).map_err(|source| self.io(&self.directory, source))?
         {
             let entry = entry.map_err(|source| self.io(&self.directory, source))?;
+            let file_type = entry
+                .file_type()
+                .map_err(|source| self.io(&entry.path(), source))?;
             let name = entry.file_name();
             let Some(name) = name.to_str() else {
                 return Err(ControlError::CorruptLog(
@@ -160,14 +167,15 @@ impl ControlLog {
                 ));
             };
             if is_stale_temp_name(name) {
+                if !file_type.is_file() {
+                    return Err(ControlError::CorruptLog(format!(
+                        "stale temporary entry {name} is not a regular file"
+                    )));
+                }
                 continue;
             }
             let sequence = parse_segment_name(name)?;
-            if !entry
-                .file_type()
-                .map_err(|source| self.io(&entry.path(), source))?
-                .is_file()
-            {
+            if !file_type.is_file() {
                 return Err(ControlError::CorruptLog(format!("unexpected entry {name}")));
             }
             segments.push((sequence, entry.path()));
@@ -180,7 +188,13 @@ impl ControlLog {
                     "expected segment {expected:020}.json, found {sequence:020}.json"
                 )));
             }
-            let metadata = fs::metadata(&path).map_err(|source| self.io(&path, source))?;
+            let metadata = fs::symlink_metadata(&path).map_err(|source| self.io(&path, source))?;
+            if !metadata.file_type().is_file() {
+                return Err(ControlError::CorruptLog(format!(
+                    "segment {} is not a regular file",
+                    path.display()
+                )));
+            }
             if metadata.len() > MAX_SEGMENT_BYTES {
                 return Err(ControlError::CorruptLog(format!(
                     "segment {} is too large",
@@ -241,6 +255,12 @@ impl ControlLog {
             };
             record.record_sha256 = record_hash(&record)?;
             let bytes = canonical_record_bytes(&record)?;
+            if bytes.len() as u64 > MAX_SEGMENT_BYTES {
+                return Err(ControlError::RecordTooLarge {
+                    size: bytes.len(),
+                    max: MAX_SEGMENT_BYTES,
+                });
+            }
             let created_directory = match fs::create_dir(&self.directory) {
                 Ok(()) => true,
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
