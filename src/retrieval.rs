@@ -6714,11 +6714,15 @@ impl RetrievalStore {
             .graph_paths
             .iter()
             .any(|path| path.seed_channel == RetrievalChannel::Entity);
+        let has_graph_paths = trace
+            .graph_paths
+            .iter()
+            .any(|path| path != &crate::model::GraphPathTrace::default());
         let has_state_selections = trace
             .state_selections
             .iter()
             .any(|selection| selection != &StateSelectionTrace::default());
-        if has_entity_matches || has_entity_seed || has_state_selections {
+        if has_entity_matches || has_graph_paths || has_state_selections {
             self.require_current_control_projection(connection, control)?;
             validate_full_derived_integrity(connection)?;
         }
