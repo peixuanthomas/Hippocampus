@@ -128,6 +128,19 @@ impl SessionStore {
     }
 
     pub fn save(&self, session: &mut Session) -> Result<PathBuf> {
+        let _root_guard = self
+            .retrieval
+            .acquire_root_write()
+            .context("无法锁定会话目录以原子保存原文和派生索引")?;
+        let controls = self.control.replay()?;
+        self.save_under_root_write(session, &controls)
+    }
+
+    fn save_under_root_write(
+        &self,
+        session: &mut Session,
+        controls: &ControlState,
+    ) -> Result<PathBuf> {
         validate_identifier(&session.id)?;
         session.normalize_legacy_provenance();
         session.validate()?;
@@ -136,11 +149,6 @@ impl SessionStore {
                 .verify_trace(&turn.context_trace.knowledge)
                 .with_context(|| format!("轮次 {} 的知识证据无法由原始快照重建", turn.id))?;
         }
-        let _root_guard = self
-            .retrieval
-            .acquire_root_write()
-            .context("无法锁定会话目录以原子保存原文和派生索引")?;
-        let controls = self.control.replay()?;
         fs::create_dir_all(&self.root)
             .with_context(|| format!("无法创建会话目录 {}", self.root.display()))?;
         let target = self.root.join(format!("{}.json", session.id));
@@ -322,12 +330,16 @@ impl SessionStore {
     }
 
     pub fn reopen(&self, session: &mut Session) -> Result<()> {
-        let controls = self.control_state()?;
+        let _root_guard = self
+            .retrieval
+            .acquire_root_write()
+            .context("无法锁定会话目录以重开会话")?;
+        let controls = self.control.replay()?;
         if !controls.allows_session(&session.id) {
             bail!("会话已排除: {}", session.id);
         }
         session.status = SessionStatus::Active;
-        self.save(session)?;
+        self.save_under_root_write(session, &controls)?;
         Ok(())
     }
 }
