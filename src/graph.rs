@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -114,6 +114,180 @@ pub(crate) struct GraphRecallSeed {
 pub(crate) struct GraphRecallResult {
     pub paths: Vec<GraphPathTrace>,
     pub warning: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GraphStatusSnapshot {
+    pub current: bool,
+    pub node_count: Option<usize>,
+    pub edge_count: Option<usize>,
+}
+
+pub(crate) fn graph_status_from_connection(
+    store: &RetrievalStore,
+    connection: &Connection,
+    config: &MemoryConfig,
+    active_document_count: usize,
+    session_filter: Option<&str>,
+) -> RetrievalResult<GraphStatusSnapshot> {
+    config
+        .validate()
+        .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+    let persisted_nodes = read_nodes(connection)?;
+    let persisted_edges = read_edges(connection)?;
+    if active_document_count == 0 {
+        let materializations: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM memory_graph_materializations",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| store.database_error(error))?;
+        if persisted_nodes.is_empty() && persisted_edges.is_empty() && materializations == 0 {
+            return Ok(GraphStatusSnapshot {
+                current: true,
+                node_count: Some(0),
+                edge_count: Some(0),
+            });
+        }
+        return Err(RetrievalError::CorruptIndex(
+            "无 active document 时图投影必须为空".into(),
+        ));
+    }
+    let spec = VectorIndexSpec::from_config(config)
+        .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+    let fingerprint = spec
+        .fingerprint()
+        .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+    let embeddings =
+        store.compatible_embeddings_from_connection(connection, &spec, &fingerprint, None)?;
+    validate_graph_embeddings(&embeddings)?;
+    let document_count: i64 = connection
+        .query_row("SELECT count(*) FROM memory_documents", [], |row| {
+            row.get(0)
+        })
+        .map_err(|error| store.database_error(error))?;
+    if usize::try_from(document_count).ok() != Some(embeddings.len()) {
+        return Ok(GraphStatusSnapshot {
+            current: false,
+            node_count: None,
+            edge_count: None,
+        });
+    }
+    let leaf = load_leaf_embedding_snapshot(store, connection, &spec)?;
+    let aggregate = load_aggregate_embedding_snapshot(store, connection, &spec)?;
+    if leaf.control_generation_sha256 != aggregate.control_generation_sha256 {
+        return Err(RetrievalError::ControlStateChanged);
+    }
+    let runs = store.validated_retrieval_runs_from_connection(connection)?;
+    let (nodes, leaves, event_rows) = build_nodes(connection, &leaf, &aggregate)?;
+    let edges = build_edges(
+        connection,
+        config,
+        &nodes,
+        &leaves,
+        &event_rows,
+        &embeddings,
+        &runs,
+    )?;
+    let config_sha256 = config_hash(config, &fingerprint);
+    let source_sha256 = source_hash(
+        connection,
+        &leaf.control_generation_sha256,
+        &leaf.catalog_sha256,
+        &aggregate.catalog_sha256,
+        &fingerprint,
+        &embeddings,
+        &runs,
+    )?;
+    let catalog_sha256 = catalog_hash(&nodes, &edges);
+    let current = exact_existing_catalog(
+        connection,
+        &nodes,
+        &edges,
+        &fingerprint,
+        &config_sha256,
+        &source_sha256,
+        &catalog_sha256,
+    )?
+    .is_some();
+    Ok(if current {
+        let scoped = scoped_graph_counts(connection, &nodes, &edges, session_filter)?;
+        GraphStatusSnapshot {
+            current: true,
+            node_count: Some(scoped.0),
+            edge_count: Some(scoped.1),
+        }
+    } else {
+        GraphStatusSnapshot {
+            current: false,
+            node_count: None,
+            edge_count: None,
+        }
+    })
+}
+
+fn scoped_graph_counts(
+    connection: &Connection,
+    nodes: &[Node],
+    edges: &[Edge],
+    session_filter: Option<&str>,
+) -> RetrievalResult<(usize, usize)> {
+    let Some(scope) = session_filter else {
+        return Ok((nodes.len(), edges.len()));
+    };
+    let mut entity_ids = BTreeSet::new();
+    let mut statement = connection.prepare(
+        "SELECT DISTINCT entity_id FROM memory_entity_mentions WHERE session_id=?1
+         UNION SELECT DISTINCT entity_id FROM memory_entity_aliases WHERE session_id=?1
+         UNION SELECT DISTINCT c.subject_entity_id FROM memory_claims c JOIN memory_claim_evidence e ON e.claim_id=c.claim_id WHERE e.session_id=?1
+         UNION SELECT DISTINCT c.object_entity_id FROM memory_claims c JOIN memory_claim_evidence e ON e.claim_id=c.claim_id WHERE e.session_id=?1 AND c.object_entity_id IS NOT NULL"
+    ).map_err(|error| RetrievalError::CorruptIndex(format!("读取 scoped graph entity provenance 失败：{error}")))?;
+    for row in statement
+        .query_map([scope], |row| row.get::<_, String>(0))
+        .map_err(|error| {
+            RetrievalError::CorruptIndex(format!(
+                "读取 scoped graph entity provenance 失败：{error}"
+            ))
+        })?
+    {
+        entity_ids.insert(row.map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?);
+    }
+    let mut claim_ids = BTreeSet::new();
+    let mut statement = connection
+        .prepare("SELECT DISTINCT claim_id FROM memory_claim_evidence WHERE session_id=?1")
+        .map_err(|error| {
+            RetrievalError::CorruptIndex(format!(
+                "读取 scoped graph claim provenance 失败：{error}"
+            ))
+        })?;
+    for row in statement
+        .query_map([scope], |row| row.get::<_, String>(0))
+        .map_err(|error| {
+            RetrievalError::CorruptIndex(format!(
+                "读取 scoped graph claim provenance 失败：{error}"
+            ))
+        })?
+    {
+        claim_ids.insert(row.map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?);
+    }
+    let scoped_nodes = nodes
+        .iter()
+        .filter(|node| match node.kind {
+            GraphNodeKind::Document => node.session_id.as_deref() == Some(scope),
+            GraphNodeKind::Entity => entity_ids.contains(&node.source_id),
+            GraphNodeKind::Claim => claim_ids.contains(&node.source_id),
+        })
+        .map(|node| node.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let edge_count = edges
+        .iter()
+        .filter(|edge| {
+            scoped_nodes.contains(edge.source.as_str())
+                || scoped_nodes.contains(edge.target.as_str())
+        })
+        .count();
+    Ok((scoped_nodes.len(), edge_count))
 }
 
 type RepresentativePath<'a> = (
@@ -2011,5 +2185,3 @@ fn report(
         materialized_at,
     }
 }
-
-use rusqlite::OptionalExtension;

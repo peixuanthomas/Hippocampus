@@ -742,6 +742,106 @@ pub fn structured_consolidation_schema() -> Value {
 }
 
 impl RetrievalStore {
+    pub(crate) fn status_consolidation_attempts_from_connection(
+        &self,
+        connection: &rusqlite::Connection,
+        control: &crate::control::ControlState,
+        session_filter: Option<&str>,
+    ) -> RetrievalResult<Vec<ConsolidationAttemptRecord>> {
+        let mut statement = connection
+            .prepare(
+                "SELECT attempt_id, batch_key, session_id, from_sequence, through_sequence,
+                        trigger, model, request_json, request_sha256, input_event_ids,
+                        input_event_hashes, response_json, response_sha256, status, input_tokens,
+                        output_tokens, latency_ms, started_at, completed_at, validation_json,
+                        error_json
+                 FROM consolidation_batches
+                 WHERE (?1 IS NULL OR session_id=?1)
+                 ORDER BY started_at, attempt_id",
+            )
+            .map_err(|error| self.database_error(error))?;
+        let rows = statement
+            .query_map([session_filter], map_stored_attempt)
+            .map_err(|error| self.database_error(error))?;
+        let mut attempts = Vec::new();
+        for row in rows {
+            let attempt = decode_stored_attempt(row.map_err(|error| self.database_error(error))?)?;
+            if control.allows_session(&attempt.session_id) {
+                attempts.push(attempt);
+            }
+        }
+        Ok(attempts)
+    }
+
+    pub(crate) fn pending_consolidation_events_from_connection(
+        &self,
+        connection: &rusqlite::Connection,
+        control: &crate::control::ControlState,
+        session_filter: Option<&str>,
+    ) -> RetrievalResult<usize> {
+        let mut statement = connection
+            .prepare("SELECT session_id FROM indexed_sessions ORDER BY session_id")
+            .map_err(|error| self.database_error(error))?;
+        let session_ids = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| self.database_error(error))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| self.database_error(error))?;
+        let mut pending = 0usize;
+        for session_id in session_ids {
+            if !control.allows_session(&session_id)
+                || session_filter.is_some_and(|scope| scope != session_id)
+            {
+                continue;
+            }
+            let events =
+                self.replay_session_from_connection_with_state(connection, &session_id, control)?;
+            let watermark =
+                self.consolidation_watermark_from_connection(connection, &session_id)?;
+            let start = validated_resume_index(&events, &watermark)?;
+            let mut cursor = start;
+            while cursor < events.len() {
+                let event = &events[cursor];
+                if event.role == EventRole::System {
+                    cursor += 1;
+                    continue;
+                }
+                if event.role != EventRole::User {
+                    return Err(RetrievalError::CorruptIndex(format!(
+                        "巩固待处理轮次未从用户事件开始：{}",
+                        event.id
+                    )));
+                }
+                let turn_id = event.turn_id.as_deref().ok_or_else(|| {
+                    RetrievalError::CorruptIndex(format!("用户事件 {} 缺少轮次 ID", event.id))
+                })?;
+                let status = event.turn_status.ok_or_else(|| {
+                    RetrievalError::CorruptIndex(format!("用户事件 {} 缺少轮次状态", event.id))
+                })?;
+                let turn_end = events[cursor..]
+                    .iter()
+                    .position(|candidate| candidate.turn_id.as_deref() != Some(turn_id))
+                    .map_or(events.len(), |offset| cursor + offset);
+                let turn = &events[cursor..turn_end];
+                if turn.iter().any(|candidate| {
+                    candidate.turn_id.as_deref() != Some(turn_id)
+                        || candidate.turn_status != Some(status)
+                }) {
+                    return Err(RetrievalError::CorruptIndex(format!(
+                        "轮次 {turn_id} 的事件元数据不一致"
+                    )));
+                }
+                if status != TurnStatus::Pending {
+                    pending = pending
+                        .checked_add(turn.len())
+                        .ok_or_else(|| RetrievalError::CorruptIndex("待巩固事件计数溢出".into()))?;
+                }
+                cursor = turn_end;
+            }
+        }
+        Ok(pending)
+    }
+
     pub fn next_consolidation_batch(
         &self,
         session_id: &str,

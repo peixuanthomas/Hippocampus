@@ -221,6 +221,79 @@ fn contains_paired_quote(value: &str) -> bool {
     })
 }
 
+fn is_lower_hex_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn latency_percentiles(mut values: Vec<u64>) -> MemoryLatencyPercentiles {
+    values.sort_unstable();
+    let nearest = |percent: usize| {
+        (!values.is_empty()).then(|| {
+            let rank = values.len().saturating_mul(percent).div_ceil(100).max(1);
+            values[rank - 1]
+        })
+    };
+    MemoryLatencyPercentiles {
+        samples: values.len(),
+        p50_ms: nearest(50),
+        p95_ms: nearest(95),
+    }
+}
+
+fn is_status_validation_error(error: &RetrievalError) -> bool {
+    matches!(
+        error,
+        RetrievalError::CorruptIndex(_)
+            | RetrievalError::StaleIndex { .. }
+            | RetrievalError::ControlProjectionStale
+            | RetrievalError::SessionNotFound(_)
+            | RetrievalError::ExcludedSession(_)
+    )
+}
+
+fn scoped_entity_count(
+    connection: &Connection,
+    session_id: Option<&str>,
+) -> RetrievalResult<usize> {
+    let count: i64 = connection
+        .query_row(
+            "SELECT count(DISTINCT e.entity_id) FROM memory_entities e
+             WHERE ?1 IS NULL OR e.created_session_id=?1
+                OR EXISTS(SELECT 1 FROM memory_entity_mentions m WHERE m.entity_id=e.entity_id AND m.session_id=?1)
+                OR EXISTS(SELECT 1 FROM memory_entity_aliases a WHERE a.entity_id=e.entity_id AND a.session_id=?1)
+                OR EXISTS(SELECT 1 FROM memory_claims c JOIN memory_claim_evidence ce ON ce.claim_id=c.claim_id
+                          WHERE ce.session_id=?1 AND (c.subject_entity_id=e.entity_id OR c.object_entity_id=e.entity_id))",
+            [session_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| RetrievalError::CorruptIndex(format!("读取 entity status 失败：{error}")))?;
+    usize::try_from(count)
+        .map_err(|_| RetrievalError::CorruptIndex("entity count 不是非负整数".into()))
+}
+
+fn scoped_episode_count(
+    connection: &Connection,
+    session_id: Option<&str>,
+) -> RetrievalResult<usize> {
+    let count: i64 = connection
+        .query_row(
+            "SELECT count(DISTINCT d.document_id) FROM memory_documents d
+             WHERE d.granularity='episode' AND (?1 IS NULL OR EXISTS(
+                 SELECT 1 FROM memory_document_members m JOIN events e ON e.event_id=m.event_id
+                 WHERE m.document_id=d.document_id AND e.session_id=?1))",
+            [session_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| {
+            RetrievalError::CorruptIndex(format!("读取 episode status 失败：{error}"))
+        })?;
+    usize::try_from(count)
+        .map_err(|_| RetrievalError::CorruptIndex("episode count 不是非负整数".into()))
+}
+
 #[derive(Debug, Error)]
 pub enum RetrievalError {
     #[error("无法访问派生索引 {path}: {source}")]
@@ -316,6 +389,54 @@ impl HybridRecallFailure {
 }
 
 pub type RetrievalResult<T> = std::result::Result<T, RetrievalError>;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryLatencyPercentiles {
+    pub samples: usize,
+    pub p50_ms: Option<u64>,
+    pub p95_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryAttemptCounts {
+    pub applied: usize,
+    pub rejected: usize,
+    pub model_error: usize,
+    pub cancelled: usize,
+    pub failed: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryStatusMetrics {
+    pub active_sessions: usize,
+    pub active_events: usize,
+    pub embedding_total: usize,
+    pub embedding_compatible: usize,
+    pub embedding_stale: usize,
+    pub pending_consolidation_events: usize,
+    pub entity_count: usize,
+    pub episode_count: usize,
+    pub graph_current: bool,
+    pub graph_node_count: Option<usize>,
+    pub graph_edge_count: Option<usize>,
+    pub consolidation_attempts: MemoryAttemptCounts,
+    pub consolidation_latency_ms: MemoryLatencyPercentiles,
+    pub retrieval_runs: usize,
+    pub retrieval_failures: usize,
+    pub retrieval_latency_ms: MemoryLatencyPercentiles,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryStatus {
+    pub session_id: Option<String>,
+    pub memory_enabled: bool,
+    pub healthy: bool,
+    pub projection_current: bool,
+    pub expected_control_generation_sha256: String,
+    pub indexed_control_generation_sha256: Option<String>,
+    pub validation_error: Option<String>,
+    pub metrics: Option<MemoryStatusMetrics>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IndexedSession {
@@ -803,6 +924,228 @@ impl RetrievalStore {
     pub fn control_state(&self) -> RetrievalResult<ControlState> {
         let _guard = self.acquire_root_read()?;
         self.replay_control_state_under_guard()
+    }
+
+    pub fn memory_status(
+        &self,
+        memory: &MemoryConfig,
+        session_id: Option<&str>,
+    ) -> RetrievalResult<MemoryStatus> {
+        memory
+            .validate()
+            .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+        let _guard = self.acquire_root_read()?;
+        let control = self.replay_control_state_under_guard()?;
+        let expected = control.generation_sha256().to_owned();
+        let mut connection = self.open_connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(|error| self.database_error(error))?;
+        let marker = transaction
+            .query_row(
+                "SELECT value FROM memory_schema_meta WHERE key='active_control_generation_sha256'",
+                [],
+                |row| {
+                    Ok(match row.get_ref(0)? {
+                        ValueRef::Text(bytes) => std::str::from_utf8(bytes)
+                            .map(str::to_owned)
+                            .unwrap_or_else(|_| "<malformed-utf8>".into()),
+                        _ => "<malformed-non-text>".into(),
+                    })
+                },
+            )
+            .optional()
+            .map_err(|error| self.database_error(error))?;
+        let marker_valid = marker.as_deref().is_none_or(is_lower_hex_sha256);
+        let projection_current = marker_valid
+            && marker
+                .as_deref()
+                .map_or(control.last_sequence() == 0, |actual| actual == expected);
+        let mut status = MemoryStatus {
+            session_id: session_id.map(str::to_owned),
+            memory_enabled: memory.enabled,
+            healthy: false,
+            projection_current,
+            expected_control_generation_sha256: expected,
+            indexed_control_generation_sha256: marker.clone(),
+            validation_error: None,
+            metrics: None,
+        };
+        if !marker_valid {
+            status.validation_error =
+                Some("active_control_generation_sha256 marker 必须为 64 位小写十六进制".into());
+        } else if !projection_current {
+            status.validation_error = Some(match marker {
+                Some(_) => "control projection generation 与当前控制日志不一致".into(),
+                None => "非空控制日志缺少 control projection generation marker".into(),
+            });
+        } else {
+            let metrics = (|| -> RetrievalResult<MemoryStatusMetrics> {
+                validate_full_derived_integrity(&transaction)?;
+                if let Some(scope) = session_id {
+                    Self::require_active_session(&control, scope)?;
+                    self.verify_indexed_session_source_projection(&transaction, scope)?;
+                }
+                let mut active_sessions = 0usize;
+                let mut active_events = 0usize;
+                let mut sessions = transaction
+                    .prepare("SELECT session_id FROM indexed_sessions ORDER BY session_id")
+                    .map_err(|error| self.database_error(error))?;
+                for row in sessions
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .map_err(|error| self.database_error(error))?
+                {
+                    let id = row.map_err(|error| self.database_error(error))?;
+                    if control.allows_session(&id) && session_id.is_none_or(|scope| scope == id) {
+                        active_sessions += 1;
+                    }
+                }
+                let mut events = transaction
+                    .prepare("SELECT event_id,session_id FROM events ORDER BY session_id,sequence")
+                    .map_err(|error| self.database_error(error))?;
+                for row in events
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .map_err(|error| self.database_error(error))?
+                {
+                    let (event_id, event_session) =
+                        row.map_err(|error| self.database_error(error))?;
+                    if control.allows_session(&event_session)
+                        && control.allows_event(&event_session, &event_id)
+                        && session_id.is_none_or(|scope| scope == event_session)
+                    {
+                        active_events += 1;
+                    }
+                }
+                let spec = VectorIndexSpec::from_config(memory)
+                    .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+                let fingerprint = embedding_fingerprint(&spec)?;
+                let embedding_total =
+                    self.active_memory_document_count(&transaction, &control, session_id)?;
+                let embedding_compatible = self
+                    .compatible_embeddings_from_connection(
+                        &transaction,
+                        &spec,
+                        &fingerprint,
+                        session_id,
+                    )?
+                    .len();
+                let embedding_stale = embedding_total
+                    .checked_sub(embedding_compatible)
+                    .ok_or_else(|| {
+                        RetrievalError::CorruptIndex(
+                            "兼容 embedding 数超过 active document 数".into(),
+                        )
+                    })?;
+                let pending_consolidation_events = self
+                    .pending_consolidation_events_from_connection(
+                        &transaction,
+                        &control,
+                        session_id,
+                    )?;
+                let entity_count = scoped_entity_count(&transaction, session_id)?;
+                let episode_count = scoped_episode_count(&transaction, session_id)?;
+                let graph_active_documents =
+                    self.active_memory_document_count(&transaction, &control, None)?;
+                let graph = crate::graph::graph_status_from_connection(
+                    self,
+                    &transaction,
+                    memory,
+                    graph_active_documents,
+                    session_id,
+                )?;
+                let attempts = self.status_consolidation_attempts_from_connection(
+                    &transaction,
+                    &control,
+                    session_id,
+                )?;
+                let mut consolidation_attempts = MemoryAttemptCounts::default();
+                let mut consolidation_latencies = Vec::with_capacity(attempts.len());
+                for attempt in attempts {
+                    use crate::consolidation::ConsolidationAttemptStatus;
+                    match attempt.status {
+                        ConsolidationAttemptStatus::Applied => consolidation_attempts.applied += 1,
+                        ConsolidationAttemptStatus::Rejected => {
+                            consolidation_attempts.rejected += 1
+                        }
+                        ConsolidationAttemptStatus::ModelError => {
+                            consolidation_attempts.model_error += 1
+                        }
+                        ConsolidationAttemptStatus::Cancelled => {
+                            consolidation_attempts.cancelled += 1
+                        }
+                    }
+                    consolidation_latencies.push(attempt.latency_ms);
+                }
+                consolidation_attempts.failed =
+                    consolidation_attempts.rejected + consolidation_attempts.model_error;
+                let mut retrieval_latencies = Vec::new();
+                let mut retrieval_failures = 0usize;
+                let mut retrieval_runs = 0usize;
+                for (answer_event_id, trace) in
+                    self.validated_retrieval_runs_from_connection(&transaction)?
+                {
+                    if let Some(scope) = session_id {
+                        let answer_session: String = transaction
+                            .query_row(
+                                "SELECT session_id FROM events WHERE event_id=?1",
+                                [&answer_event_id],
+                                |row| row.get(0),
+                            )
+                            .map_err(|error| self.database_error(error))?;
+                        if answer_session != scope {
+                            continue;
+                        }
+                    }
+                    retrieval_runs += 1;
+                    if trace.status != "ok"
+                        || trace
+                            .channels
+                            .iter()
+                            .any(|channel| channel.status == "error" || channel.error.is_some())
+                    {
+                        retrieval_failures += 1;
+                    }
+                    retrieval_latencies.push(trace.elapsed_ms);
+                }
+                Ok(MemoryStatusMetrics {
+                    active_sessions,
+                    active_events,
+                    embedding_total,
+                    embedding_compatible,
+                    embedding_stale,
+                    pending_consolidation_events,
+                    entity_count,
+                    episode_count,
+                    graph_current: graph.current,
+                    graph_node_count: graph.node_count,
+                    graph_edge_count: graph.edge_count,
+                    consolidation_attempts,
+                    consolidation_latency_ms: latency_percentiles(consolidation_latencies),
+                    retrieval_runs,
+                    retrieval_failures,
+                    retrieval_latency_ms: latency_percentiles(retrieval_latencies),
+                })
+            })();
+            match metrics {
+                Ok(metrics) => status.metrics = Some(metrics),
+                Err(error) if is_status_validation_error(&error) => {
+                    status.validation_error = Some(error.to_string());
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if let Some(metrics) = status.metrics.as_ref() {
+            status.healthy = status.projection_current
+                && status.validation_error.is_none()
+                && (!memory.enabled || (metrics.embedding_stale == 0 && metrics.graph_current));
+        }
+        self.require_unchanged_control_state(&control)?;
+        transaction
+            .commit()
+            .map_err(|error| self.database_error(error))?;
+        Ok(status)
     }
 
     pub(crate) fn replay_control_state_under_guard(&self) -> RetrievalResult<ControlState> {

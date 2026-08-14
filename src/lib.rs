@@ -15,7 +15,8 @@ pub mod vector;
 pub mod web;
 
 pub use config::{
-    AppConfig, KnowledgeConfig, KnowledgeSourceConfig, KnowledgeSourceKind, WebSearchConfig,
+    AdaptiveBudgetConfig, AppConfig, KnowledgeConfig, KnowledgeSourceConfig, KnowledgeSourceKind,
+    MemoryBudgetConfig, MemoryConfig, WebSearchConfig,
 };
 pub use consolidation::{
     BoundarySuggestionReason, CONSOLIDATION_MAX_CHARS, CONSOLIDATION_MAX_TURNS, ClaimCardinality,
@@ -67,7 +68,8 @@ pub use ollama::{
 pub use retrieval::{
     AggregateEmbeddingDocument, AggregateEmbeddingSnapshot, AnswerContext, AnswerContextItem,
     DirectMessageEmbedding, EmbeddingPublishReport, IndexedSession, LeafEmbeddingDocument,
-    LeafEmbeddingSnapshot, RebuildOptions, RebuildReport, RecallResult, RecalledEvidence,
+    LeafEmbeddingSnapshot, MemoryAttemptCounts, MemoryLatencyPercentiles, MemoryStatus,
+    MemoryStatusMetrics, RebuildOptions, RebuildReport, RecallResult, RecalledEvidence,
     ResolvedSpan, RetrievalError, RetrievalStore, StoredEvent, SyncReport, classify_query,
 };
 pub use store::{IndexSyncAfterSourceCommit, SessionStore};
