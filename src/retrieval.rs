@@ -254,6 +254,7 @@ struct ProjectedVectorCandidate {
 
 #[derive(Clone)]
 struct FusedRawCandidate {
+    pre_cap_rank: usize,
     document_id: String,
     granularity: RetrievalDocumentGranularity,
     span: SourceSpan,
@@ -1857,6 +1858,7 @@ impl RetrievalStore {
             let is_protected = protected_span.as_ref() == Some(&candidate.span);
             let episode_id = self.resolve_episode_id(&connection, &candidate.span.event_id)?;
             let entry = fused.entry(key).or_insert_with(|| FusedRawCandidate {
+                pre_cap_rank: 0,
                 document_id: candidate.document_id.clone(),
                 granularity: candidate.granularity,
                 span: candidate.span.clone(),
@@ -1926,6 +1928,7 @@ impl RetrievalStore {
             }
             let key = raw_candidate_key(&candidate.span);
             let entry = fused.entry(key).or_insert_with(|| FusedRawCandidate {
+                pre_cap_rank: 0,
                 document_id: candidate.document_id.clone(),
                 granularity: candidate.granularity,
                 span: candidate.span.clone(),
@@ -1989,16 +1992,25 @@ impl RetrievalStore {
                 .total_cmp(&left.rrf_score)
                 .then_with(|| left.document_id.cmp(&right.document_id))
         });
+        for (index, candidate) in candidates.iter_mut().enumerate() {
+            candidate.pre_cap_rank = index + 1;
+        }
+        let vector_candidate_count = candidates
+            .iter()
+            .filter(|candidate| candidate.vector_rank.is_some())
+            .count()
+            + excluded_vectors.len();
+        let mut capped_candidates = Vec::new();
         if candidates.len() > memory_config.candidate_limit {
-            let protected = candidates
+            capped_candidates = candidates.split_off(memory_config.candidate_limit);
+            let protected = capped_candidates
                 .iter()
                 .position(|candidate| candidate.protected_exact)
-                .map(|index| (index, candidates[index].clone()));
-            candidates.truncate(memory_config.candidate_limit);
-            if let Some((index, protected_candidate)) = protected
-                && index >= memory_config.candidate_limit
-            {
-                candidates.pop();
+                .map(|index| capped_candidates.remove(index));
+            if let Some(protected_candidate) = protected {
+                if let Some(displaced) = candidates.pop() {
+                    capped_candidates.push(displaced);
+                }
                 candidates.push(protected_candidate);
                 candidates.sort_by(|left, right| {
                     right
@@ -2008,6 +2020,11 @@ impl RetrievalStore {
                 });
             }
         }
+        for candidate in &mut capped_candidates {
+            candidate.selected = false;
+            candidate.reason = "candidate_limit".into();
+        }
+        capped_candidates.sort_by_key(|candidate| candidate.pre_cap_rank);
         excluded_vectors.sort_by(|left, right| {
             left.vector_rank
                 .cmp(&right.vector_rank)
@@ -2026,6 +2043,8 @@ impl RetrievalStore {
             retrieval_config,
             bm25_ms,
             vector_ms,
+            vector_candidate_count,
+            capped_candidates,
             excluded_vectors,
         )
     }
@@ -2285,6 +2304,8 @@ impl RetrievalStore {
         retrieval_config: RetrievalConfig,
         bm25_ms: u64,
         vector_ms: u64,
+        vector_candidate_count: usize,
+        capped_candidates: Vec<FusedRawCandidate>,
         excluded_vectors: Vec<FusionCandidateTrace>,
     ) -> RetrievalResult<RecallResult> {
         let mut processing_order = (0..candidates.len()).collect::<Vec<_>>();
@@ -2386,7 +2407,7 @@ impl RetrievalStore {
         let mut expansion_hashes = HashSet::new();
         for &index in &selected {
             let candidate = &candidates[index];
-            let rank = index + 1;
+            let rank = candidate.pre_cap_rank;
             let selected_item = SelectedEvidence {
                 span: candidate.span.clone(),
                 content_sha256: candidate.content_sha256.clone(),
@@ -2408,9 +2429,9 @@ impl RetrievalStore {
         bm25.trace.selected_evidence = selected_evidence;
         bm25.trace.fusion_candidates = candidates
             .iter()
-            .enumerate()
-            .map(|(index, candidate)| FusionCandidateTrace {
-                fused_rank: index + 1,
+            .chain(capped_candidates.iter())
+            .map(|candidate| FusionCandidateTrace {
+                fused_rank: candidate.pre_cap_rank,
                 document_id: candidate.document_id.clone(),
                 span: candidate.span.clone(),
                 session_id: candidate.session_id.clone(),
@@ -2429,6 +2450,9 @@ impl RetrievalStore {
             .collect();
         bm25.trace
             .fusion_candidates
+            .sort_by_key(|candidate| candidate.fused_rank);
+        bm25.trace
+            .fusion_candidates
             .extend(excluded_vectors.iter().cloned());
         bm25.trace.channels = vec![
             channel_trace(
@@ -2441,11 +2465,7 @@ impl RetrievalStore {
             channel_trace(
                 RetrievalChannel::Vector,
                 "ok",
-                candidates
-                    .iter()
-                    .filter(|candidate| candidate.vector_rank.is_some())
-                    .count()
-                    + excluded_vectors.len(),
+                vector_candidate_count,
                 vector_ms,
                 None,
             ),
