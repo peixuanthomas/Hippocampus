@@ -4601,7 +4601,10 @@ impl RetrievalStore {
             .optional()
             .map_err(|e| self.database_error(e))?
             .map(|json| {
-                serde_json::from_str(&json).map_err(|e| RetrievalError::CorruptIndex(e.to_string()))
+                let mut trace: RetrievalTrace = serde_json::from_str(&json)
+                    .map_err(|e| RetrievalError::CorruptIndex(e.to_string()))?;
+                trace.normalize_usage();
+                Ok::<RetrievalTrace, RetrievalError>(trace)
             })
             .transpose()?
             .unwrap_or_default();
@@ -5504,11 +5507,12 @@ impl RetrievalStore {
                     "retrieval run {answer_event_id} 与原始 trace 不一致"
                 )));
             }
-            let actual: RetrievalTrace = serde_json::from_str(&json).map_err(|error| {
+            let mut actual: RetrievalTrace = serde_json::from_str(&json).map_err(|error| {
                 RetrievalError::CorruptIndex(format!(
                     "retrieval run {answer_event_id} JSON 无效：{error}"
                 ))
             })?;
+            actual.normalize_usage();
             expected.insert(answer_event_id, actual);
         }
         Ok(expected.into_iter().collect())

@@ -1480,12 +1480,12 @@ impl<B: ChatBackend> ChatEngine<B> {
         }
 
         let selected_plan = prepared.plan.clone();
-        let mandatory_tokens = selected_plan
-            .retrieval_trace
-            .budget_allocation
-            .mandatory_input_tokens;
-        if mandatory_tokens == 0 {
-            bail!("prepared adaptive plan 缺少精确 mandatory token 记录");
+        let budget_allocation = &selected_plan.retrieval_trace.budget_allocation;
+        let mandatory_tokens = budget_allocation
+            .mandatory_probe_input_tokens()
+            .ok_or_else(|| anyhow!("prepared adaptive plan 缺少精确 mandatory probe provenance"))?;
+        if mandatory_tokens != budget_allocation.mandatory_input_tokens {
+            bail!("prepared adaptive plan 的 mandatory probe 与 token 记录不一致");
         }
         if mandatory_tokens > session.budget.trim_target() {
             let message = "系统提示与当前输入超过 80% 安全裁剪目标，请缩短系统提示或当前输入";

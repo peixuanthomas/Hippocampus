@@ -294,6 +294,16 @@ impl BudgetAllocationTrace {
             probe.usage.refresh();
         }
     }
+
+    pub fn mandatory_probe_input_tokens(&self) -> Option<u64> {
+        self.probes.iter().find_map(|probe| {
+            (probe.stage == "mandatory_probe"
+                && !probe.request_sha256.is_empty()
+                && matches!(probe.kind.as_str(), "normal" | "agent"))
+            .then_some(probe.usage.input_tokens)
+            .flatten()
+        })
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
