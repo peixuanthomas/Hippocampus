@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::knowledge::KnowledgeRecall;
 use crate::model::{
     ChatMessage, ContextItemTrace, ContextPlan, EventRole, SelectedEvidence, Session, SourceSpan,
@@ -269,8 +271,25 @@ impl<'a> WrappedHistoryCursor<'a> {
         item: &ContextItemTrace,
         is_session_system_prompt: bool,
     ) -> Result<Option<EventRole>, &'static str> {
-        if !self.enabled || item.role != EventRole::System || is_session_system_prompt {
+        if is_session_system_prompt {
             return Ok(None);
+        }
+        if !self.enabled {
+            return if item.role == EventRole::System {
+                Err("未标记上下文包含非会话系统片段")
+            } else {
+                Ok(None)
+            };
+        }
+        if self.next == self.evidence.len() {
+            return if item.role == EventRole::System {
+                Err("不可信历史证据之后包含额外系统片段")
+            } else {
+                Ok(None)
+            };
+        }
+        if item.role != EventRole::System {
+            return Err("不可信历史证据块被普通对话片段打断");
         }
         let selected = self
             .evidence
@@ -383,4 +402,3 @@ mod tests {
         assert_eq!(plan.context_sha256, context_sha256(&plan.messages));
     }
 }
-use std::collections::HashSet;
