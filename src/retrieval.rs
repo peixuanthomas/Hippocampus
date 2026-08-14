@@ -1305,11 +1305,6 @@ impl RetrievalStore {
             let vector = decode_f32_le(&bytes, dimensions).map_err(|error| {
                 RetrievalError::CorruptIndex(format!("文档 {document_id} 的兼容向量损坏：{error}"))
             })?;
-            if !is_unit_vector(&vector) {
-                return Err(RetrievalError::CorruptIndex(format!(
-                    "文档 {document_id} 的兼容向量不是有限单位向量"
-                )));
-            }
             compatible.push(StoredEmbedding {
                 document_id,
                 session_id,
@@ -8362,9 +8357,15 @@ CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_episode_materializations_de
 CREATE TRIGGER IF NOT EXISTS graph_invalidate_consolidation_watermarks_insert AFTER INSERT ON consolidation_watermarks BEGIN DELETE FROM memory_graph_materializations; END;
 CREATE TRIGGER IF NOT EXISTS graph_invalidate_consolidation_watermarks_update AFTER UPDATE ON consolidation_watermarks BEGIN DELETE FROM memory_graph_materializations; END;
 CREATE TRIGGER IF NOT EXISTS graph_invalidate_consolidation_watermarks_delete AFTER DELETE ON consolidation_watermarks BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_consolidation_batches_insert AFTER INSERT ON consolidation_batches BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_consolidation_batches_update AFTER UPDATE ON consolidation_batches BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_consolidation_batches_delete AFTER DELETE ON consolidation_batches BEGIN DELETE FROM memory_graph_materializations; END;
 CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_entities_insert AFTER INSERT ON memory_entities BEGIN DELETE FROM memory_graph_materializations; END;
 CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_entities_update AFTER UPDATE ON memory_entities BEGIN DELETE FROM memory_graph_materializations; END;
 CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_entities_delete AFTER DELETE ON memory_entities BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_entity_aliases_insert AFTER INSERT ON memory_entity_aliases BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_entity_aliases_update AFTER UPDATE ON memory_entity_aliases BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_entity_aliases_delete AFTER DELETE ON memory_entity_aliases BEGIN DELETE FROM memory_graph_materializations; END;
 CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_entity_mentions_insert AFTER INSERT ON memory_entity_mentions BEGIN DELETE FROM memory_graph_materializations; END;
 CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_entity_mentions_update AFTER UPDATE ON memory_entity_mentions BEGIN DELETE FROM memory_graph_materializations; END;
 CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_entity_mentions_delete AFTER DELETE ON memory_entity_mentions BEGIN DELETE FROM memory_graph_materializations; END;

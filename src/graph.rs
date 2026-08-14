@@ -351,6 +351,7 @@ pub(crate) fn refresh_graph(
     validate_full_derived_integrity(&transaction)?;
     let embeddings =
         store.compatible_embeddings_from_connection(&transaction, &spec, &fingerprint, None)?;
+    validate_graph_embeddings(&embeddings)?;
     let document_count: i64 = transaction
         .query_row("SELECT count(*) FROM memory_documents", [], |row| {
             row.get(0)
@@ -434,6 +435,37 @@ pub(crate) fn refresh_graph(
         fingerprint,
         materialized_at,
     ))
+}
+
+fn validate_graph_embeddings(embeddings: &[StoredEmbedding]) -> RetrievalResult<()> {
+    for embedding in embeddings {
+        if embedding.vector.is_empty() {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "图输入文档 {} 的向量为空",
+                embedding.document_id
+            )));
+        }
+        let norm_squared = embedding.vector.iter().try_fold(0.0_f64, |sum, value| {
+            value
+                .is_finite()
+                .then_some(sum + f64::from(*value) * f64::from(*value))
+        });
+        let Some(norm_squared) = norm_squared.filter(|value| value.is_finite() && *value > 0.0)
+        else {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "图输入文档 {} 的向量包含非有限值或零范数",
+                embedding.document_id
+            )));
+        };
+        let norm = norm_squared.sqrt();
+        if !norm.is_finite() || (norm - 1.0).abs() > 1e-5 {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "图输入文档 {} 的向量不是单位向量",
+                embedding.document_id
+            )));
+        }
+    }
+    Ok(())
 }
 
 type EventRow = (
