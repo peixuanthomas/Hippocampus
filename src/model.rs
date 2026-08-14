@@ -191,6 +191,36 @@ pub struct GraphPathTrace {
     pub node_ids: Vec<String>,
     #[serde(default)]
     pub score: f64,
+    #[serde(default)]
+    pub seed_channel: RetrievalChannel,
+    #[serde(default)]
+    pub seed_node_id: String,
+    #[serde(default)]
+    pub seed_source_id: String,
+    #[serde(default)]
+    pub seed_rank: usize,
+    #[serde(default)]
+    pub seed_score: f64,
+    #[serde(default)]
+    pub seed_mass: f64,
+    #[serde(default)]
+    pub edge_ids: Vec<String>,
+    #[serde(default)]
+    pub target_rank: usize,
+    #[serde(default)]
+    pub target_granularity: Option<RetrievalDocumentGranularity>,
+    #[serde(default)]
+    pub target_session_id: String,
+    #[serde(default)]
+    pub span: Option<SourceSpan>,
+    #[serde(default)]
+    pub content_sha256: String,
+    #[serde(default)]
+    pub role: Option<EventRole>,
+    #[serde(default)]
+    pub selected: bool,
+    #[serde(default)]
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

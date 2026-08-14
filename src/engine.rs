@@ -1005,18 +1005,93 @@ impl<B: ChatBackend> ChatEngine<B> {
             let refresh_started = Instant::now();
             match self.refresh_embeddings(CancellationToken::new()).await {
                 Ok(_) => {
-                    self.store
-                        .retrieval()
-                        .hybrid_recall(
-                            &self.client,
-                            &user_content,
-                            &current_event_id,
-                            &recent_event_ids,
-                            None,
-                            session.retrieval.clone(),
-                            &self.config.memory,
-                        )
-                        .await
+                    let graph_store = self.store.retrieval().clone();
+                    let graph_config = self.config.memory.clone();
+                    let graph_started = Instant::now();
+                    match tokio::task::spawn_blocking(move || {
+                        graph_store.refresh_graph(&graph_config)
+                    })
+                    .await
+                    {
+                        Ok(Ok(_)) => {
+                            self.store
+                                .retrieval()
+                                .hybrid_recall(
+                                    &self.client,
+                                    &user_content,
+                                    &current_event_id,
+                                    &recent_event_ids,
+                                    None,
+                                    session.retrieval.clone(),
+                                    &self.config.memory,
+                                )
+                                .await
+                        }
+                        graph_result => {
+                            let graph_elapsed = elapsed_millis(graph_started);
+                            let cause = match graph_result {
+                                Ok(Err(error)) => error.to_string(),
+                                Err(error) => {
+                                    format!("blocking graph refresh task failed: {error}")
+                                }
+                                Ok(Ok(_)) => unreachable!(),
+                            };
+                            let message = format!("graph refresh failed: {cause}");
+                            let fallback_started = Instant::now();
+                            self.store
+                                .retrieval()
+                                .keyword_recall(
+                                    &user_content,
+                                    &current_event_id,
+                                    &recent_event_ids,
+                                    session.retrieval.clone(),
+                                )
+                                .map(|mut recall| {
+                                    let bm25_elapsed = elapsed_millis(fallback_started);
+                                    recall.trace.status = "bm25_fallback".into();
+                                    recall.trace.warnings.push(message.clone());
+                                    recall.trace.elapsed_ms =
+                                        graph_elapsed.saturating_add(bm25_elapsed);
+                                    recall.trace.channels = vec![
+                                        crate::model::ChannelTrace {
+                                            channel: RetrievalChannel::Bm25,
+                                            status: "ok".into(),
+                                            candidate_count: recall.trace.candidates.len(),
+                                            elapsed_ms: bm25_elapsed,
+                                            error: None,
+                                        },
+                                        crate::model::ChannelTrace {
+                                            channel: RetrievalChannel::Vector,
+                                            status: "skipped".into(),
+                                            ..Default::default()
+                                        },
+                                        crate::model::ChannelTrace {
+                                            channel: RetrievalChannel::Entity,
+                                            status: "skipped".into(),
+                                            ..Default::default()
+                                        },
+                                        crate::model::ChannelTrace {
+                                            channel: RetrievalChannel::State,
+                                            status: "skipped".into(),
+                                            ..Default::default()
+                                        },
+                                        crate::model::ChannelTrace {
+                                            channel: RetrievalChannel::Episode,
+                                            status: "skipped".into(),
+                                            ..Default::default()
+                                        },
+                                        crate::model::ChannelTrace {
+                                            channel: RetrievalChannel::Graph,
+                                            status: "error".into(),
+                                            elapsed_ms: graph_elapsed,
+                                            error: Some(message.clone()),
+                                            ..Default::default()
+                                        },
+                                    ];
+                                    recall
+                                })
+                        }
+                    }
                 }
                 Err(error) => {
                     let refresh_elapsed = elapsed_millis(refresh_started);

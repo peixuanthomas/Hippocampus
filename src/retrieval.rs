@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::config::MemoryConfig;
+use crate::config::{MemoryBudgetConfig, MemoryConfig};
 use crate::consolidation::{
     normalize_match, original_claim_valid_to_by_id, validate_full_derived_integrity,
 };
@@ -21,6 +21,7 @@ use crate::episode::{
     EpisodeMember, EpisodePlanInput, aggregate_members_hash, ledger_snapshot_hash, plan_episodes,
     session_document_id,
 };
+use crate::graph::GraphRecallSeed;
 use crate::knowledge::{KnowledgeStore, KnowledgeTrace};
 use crate::model::{
     BudgetAllocationTrace, ChannelTrace, ChatMessage, ContextItemTrace, EntityMatchTrace,
@@ -256,6 +257,41 @@ pub enum RetrievalError {
     RootLockPoisoned { path: PathBuf },
     #[error("向量索引缓存锁已损坏")]
     VectorCachePoisoned,
+    #[error("{0}")]
+    HybridRecall(#[from] HybridRecallFailure),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HybridRecallStage {
+    Vector,
+    EntityState,
+    Graph,
+}
+
+#[derive(Debug, Error)]
+#[error("{cause}")]
+pub struct HybridRecallFailure {
+    stage: HybridRecallStage,
+    cause: String,
+    elapsed_ms: u64,
+}
+
+impl HybridRecallFailure {
+    fn new(stage: HybridRecallStage, error: impl std::fmt::Display) -> Self {
+        Self {
+            stage,
+            cause: error.to_string(),
+            elapsed_ms: 0,
+        }
+    }
+
+    fn timed(stage: HybridRecallStage, error: impl std::fmt::Display, started: Instant) -> Self {
+        Self {
+            stage,
+            cause: error.to_string(),
+            elapsed_ms: elapsed_ms(started),
+        }
+    }
 }
 
 pub type RetrievalResult<T> = std::result::Result<T, RetrievalError>;
@@ -1856,6 +1892,7 @@ impl RetrievalStore {
             &recent,
             &mut used_events,
             &mut used_hashes,
+            session_filter,
         )?;
         Ok(RecallResult { trace, evidence })
     }
@@ -1909,6 +1946,8 @@ impl RetrievalStore {
                 channel_trace(RetrievalChannel::Vector, "disabled", 0, 0, None),
                 channel_trace(RetrievalChannel::Entity, "disabled", 0, 0, None),
                 channel_trace(RetrievalChannel::State, "disabled", 0, 0, None),
+                channel_trace(RetrievalChannel::Episode, "disabled", 0, 0, None),
+                channel_trace(RetrievalChannel::Graph, "disabled", 0, 0, None),
             ];
             result.trace.elapsed_ms = elapsed_ms(started);
             return Ok(result);
@@ -1970,25 +2009,47 @@ impl RetrievalStore {
         let retrieval = retrieval_config.clone();
         let memory = memory_config.clone();
         let fused_task = tokio::task::spawn_blocking(move || {
-            fusion_store.fuse_vector_recall(
-                bm25,
-                &fusion_query,
-                vector_input.0,
-                vector_input.1,
-                &fusion_current,
-                &fusion_recent,
-                fusion_scope.as_deref(),
-                retrieval,
-                memory,
-                bm25_ms,
-                vector_elapsed,
-            )
+            fusion_store
+                .fuse_vector_recall(
+                    bm25,
+                    &fusion_query,
+                    vector_input.0,
+                    vector_input.1,
+                    &fusion_current,
+                    &fusion_recent,
+                    fusion_scope.as_deref(),
+                    retrieval,
+                    memory,
+                    bm25_ms,
+                    vector_elapsed,
+                )
+                .map_err(|error| match error {
+                    RetrievalError::HybridRecall(_) => error,
+                    other => RetrievalError::HybridRecall(HybridRecallFailure::new(
+                        HybridRecallStage::Vector,
+                        other,
+                    )),
+                })
         });
         let mut result = match join_blocking(fused_task).await {
             Ok(result) => result,
             Err(error) => {
                 let message = error.to_string();
-                if message.contains("entity/state recall") {
+                let graph_elapsed = match &error {
+                    RetrievalError::HybridRecall(failure) => failure.elapsed_ms,
+                    _ => 0,
+                };
+                if matches!(&error, RetrievalError::HybridRecall(failure) if failure.stage == HybridRecallStage::Graph)
+                {
+                    apply_graph_fallback(
+                        &mut fallback,
+                        bm25_ms,
+                        elapsed_ms(embed_started),
+                        graph_elapsed,
+                        message,
+                    );
+                } else if matches!(&error, RetrievalError::HybridRecall(failure) if failure.stage == HybridRecallStage::EntityState)
+                {
                     apply_sidecar_fallback(
                         &mut fallback,
                         bm25_ms,
@@ -2098,7 +2159,7 @@ impl RetrievalStore {
     #[allow(clippy::too_many_arguments)]
     fn fuse_vector_recall(
         &self,
-        bm25: RecallResult,
+        mut bm25: RecallResult,
         raw_query: &str,
         query_vector: Vec<f32>,
         index: Arc<HnswVectorIndex>,
@@ -2110,20 +2171,73 @@ impl RetrievalStore {
         bm25_ms: u64,
         vector_ms: u64,
     ) -> RetrievalResult<RecallResult> {
+        let _guard = self.acquire_root_read()?;
         let hits = index
             .search(&query_vector, memory_config.vector_candidate_limit)
             .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
-        let connection = self.open_connection()?;
+        let vector_aggregate_sources = hits
+            .iter()
+            .filter(|hit| {
+                matches!(
+                    hit.granularity,
+                    RetrievalDocumentGranularity::Episode | RetrievalDocumentGranularity::Session
+                )
+            })
+            .map(|hit| hit.document_id.clone())
+            .collect::<BTreeSet<_>>();
+        let mut connection = self.open_connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(|error| self.database_error(error))?;
+        let mut graph_seeds = bm25
+            .trace
+            .candidates
+            .iter()
+            .filter(|candidate| {
+                matches!(
+                    candidate.reason.as_str(),
+                    "selected_core" | "evidence_budget" | "selection_limit"
+                )
+            })
+            .map(|candidate| GraphRecallSeed {
+                channel: RetrievalChannel::Bm25,
+                source_id: candidate.document_id.clone(),
+                document_id: Some(candidate.document_id.clone()),
+                rank: candidate.raw_rank,
+                score: candidate.bm25_score,
+            })
+            .collect::<Vec<_>>();
+        let recent_set = recent_event_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
         let mut projected = Vec::new();
         for (rank_index, hit) in hits.iter().enumerate() {
-            projected.extend(self.project_vector_hit(
-                &connection,
+            let mut hit_projection = self.project_vector_hit(
+                &transaction,
                 &index,
                 &query_vector,
                 hit,
                 rank_index + 1,
-                memory_config.candidate_limit,
-            )?);
+                usize::MAX,
+            )?;
+            let blocked = hit_projection.iter().any(|raw| {
+                raw.span.event_id == current_user_event_id
+                    || recent_set.contains(raw.span.event_id.as_str())
+                    || raw.role == EventRole::System
+                    || session_filter.is_some_and(|scope| raw.session_id != scope)
+            });
+            if !blocked {
+                graph_seeds.push(GraphRecallSeed {
+                    channel: RetrievalChannel::Vector,
+                    source_id: hit.document_id.clone(),
+                    document_id: Some(hit.document_id.clone()),
+                    rank: rank_index + 1,
+                    score: f64::from(hit.cosine_similarity),
+                });
+            }
+            hit_projection.truncate(memory_config.candidate_limit);
+            projected.extend(hit_projection);
         }
         let mut fused = HashMap::<(String, usize, usize), FusedRawCandidate>::new();
         let mut excluded_vectors = Vec::new();
@@ -2140,11 +2254,11 @@ impl RetrievalStore {
             .iter()
             .filter(|candidate| eligible.contains(&candidate.reason.as_str()))
         {
-            let event = self.get_event_from_connection(&connection, &candidate.span.event_id)?;
+            let event = self.get_event_from_connection(&transaction, &candidate.span.event_id)?;
             let content = slice_chars(&event.content, &candidate.span)?;
             let key = raw_candidate_key(&candidate.span);
             let is_protected = protected_span.as_ref() == Some(&candidate.span);
-            let episode_id = self.resolve_episode_id(&connection, &candidate.span.event_id)?;
+            let episode_id = self.resolve_episode_id(&transaction, &candidate.span.event_id)?;
             let entry = fused.entry(key).or_insert_with(|| FusedRawCandidate {
                 pre_cap_rank: 0,
                 document_id: candidate.document_id.clone(),
@@ -2324,7 +2438,7 @@ impl RetrievalStore {
         });
         let sidecar = self
             .load_state_sidecar(
-                &connection,
+                &transaction,
                 raw_query,
                 current_user_event_id,
                 recent_event_ids,
@@ -2332,23 +2446,544 @@ impl RetrievalStore {
                 bm25.trace.query_kind,
                 memory_config.candidate_limit,
             )
-            .map_err(|error| {
-                RetrievalError::CorruptIndex(format!("entity/state recall: {error}"))
-            })?;
-        self.select_fused_candidates(
-            &connection,
-            candidates,
-            bm25,
+            .map_err(|error| HybridRecallFailure::new(HybridRecallStage::EntityState, error))?;
+        let entity_seed_rows = sidecar
+            .entity_matches
+            .iter()
+            .filter_map(|matched| {
+                matched.selected_entity_id.as_ref().map(|entity_id| {
+                    let priority = match matched.match_basis.as_str() {
+                        "stable_identifier" => 0,
+                        "explicit_alias" => 1,
+                        "ent_self" => 2,
+                        _ => 3,
+                    };
+                    (priority, matched.normalized_text.clone(), entity_id.clone())
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut entity_best = BTreeMap::<String, (u8, String)>::new();
+        for (priority, normalized, entity_id) in entity_seed_rows {
+            let candidate = (priority, normalized);
+            if entity_best
+                .get(&entity_id)
+                .is_none_or(|old| candidate < *old)
+            {
+                entity_best.insert(entity_id, candidate);
+            }
+        }
+        let mut entity_seeds = entity_best
+            .into_iter()
+            .map(|(entity_id, (priority, normalized))| (priority, normalized, entity_id))
+            .collect::<Vec<_>>();
+        entity_seeds.sort();
+        graph_seeds.extend(entity_seeds.into_iter().enumerate().map(
+            |(index, (_, _, entity_id))| GraphRecallSeed {
+                channel: RetrievalChannel::Entity,
+                source_id: entity_id,
+                document_id: None,
+                rank: index + 1,
+                score: 1.0 / (index + 1) as f64,
+            },
+        ));
+        let graph_started = Instant::now();
+        let graph_seed_documents = graph_seeds
+            .iter()
+            .filter_map(|seed| seed.document_id.clone())
+            .collect::<BTreeSet<_>>();
+        let graph = crate::graph::recall_graph_from_connection(
+            self,
+            &transaction,
+            &memory_config,
+            &graph_seeds,
+            session_filter,
+        )
+        .map_err(|error| {
+            HybridRecallFailure::timed(HybridRecallStage::Graph, error, graph_started)
+        })?;
+        let graph_ms = elapsed_ms(graph_started);
+        let selected_budget = memory_budget_for_query(&memory_config, bm25.trace.query_kind);
+        bm25.trace.budget_allocation = BudgetAllocationTrace {
+            query_kind: bm25.trace.query_kind,
+            recent_history_percent: selected_budget.recent_history,
+            exact_or_state_percent: selected_budget.exact_or_state,
+            episode_percent: selected_budget.episode,
+            graph_percent: selected_budget.graph,
+        };
+        let mut result = self
+            .select_fused_candidates(
+                &transaction,
+                candidates,
+                bm25,
+                retrieval_config.clone(),
+                bm25_ms,
+                vector_ms,
+                vector_candidate_count,
+                capped_candidates,
+                excluded_vectors,
+                sidecar,
+            )
+            .map_err(|error| HybridRecallFailure::new(HybridRecallStage::EntityState, error))?;
+        self.inject_graph_candidates(
+            &transaction,
+            &index,
+            &query_vector,
             current_user_event_id,
             recent_event_ids,
-            retrieval_config,
-            bm25_ms,
-            vector_ms,
-            vector_candidate_count,
-            capped_candidates,
-            excluded_vectors,
-            sidecar,
+            session_filter,
+            &retrieval_config,
+            &memory_config,
+            &graph_seed_documents,
+            &vector_aggregate_sources,
+            graph,
+            graph_ms,
+            &mut result,
         )
+        .map_err(|error| {
+            HybridRecallFailure::timed(HybridRecallStage::Graph, error, graph_started)
+        })?;
+        let recent = recent_event_ids.iter().map(String::as_str).collect();
+        let mut expansion_events = result
+            .evidence
+            .iter()
+            .map(|item| item.selected.span.event_id.clone())
+            .collect();
+        let mut expansion_hashes = result
+            .evidence
+            .iter()
+            .map(|item| item.selected.content_sha256.clone())
+            .collect();
+        self.expand_context(
+            &transaction,
+            &mut result.trace,
+            &mut result.evidence,
+            current_user_event_id,
+            &recent,
+            &mut expansion_events,
+            &mut expansion_hashes,
+            session_filter,
+        )
+        .map_err(|error| {
+            HybridRecallFailure::timed(HybridRecallStage::Graph, error, graph_started)
+        })?;
+        transaction
+            .commit()
+            .map_err(|error| self.database_error(error))?;
+        Ok(result)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn inject_graph_candidates(
+        &self,
+        connection: &Connection,
+        index: &HnswVectorIndex,
+        query_vector: &[f32],
+        current_user_event_id: &str,
+        recent_event_ids: &[String],
+        session_filter: Option<&str>,
+        retrieval_config: &RetrievalConfig,
+        memory_config: &MemoryConfig,
+        seed_documents: &BTreeSet<String>,
+        vector_aggregate_sources: &BTreeSet<String>,
+        mut graph: crate::graph::GraphRecallResult,
+        graph_ms: u64,
+        result: &mut RecallResult,
+    ) -> RetrievalResult<()> {
+        let candidate_count = graph.paths.len();
+        if let Some(warning) = graph.warning.take() {
+            result.trace.warnings.push(warning);
+        }
+        result.trace.config = retrieval_config.clone();
+        let budget = memory_budget_for_query(memory_config, result.trace.query_kind);
+        result.trace.budget_allocation = BudgetAllocationTrace {
+            query_kind: result.trace.query_kind,
+            recent_history_percent: budget.recent_history,
+            exact_or_state_percent: budget.exact_or_state,
+            episode_percent: budget.episode,
+            graph_percent: budget.graph,
+        };
+        let recent = recent_event_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        let mut used_events = result
+            .evidence
+            .iter()
+            .filter(|item| item.selected.kind == EvidenceKind::Core)
+            .map(|item| item.selected.span.event_id.clone())
+            .collect::<HashSet<_>>();
+        let mut used_hashes = result
+            .evidence
+            .iter()
+            .filter(|item| item.selected.kind == EvidenceKind::Core)
+            .map(|item| item.selected.content_sha256.clone())
+            .collect::<HashSet<_>>();
+        let mut used_episodes = BTreeSet::new();
+        for evidence in &result.evidence {
+            if evidence.selected.kind == EvidenceKind::Core
+                && let Some(episode) =
+                    self.resolve_episode_id(connection, &evidence.selected.span.event_id)?
+            {
+                used_episodes.insert(episode);
+            }
+        }
+        let mut slots = result
+            .evidence
+            .iter()
+            .filter(|item| item.selected.kind == EvidenceKind::Core)
+            .count();
+        let mut chars = result
+            .evidence
+            .iter()
+            .filter(|item| item.selected.kind == EvidenceKind::Core)
+            .map(|item| item.content.chars().count())
+            .sum::<usize>();
+        let graph_slot_budget = if budget.graph == 0 {
+            0
+        } else {
+            (retrieval_config.max_selected * usize::from(budget.graph))
+                .div_ceil(100)
+                .max(1)
+        };
+        let graph_char_budget =
+            (retrieval_config.evidence_char_budget * usize::from(budget.graph)).div_ceil(100);
+        let mut graph_slots = 0usize;
+        let mut graph_chars = 0usize;
+        let mut eligible = 0usize;
+        let mut aggregate_sources = vector_aggregate_sources.clone();
+        for path in &mut graph.paths {
+            if seed_documents.contains(&path.target_document_id) {
+                path.reason = "seed_document".into();
+                continue;
+            }
+            let row = connection.query_row("SELECT session_id,granularity,source_sha256 FROM memory_documents WHERE document_id=?1", [path.target_document_id.as_str()], |row| Ok((row.get::<_,String>(0)?, row.get::<_,String>(1)?, row.get::<_,String>(2)?))).optional().map_err(|error| self.database_error(error))?.ok_or_else(|| RetrievalError::CorruptIndex(format!("图 target 文档缺失：{}", path.target_document_id)))?;
+            let granularity = parse_granularity(&row.1)?;
+            if matches!(
+                granularity,
+                RetrievalDocumentGranularity::Episode | RetrievalDocumentGranularity::Session
+            ) {
+                aggregate_sources.insert(path.target_document_id.clone());
+            }
+            let hit = crate::vector::VectorSearchHit {
+                document_id: path.target_document_id.clone(),
+                session_id: row.0,
+                granularity,
+                source_sha256: row.2,
+                cosine_similarity: 0.0,
+                cosine_distance: 1.0,
+            };
+            let raw = self.project_graph_target(
+                connection,
+                index,
+                query_vector,
+                &hit,
+                path.target_rank,
+                current_user_event_id,
+                &recent,
+                session_filter,
+            )?;
+            let Some(raw) = raw else {
+                path.reason = "no_eligible_raw_member".into();
+                continue;
+            };
+            path.target_granularity = Some(granularity);
+            path.target_session_id = raw.session_id.clone();
+            path.span = Some(raw.span.clone());
+            path.content_sha256 = raw.content_sha256.clone();
+            path.role = Some(raw.role);
+            path.reason = if raw.span.event_id == current_user_event_id {
+                "current_message"
+            } else if recent.contains(raw.span.event_id.as_str()) {
+                "recent_context"
+            } else if raw.role == EventRole::System {
+                "system_message"
+            } else if session_filter.is_some_and(|scope| raw.session_id != scope) {
+                "scope_mismatch"
+            } else {
+                "eligible"
+            }
+            .into();
+            if path.reason != "eligible" {
+                continue;
+            }
+            eligible += 1;
+            if eligible > memory_config.graph_candidate_limit {
+                path.reason = "candidate_limit".into();
+                continue;
+            }
+            if let Some(existing) = result.evidence.iter().position(|item| {
+                item.selected.kind == EvidenceKind::Core && item.selected.span == raw.span
+            }) {
+                path.selected = true;
+                path.reason = "selected_coalesced".into();
+                if let Some(fused) = result
+                    .trace
+                    .fusion_candidates
+                    .iter_mut()
+                    .find(|candidate| candidate.span == raw.span)
+                {
+                    fused.selected = true;
+                }
+                let _ = existing;
+                continue;
+            }
+            let raw_chars = raw.content.chars().count();
+            if graph_slots >= graph_slot_budget {
+                path.reason = "graph_slot_limit".into();
+                continue;
+            }
+            if graph_chars + raw_chars > graph_char_budget {
+                path.reason = "graph_evidence_budget".into();
+                continue;
+            }
+            let mut conflicting = result.evidence.iter().position(|item| {
+                item.selected.kind == EvidenceKind::Core
+                    && (item.selected.span.event_id == raw.span.event_id
+                        || item.selected.content_sha256 == raw.content_sha256)
+            });
+            if conflicting.is_none()
+                && let Some(target_episode) = &raw.episode_id
+            {
+                for (index, item) in result.evidence.iter().enumerate() {
+                    if item.selected.kind == EvidenceKind::Core
+                        && self
+                            .resolve_episode_id(connection, &item.selected.span.event_id)?
+                            .as_ref()
+                            == Some(target_episode)
+                    {
+                        conflicting = Some(index);
+                        break;
+                    }
+                }
+            }
+            let displacement = conflicting.or_else(|| {
+                (slots >= retrieval_config.max_selected
+                    || chars + raw_chars > retrieval_config.evidence_char_budget)
+                    .then(|| {
+                        result
+                            .evidence
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, item)| {
+                                item.selected.kind == EvidenceKind::Core
+                                    && item.selected.reason == "selected_mmr"
+                            })
+                            .max_by_key(|(_, item)| item.selected.originating_candidate_rank)
+                            .map(|(index, _)| index)
+                    })
+                    .flatten()
+            });
+            if let Some(index) = displacement {
+                let displaced = &result.evidence[index];
+                let can_displace = displaced.selected.reason == "selected_mmr"
+                    && result
+                        .trace
+                        .fusion_candidates
+                        .iter()
+                        .find(|candidate| candidate.span == displaced.selected.span)
+                        .is_none_or(|candidate| !candidate.protected_exact);
+                if !can_displace {
+                    path.reason = if conflicting.is_some() {
+                        "duplicate_protected_or_state"
+                    } else {
+                        "selection_limit"
+                    }
+                    .into();
+                    continue;
+                }
+                let displaced = result.evidence.remove(index);
+                result
+                    .trace
+                    .selected_evidence
+                    .retain(|selected| selected.span != displaced.selected.span);
+                if let Some(candidate) = result
+                    .trace
+                    .fusion_candidates
+                    .iter_mut()
+                    .find(|candidate| candidate.span == displaced.selected.span)
+                {
+                    candidate.selected = false;
+                    candidate.reason = "displaced_by_graph".into();
+                }
+                slots -= 1;
+                chars -= displaced.content.chars().count();
+                used_events.remove(&displaced.selected.span.event_id);
+                used_hashes.remove(&displaced.selected.content_sha256);
+                if let Some(episode) =
+                    self.resolve_episode_id(connection, &displaced.selected.span.event_id)?
+                {
+                    used_episodes.remove(&episode);
+                }
+            } else if conflicting.is_some() {
+                path.reason = "duplicate_protected_or_state".into();
+                continue;
+            }
+            if slots >= retrieval_config.max_selected
+                || chars + raw_chars > retrieval_config.evidence_char_budget
+            {
+                path.reason = if slots >= retrieval_config.max_selected {
+                    "selection_limit"
+                } else {
+                    "evidence_budget"
+                }
+                .into();
+                continue;
+            }
+            let selected = SelectedEvidence {
+                span: raw.span.clone(),
+                content_sha256: raw.content_sha256.clone(),
+                role: raw.role,
+                kind: EvidenceKind::Core,
+                originating_candidate_rank: None,
+                reason: "selected_graph".into(),
+            };
+            result.trace.selected_evidence.push(selected.clone());
+            result.evidence.push(RecalledEvidence {
+                selected,
+                content: raw.content,
+            });
+            used_events.insert(raw.span.event_id);
+            used_hashes.insert(raw.content_sha256);
+            if let Some(episode) = raw.episode_id {
+                used_episodes.insert(episode);
+            }
+            slots += 1;
+            chars += raw_chars;
+            graph_slots += 1;
+            graph_chars += raw_chars;
+            path.selected = true;
+            path.reason = "selected_graph".into();
+        }
+        result.trace.graph_paths = graph.paths;
+        result.trace.channels.retain(|channel| {
+            !matches!(
+                channel.channel,
+                RetrievalChannel::Episode | RetrievalChannel::Graph
+            )
+        });
+        result.trace.channels.push(channel_trace(
+            RetrievalChannel::Episode,
+            if aggregate_sources.is_empty() {
+                "empty"
+            } else {
+                "ok"
+            },
+            aggregate_sources.len(),
+            0,
+            None,
+        ));
+        result.trace.channels.push(channel_trace(
+            RetrievalChannel::Graph,
+            if candidate_count == 0 { "empty" } else { "ok" },
+            candidate_count,
+            graph_ms,
+            None,
+        ));
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn project_graph_target(
+        &self,
+        connection: &Connection,
+        index: &HnswVectorIndex,
+        query_vector: &[f32],
+        hit: &crate::vector::VectorSearchHit,
+        rank: usize,
+        current: &str,
+        recent: &HashSet<&str>,
+        session_filter: Option<&str>,
+    ) -> RetrievalResult<Option<ProjectedVectorCandidate>> {
+        if matches!(
+            hit.granularity,
+            RetrievalDocumentGranularity::Message | RetrievalDocumentGranularity::Fragment
+        ) {
+            return self
+                .project_vector_hit(connection, index, query_vector, hit, rank, 1)
+                .map(|mut rows| rows.pop());
+        }
+        validate_aggregate_document_source(
+            connection,
+            &hit.document_id,
+            &hit.session_id,
+            &hit.source_sha256,
+        )?;
+        let mut statement = connection.prepare(
+            "SELECT m.ordinal,m.event_id,m.start_char,m.end_char,m.content_sha256 FROM memory_document_members m WHERE m.document_id=?1 ORDER BY m.ordinal"
+        ).map_err(|error| self.database_error(error))?;
+        let members = statement
+            .query_map([hit.document_id.as_str()], |row| {
+                Ok((
+                    i64_to_usize(row.get(0)?)?,
+                    row.get::<_, String>(1)?,
+                    i64_to_usize(row.get(2)?)?,
+                    i64_to_usize(row.get(3)?)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })
+            .map_err(|error| self.database_error(error))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| self.database_error(error))?;
+        let stored_count: usize = connection
+            .query_row(
+                "SELECT member_count FROM memory_documents WHERE document_id=?1",
+                [hit.document_id.as_str()],
+                |row| i64_to_usize(row.get(0)?),
+            )
+            .map_err(|error| self.database_error(error))?;
+        if members.len() != stored_count {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "聚合文档 {} member_count 不匹配",
+                hit.document_id
+            )));
+        }
+        let mut eligible = Vec::new();
+        for (ordinal, event_id, start, end, hash) in members {
+            let message_document_id = connection.query_row(
+                "SELECT d.document_id FROM memory_documents d JOIN memory_document_members m ON m.document_id=d.document_id WHERE d.session_id=?1 AND d.granularity='message' AND d.member_count=1 AND m.ordinal=0 AND m.event_id=?2 AND m.start_char=?3 AND m.end_char=?4 AND m.content_sha256=?5",
+                params![hit.session_id,event_id,usize_to_i64(start).map_err(|error| self.database_error(error))?,usize_to_i64(end).map_err(|error| self.database_error(error))?,hash], |row| row.get::<_,String>(0)
+            ).optional().map_err(|error| self.database_error(error))?.ok_or_else(|| RetrievalError::CorruptIndex(format!("聚合文档 {} 成员缺少 message 文档", hit.document_id)))?;
+            let vector = index
+                .vector_for_document(&message_document_id)
+                .ok_or_else(|| {
+                    RetrievalError::CorruptIndex(format!(
+                        "图聚合成员 {message_document_id} 缺少兼容向量"
+                    ))
+                })?;
+            let similarity = exact_cosine_f64(query_vector, vector)?;
+            let raw = self.load_projected_raw(
+                connection,
+                &message_document_id,
+                &hit.document_id,
+                RetrievalDocumentGranularity::Message,
+                rank,
+                similarity,
+                stored_count,
+                vector,
+            )?;
+            if raw.span.event_id != current
+                && !recent.contains(raw.span.event_id.as_str())
+                && raw.role != EventRole::System
+                && session_filter.is_none_or(|scope| raw.session_id == scope)
+            {
+                eligible.push((
+                    similarity,
+                    ordinal,
+                    raw.span.event_id.clone(),
+                    message_document_id,
+                    raw,
+                ));
+            }
+        }
+        eligible.sort_by(|left, right| {
+            right
+                .0
+                .total_cmp(&left.0)
+                .then_with(|| left.1.cmp(&right.1))
+                .then_with(|| left.2.cmp(&right.2))
+                .then_with(|| left.3.cmp(&right.3))
+        });
+        Ok(eligible.into_iter().next().map(|row| row.4))
     }
 
     fn project_vector_hit(
@@ -3237,8 +3872,6 @@ impl RetrievalStore {
         connection: &Connection,
         mut candidates: Vec<FusedRawCandidate>,
         mut bm25: RecallResult,
-        current_user_event_id: &str,
-        recent_event_ids: &[String],
         retrieval_config: RetrievalConfig,
         bm25_ms: u64,
         vector_ms: u64,
@@ -3618,16 +4251,6 @@ impl RetrievalStore {
                 None,
             ),
         ];
-        let recent = recent_event_ids.iter().map(String::as_str).collect();
-        self.expand_context(
-            connection,
-            &mut bm25.trace,
-            &mut evidence,
-            current_user_event_id,
-            &recent,
-            &mut expansion_events,
-            &mut expansion_hashes,
-        )?;
         let mut emitted_events = evidence
             .iter()
             .map(|item| item.selected.span.event_id.clone())
@@ -3765,6 +4388,8 @@ impl RetrievalStore {
                     reason: candidate.trace.reason.clone(),
                 };
                 bm25.trace.selected_evidence.push(selected.clone());
+                expansion_events.insert(selected.span.event_id.clone());
+                expansion_hashes.insert(selected.content_sha256.clone());
                 evidence.push(RecalledEvidence {
                     selected,
                     content: candidate.content.clone(),
@@ -3795,6 +4420,7 @@ impl RetrievalStore {
         recent: &HashSet<&str>,
         used_events: &mut HashSet<String>,
         used_hashes: &mut HashSet<String>,
+        session_filter: Option<&str>,
     ) -> RetrievalResult<()> {
         let mut budget = 0usize;
         let cores = evidence.clone();
@@ -3816,6 +4442,9 @@ impl RetrievalStore {
                     continue;
                 }
                 let adjacent = self.get_event_from_connection(connection, &id)?;
+                if session_filter.is_some_and(|scope| adjacent.session_id != scope) {
+                    continue;
+                }
                 let session = self.get_session_from_connection(connection, &adjacent.session_id)?;
                 self.verify_fresh(&session)?;
                 verify_event_hash(&adjacent)?;
@@ -8468,6 +9097,28 @@ fn channel_trace(
     }
 }
 
+fn memory_budget_for_query(config: &MemoryConfig, kind: QueryKind) -> MemoryBudgetConfig {
+    match kind {
+        QueryKind::ExactFact => config.budgets.exact_fact,
+        QueryKind::GeneralSemantic => config.budgets.general_semantic,
+        QueryKind::EventRecap => config.budgets.event_recap,
+        QueryKind::TemporalState => config.budgets.temporal_state,
+        QueryKind::MultiHop => config.budgets.multi_hop,
+    }
+}
+
+fn parse_granularity(value: &str) -> RetrievalResult<RetrievalDocumentGranularity> {
+    match value {
+        "message" => Ok(RetrievalDocumentGranularity::Message),
+        "fragment" => Ok(RetrievalDocumentGranularity::Fragment),
+        "episode" => Ok(RetrievalDocumentGranularity::Episode),
+        "session" => Ok(RetrievalDocumentGranularity::Session),
+        _ => Err(RetrievalError::CorruptIndex(format!(
+            "无效文档粒度 {value}"
+        ))),
+    }
+}
+
 fn apply_vector_fallback(result: &mut RecallResult, bm25_ms: u64, vector_ms: u64, error: String) {
     result.trace.status = "bm25_fallback".into();
     result.trace.channels = vec![
@@ -8517,6 +9168,47 @@ fn apply_sidecar_fallback(result: &mut RecallResult, bm25_ms: u64, vector_ms: u6
         channel_trace(RetrievalChannel::State, "error", 0, 0, Some(error.clone())),
         channel_trace(RetrievalChannel::Episode, "skipped", 0, 0, None),
         channel_trace(RetrievalChannel::Graph, "skipped", 0, 0, None),
+    ];
+    result.trace.warnings.push(error);
+}
+
+fn apply_graph_fallback(
+    result: &mut RecallResult,
+    bm25_ms: u64,
+    vector_ms: u64,
+    graph_ms: u64,
+    error: String,
+) {
+    result.trace.status = "bm25_fallback".into();
+    result.trace.fusion_candidates.clear();
+    result.trace.entity_matches.clear();
+    result.trace.state_selections.clear();
+    result.trace.graph_paths.clear();
+    result.trace.channels = vec![
+        channel_trace(
+            RetrievalChannel::Bm25,
+            "ok",
+            result.trace.candidates.len(),
+            bm25_ms,
+            None,
+        ),
+        channel_trace(
+            RetrievalChannel::Vector,
+            "discarded",
+            0,
+            vector_ms,
+            Some("advanced evidence discarded".into()),
+        ),
+        channel_trace(RetrievalChannel::Entity, "discarded", 0, 0, None),
+        channel_trace(RetrievalChannel::State, "discarded", 0, 0, None),
+        channel_trace(RetrievalChannel::Episode, "discarded", 0, 0, None),
+        channel_trace(
+            RetrievalChannel::Graph,
+            "error",
+            0,
+            graph_ms,
+            Some(error.clone()),
+        ),
     ];
     result.trace.warnings.push(error);
 }

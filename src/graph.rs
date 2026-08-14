@@ -7,7 +7,10 @@ use sha2::{Digest, Sha256};
 
 use crate::config::MemoryConfig;
 use crate::consolidation::{normalize_match, validate_full_derived_integrity};
-use crate::model::{EventRole, EvidenceKind, RetrievalDocumentGranularity, TurnStatus};
+use crate::model::{
+    EventRole, EvidenceKind, GraphPathTrace, RetrievalChannel, RetrievalDocumentGranularity,
+    TurnStatus,
+};
 use crate::retrieval::{
     RetrievalError, RetrievalResult, RetrievalStore, load_aggregate_embedding_snapshot,
     load_leaf_embedding_snapshot, parse_status, query_terms,
@@ -97,6 +100,34 @@ struct Edge {
     provenance_json: String,
     provenance_sha256: String,
 }
+
+#[derive(Debug, Clone)]
+pub(crate) struct GraphRecallSeed {
+    pub channel: RetrievalChannel,
+    pub source_id: String,
+    pub document_id: Option<String>,
+    pub rank: usize,
+    pub score: f64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct GraphRecallResult {
+    pub paths: Vec<GraphPathTrace>,
+    pub warning: Option<String>,
+}
+
+type RepresentativePath<'a> = (
+    f64,
+    usize,
+    usize,
+    String,
+    String,
+    Vec<String>,
+    Vec<String>,
+    Vec<String>,
+    &'a GraphRecallSeed,
+    f64,
+);
 
 impl PartialEq for Edge {
     fn eq(&self, other: &Self) -> bool {
@@ -435,6 +466,386 @@ pub(crate) fn refresh_graph(
         fingerprint,
         materialized_at,
     ))
+}
+
+pub(crate) fn recall_graph_from_connection(
+    store: &RetrievalStore,
+    connection: &Connection,
+    config: &MemoryConfig,
+    seeds: &[GraphRecallSeed],
+    session_filter: Option<&str>,
+) -> RetrievalResult<GraphRecallResult> {
+    config
+        .validate()
+        .map_err(|error| RetrievalError::CorruptIndex(format!("memory 配置无效：{error}")))?;
+    if seeds.is_empty() {
+        return Ok(GraphRecallResult::default());
+    }
+    if seeds
+        .iter()
+        .any(|seed| seed.rank == 0 || !seed.score.is_finite())
+    {
+        return Err(RetrievalError::CorruptIndex(
+            "图 seed rank/score 无效".into(),
+        ));
+    }
+    let spec = VectorIndexSpec::from_config(config)
+        .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+    let fingerprint = spec
+        .fingerprint()
+        .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+    let leaf_snapshot = load_leaf_embedding_snapshot(store, connection, &spec)?;
+    let aggregate_snapshot = load_aggregate_embedding_snapshot(store, connection, &spec)?;
+    validate_full_derived_integrity(connection)?;
+    let embeddings =
+        store.compatible_embeddings_from_connection(connection, &spec, &fingerprint, None)?;
+    validate_graph_embeddings(&embeddings)?;
+    let document_count: i64 = connection
+        .query_row("SELECT count(*) FROM memory_documents", [], |row| {
+            row.get(0)
+        })
+        .map_err(|error| store.database_error(error))?;
+    if usize::try_from(document_count).ok() != Some(embeddings.len()) {
+        return Err(RetrievalError::CorruptIndex(
+            "memory_documents 未被 compatible embeddings 完整覆盖".into(),
+        ));
+    }
+    let runs = store.validated_retrieval_runs_from_connection(connection)?;
+    let (expected_nodes, leaves, event_rows) =
+        build_nodes(connection, &leaf_snapshot, &aggregate_snapshot)?;
+    let expected_edges = build_edges(
+        connection,
+        config,
+        &expected_nodes,
+        &leaves,
+        &event_rows,
+        &embeddings,
+        &runs,
+    )?;
+    let config_sha256 = config_hash(config, &fingerprint);
+    let source_sha256 = source_hash(
+        connection,
+        &leaf_snapshot.catalog_sha256,
+        &aggregate_snapshot.catalog_sha256,
+        &fingerprint,
+        &embeddings,
+        &runs,
+    )?;
+    let catalog_sha256 = catalog_hash(&expected_nodes, &expected_edges);
+    if exact_existing_catalog(
+        connection,
+        &expected_nodes,
+        &expected_edges,
+        &fingerprint,
+        &config_sha256,
+        &source_sha256,
+        &catalog_sha256,
+    )?
+    .is_none()
+    {
+        return Err(RetrievalError::CorruptIndex(
+            "图 materialization 缺失或已过期".into(),
+        ));
+    }
+
+    let nodes = read_nodes(connection)?;
+    let edges = read_edges(connection)?;
+    let by_id = nodes
+        .iter()
+        .map(|node| (node.id.as_str(), node))
+        .collect::<BTreeMap<_, _>>();
+    let allowed = |node: &Node| {
+        node.kind == GraphNodeKind::Entity
+            || session_filter.is_none_or(|scope| node.session_id.as_deref() == Some(scope))
+    };
+    let channel_key = |channel| match channel {
+        RetrievalChannel::Bm25 => 0_u8,
+        RetrievalChannel::Vector => 1,
+        RetrievalChannel::Entity => 2,
+        RetrievalChannel::State => 3,
+        RetrievalChannel::Episode => 4,
+        RetrievalChannel::Graph => 5,
+    };
+    let mut channel_counts = BTreeMap::<u8, f64>::new();
+    for seed in seeds {
+        *channel_counts.entry(channel_key(seed.channel)).or_default() += 1.0 / seed.rank as f64;
+    }
+    let active_channels = channel_counts.len() as f64;
+    let mut seed_rows = Vec::new();
+    let mut personalization = BTreeMap::<String, f64>::new();
+    for seed in seeds {
+        let kind = if seed.channel == RetrievalChannel::Entity {
+            GraphNodeKind::Entity
+        } else {
+            GraphNodeKind::Document
+        };
+        let id = node_id(kind, &seed.source_id);
+        let node = by_id
+            .get(id.as_str())
+            .ok_or_else(|| RetrievalError::CorruptIndex(format!("图 seed 节点缺失：{id}")))?;
+        if !allowed(node) {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "图 seed 节点超出会话范围：{id}"
+            )));
+        }
+        let mass =
+            (1.0 / seed.rank as f64) / channel_counts[&channel_key(seed.channel)] / active_channels;
+        *personalization.entry(id.clone()).or_default() += mass;
+        seed_rows.push((seed, id, mass));
+    }
+    let total = personalization.values().sum::<f64>();
+    if !total.is_finite() || (total - 1.0).abs() > 1e-9 {
+        return Err(RetrievalError::CorruptIndex(
+            "图 personalization 未严格归一".into(),
+        ));
+    }
+
+    let mut incident = BTreeMap::<String, Vec<&Edge>>::new();
+    for edge in &edges {
+        let source = by_id
+            .get(edge.source.as_str())
+            .ok_or_else(|| RetrievalError::CorruptIndex(format!("图边 {} source 缺失", edge.id)))?;
+        let target = by_id
+            .get(edge.target.as_str())
+            .ok_or_else(|| RetrievalError::CorruptIndex(format!("图边 {} target 缺失", edge.id)))?;
+        if allowed(source) && allowed(target) {
+            incident.entry(edge.source.clone()).or_default().push(edge);
+            incident.entry(edge.target.clone()).or_default().push(edge);
+        }
+    }
+    let mut local = personalization.keys().cloned().collect::<BTreeSet<_>>();
+    let mut frontier = local.clone();
+    for _ in 0..config.max_graph_depth {
+        let mut next = BTreeSet::new();
+        for id in &frontier {
+            for edge in incident.get(id).into_iter().flatten() {
+                let other = if edge.source == *id {
+                    &edge.target
+                } else {
+                    &edge.source
+                };
+                if local.insert(other.clone()) {
+                    next.insert(other.clone());
+                }
+            }
+        }
+        frontier = next;
+    }
+    let mut rank = personalization.clone();
+    for id in &local {
+        rank.entry(id.clone()).or_default();
+    }
+    let mut converged = false;
+    for _ in 0..50 {
+        let mut next = personalization
+            .iter()
+            .map(|(id, mass)| (id.clone(), 0.5 * mass))
+            .collect::<BTreeMap<_, _>>();
+        let mut dangling = 0.0;
+        for (id, mass) in &rank {
+            let local_edges = incident
+                .get(id)
+                .into_iter()
+                .flatten()
+                .filter(|edge| {
+                    local.contains(if edge.source == *id {
+                        &edge.target
+                    } else {
+                        &edge.source
+                    })
+                })
+                .collect::<Vec<_>>();
+            let weight = local_edges.iter().map(|edge| edge.weight).sum::<f64>();
+            if !weight.is_finite() || weight < 0.0 {
+                return Err(RetrievalError::CorruptIndex("图局部转移权重无效".into()));
+            }
+            if weight == 0.0 {
+                dangling += mass;
+            } else {
+                for edge in local_edges {
+                    let other = if edge.source == *id {
+                        &edge.target
+                    } else {
+                        &edge.source
+                    };
+                    *next.entry(other.clone()).or_default() += 0.5 * mass * edge.weight / weight;
+                }
+            }
+        }
+        for (id, mass) in &personalization {
+            *next.entry(id.clone()).or_default() += 0.5 * dangling * mass;
+        }
+        let delta = local
+            .iter()
+            .map(|id| {
+                (next.get(id).copied().unwrap_or(0.0) - rank.get(id).copied().unwrap_or(0.0)).abs()
+            })
+            .sum::<f64>();
+        if next
+            .values()
+            .any(|value| !value.is_finite() || *value < 0.0)
+        {
+            return Err(RetrievalError::CorruptIndex("图 PPR 产生无效数值".into()));
+        }
+        let next_total = next.values().sum::<f64>();
+        if !next_total.is_finite() || (next_total - 1.0).abs() > 1e-9 {
+            return Err(RetrievalError::CorruptIndex("图 PPR 质量未守恒".into()));
+        }
+        rank = next;
+        if delta <= 1e-6 {
+            converged = true;
+            break;
+        }
+    }
+    let mut targets = local
+        .iter()
+        .filter_map(|id| {
+            let node = by_id[id.as_str()];
+            (node.kind == GraphNodeKind::Document)
+                .then(|| (id.clone(), node, rank.get(id).copied().unwrap_or(0.0)))
+        })
+        .collect::<Vec<_>>();
+    targets.sort_by(|left, right| {
+        right
+            .2
+            .total_cmp(&left.2)
+            .then_with(|| left.1.source_id.cmp(&right.1.source_id))
+    });
+    let mut paths = Vec::new();
+    for (target_rank, (target_id, target, score)) in targets.into_iter().enumerate() {
+        let mut best: Option<RepresentativePath<'_>> = None;
+        for (seed, seed_id, seed_mass) in &seed_rows {
+            let channel_priority = match seed.channel {
+                RetrievalChannel::Bm25 => 0,
+                RetrievalChannel::Vector => 1,
+                _ => 2,
+            };
+            let mut candidates = Vec::new();
+            if seed_id == &target_id {
+                candidates.push((Vec::new(), vec![seed_id.clone()], 1.0));
+            }
+            for first in incident.get(seed_id).into_iter().flatten() {
+                let mid = if first.source == *seed_id {
+                    &first.target
+                } else {
+                    &first.source
+                };
+                let denom = incident
+                    .get(seed_id)
+                    .into_iter()
+                    .flatten()
+                    .filter(|edge| {
+                        local.contains(if edge.source == *seed_id {
+                            &edge.target
+                        } else {
+                            &edge.source
+                        })
+                    })
+                    .map(|edge| edge.weight)
+                    .sum::<f64>();
+                if mid == &target_id {
+                    candidates.push((
+                        vec![*first],
+                        vec![seed_id.clone(), mid.clone()],
+                        first.weight / denom,
+                    ));
+                }
+                if config.max_graph_depth == 2 && mid != seed_id {
+                    for second in incident.get(mid).into_iter().flatten() {
+                        let end = if second.source == *mid {
+                            &second.target
+                        } else {
+                            &second.source
+                        };
+                        if end == &target_id && end != seed_id {
+                            let mid_denom = incident
+                                .get(mid)
+                                .into_iter()
+                                .flatten()
+                                .filter(|edge| {
+                                    local.contains(if edge.source == *mid {
+                                        &edge.target
+                                    } else {
+                                        &edge.source
+                                    })
+                                })
+                                .map(|edge| edge.weight)
+                                .sum::<f64>();
+                            candidates.push((
+                                vec![*first, *second],
+                                vec![seed_id.clone(), mid.clone(), end.clone()],
+                                first.weight / denom * second.weight / mid_denom,
+                            ));
+                        }
+                    }
+                }
+            }
+            for (path_edges, path_nodes, probability) in candidates {
+                let quality = seed_mass * probability;
+                let edge_ids = path_edges
+                    .iter()
+                    .map(|edge| edge.id.clone())
+                    .collect::<Vec<_>>();
+                let edge_types = path_edges
+                    .iter()
+                    .map(|edge| edge_name(edge.kind).to_owned())
+                    .collect::<Vec<_>>();
+                let key = (
+                    quality,
+                    path_edges.len(),
+                    channel_priority,
+                    seed_id.clone(),
+                    seed.source_id.clone(),
+                    edge_ids.clone(),
+                    path_nodes.clone(),
+                    edge_types,
+                    *seed,
+                    *seed_mass,
+                );
+                let replace = best.as_ref().is_none_or(|old| {
+                    quality > old.0
+                        || (quality == old.0
+                            && (key.1, key.2, &key.3, &key.4, &key.5, &key.6)
+                                < (old.1, old.2, &old.3, &old.4, &old.5, &old.6))
+                });
+                if replace {
+                    best = Some(key);
+                }
+            }
+        }
+        let Some((_, _, _, seed_node_id, _, edge_ids, node_ids, edge_types, seed, seed_mass)) =
+            best
+        else {
+            continue;
+        };
+        paths.push(GraphPathTrace {
+            seed_document_id: seed.document_id.clone().unwrap_or_default(),
+            target_document_id: target.source_id.clone(),
+            edge_types,
+            node_ids,
+            score,
+            seed_channel: seed.channel,
+            seed_node_id,
+            seed_source_id: seed.source_id.clone(),
+            seed_rank: seed.rank,
+            seed_score: seed.score,
+            seed_mass,
+            edge_ids,
+            target_rank: target_rank + 1,
+            target_granularity: target.granularity,
+            target_session_id: target.session_id.clone().unwrap_or_default(),
+            reason: if seed.document_id.as_deref() == Some(target.source_id.as_str()) {
+                "seed_document".into()
+            } else {
+                String::new()
+            },
+            ..Default::default()
+        });
+    }
+    Ok(GraphRecallResult {
+        paths,
+        warning: (!converged).then(|| "graph PPR did not converge after 50 iterations".into()),
+    })
 }
 
 fn validate_graph_embeddings(embeddings: &[StoredEmbedding]) -> RetrievalResult<()> {
