@@ -1351,7 +1351,7 @@ fn read_nodes(c: &Connection) -> RetrievalResult<Vec<Node>> {
     .map_err(|e| RetrievalError::CorruptIndex(e.to_string()))
 }
 fn read_edges(c: &Connection) -> RetrievalResult<Vec<Edge>> {
-    let mut s=c.prepare("SELECT edge_id,edge_type,source_node_id,target_node_id,weight,directed,provenance_json,provenance_sha256 FROM memory_graph_edges ORDER BY edge_type,source_node_id,target_node_id").map_err(|e|RetrievalError::CorruptIndex(e.to_string()))?;
+    let mut s=c.prepare("SELECT edge_id,edge_type,source_node_id,target_node_id,weight,directed,provenance_json,provenance_sha256 FROM memory_graph_edges").map_err(|e|RetrievalError::CorruptIndex(e.to_string()))?;
     let mut out = Vec::new();
     let rows = s
         .query_map([], |r| {
@@ -1389,6 +1389,9 @@ fn read_edges(c: &Connection) -> RetrievalResult<Vec<Edge>> {
             provenance_sha256: hash,
         });
     }
+    out.sort_by(|left, right| {
+        (left.kind, &left.source, &left.target).cmp(&(right.kind, &right.source, &right.target))
+    });
     Ok(out)
 }
 fn parse_edge(v: &str) -> RetrievalResult<GraphEdgeType> {
