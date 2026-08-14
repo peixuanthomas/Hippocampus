@@ -2984,6 +2984,31 @@ impl RetrievalStore {
             return Ok(result);
         }
 
+        {
+            let _guard = self.acquire_root_read()?;
+            let control = self.replay_control_state_under_guard()?;
+            if let Some(session_id) = session_filter {
+                Self::require_active_session(&control, session_id)?;
+            }
+            let mut connection = self.open_connection()?;
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Deferred)
+                .map_err(|error| self.database_error(error))?;
+            self.validate_recall_input_id(
+                &transaction,
+                &control,
+                current_user_event_id,
+                session_filter,
+            )?;
+            for event_id in recent_event_ids {
+                self.validate_recall_input_id(&transaction, &control, event_id, session_filter)?;
+            }
+            transaction
+                .commit()
+                .map_err(|error| self.database_error(error))?;
+            self.require_unchanged_control_state(&control)?;
+        }
+
         let spec = VectorIndexSpec::from_config(memory_config)
             .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
         let query_kind = classify_query(raw_query);
