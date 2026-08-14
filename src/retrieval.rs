@@ -1236,7 +1236,9 @@ impl RetrievalStore {
         let aggregate_readiness = if aggregate_sessions.is_empty() {
             HashMap::new()
         } else {
-            self.validate_aggregate_derived_integrity(connection)?;
+            if session_filter.is_none() {
+                self.validate_aggregate_derived_integrity(connection)?;
+            }
             self.aggregate_readiness_by_session(
                 connection,
                 &aggregate_sessions,
@@ -2013,15 +2015,18 @@ impl RetrievalStore {
         spec.validate()
             .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
         let _guard = self.acquire_root_read()?;
-        let connection = self.open_connection()?;
+        let mut connection = self.open_connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(|error| self.database_error(error))?;
         let total = if let Some(session_id) = session_filter {
-            connection.query_row(
+            transaction.query_row(
                 "SELECT count(*) FROM memory_documents WHERE session_id=?1",
                 [session_id],
                 |row| i64_to_usize(row.get(0)?),
             )
         } else {
-            connection.query_row("SELECT count(*) FROM memory_documents", [], |row| {
+            transaction.query_row("SELECT count(*) FROM memory_documents", [], |row| {
                 i64_to_usize(row.get(0)?)
             })
         }
@@ -2030,7 +2035,7 @@ impl RetrievalStore {
             .fingerprint()
             .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
         let rows = self.compatible_embeddings_from_connection(
-            &connection,
+            &transaction,
             spec,
             &fingerprint,
             session_filter,
@@ -2041,6 +2046,9 @@ impl RetrievalStore {
                 rows.len()
             )));
         }
+        transaction
+            .commit()
+            .map_err(|error| self.database_error(error))?;
         if session_filter.is_some() {
             return HnswVectorIndex::rebuild(spec.clone(), rows)
                 .map(Arc::new)
@@ -8239,6 +8247,8 @@ fn apply_vector_fallback(result: &mut RecallResult, bm25_ms: u64, vector_ms: u64
         ),
         channel_trace(RetrievalChannel::Entity, "skipped", 0, 0, None),
         channel_trace(RetrievalChannel::State, "skipped", 0, 0, None),
+        channel_trace(RetrievalChannel::Episode, "skipped", 0, 0, None),
+        channel_trace(RetrievalChannel::Graph, "skipped", 0, 0, None),
     ];
     result.trace.warnings.push(error);
 }
@@ -8265,6 +8275,8 @@ fn apply_sidecar_fallback(result: &mut RecallResult, bm25_ms: u64, vector_ms: u6
         ),
         channel_trace(RetrievalChannel::Entity, "error", 0, 0, Some(error.clone())),
         channel_trace(RetrievalChannel::State, "error", 0, 0, Some(error.clone())),
+        channel_trace(RetrievalChannel::Episode, "skipped", 0, 0, None),
+        channel_trace(RetrievalChannel::Graph, "skipped", 0, 0, None),
     ];
     result.trace.warnings.push(error);
 }
