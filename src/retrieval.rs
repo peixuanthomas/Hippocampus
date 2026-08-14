@@ -951,17 +951,30 @@ impl RetrievalStore {
         control: &ControlState,
         document_id: &str,
     ) -> RetrievalResult<bool> {
+        let memory = connection.query_row(
+            "SELECT session_id,granularity,source_sha256 FROM memory_documents WHERE document_id=?1",
+            [document_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+        ).optional().map_err(|error| self.database_error(error))?
+            .ok_or_else(|| RetrievalError::CorruptIndex(
+                "trace 文档引用缺少 memory_documents 来源".into()
+            ))?;
         let raw = connection
             .query_row(
-                "SELECT r.event_id,e.session_id FROM retrieval_documents r
+                "SELECT r.event_id,e.session_id,r.start_char,r.end_char,r.granularity,r.content_sha256
+                 FROM retrieval_documents r
              LEFT JOIN events e ON e.event_id=r.event_id WHERE r.document_id=?1",
                 [document_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                |row| Ok((
+                    row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?,
+                    i64_to_usize(row.get(2)?)?, i64_to_usize(row.get(3)?)?,
+                    row.get::<_, String>(4)?, row.get::<_, String>(5)?,
+                )),
             )
             .optional()
             .map_err(|error| self.database_error(error))?;
-        if let Some((event_id, session_id)) = raw {
-            if control.event_is_excluded(&event_id)
+        if let Some((event_id, session_id, _, _, _, _)) = &raw {
+            if control.event_is_excluded(event_id)
                 || session_id
                     .as_deref()
                     .is_some_and(|session| !control.allows_session(session))
@@ -974,7 +987,77 @@ impl RetrievalStore {
                 ));
             }
         }
-        self.memory_document_is_active(connection, control, document_id)
+        let active = self.memory_document_is_active(connection, control, document_id)?;
+        if !active {
+            return Ok(false);
+        }
+        match memory.1.as_str() {
+            "message" | "fragment" => {
+                let (event_id, session_id, start, end, granularity, hash) =
+                    raw.ok_or_else(|| {
+                        RetrievalError::CorruptIndex(
+                            "active leaf 文档缺少 retrieval_documents 来源".into(),
+                        )
+                    })?;
+                let member = connection
+                    .query_row(
+                        "SELECT event_id,start_char,end_char,content_sha256
+                     FROM memory_document_members WHERE document_id=?1 AND ordinal=0",
+                        [document_id],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                i64_to_usize(row.get(1)?)?,
+                                i64_to_usize(row.get(2)?)?,
+                                row.get::<_, String>(3)?,
+                            ))
+                        },
+                    )
+                    .map_err(|error| self.database_error(error))?;
+                if session_id.as_deref() != Some(memory.0.as_str())
+                    || event_id != member.0
+                    || start != member.1
+                    || end != member.2
+                    || granularity != memory.1
+                    || hash != memory.2
+                    || hash != member.3
+                {
+                    return Err(RetrievalError::CorruptIndex(
+                        "active leaf 文档的 retrieval/memory 来源不一致".into(),
+                    ));
+                }
+            }
+            "episode" | "session" => {
+                if let Some((event_id, session_id, start, end, granularity, hash)) = raw {
+                    let member_count: i64 = connection
+                        .query_row(
+                            "SELECT count(*) FROM memory_document_members
+                         WHERE document_id=?1 AND event_id=?2 AND start_char=?3
+                           AND end_char=?4 AND content_sha256=?5",
+                            params![
+                                document_id,
+                                event_id,
+                                usize_to_i64(start).map_err(|error| self.database_error(error))?,
+                                usize_to_i64(end).map_err(|error| self.database_error(error))?,
+                                hash
+                            ],
+                            |row| row.get(0),
+                        )
+                        .map_err(|error| self.database_error(error))?;
+                    if session_id.as_deref() != Some(memory.0.as_str())
+                        || granularity != memory.1
+                        || hash != memory.2
+                        || member_count != 1
+                    {
+                        return Err(RetrievalError::CorruptIndex(
+                            "aggregate 文档的 retrieval/memory 来源不一致".into(),
+                        ));
+                    }
+                }
+            }
+            _ => unreachable!("memory_document_is_active validated granularity"),
+        }
+        Ok(true)
     }
 
     fn active_memory_document_count(
