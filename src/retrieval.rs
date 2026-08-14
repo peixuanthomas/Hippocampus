@@ -12,7 +12,7 @@ use thiserror::Error;
 
 use crate::config::MemoryConfig;
 use crate::consolidation::{normalize_match, validate_full_derived_integrity};
-use crate::context::WrappedHistoryCursor;
+use crate::context::{WrappedHistoryCursor, wrapped_history_identity};
 use crate::episode::{
     EMBEDDING_COSINE_SIMILARITY_THRESHOLD, EPISODE_ALGORITHM_VERSION, EpisodeBoundaryDecision,
     EpisodeBoundarySuggestion, EpisodeDocument, EpisodeInputMessage, EpisodeMaterializationReport,
@@ -2778,6 +2778,20 @@ impl RetrievalStore {
                     "回答 {answer_event_id} 在原始会话中缺少对应轮次"
                 ))
             })?;
+        if turn.context_trace.untrusted_history_wrapped {
+            let expected_identity = wrapped_history_identity(
+                &source.session.ai_name,
+                &turn.context_trace.retrieval.selected_evidence,
+            );
+            if turn.context_trace.identity_instruction.as_deref()
+                != Some(expected_identity.as_str())
+                || answer.identity_instruction.as_deref() != Some(expected_identity.as_str())
+            {
+                return Err(RetrievalError::CorruptIndex(
+                    "不可信历史身份指令与规范元数据不匹配".into(),
+                ));
+            }
+        }
         answer.knowledge_trace = turn.context_trace.knowledge.clone();
         KnowledgeStore::new(&self.root)
             .and_then(|store| store.verify_trace(&answer.knowledge_trace))
@@ -2839,7 +2853,11 @@ impl RetrievalStore {
                     is_session_system_prompt,
                 )
                 .map_err(|message| RetrievalError::CorruptIndex(message.into()))?;
-            if source_event.role != role && wrapped_source_role != Some(source_event.role) {
+            let role_matches = match wrapped_source_role {
+                Some(selected_role) => selected_role == source_event.role,
+                None => role == source_event.role,
+            };
+            if !role_matches {
                 return Err(RetrievalError::CorruptIndex(
                     "回答上下文角色与原始事件不匹配".into(),
                 ));
@@ -3011,6 +3029,18 @@ impl RetrievalStore {
                 source.legacy,
                 &source.path,
             )?;
+            if derived.untrusted_history_wrapped {
+                let expected_identity = wrapped_history_identity(
+                    &source.session.ai_name,
+                    &turn.context_trace.retrieval.selected_evidence,
+                );
+                if derived.identity_instruction.as_deref() != Some(expected_identity.as_str()) {
+                    return Err(RetrievalError::InvalidSource {
+                        path: source.path.clone(),
+                        message: format!("回答 {} 的不可信历史身份指令与规范元数据不匹配", turn.id),
+                    });
+                }
+            }
             insert_answer_context(transaction, &answer_id, turn, &derived)
                 .map_err(|error| self.database_error(error))?;
             transaction
@@ -3075,7 +3105,11 @@ impl RetrievalStore {
                     path: source.path.clone(),
                     message: message.into(),
                 })?;
-                if item.role != event.role && wrapped_source_role != Some(event.role) {
+                let role_matches = match wrapped_source_role {
+                    Some(selected_role) => selected_role == event.role,
+                    None => item.role == event.role,
+                };
+                if !role_matches {
                     return Err(RetrievalError::InvalidSource {
                         path: source.path.clone(),
                         message: format!(
