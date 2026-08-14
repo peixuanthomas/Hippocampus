@@ -481,6 +481,7 @@ pub struct LeafEmbeddingDocument {
 #[derive(Debug, Clone, PartialEq)]
 pub struct LeafEmbeddingSnapshot {
     pub catalog_sha256: String,
+    pub control_generation_sha256: String,
     pub session_ids: Vec<String>,
     pub documents: Vec<LeafEmbeddingDocument>,
 }
@@ -507,6 +508,7 @@ pub struct AggregateEmbeddingDocument {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AggregateEmbeddingSnapshot {
     pub catalog_sha256: String,
+    pub control_generation_sha256: String,
     pub documents: Vec<AggregateEmbeddingDocument>,
 }
 
@@ -845,6 +847,23 @@ impl RetrievalStore {
     ) -> RetrievalResult<()> {
         if !self.control_projection_is_current(connection, state)? {
             return Err(RetrievalError::ControlProjectionStale);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn verify_embedding_refresh_generation(
+        &self,
+        expected_generation_sha256: &str,
+    ) -> RetrievalResult<()> {
+        {
+            let _guard = self.acquire_root_read()?;
+            let state = self.replay_control_state_under_guard()?;
+            if state.generation_sha256() != expected_generation_sha256 {
+                return Err(RetrievalError::ControlStateChanged);
+            }
+            let connection = self.open_connection()?;
+            self.require_current_control_projection(&connection, &state)?;
+            self.require_unchanged_control_state(&state)?;
         }
         Ok(())
     }
@@ -1955,6 +1974,7 @@ impl RetrievalStore {
         let transaction = connection
             .transaction()
             .map_err(|error| self.database_error(error))?;
+        self.require_current_control_projection(&transaction, &control)?;
         let mut document_ids = HashSet::with_capacity(writes.len());
         let mut prepared = Vec::with_capacity(writes.len());
         let mut leaf_sessions = HashSet::new();
@@ -2173,7 +2193,9 @@ impl RetrievalStore {
         let _guard = self.acquire_root_read()?;
         let control = self.replay_control_state_under_guard()?;
         let connection = self.open_connection()?;
-        let snapshot = load_leaf_embedding_snapshot(self, &connection, spec)?;
+        self.require_current_control_projection(&connection, &control)?;
+        let snapshot =
+            load_leaf_embedding_snapshot_with_control(self, &connection, spec, &control)?;
         self.require_unchanged_control_state(&control)?;
         Ok(snapshot)
     }
@@ -2197,12 +2219,20 @@ impl RetrievalStore {
         )?;
         let _guard = self.acquire_root_write()?;
         let control = self.replay_control_state_under_guard()?;
+        if snapshot.control_generation_sha256 != control.generation_sha256() {
+            return Err(RetrievalError::EmbeddingCatalogStale {
+                kind: "leaf".into(),
+            });
+        }
         let mut connection = self.open_connection()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| self.database_error(error))?;
-        let current = load_leaf_embedding_snapshot(self, &transaction, spec)?;
+        self.require_current_control_projection(&transaction, &control)?;
+        let current =
+            load_leaf_embedding_snapshot_with_control(self, &transaction, spec, &control)?;
         if current.catalog_sha256 != snapshot.catalog_sha256
+            || current.control_generation_sha256 != snapshot.control_generation_sha256
             || current.session_ids != snapshot.session_ids
             || current.documents != snapshot.documents
         {
@@ -2275,7 +2305,9 @@ impl RetrievalStore {
         let _guard = self.acquire_root_read()?;
         let control = self.replay_control_state_under_guard()?;
         let connection = self.open_connection()?;
-        let snapshot = load_aggregate_embedding_snapshot(self, &connection, spec)?;
+        self.require_current_control_projection(&connection, &control)?;
+        let snapshot =
+            load_aggregate_embedding_snapshot_with_control(self, &connection, spec, &control)?;
         self.require_unchanged_control_state(&control)?;
         Ok(snapshot)
     }
@@ -2299,11 +2331,18 @@ impl RetrievalStore {
         )?;
         let _guard = self.acquire_root_write()?;
         let control = self.replay_control_state_under_guard()?;
+        if snapshot.control_generation_sha256 != control.generation_sha256() {
+            return Err(RetrievalError::EmbeddingCatalogStale {
+                kind: "aggregate".into(),
+            });
+        }
         let mut connection = self.open_connection()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| self.database_error(error))?;
-        let current = load_aggregate_embedding_snapshot(self, &transaction, spec)?;
+        self.require_current_control_projection(&transaction, &control)?;
+        let current =
+            load_aggregate_embedding_snapshot_with_control(self, &transaction, spec, &control)?;
         if current != *snapshot {
             return Err(RetrievalError::EmbeddingCatalogStale {
                 kind: "aggregate".into(),
@@ -2369,6 +2408,7 @@ impl RetrievalStore {
         let _guard = self.acquire_root_read()?;
         let control = self.replay_control_state_under_guard()?;
         let connection = self.open_connection()?;
+        self.require_current_control_projection(&connection, &control)?;
         let fingerprint = spec
             .fingerprint()
             .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
@@ -2384,6 +2424,7 @@ impl RetrievalStore {
         let _guard = self.acquire_root_read()?;
         let control = self.replay_control_state_under_guard()?;
         let connection = self.open_connection()?;
+        self.require_current_control_projection(&connection, &control)?;
         let total = self.active_memory_document_count(&connection, &control, None)?;
         let fingerprint = spec
             .fingerprint()
@@ -8770,6 +8811,16 @@ pub(crate) fn load_leaf_embedding_snapshot(
     connection: &Connection,
     spec: &VectorIndexSpec,
 ) -> RetrievalResult<LeafEmbeddingSnapshot> {
+    let control = store.replay_control_state_under_guard()?;
+    load_leaf_embedding_snapshot_with_control(store, connection, spec, &control)
+}
+
+fn load_leaf_embedding_snapshot_with_control(
+    store: &RetrievalStore,
+    connection: &Connection,
+    spec: &VectorIndexSpec,
+    control: &ControlState,
+) -> RetrievalResult<LeafEmbeddingSnapshot> {
     let fingerprint = embedding_fingerprint(spec)?;
     let mut hasher = Sha256::new();
     hash_string(&mut hasher, "hippocampus.embedding.catalog.leaf");
@@ -8778,8 +8829,8 @@ pub(crate) fn load_leaf_embedding_snapshot(
         &EMBEDDING_CATALOG_ALGORITHM_VERSION.to_be_bytes(),
     );
     hash_string(&mut hasher, &fingerprint);
-    let control = store.replay_control_state_under_guard()?;
-    hash_string(&mut hasher, &control.generation_sha256());
+    let control_generation_sha256 = control.generation_sha256();
+    hash_string(&mut hasher, &control_generation_sha256);
     let session_ids = hash_session_catalog(connection, &mut hasher)?
         .into_iter()
         .filter(|id| control.allows_session(id))
@@ -8888,7 +8939,7 @@ pub(crate) fn load_leaf_embedding_snapshot(
         if !control.allows_event(&session_id, &event_id) {
             continue;
         }
-        if store.memory_document_is_active(connection, &control, &id)? {
+        if store.memory_document_is_active(connection, control, &id)? {
             actual_ids.push(id);
         }
     }
@@ -8902,7 +8953,7 @@ pub(crate) fn load_leaf_embedding_snapshot(
         .map_err(|error| RetrievalError::CorruptIndex(format!("读取 memory leaf catalog 失败：{error}")))?;
     let mut memory_ids = Vec::new();
     for id in all_memory_ids {
-        if store.memory_document_is_active(connection, &control, &id)? {
+        if store.memory_document_is_active(connection, control, &id)? {
             memory_ids.push(id);
         }
     }
@@ -8965,6 +9016,7 @@ pub(crate) fn load_leaf_embedding_snapshot(
     hash_embedding_rows(connection, &mut hasher, "'message','fragment'")?;
     Ok(LeafEmbeddingSnapshot {
         catalog_sha256: format!("{:x}", hasher.finalize()),
+        control_generation_sha256,
         session_ids,
         documents,
     })
@@ -8975,6 +9027,16 @@ pub(crate) fn load_aggregate_embedding_snapshot(
     connection: &Connection,
     spec: &VectorIndexSpec,
 ) -> RetrievalResult<AggregateEmbeddingSnapshot> {
+    let control = store.replay_control_state_under_guard()?;
+    load_aggregate_embedding_snapshot_with_control(store, connection, spec, &control)
+}
+
+fn load_aggregate_embedding_snapshot_with_control(
+    store: &RetrievalStore,
+    connection: &Connection,
+    spec: &VectorIndexSpec,
+    control: &ControlState,
+) -> RetrievalResult<AggregateEmbeddingSnapshot> {
     let fingerprint = embedding_fingerprint(spec)?;
     let mut hasher = Sha256::new();
     hash_string(&mut hasher, "hippocampus.embedding.catalog.aggregate");
@@ -8983,8 +9045,8 @@ pub(crate) fn load_aggregate_embedding_snapshot(
         &EMBEDDING_CATALOG_ALGORITHM_VERSION.to_be_bytes(),
     );
     hash_string(&mut hasher, &fingerprint);
-    let control = store.replay_control_state_under_guard()?;
-    hash_string(&mut hasher, &control.generation_sha256());
+    let control_generation_sha256 = control.generation_sha256();
+    hash_string(&mut hasher, &control_generation_sha256);
     let session_ids = hash_session_catalog(connection, &mut hasher)?
         .into_iter()
         .filter(|id| control.allows_session(id))
@@ -9007,7 +9069,7 @@ pub(crate) fn load_aggregate_embedding_snapshot(
         }
         let persisted = load_persisted_aggregate_documents(connection, session_id)?;
         for document in persisted {
-            if !store.memory_document_is_active(connection, &control, &document.document_id)? {
+            if !store.memory_document_is_active(connection, control, &document.document_id)? {
                 continue;
             }
             let granularity = match document.granularity.as_str() {
@@ -9109,6 +9171,7 @@ pub(crate) fn load_aggregate_embedding_snapshot(
     hash_embedding_rows(connection, &mut hasher, "'episode','session'")?;
     Ok(AggregateEmbeddingSnapshot {
         catalog_sha256: format!("{:x}", hasher.finalize()),
+        control_generation_sha256,
         documents,
     })
 }

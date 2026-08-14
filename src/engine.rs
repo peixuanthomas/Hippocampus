@@ -528,6 +528,20 @@ impl<B: ChatBackend> ChatEngine<B> {
                 dimensions: None,
                 truncate: false,
             };
+            let retrieval = self.store.retrieval().clone();
+            let expected_generation = leaf_snapshot.control_generation_sha256.clone();
+            tokio::task::spawn_blocking(move || {
+                retrieval.verify_embedding_refresh_generation(&expected_generation)
+            })
+            .await
+            .map_err(|source| EmbeddingRefreshError::TaskJoin {
+                stage: EmbeddingRefreshStage::Backend,
+                source,
+            })?
+            .map_err(|source| EmbeddingRefreshError::Retrieval {
+                stage: EmbeddingRefreshStage::Backend,
+                source,
+            })?;
             backend_batches += 1;
             let call = self.client.embed(request);
             let response = tokio::select! {
