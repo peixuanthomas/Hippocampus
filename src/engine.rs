@@ -1001,24 +1001,36 @@ impl<B: ChatBackend> ChatEngine<B> {
                 ]
             })
             .collect::<Vec<_>>();
-        let recall = self
-            .store
-            .retrieval()
-            .keyword_recall(
+        let recall = if self.config.memory.enabled {
+            self.store
+                .retrieval()
+                .hybrid_recall(
+                    &self.client,
+                    &user_content,
+                    &current_event_id,
+                    &recent_event_ids,
+                    None,
+                    session.retrieval.clone(),
+                    &self.config.memory,
+                )
+                .await
+        } else {
+            self.store.retrieval().keyword_recall(
                 &user_content,
                 &current_event_id,
                 &recent_event_ids,
                 session.retrieval.clone(),
             )
-            .inspect_err(|error| {
-                session.turns[turn_index].context_trace.retrieval = crate::model::RetrievalTrace {
-                    status: "failed".into(),
-                    current_query_event_id: current_event_id.clone(),
-                    error: Some(error.to_string()),
-                    config: session.retrieval.clone(),
-                    ..Default::default()
-                };
-            })?;
+        }
+        .inspect_err(|error| {
+            session.turns[turn_index].context_trace.retrieval = crate::model::RetrievalTrace {
+                status: "failed".into(),
+                current_query_event_id: current_event_id.clone(),
+                error: Some(error.to_string()),
+                config: session.retrieval.clone(),
+                ..Default::default()
+            };
+        })?;
         let knowledge = self
             .store
             .knowledge()
