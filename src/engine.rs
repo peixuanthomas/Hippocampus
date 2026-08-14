@@ -167,6 +167,42 @@ struct BudgetEvidenceGroup {
     evidence: Vec<RecalledEvidence>,
 }
 
+#[derive(Debug, Clone)]
+enum AcceptedBudgetUnit {
+    Recent {
+        index: usize,
+        increment: u64,
+        reflow: bool,
+    },
+    Evidence {
+        id: String,
+        bucket: BudgetBucket,
+        increment: u64,
+        reflow: bool,
+    },
+}
+
+impl AcceptedBudgetUnit {
+    fn bucket(&self) -> BudgetBucket {
+        match self {
+            Self::Recent { .. } => BudgetBucket::RecentHistory,
+            Self::Evidence { bucket, .. } => *bucket,
+        }
+    }
+
+    fn increment(&self) -> u64 {
+        match self {
+            Self::Recent { increment, .. } | Self::Evidence { increment, .. } => *increment,
+        }
+    }
+
+    fn is_reflow(&self) -> bool {
+        match self {
+            Self::Recent { reflow, .. } | Self::Evidence { reflow, .. } => *reflow,
+        }
+    }
+}
+
 fn consolidation_report(
     session: &Session,
     trigger: ConsolidationTrigger,
@@ -2336,6 +2372,7 @@ impl<B: ChatBackend> ChatEngine<B> {
         let mut deferred_history = Vec::<usize>::new();
         let mut deferred_groups = Vec::<BudgetEvidenceGroup>::new();
         let mut rejected_increments = HashMap::<String, u64>::new();
+        let mut acceptance_log = Vec::<AcceptedBudgetUnit>::new();
 
         let recent_started = Instant::now();
         let recent_limit = mandatory_tokens.saturating_add(budget.initial_tokens.recent_history);
@@ -2359,6 +2396,11 @@ impl<B: ChatBackend> ChatEngine<B> {
                     .actual_tokens
                     .recent_history
                     .saturating_add(tokens.saturating_sub(current_tokens));
+                acceptance_log.push(AcceptedBudgetUnit::Recent {
+                    index: *index,
+                    increment: tokens.saturating_sub(current_tokens),
+                    reflow: false,
+                });
                 current_tokens = tokens;
             } else {
                 rejected_increments.insert(
@@ -2416,6 +2458,12 @@ impl<B: ChatBackend> ChatEngine<B> {
                 if tokens <= input_budget && tokens.saturating_sub(bucket_base) <= share {
                     accepted_groups = proposed_groups;
                     add_breakdown(&mut budget.actual_tokens, bucket, increment);
+                    acceptance_log.push(AcceptedBudgetUnit::Evidence {
+                        id: group.id.clone(),
+                        bucket,
+                        increment,
+                        reflow: false,
+                    });
                     current_tokens = tokens;
                 } else {
                     rejected_increments.insert(group.id.clone(), increment);
@@ -2459,6 +2507,11 @@ impl<B: ChatBackend> ChatEngine<B> {
                     if tokens <= input_budget && increment <= reflow_pool {
                         accepted_history = proposed;
                         add_breakdown(&mut budget.actual_tokens, bucket, increment);
+                        acceptance_log.push(AcceptedBudgetUnit::Recent {
+                            index: *index,
+                            increment,
+                            reflow: true,
+                        });
                         reflow_pool = reflow_pool.saturating_sub(increment);
                         current_tokens = tokens;
                     } else {
@@ -2502,6 +2555,12 @@ impl<B: ChatBackend> ChatEngine<B> {
                     if tokens <= input_budget && increment <= reflow_pool {
                         accepted_groups = proposed_groups;
                         add_breakdown(&mut budget.actual_tokens, bucket, increment);
+                        acceptance_log.push(AcceptedBudgetUnit::Evidence {
+                            id: group.id.clone(),
+                            bucket,
+                            increment,
+                            reflow: true,
+                        });
                         reflow_pool = reflow_pool.saturating_sub(increment);
                         current_tokens = tokens;
                     } else {
@@ -2557,7 +2616,7 @@ impl<B: ChatBackend> ChatEngine<B> {
         }
 
         let final_started = Instant::now();
-        let final_recall = recall_for_groups(recall, &accepted_groups);
+        let mut final_recall = recall_for_groups(recall, &accepted_groups);
         let mut current = self
             .assemble_and_probe(
                 session,
@@ -2569,6 +2628,95 @@ impl<B: ChatBackend> ChatEngine<B> {
             )
             .await?;
         current_tokens = plan_metric(&current)?;
+        while current_tokens > input_budget {
+            let Some(removed) = acceptance_log.pop() else {
+                budget.mandatory_input_tokens = current_tokens;
+                budget.available_input_tokens = 0;
+                break;
+            };
+            let (bucket, group_id, removed_increment) = match removed {
+                AcceptedBudgetUnit::Recent {
+                    index, increment, ..
+                } => {
+                    accepted_history.retain(|candidate| *candidate != index);
+                    (
+                        BudgetBucket::RecentHistory,
+                        format!("turn:{}", session.turns[index].id),
+                        increment,
+                    )
+                }
+                AcceptedBudgetUnit::Evidence {
+                    id,
+                    bucket,
+                    increment,
+                    ..
+                } => {
+                    accepted_groups.retain(|group| group.id != id);
+                    (bucket, id, increment)
+                }
+            };
+            budget.exclusions.retain(|exclusion| {
+                exclusion.candidate_group_id != group_id || exclusion.stage == "final_probe"
+            });
+            if !budget.exclusions.iter().any(|exclusion| {
+                exclusion.candidate_group_id == group_id && exclusion.stage == "final_probe"
+            }) {
+                budget.exclusions.push(BudgetExclusionTrace {
+                    bucket,
+                    candidate_group_id: group_id,
+                    stage: "final_probe".into(),
+                    reason: "final_probe_over_budget".into(),
+                    exact_increment_tokens: Some(removed_increment),
+                });
+            }
+            final_recall = recall_for_groups(recall, &accepted_groups);
+            current = self
+                .assemble_and_probe(
+                    session,
+                    turn_index,
+                    &accepted_history,
+                    user_content,
+                    &final_recall,
+                    knowledge,
+                )
+                .await?;
+            current_tokens = plan_metric(&current)?;
+        }
+        budget.actual_tokens = BudgetTokenBreakdown::default();
+        for accepted in &acceptance_log {
+            add_breakdown(
+                &mut budget.actual_tokens,
+                accepted.bucket(),
+                accepted.increment(),
+            );
+        }
+        let initial_consumed = acceptance_log
+            .iter()
+            .filter(|accepted| !accepted.is_reflow())
+            .map(AcceptedBudgetUnit::increment)
+            .sum::<u64>();
+        let mut remaining = available.saturating_sub(initial_consumed);
+        budget.reflow.clear();
+        for bucket in [
+            BudgetBucket::RecentHistory,
+            BudgetBucket::ExactOrState,
+            BudgetBucket::Episode,
+            BudgetBucket::Graph,
+        ] {
+            let offered = remaining;
+            let consumed = acceptance_log
+                .iter()
+                .filter(|accepted| accepted.is_reflow() && accepted.bucket() == bucket)
+                .map(AcceptedBudgetUnit::increment)
+                .sum::<u64>();
+            remaining = remaining.saturating_sub(consumed);
+            budget.reflow.push(BudgetReflowTrace {
+                bucket,
+                offered_tokens: offered,
+                consumed_tokens: consumed,
+                remaining_tokens: remaining,
+            });
+        }
         budget.final_input_tokens = Some(current_tokens);
         budget.stage_latencies.push(BudgetStageLatencyTrace {
             stage: "final_probe".into(),

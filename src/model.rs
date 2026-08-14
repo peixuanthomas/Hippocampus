@@ -1582,6 +1582,7 @@ mod tests {
                 exact_or_state_percent: 30,
                 episode_percent: 15,
                 graph_percent: 10,
+                ..Default::default()
             }
         );
         assert!(trace.warnings.is_empty());
