@@ -1194,6 +1194,124 @@ impl RetrievalStore {
         }
     }
 
+    fn document_metadata_is_active(
+        &self,
+        connection: &Connection,
+        control: &ControlState,
+        document_id: &str,
+    ) -> RetrievalResult<(bool, String, RetrievalDocumentGranularity)> {
+        let active = self.document_reference_is_active(connection, control, document_id)?;
+        let (session_id, granularity) = connection
+            .query_row(
+                "SELECT session_id,granularity FROM memory_documents WHERE document_id=?1",
+                [document_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| self.database_error(error))?
+            .ok_or_else(|| {
+                RetrievalError::CorruptIndex("trace 文档引用缺少 canonical 元数据".into())
+            })?;
+        Ok((active, session_id, parse_granularity(&granularity)?))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn document_span_binding_is_active(
+        &self,
+        connection: &Connection,
+        control: &ControlState,
+        document_id: &str,
+        expected_session: &str,
+        expected_span: &SourceSpan,
+        expected_granularity: Option<RetrievalDocumentGranularity>,
+        require_leaf: bool,
+    ) -> RetrievalResult<bool> {
+        let (active, session_id, granularity) =
+            self.document_metadata_is_active(connection, control, document_id)?;
+        if session_id != expected_session
+            || expected_granularity.is_some_and(|expected| expected != granularity)
+        {
+            return Err(RetrievalError::CorruptIndex(
+                "trace 文档与 raw session/granularity 不一致".into(),
+            ));
+        }
+        match granularity {
+            RetrievalDocumentGranularity::Message | RetrievalDocumentGranularity::Fragment => {
+                let member = connection
+                    .query_row(
+                        "SELECT event_id,start_char,end_char FROM memory_document_members
+                         WHERE document_id=?1 AND ordinal=0",
+                        [document_id],
+                        |row| {
+                            Ok(SourceSpan {
+                                event_id: row.get(0)?,
+                                start_char: i64_to_usize(row.get(1)?)?,
+                                end_char: i64_to_usize(row.get(2)?)?,
+                            })
+                        },
+                    )
+                    .map_err(|error| self.database_error(error))?;
+                if member != *expected_span {
+                    return Err(RetrievalError::CorruptIndex(
+                        "trace leaf 文档未精确绑定 raw span".into(),
+                    ));
+                }
+            }
+            RetrievalDocumentGranularity::Episode | RetrievalDocumentGranularity::Session => {
+                if require_leaf {
+                    return Err(RetrievalError::CorruptIndex(
+                        "trace primary 文档必须是 canonical leaf".into(),
+                    ));
+                }
+                let aggregate =
+                    load_persisted_aggregate_document(connection, document_id, expected_session)?;
+                if aggregate
+                    .members
+                    .iter()
+                    .filter(|member| member.span == *expected_span)
+                    .count()
+                    != 1
+                {
+                    return Err(RetrievalError::CorruptIndex(
+                        "trace aggregate 文档未精确包含 raw member".into(),
+                    ));
+                }
+            }
+        }
+        Ok(active)
+    }
+
+    fn episode_reference_is_active(
+        &self,
+        connection: &Connection,
+        control: &ControlState,
+        document_id: &str,
+        expected_session: &str,
+        event_id: &str,
+    ) -> RetrievalResult<bool> {
+        let (active, session_id, granularity) =
+            self.document_metadata_is_active(connection, control, document_id)?;
+        if session_id != expected_session || granularity != RetrievalDocumentGranularity::Episode {
+            return Err(RetrievalError::CorruptIndex(
+                "fusion episode_id 未绑定 canonical episode".into(),
+            ));
+        }
+        let aggregate =
+            load_persisted_aggregate_document(connection, document_id, expected_session)?;
+        if aggregate
+            .members
+            .iter()
+            .filter(|member| member.event_id == event_id)
+            .count()
+            != 1
+        {
+            return Err(RetrievalError::CorruptIndex(
+                "fusion episode_id 未唯一包含 raw event".into(),
+            ));
+        }
+        Ok(active)
+    }
+
     fn ranked_candidate_document_is_active(
         &self,
         connection: &Connection,
@@ -3839,6 +3957,189 @@ impl RetrievalStore {
         }
     }
 
+    #[allow(clippy::type_complexity)]
+    fn claim_snapshots_at(
+        &self,
+        connection: &Connection,
+        visibility_upper: DateTime<Utc>,
+    ) -> RetrievalResult<(
+        BTreeMap<String, ClaimSnapshot>,
+        BTreeMap<String, BTreeSet<String>>,
+    )> {
+        let original_valid_to = original_claim_valid_to_by_id(connection)?;
+        let mut transitions = BTreeMap::<String, Vec<RecallTransition>>::new();
+        let mut statement = connection
+            .prepare(
+                "SELECT claim_id,to_state,reason,related_claim_id,created_at
+                 FROM memory_claim_transitions ORDER BY claim_id,ordinal,created_at,transition_id",
+            )
+            .map_err(|error| self.database_error(error))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })
+            .map_err(|error| self.database_error(error))?;
+        for row in rows {
+            let (claim, to_state, reason, related_claim_id, created_at) =
+                row.map_err(|error| self.database_error(error))?;
+            if !matches!(
+                to_state.as_str(),
+                "active" | "superseded" | "conflicted" | "uncertain"
+            ) || !matches!(
+                reason.as_str(),
+                "created"
+                    | "confirmed"
+                    | "certainty_upgraded"
+                    | "conflicted"
+                    | "corrected"
+                    | "replaced"
+            ) {
+                return Err(RetrievalError::CorruptIndex(format!(
+                    "声明 {claim} 的迁移状态损坏"
+                )));
+            }
+            transitions
+                .entry(claim)
+                .or_default()
+                .push(RecallTransition {
+                    to_state,
+                    reason,
+                    related_claim_id,
+                    created_at: parse_retrieval_time(&created_at, "transition.created_at")?,
+                });
+        }
+        drop(statement);
+        let mut claim_metadata = BTreeMap::<String, (String, String)>::new();
+        let mut statement = connection
+            .prepare(
+                "SELECT c.claim_id,c.certainty,c.valid_from
+                 FROM memory_claims c ORDER BY c.claim_id",
+            )
+            .map_err(|error| self.database_error(error))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|error| self.database_error(error))?;
+        for row in rows {
+            let (claim, certainty, valid_from) = row.map_err(|error| self.database_error(error))?;
+            claim_metadata.insert(claim, (certainty, valid_from));
+        }
+        drop(statement);
+        if claim_metadata.len() != original_valid_to.len()
+            || claim_metadata
+                .keys()
+                .any(|claim| !original_valid_to.contains_key(claim))
+        {
+            return Err(RetrievalError::CorruptIndex(
+                "当前声明与 applied 创建账本不一致".into(),
+            ));
+        }
+        let mut snapshots = BTreeMap::<String, ClaimSnapshot>::new();
+        for (claim, (current_certainty, _)) in &claim_metadata {
+            let original_end = original_valid_to.get(claim).ok_or_else(|| {
+                RetrievalError::CorruptIndex(format!("声明 {claim} 缺少 applied 创建账本"))
+            })?;
+            let Some(history) = transitions.get(claim) else {
+                continue;
+            };
+            let visible = history
+                .iter()
+                .filter(|transition| transition.created_at <= visibility_upper)
+                .collect::<Vec<_>>();
+            if !visible
+                .iter()
+                .any(|transition| transition.reason == "created")
+            {
+                continue;
+            }
+            let state = visible
+                .last()
+                .expect("visible created transition")
+                .to_state
+                .clone();
+            let certainty = if history.iter().any(|transition| {
+                transition.reason == "certainty_upgraded"
+                    && transition.created_at > visibility_upper
+            }) {
+                "uncertain".into()
+            } else {
+                current_certainty.clone()
+            };
+            let valid_to = if original_end.is_some() {
+                original_end.clone()
+            } else {
+                visible.iter().find_map(|transition| {
+                    matches!(transition.reason.as_str(), "corrected" | "replaced")
+                        .then(|| transition.related_claim_id.as_ref())
+                        .flatten()
+                        .filter(|related| {
+                            transitions.get(*related).is_some_and(|history| {
+                                history.iter().any(|transition| {
+                                    transition.reason == "created"
+                                        && transition.created_at <= visibility_upper
+                                })
+                            })
+                        })
+                        .and_then(|related| claim_metadata.get(related))
+                        .map(|(_, related_from)| related_from.clone())
+                })
+            };
+            let related_claim_ids = visible
+                .iter()
+                .filter_map(|transition| transition.related_claim_id.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            snapshots.insert(
+                claim.clone(),
+                ClaimSnapshot {
+                    state,
+                    certainty,
+                    valid_to,
+                    related_claim_ids,
+                },
+            );
+        }
+        let mut conflicts = BTreeMap::<String, BTreeSet<String>>::new();
+        for (claim, history) in &transitions {
+            for transition in history.iter().filter(|transition| {
+                transition.created_at <= visibility_upper && transition.reason == "conflicted"
+            }) {
+                let Some(related) = transition.related_claim_id.as_ref() else {
+                    continue;
+                };
+                if snapshots
+                    .get(claim)
+                    .is_some_and(|snapshot| snapshot.state == "conflicted")
+                    && snapshots
+                        .get(related)
+                        .is_some_and(|snapshot| snapshot.state == "conflicted")
+                {
+                    conflicts
+                        .entry(claim.clone())
+                        .or_default()
+                        .insert(related.clone());
+                    conflicts
+                        .entry(related.clone())
+                        .or_default()
+                        .insert(claim.clone());
+                }
+            }
+        }
+        Ok((snapshots, conflicts))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn load_state_sidecar(
         &self,
@@ -5707,6 +6008,313 @@ impl RetrievalStore {
             && expected_session.is_none_or(|session| control.allows_session(session)))
     }
 
+    fn state_selection_is_active(
+        &self,
+        connection: &Connection,
+        control: &ControlState,
+        selection: &StateSelectionTrace,
+        snapshots: &BTreeMap<String, ClaimSnapshot>,
+        conflicts: &BTreeMap<String, BTreeSet<String>>,
+    ) -> RetrievalResult<bool> {
+        if selection.claim_id.is_empty() || selection.rank == 0 || selection.reason.is_empty() {
+            return Err(RetrievalError::CorruptIndex(
+                "state trace 缺少 canonical claim selection".into(),
+            ));
+        }
+        let claim = connection
+            .query_row(
+                "SELECT subject_entity_id,object_entity_id,predicate_key,asserted_at,event_time,
+                        valid_from,reference_time
+                 FROM memory_claims WHERE claim_id=?1",
+                [&selection.claim_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| self.database_error(error))?
+            .ok_or_else(|| RetrievalError::CorruptIndex("state trace claim 不存在".into()))?;
+        let snapshot = snapshots.get(&selection.claim_id).ok_or_else(|| {
+            RetrievalError::CorruptIndex("state trace claim 在查询时间不可见".into())
+        })?;
+        if selection.subject_entity_id != claim.0
+            || selection.object_entity_id != claim.1
+            || selection.predicate_key != claim.2
+            || selection.asserted_at != claim.3
+            || selection.event_time != claim.4
+            || selection.valid_from != claim.5
+            || selection.reference_time != claim.6
+            || selection.state != snapshot.state
+            || selection.certainty != snapshot.certainty
+            || selection.valid_to != snapshot.valid_to
+            || selection.related_claim_ids != snapshot.related_claim_ids
+        {
+            return Err(RetrievalError::CorruptIndex(
+                "state trace 与 authoritative as-of claim 不一致".into(),
+            ));
+        }
+        let conflict_group = if snapshot.state == "conflicted" {
+            complete_conflict_group(conflicts, &selection.claim_id)
+        } else {
+            vec![selection.claim_id.clone()]
+        };
+        if !conflict_group
+            .iter()
+            .any(|claim_id| claim_id == &selection.claim_id)
+        {
+            return Err(RetrievalError::CorruptIndex(
+                "state trace claim 不属于 authoritative conflict group".into(),
+            ));
+        }
+        if selection.selected
+            && selection.reason != format!("selected_state:{}", selection.claim_id)
+        {
+            return Err(RetrievalError::CorruptIndex(
+                "state trace selected reason 未绑定 claim".into(),
+            ));
+        }
+        match (
+            selection.evidence_id.as_deref(),
+            selection.evidence_span.as_ref(),
+            selection.evidence_role,
+        ) {
+            (None, None, None) => {
+                if selection.selected {
+                    return Err(RetrievalError::CorruptIndex(
+                        "selected state trace 缺少 evidence".into(),
+                    ));
+                }
+                Ok(true)
+            }
+            (Some(evidence_id), Some(span), Some(evidence_role)) => {
+                let evidence = connection
+                    .query_row(
+                        "SELECT claim_id,session_id,batch_key,event_id,sequence,role,
+                                start_char,end_char,content_sha256
+                         FROM memory_claim_evidence WHERE evidence_id=?1",
+                        [evidence_id],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                                i64_to_usize(row.get(4)?)?,
+                                parse_role(&row.get::<_, String>(5)?)?,
+                                i64_to_usize(row.get(6)?)?,
+                                i64_to_usize(row.get(7)?)?,
+                                row.get::<_, String>(8)?,
+                            ))
+                        },
+                    )
+                    .optional()
+                    .map_err(|error| self.database_error(error))?
+                    .ok_or_else(|| {
+                        RetrievalError::CorruptIndex("state trace evidence_id 不存在".into())
+                    })?;
+                let event = self.authoritative_indexed_event(connection, &evidence.3)?;
+                let expected_span = SourceSpan {
+                    event_id: evidence.3.clone(),
+                    start_char: evidence.6,
+                    end_char: evidence.7,
+                };
+                let content = slice_chars(&event.content, &expected_span)?;
+                if evidence.0 != selection.claim_id
+                    || evidence.1 != event.session_id
+                    || evidence.2.is_empty()
+                    || evidence.4 != event.sequence
+                    || evidence.5 != event.role
+                    || evidence_role != EventRole::User
+                    || evidence.5 != evidence_role
+                    || expected_span != *span
+                    || content_sha256(&content) != evidence.8
+                {
+                    return Err(RetrievalError::CorruptIndex(
+                        "state trace evidence 与 authoritative claim/raw span 不一致".into(),
+                    ));
+                }
+                self.trace_span_is_active(
+                    connection,
+                    control,
+                    Some(&evidence.1),
+                    span,
+                    Some(&evidence.8),
+                    Some(evidence_role),
+                )
+            }
+            _ => Err(RetrievalError::CorruptIndex(
+                "state trace evidence tuple 不完整".into(),
+            )),
+        }
+    }
+
+    fn graph_path_is_active(
+        &self,
+        connection: &Connection,
+        control: &ControlState,
+        path: &crate::model::GraphPathTrace,
+    ) -> RetrievalResult<bool> {
+        if path == &crate::model::GraphPathTrace::default() {
+            return Ok(true);
+        }
+        let target_granularity = path.target_granularity.ok_or_else(|| {
+            RetrievalError::CorruptIndex("graph trace 缺少 target granularity".into())
+        })?;
+        if path.seed_node_id.is_empty()
+            || path.seed_source_id.is_empty()
+            || path.target_document_id.is_empty()
+            || path.target_session_id.is_empty()
+            || path.reason.is_empty()
+            || path.seed_rank == 0
+            || path.target_rank == 0
+            || !path.score.is_finite()
+            || path.score < 0.0
+            || !path.path_quality.is_finite()
+            || path.path_quality <= 0.0
+            || !path.seed_score.is_finite()
+            || !path.seed_mass.is_finite()
+            || path.seed_mass <= 0.0
+            || path.edge_ids.len() > 2
+            || path.edge_types.len() != path.edge_ids.len()
+            || path.node_ids.len() != path.edge_ids.len() + 1
+            || path.node_ids.iter().any(String::is_empty)
+            || path.edge_ids.iter().any(String::is_empty)
+            || path.edge_types.iter().any(String::is_empty)
+            || path
+                .node_ids
+                .iter()
+                .any(|node_id| !trace_graph_id_is_valid(node_id, "gnode_"))
+            || path
+                .edge_ids
+                .iter()
+                .any(|edge_id| !trace_graph_id_is_valid(edge_id, "gedge_"))
+            || path.node_ids.iter().collect::<HashSet<_>>().len() != path.node_ids.len()
+            || path.edge_ids.iter().collect::<HashSet<_>>().len() != path.edge_ids.len()
+        {
+            return Err(RetrievalError::CorruptIndex(
+                "graph trace 的自包含 path provenance 不规范".into(),
+            ));
+        }
+        let expected_seed_node = match path.seed_channel {
+            RetrievalChannel::Bm25 | RetrievalChannel::Vector => {
+                if path.seed_document_id.is_empty() || path.seed_document_id != path.seed_source_id
+                {
+                    return Err(RetrievalError::CorruptIndex(
+                        "graph document seed 字段不一致".into(),
+                    ));
+                }
+                trace_graph_node_id("document", &path.seed_source_id)
+            }
+            RetrievalChannel::Entity => {
+                if !path.seed_document_id.is_empty() {
+                    return Err(RetrievalError::CorruptIndex(
+                        "graph entity seed 不应包含 document_id".into(),
+                    ));
+                }
+                trace_graph_node_id("entity", &path.seed_source_id)
+            }
+            _ => {
+                return Err(RetrievalError::CorruptIndex(
+                    "graph trace 包含未生产的 seed channel".into(),
+                ));
+            }
+        };
+        let expected_target_node = trace_graph_node_id("document", &path.target_document_id);
+        if path.seed_node_id != expected_seed_node
+            || path.node_ids.first() != Some(&expected_seed_node)
+            || path.node_ids.last() != Some(&expected_target_node)
+        {
+            return Err(RetrievalError::CorruptIndex(
+                "graph trace 的 seed/target node 绑定不一致".into(),
+            ));
+        }
+        for index in 0..path.edge_ids.len() {
+            if !trace_graph_edge_id_matches(
+                &path.edge_types[index],
+                &path.node_ids[index],
+                &path.node_ids[index + 1],
+                &path.edge_ids[index],
+            ) {
+                return Err(RetrievalError::CorruptIndex(
+                    "graph trace 的 edge ID/type/path 绑定不一致".into(),
+                ));
+            }
+        }
+        let (target_active, target_session, stored_granularity) =
+            self.document_metadata_is_active(connection, control, &path.target_document_id)?;
+        if target_session != path.target_session_id || stored_granularity != target_granularity {
+            return Err(RetrievalError::CorruptIndex(
+                "graph target document/session/granularity 不一致".into(),
+            ));
+        }
+        let mut active = target_active;
+        if !path.seed_document_id.is_empty() {
+            let (seed_active, _, _) =
+                self.document_metadata_is_active(connection, control, &path.seed_document_id)?;
+            active &= seed_active;
+        }
+        match (&path.span, path.role) {
+            (Some(span), Some(role)) => {
+                if path.content_sha256.is_empty() {
+                    return Err(RetrievalError::CorruptIndex(
+                        "graph target span 缺少 content hash".into(),
+                    ));
+                }
+                let span_active = self.trace_span_is_active(
+                    connection,
+                    control,
+                    Some(&path.target_session_id),
+                    span,
+                    Some(&path.content_sha256),
+                    Some(role),
+                )?;
+                let document_active = self.document_span_binding_is_active(
+                    connection,
+                    control,
+                    &path.target_document_id,
+                    &path.target_session_id,
+                    span,
+                    Some(target_granularity),
+                    false,
+                )?;
+                active &= span_active && document_active;
+            }
+            (None, None) => {
+                if !path.content_sha256.is_empty()
+                    || path.selected
+                    || path.reason == "no_eligible_raw_member"
+                        && !matches!(
+                            target_granularity,
+                            RetrievalDocumentGranularity::Episode
+                                | RetrievalDocumentGranularity::Session
+                        )
+                    || !matches!(
+                        path.reason.as_str(),
+                        "seed_document" | "no_eligible_raw_member"
+                    )
+                {
+                    return Err(RetrievalError::CorruptIndex(
+                        "graph no-span path 字段不规范".into(),
+                    ));
+                }
+            }
+            _ => {
+                return Err(RetrievalError::CorruptIndex(
+                    "graph target span/role tuple 不完整".into(),
+                ));
+            }
+        }
+        Ok(active)
+    }
+
     fn retrieval_trace_is_active(
         &self,
         connection: &Connection,
@@ -5747,69 +6355,208 @@ impl RetrievalStore {
             active &= span_active && document_active;
         }
         for candidate in &trace.fusion_candidates {
-            let legacy_empty = candidate.span.event_id.is_empty()
-                && candidate.session_id.is_empty()
-                && candidate.document_id.is_empty()
-                && candidate.source_document_ids.is_empty()
-                && candidate.episode_id.is_none();
-            if candidate.span.event_id.is_empty() && !legacy_empty {
+            if candidate == &FusionCandidateTrace::default() {
+                continue;
+            }
+            if candidate.span.event_id.is_empty()
+                || candidate.session_id.is_empty()
+                || candidate.document_id.is_empty()
+                || candidate.source_document_ids.is_empty()
+                || candidate.source_document_ids.iter().any(String::is_empty)
+                || candidate
+                    .source_document_ids
+                    .windows(2)
+                    .any(|pair| pair[0] >= pair[1])
+                || candidate.bm25_rank.is_some() != candidate.bm25_score.is_some()
+                || candidate.vector_rank.is_some() != candidate.vector_score.is_some()
+                || candidate.bm25_rank.is_some_and(|rank| rank == 0)
+                || candidate.vector_rank.is_some_and(|rank| rank == 0)
+                || candidate.bm25_score.is_some_and(|score| !score.is_finite())
+                || candidate
+                    .vector_score
+                    .is_some_and(|score| !score.is_finite())
+                || !candidate.rrf_score.is_finite()
+                || candidate.rrf_score < 0.0
+                || candidate.bm25_rank.is_none() && candidate.vector_rank.is_none()
+                || candidate.protected_exact && candidate.bm25_rank.is_none()
+                || candidate.reason.is_empty()
+                || candidate.episode_id.as_ref().is_some_and(String::is_empty)
+                || candidate.fused_rank == 0
+                    && (candidate.bm25_rank.is_some()
+                        || candidate.vector_rank.is_none()
+                        || candidate.rrf_score != 0.0
+                        || candidate.protected_exact
+                        || candidate.selected
+                        || !matches!(
+                            candidate.reason.as_str(),
+                            "current_message" | "recent_context" | "system_message"
+                        ))
+                || candidate.fused_rank > 0 && candidate.rrf_score <= 0.0
+            {
                 return Err(RetrievalError::CorruptIndex(
-                    "fusion trace 缺少权威来源".into(),
+                    "fusion trace 的 canonical producer 字段不规范".into(),
                 ));
             }
-            active &= self.trace_span_is_active(
+            if candidate.bm25_rank.is_some()
+                && !candidate
+                    .source_document_ids
+                    .iter()
+                    .any(|source| source == &candidate.document_id)
+            {
+                return Err(RetrievalError::CorruptIndex(
+                    "fusion BM25 source 集合缺少 primary document".into(),
+                ));
+            }
+            if let Some(bm25_rank) = candidate.bm25_rank {
+                let mut matches = trace
+                    .candidates
+                    .iter()
+                    .filter(|ranked| ranked.raw_rank == bm25_rank);
+                let ranked = matches.next().ok_or_else(|| {
+                    RetrievalError::CorruptIndex(
+                        "fusion BM25 rank 缺少 canonical ranked candidate".into(),
+                    )
+                })?;
+                if matches.next().is_some()
+                    || ranked.document_id != candidate.document_id
+                    || ranked.span != candidate.span
+                    || ranked.session_id != candidate.session_id
+                    || ranked.granularity != candidate.granularity
+                    || candidate.bm25_score != Some(ranked.bm25_score)
+                {
+                    return Err(RetrievalError::CorruptIndex(
+                        "fusion BM25 candidate 与 ranked raw provenance 不一致".into(),
+                    ));
+                }
+            }
+            if candidate.vector_rank.is_none()
+                && candidate.source_document_ids.as_slice()
+                    != std::slice::from_ref(&candidate.document_id)
+            {
+                return Err(RetrievalError::CorruptIndex(
+                    "fusion BM25-only source 集合不精确".into(),
+                ));
+            }
+            let span_active = self.trace_span_is_active(
                 connection,
                 control,
-                (!candidate.session_id.is_empty()).then_some(candidate.session_id.as_str()),
+                Some(&candidate.session_id),
                 &candidate.span,
                 None,
                 None,
             )?;
-            for document_id in std::iter::once(candidate.document_id.as_str())
-                .chain(candidate.source_document_ids.iter().map(String::as_str))
-                .chain(candidate.episode_id.iter().map(String::as_str))
-                .filter(|id| !id.is_empty())
-            {
-                active &= self.document_reference_is_active(connection, control, document_id)?;
+            let primary_active = self.document_span_binding_is_active(
+                connection,
+                control,
+                &candidate.document_id,
+                &candidate.session_id,
+                &candidate.span,
+                Some(candidate.granularity),
+                true,
+            )?;
+            let mut sources_active = true;
+            for document_id in &candidate.source_document_ids {
+                sources_active &= self.document_span_binding_is_active(
+                    connection,
+                    control,
+                    document_id,
+                    &candidate.session_id,
+                    &candidate.span,
+                    None,
+                    false,
+                )?;
             }
+            let expected_episode = self.resolve_episode_id(connection, &candidate.span.event_id)?;
+            if candidate.episode_id != expected_episode {
+                return Err(RetrievalError::CorruptIndex(
+                    "fusion episode_id 与 raw event membership 不一致".into(),
+                ));
+            }
+            let episode_active = if let Some(episode_id) = &candidate.episode_id {
+                self.episode_reference_is_active(
+                    connection,
+                    control,
+                    episode_id,
+                    &candidate.session_id,
+                    &candidate.span.event_id,
+                )?
+            } else {
+                true
+            };
+            active &= span_active && primary_active && sources_active && episode_active;
         }
-        for selection in &trace.state_selections {
-            if let Some(span) = &selection.evidence_span {
-                if span.event_id.is_empty() {
+        if trace
+            .state_selections
+            .iter()
+            .any(|selection| selection != &StateSelectionTrace::default())
+        {
+            self.require_current_control_projection(connection, control)?;
+            validate_full_derived_integrity(connection)?;
+            if trace.current_query_event_id.is_empty() {
+                return Err(RetrievalError::CorruptIndex(
+                    "state trace 缺少 current query event".into(),
+                ));
+            }
+            let current =
+                self.authoritative_indexed_event(connection, &trace.current_query_event_id)?;
+            if current.role != EventRole::User {
+                return Err(RetrievalError::CorruptIndex(
+                    "state trace current query 不是 user event".into(),
+                ));
+            }
+            let current_reference = DateTime::parse_from_rfc3339(&current.created_at)
+                .map_err(|_| RetrievalError::CorruptIndex("当前查询事件时间损坏".into()))?
+                .with_timezone(&Utc);
+            let normalized_query = normalize_match(&current.content);
+            let visibility_upper = explicit_query_date(&normalized_query)
+                .0
+                .map(|value| value.min(current_reference))
+                .unwrap_or(current_reference);
+            let (snapshots, conflicts) = self.claim_snapshots_at(connection, visibility_upper)?;
+            let mut selections_by_claim = HashMap::<&str, &StateSelectionTrace>::new();
+            let mut selection_ranks = HashSet::new();
+            for selection in &trace.state_selections {
+                if selection == &StateSelectionTrace::default() {
+                    continue;
+                }
+                if selections_by_claim
+                    .insert(&selection.claim_id, selection)
+                    .is_some()
+                    || !selection_ranks.insert(selection.rank)
+                {
                     return Err(RetrievalError::CorruptIndex(
-                        "state trace 缺少权威来源".into(),
+                        "state trace 包含重复 claim 或 rank".into(),
                     ));
                 }
-                active &= self.trace_span_is_active(connection, control, None, span, None, None)?;
+                active &= self.state_selection_is_active(
+                    connection, control, selection, &snapshots, &conflicts,
+                )?;
+            }
+            for selection in selections_by_claim.values() {
+                let snapshot = snapshots.get(&selection.claim_id).ok_or_else(|| {
+                    RetrievalError::CorruptIndex("state trace claim 在查询时间不可见".into())
+                })?;
+                let conflict_group = if snapshot.state == "conflicted" {
+                    complete_conflict_group(&conflicts, &selection.claim_id)
+                } else {
+                    vec![selection.claim_id.clone()]
+                };
+                if conflict_group
+                    .iter()
+                    .any(|claim_id| !selections_by_claim.contains_key(claim_id.as_str()))
+                    || selection.selected
+                        && conflict_group
+                            .iter()
+                            .any(|claim_id| !selections_by_claim[claim_id.as_str()].selected)
+                {
+                    return Err(RetrievalError::CorruptIndex(
+                        "state trace 未完整绑定 authoritative conflict group".into(),
+                    ));
+                }
             }
         }
         for path in &trace.graph_paths {
-            if !path.target_session_id.is_empty() && path.span.is_none() {
-                return Err(RetrievalError::CorruptIndex(
-                    "graph trace 缺少目标来源片段".into(),
-                ));
-            }
-            if let Some(span) = &path.span {
-                if span.event_id.is_empty() {
-                    return Err(RetrievalError::CorruptIndex(
-                        "graph trace 缺少权威来源".into(),
-                    ));
-                }
-                active &= self.trace_span_is_active(
-                    connection,
-                    control,
-                    (!path.target_session_id.is_empty()).then_some(path.target_session_id.as_str()),
-                    span,
-                    None,
-                    None,
-                )?;
-            }
-            for document_id in [&path.seed_document_id, &path.target_document_id]
-                .into_iter()
-                .filter(|id| !id.is_empty())
-            {
-                active &= self.document_reference_is_active(connection, control, document_id)?;
-            }
+            active &= self.graph_path_is_active(connection, control, path)?;
         }
         for selected in &trace.selected_evidence {
             if selected.span.event_id.is_empty() {
@@ -10708,6 +11455,72 @@ fn granularity_name(granularity: RetrievalDocumentGranularity) -> &'static str {
         RetrievalDocumentGranularity::Fragment => "fragment",
         RetrievalDocumentGranularity::Episode => "episode",
         RetrievalDocumentGranularity::Session => "session",
+    }
+}
+
+fn trace_graph_hash_parts(domain: &str, parts: &[&[u8]]) -> String {
+    let mut hasher = Sha256::new();
+    let domain = domain.as_bytes();
+    hasher.update((domain.len() as u64).to_le_bytes());
+    hasher.update(domain);
+    for part in parts {
+        hasher.update((part.len() as u64).to_le_bytes());
+        hasher.update(part);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn trace_graph_id_is_valid(value: &str, prefix: &str) -> bool {
+    value.strip_prefix(prefix).is_some_and(is_sha256_hex)
+}
+
+fn trace_graph_node_id(kind: &str, source_id: &str) -> String {
+    format!(
+        "gnode_{}",
+        trace_graph_hash_parts(
+            "hippocampus.graph.node-id.v1",
+            &[kind.as_bytes(), source_id.as_bytes()],
+        )
+    )
+}
+
+fn trace_graph_edge_id(edge_type: &str, source: &str, target: &str) -> String {
+    format!(
+        "gedge_{}",
+        trace_graph_hash_parts(
+            "hippocampus.graph.edge-id.v1",
+            &[edge_type.as_bytes(), source.as_bytes(), target.as_bytes(),],
+        )
+    )
+}
+
+fn trace_graph_edge_id_matches(edge_type: &str, left: &str, right: &str, edge_id: &str) -> bool {
+    const EDGE_TYPES: &[&str] = &[
+        "reply",
+        "adjacent",
+        "episode_member",
+        "entity_mention",
+        "shared_entity",
+        "keyword_cooccurrence",
+        "embedding_mutual_top_k",
+        "common_recall",
+        "support",
+        "conflict",
+        "replacement",
+    ];
+    if !EDGE_TYPES.contains(&edge_type) || left == right {
+        return false;
+    }
+    if edge_type == "replacement" {
+        edge_id == trace_graph_edge_id(edge_type, left, right)
+            || edge_id == trace_graph_edge_id(edge_type, right, left)
+    } else {
+        let (source, target) = if left < right {
+            (left, right)
+        } else {
+            (right, left)
+        };
+        edge_id == trace_graph_edge_id(edge_type, source, target)
     }
 }
 
