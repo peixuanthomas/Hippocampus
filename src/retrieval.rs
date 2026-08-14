@@ -951,14 +951,6 @@ impl RetrievalStore {
         control: &ControlState,
         document_id: &str,
     ) -> RetrievalResult<bool> {
-        let memory = connection.query_row(
-            "SELECT session_id,granularity,source_sha256 FROM memory_documents WHERE document_id=?1",
-            [document_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
-        ).optional().map_err(|error| self.database_error(error))?
-            .ok_or_else(|| RetrievalError::CorruptIndex(
-                "trace 文档引用缺少 memory_documents 来源".into()
-            ))?;
         let raw = connection
             .query_row(
                 "SELECT r.event_id,e.session_id,r.start_char,r.end_char,r.granularity,r.content_sha256
@@ -987,12 +979,19 @@ impl RetrievalStore {
                 ));
             }
         }
-        let active = self.memory_document_is_active(connection, control, document_id)?;
-        if !active {
-            return Ok(false);
-        }
+        let memory = connection.query_row(
+            "SELECT session_id,granularity,source_sha256 FROM memory_documents WHERE document_id=?1",
+            [document_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+        ).optional().map_err(|error| self.database_error(error))?
+            .ok_or_else(|| RetrievalError::CorruptIndex(
+                "trace 文档引用缺少 memory_documents 来源".into()
+            ))?;
         match memory.1.as_str() {
             "message" | "fragment" => {
+                if !self.memory_document_is_active(connection, control, document_id)? {
+                    return Ok(false);
+                }
                 let (event_id, session_id, start, end, granularity, hash) =
                     raw.ok_or_else(|| {
                         RetrievalError::CorruptIndex(
@@ -1028,6 +1027,15 @@ impl RetrievalStore {
                 }
             }
             "episode" | "session" => {
+                let aggregate =
+                    load_persisted_aggregate_document(connection, document_id, &memory.0)?;
+                if aggregate
+                    .members
+                    .iter()
+                    .any(|member| !control.allows_event(&aggregate.session_id, &member.event_id))
+                {
+                    return Ok(false);
+                }
                 if let Some((event_id, session_id, start, end, granularity, hash)) = raw {
                     let member_count: i64 = connection
                         .query_row(
@@ -1055,7 +1063,63 @@ impl RetrievalStore {
                     }
                 }
             }
-            _ => unreachable!("memory_document_is_active validated granularity"),
+            _ => {
+                return Err(RetrievalError::CorruptIndex(
+                    "trace 文档引用包含无效粒度".into(),
+                ));
+            }
+        }
+        Ok(true)
+    }
+
+    fn ranked_candidate_document_is_active(
+        &self,
+        connection: &Connection,
+        control: &ControlState,
+        candidate: &RankedCandidate,
+    ) -> RetrievalResult<bool> {
+        if candidate.document_id.is_empty() {
+            return Err(RetrievalError::CorruptIndex(
+                "BM25 trace 缺少 document_id".into(),
+            ));
+        }
+        if !self.document_reference_is_active(connection, control, &candidate.document_id)? {
+            return Ok(false);
+        }
+        let granularity = match candidate.granularity {
+            RetrievalDocumentGranularity::Message => "message",
+            RetrievalDocumentGranularity::Fragment => "fragment",
+            RetrievalDocumentGranularity::Episode => "episode",
+            RetrievalDocumentGranularity::Session => "session",
+        };
+        let count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM retrieval_documents r
+             JOIN events e ON e.event_id=r.event_id
+             JOIN source_spans s ON s.event_id=r.event_id
+                AND s.start_char=r.start_char AND s.end_char=r.end_char
+             WHERE r.document_id=?1 AND e.session_id=?2 AND r.event_id=?3
+               AND r.start_char=?4 AND r.end_char=?5 AND r.granularity=?6
+               AND r.content_sha256=?7 AND s.content_sha256=?7 AND e.role=?8",
+                params![
+                    candidate.document_id,
+                    candidate.session_id,
+                    candidate.span.event_id,
+                    usize_to_i64(candidate.span.start_char)
+                        .map_err(|error| self.database_error(error))?,
+                    usize_to_i64(candidate.span.end_char)
+                        .map_err(|error| self.database_error(error))?,
+                    granularity,
+                    candidate.content_sha256,
+                    candidate.role.as_str()
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|error| self.database_error(error))?;
+        if count != 1 {
+            return Err(RetrievalError::CorruptIndex(
+                "BM25 trace 与 canonical retrieval 来源不一致".into(),
+            ));
         }
         Ok(true)
     }
@@ -5519,6 +5583,9 @@ impl RetrievalStore {
                 Some(&candidate.session_id),
                 &candidate.span,
             )? {
+                return Ok(false);
+            }
+            if !self.ranked_candidate_document_is_active(connection, control, candidate)? {
                 return Ok(false);
             }
         }
