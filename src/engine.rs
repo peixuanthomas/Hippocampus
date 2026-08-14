@@ -710,6 +710,17 @@ impl<B: ChatBackend> ChatEngine<B> {
         cancellation: CancellationToken,
     ) -> ConsolidationRunReport {
         let mut report = consolidation_report(session, trigger);
+        match self.store.control_state() {
+            Ok(controls) if controls.allows_session(&session.id) => {}
+            Ok(_) => {
+                report.warnings.push(format!("会话已排除: {}", session.id));
+                return report;
+            }
+            Err(error) => {
+                report.warnings.push(format!("无法读取控制状态: {error}"));
+                return report;
+            }
+        }
         if !self.config.memory.enabled {
             report.status = ConsolidationRunStatus::Disabled;
             return report;
@@ -990,6 +1001,10 @@ impl<B: ChatBackend> ChatEngine<B> {
         session: &mut Session,
         user_content: String,
     ) -> Result<PreparedTurn> {
+        let controls = self.store.control_state()?;
+        if !controls.allows_session(&session.id) {
+            bail!("会话已排除: {}", session.id);
+        }
         if user_content.trim().is_empty() {
             bail!("用户输入不能为空");
         }
@@ -1013,7 +1028,7 @@ impl<B: ChatBackend> ChatEngine<B> {
         self.store.save(session)?;
 
         let prepared = self
-            .prepare_persisted_turn(session, turn_index, user_content, start_before)
+            .prepare_persisted_turn(session, turn_index, user_content, start_before, &controls)
             .await;
         if let Err(error) = &prepared
             && session.turns[turn_index].status == TurnStatus::Pending
@@ -1034,10 +1049,12 @@ impl<B: ChatBackend> ChatEngine<B> {
         turn_index: usize,
         user_content: String,
         start_before: usize,
+        controls: &crate::control::ControlState,
     ) -> Result<PreparedTurn> {
         let history = session
             .eligible_turns(Some(turn_index), true)
             .into_iter()
+            .filter(|(_, turn)| controls.allows_turn(&session.id, &turn.id))
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
         let current_event_id = crate::model::event_id(

@@ -140,6 +140,7 @@ impl SessionStore {
             .retrieval
             .acquire_root_write()
             .context("无法锁定会话目录以原子保存原文和派生索引")?;
+        let controls = self.control.replay()?;
         fs::create_dir_all(&self.root)
             .with_context(|| format!("无法创建会话目录 {}", self.root.display()))?;
         let target = self.root.join(format!("{}.json", session.id));
@@ -170,6 +171,9 @@ impl SessionStore {
             let _ = fs::remove_file(&temporary);
         }
         result.with_context(|| format!("无法原子保存会话 {}", target.display()))?;
+        if !controls.allows_session(&session.id) || controls.session_has_excluded_event(session) {
+            return Ok(target);
+        }
         self.retrieval
             .sync_session_under_root_write(session, &target)
             .map_err(|source| IndexSyncAfterSourceCommit {
@@ -180,20 +184,26 @@ impl SessionStore {
     }
 
     pub fn load(&self, identifier: &str) -> Result<Session> {
-        let path = self.resolve(identifier)?;
-        let raw =
-            fs::read(&path).with_context(|| format!("无法读取会话文件 {}", path.display()))?;
-        let mut session: Session = serde_json::from_slice(&raw)
-            .map_err(|error| anyhow!("会话文件损坏或格式不受支持: {}: {error}", path.display()))?;
-        session.normalize_legacy_provenance();
-        session
-            .validate()
-            .map_err(|error| anyhow!("会话文件损坏或格式不受支持: {}: {error}", path.display()))?;
-        session.refresh_cumulative_usage();
-        Ok(session)
+        let _guard = self.retrieval.acquire_root_read()?;
+        let controls = self.control.replay()?;
+        let path = self.resolve_with_controls(identifier, &controls)?;
+        self.load_raw_path(&path)
     }
 
     pub fn resolve(&self, identifier: &str) -> Result<PathBuf> {
+        let _guard = self.retrieval.acquire_root_read()?;
+        let controls = self.control.replay()?;
+        self.resolve_with_controls(identifier, &controls)
+    }
+
+    #[allow(dead_code)] // Reserved for control restore/status/rebuild paths.
+    pub(crate) fn load_raw(&self, identifier: &str) -> Result<Session> {
+        let path = self.resolve_raw(identifier)?;
+        self.load_raw_path(&path)
+    }
+
+    #[allow(dead_code)] // Reserved for control restore/status/rebuild paths.
+    pub(crate) fn resolve_raw(&self, identifier: &str) -> Result<PathBuf> {
         validate_identifier(identifier).map_err(|_| anyhow!("无效会话标识: {identifier:?}"))?;
         let exact = self.root.join(format!("{identifier}.json"));
         if exact.is_file() {
@@ -227,7 +237,73 @@ impl SessionStore {
         }
     }
 
+    fn resolve_with_controls(&self, identifier: &str, controls: &ControlState) -> Result<PathBuf> {
+        validate_identifier(identifier).map_err(|_| anyhow!("无效会话标识: {identifier:?}"))?;
+        let exact = self.root.join(format!("{identifier}.json"));
+        if exact.is_file() {
+            if !controls.allows_session(identifier) {
+                bail!("会话已排除: {identifier}");
+            }
+            return Ok(exact);
+        }
+        let mut active = Vec::new();
+        let mut excluded = Vec::new();
+        if self.root.is_dir() {
+            for entry in fs::read_dir(&self.root)? {
+                let path = entry?.path();
+                let Some(stem) = path.file_stem().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                if path.extension().and_then(|value| value.to_str()) == Some("json")
+                    && stem.starts_with(identifier)
+                {
+                    if controls.allows_session(stem) {
+                        active.push(path);
+                    } else {
+                        excluded.push(path);
+                    }
+                }
+            }
+        }
+        active.sort();
+        match active.len() {
+            0 if !excluded.is_empty() => bail!("会话已排除: {identifier}"),
+            0 => bail!("找不到会话: {identifier}"),
+            1 => Ok(active.remove(0)),
+            _ => {
+                let names = active
+                    .iter()
+                    .take(5)
+                    .filter_map(|path| path.file_stem()?.to_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                bail!("会话前缀不唯一: {identifier}（匹配 {names}）")
+            }
+        }
+    }
+
+    fn load_raw_path(&self, path: &Path) -> Result<Session> {
+        let raw = fs::read(path).with_context(|| format!("无法读取会话文件 {}", path.display()))?;
+        let mut session: Session = serde_json::from_slice(&raw)
+            .map_err(|error| anyhow!("会话文件损坏或格式不受支持: {}: {error}", path.display()))?;
+        session.normalize_legacy_provenance();
+        session
+            .validate()
+            .map_err(|error| anyhow!("会话文件损坏或格式不受支持: {}: {error}", path.display()))?;
+        let expected_id = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| anyhow!("会话文件名无效: {}", path.display()))?;
+        if session.id != expected_id {
+            bail!("会话文件名与会话 ID 不一致: {}", path.display());
+        }
+        session.refresh_cumulative_usage();
+        Ok(session)
+    }
+
     pub fn list_sessions(&self) -> Result<Vec<Session>> {
+        let _guard = self.retrieval.acquire_root_read()?;
+        let controls = self.control.replay()?;
         if !self.root.is_dir() {
             return Ok(Vec::new());
         }
@@ -236,8 +312,9 @@ impl SessionStore {
             let path = entry?.path();
             if path.extension().and_then(|value| value.to_str()) == Some("json")
                 && let Some(stem) = path.file_stem().and_then(|value| value.to_str())
+                && controls.allows_session(stem)
             {
-                sessions.push(self.load(stem)?);
+                sessions.push(self.load_raw_path(&path)?);
             }
         }
         sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
@@ -245,6 +322,10 @@ impl SessionStore {
     }
 
     pub fn reopen(&self, session: &mut Session) -> Result<()> {
+        let controls = self.control_state()?;
+        if !controls.allows_session(&session.id) {
+            bail!("会话已排除: {}", session.id);
+        }
         session.status = SessionStatus::Active;
         self.save(session)?;
         Ok(())

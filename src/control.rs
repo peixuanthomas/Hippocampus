@@ -63,6 +63,10 @@ pub struct ControlState {
 }
 
 impl ControlState {
+    pub fn allows_session(&self, session_id: &str) -> bool {
+        !self.session_is_excluded(session_id)
+    }
+
     pub fn session_is_excluded(&self, session_id: &str) -> bool {
         self.excluded_sessions.contains(session_id)
     }
@@ -72,7 +76,24 @@ impl ControlState {
     }
 
     pub fn allows_event(&self, session_id: &str, event_id: &str) -> bool {
-        !self.session_is_excluded(session_id) && !self.event_is_excluded(event_id)
+        self.allows_session(session_id) && !self.event_is_excluded(event_id)
+    }
+
+    pub fn allows_turn(&self, session_id: &str, turn_id: &str) -> bool {
+        self.allows_event(
+            session_id,
+            &crate::model::event_id(session_id, Some(turn_id), EventRole::User),
+        ) && self.allows_event(
+            session_id,
+            &crate::model::event_id(session_id, Some(turn_id), EventRole::Assistant),
+        )
+    }
+
+    pub(crate) fn session_has_excluded_event(&self, session: &Session) -> bool {
+        session
+            .turns
+            .iter()
+            .any(|turn| !self.allows_turn(&session.id, &turn.id))
     }
 
     pub fn excluded_sessions(&self) -> impl ExactSizeIterator<Item = &str> {
