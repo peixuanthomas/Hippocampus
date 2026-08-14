@@ -863,7 +863,9 @@ impl RetrievalStore {
             member_count,
         )) = row
         else {
-            return Ok(false);
+            return Err(RetrievalError::CorruptIndex(format!(
+                "派生文档 {document_id} 缺少 memory_documents 来源"
+            )));
         };
         if !state.allows_session(&session_id) {
             return Ok(false);
@@ -941,6 +943,38 @@ impl RetrievalStore {
             }
         }
         Ok(!members.is_empty())
+    }
+
+    fn document_reference_is_active(
+        &self,
+        connection: &Connection,
+        control: &ControlState,
+        document_id: &str,
+    ) -> RetrievalResult<bool> {
+        let raw = connection
+            .query_row(
+                "SELECT r.event_id,e.session_id FROM retrieval_documents r
+             LEFT JOIN events e ON e.event_id=r.event_id WHERE r.document_id=?1",
+                [document_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()
+            .map_err(|error| self.database_error(error))?;
+        if let Some((event_id, session_id)) = raw {
+            if control.event_is_excluded(&event_id)
+                || session_id
+                    .as_deref()
+                    .is_some_and(|session| !control.allows_session(session))
+            {
+                return Ok(false);
+            }
+            if session_id.is_none() {
+                return Err(RetrievalError::CorruptIndex(
+                    "派生文档缺少权威来源事件".into(),
+                ));
+            }
+        }
+        self.memory_document_is_active(connection, control, document_id)
     }
 
     fn active_memory_document_count(
@@ -5108,6 +5142,9 @@ impl RetrievalStore {
                 "回答上下文索引元数据与来源 trace 不匹配".into(),
             ));
         }
+        if !self.retrieval_trace_is_active(connection, &state, &answer.retrieval_trace)? {
+            return Err(RetrievalError::ExcludedEvent(answer_event_id.to_owned()));
+        }
         if turn.context_trace.untrusted_history_wrapped {
             let expected_identity = wrapped_history_identity(
                 &source.session.ai_name,
@@ -5266,11 +5303,6 @@ impl RetrievalStore {
             )));
         }
         drop(statement);
-        for selected in &answer.retrieval_trace.selected_evidence {
-            let source_event =
-                self.get_event_from_connection(connection, &selected.span.event_id)?;
-            Self::require_active_event(&state, &source_event)?;
-        }
         self.require_unchanged_control_state(&state)?;
         transaction
             .commit()
@@ -5313,6 +5345,182 @@ impl RetrievalStore {
             }
         }
         Ok(None)
+    }
+
+    fn trace_span_is_active(
+        &self,
+        connection: &Connection,
+        control: &ControlState,
+        expected_session: Option<&str>,
+        span: &SourceSpan,
+    ) -> RetrievalResult<bool> {
+        if span.event_id.is_empty() {
+            return Ok(true);
+        }
+        if control.event_is_excluded(&span.event_id)
+            || expected_session.is_some_and(|session| !control.allows_session(session))
+        {
+            return Ok(false);
+        }
+        let event = connection
+            .query_row(
+                "SELECT event_id, session_id, turn_id, sequence, role, created_at, content,
+                        content_sha256, reply_to_event_id, token_count, turn_status, done_reason, error
+                 FROM events WHERE event_id=?1",
+                [&span.event_id],
+                map_event,
+            )
+            .optional()
+            .map_err(|error| self.database_error(error))?
+            .ok_or_else(|| RetrievalError::CorruptIndex("trace 来源事件不存在".into()))?;
+        if expected_session.is_some_and(|session| session != event.session_id) {
+            return Err(RetrievalError::CorruptIndex(
+                "trace 来源事件属于错误会话".into(),
+            ));
+        }
+        if !control.allows_event(&event.session_id, &event.id) {
+            return Ok(false);
+        }
+        verify_event_hash(&event)?;
+        let content = slice_chars(&event.content, span)?;
+        let stored_hash = connection
+            .query_row(
+                "SELECT content_sha256 FROM source_spans
+                 WHERE event_id=?1 AND start_char=?2 AND end_char=?3",
+                params![
+                    span.event_id,
+                    usize_to_i64(span.start_char).map_err(|error| self.database_error(error))?,
+                    usize_to_i64(span.end_char).map_err(|error| self.database_error(error))?
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| self.database_error(error))?;
+        if stored_hash.as_deref() != Some(content_sha256(&content).as_str()) {
+            return Err(RetrievalError::CorruptIndex(
+                "trace 来源片段与权威原文不一致".into(),
+            ));
+        }
+        Ok(true)
+    }
+
+    fn retrieval_trace_is_active(
+        &self,
+        connection: &Connection,
+        control: &ControlState,
+        trace: &RetrievalTrace,
+    ) -> RetrievalResult<bool> {
+        if !trace.current_query_event_id.is_empty() {
+            if control.event_is_excluded(&trace.current_query_event_id) {
+                return Ok(false);
+            }
+            if let Some(event) = connection.query_row(
+                "SELECT event_id, session_id, turn_id, sequence, role, created_at, content,
+                        content_sha256, reply_to_event_id, token_count, turn_status, done_reason, error
+                 FROM events WHERE event_id=?1",
+                [&trace.current_query_event_id], map_event,
+            ).optional().map_err(|error| self.database_error(error))? {
+                if !control.allows_event(&event.session_id, &event.id) { return Ok(false); }
+                verify_event_hash(&event)?;
+            }
+        }
+        for candidate in &trace.candidates {
+            if candidate.span.event_id.is_empty() || candidate.session_id.is_empty() {
+                return Err(RetrievalError::CorruptIndex(
+                    "BM25 trace 缺少权威来源".into(),
+                ));
+            }
+            if !self.trace_span_is_active(
+                connection,
+                control,
+                Some(&candidate.session_id),
+                &candidate.span,
+            )? {
+                return Ok(false);
+            }
+        }
+        for candidate in &trace.fusion_candidates {
+            let legacy_empty = candidate.span.event_id.is_empty()
+                && candidate.session_id.is_empty()
+                && candidate.document_id.is_empty()
+                && candidate.source_document_ids.is_empty()
+                && candidate.episode_id.is_none();
+            if candidate.span.event_id.is_empty() && !legacy_empty {
+                return Err(RetrievalError::CorruptIndex(
+                    "fusion trace 缺少权威来源".into(),
+                ));
+            }
+            if !self.trace_span_is_active(
+                connection,
+                control,
+                (!candidate.session_id.is_empty()).then_some(candidate.session_id.as_str()),
+                &candidate.span,
+            )? {
+                return Ok(false);
+            }
+            for document_id in std::iter::once(candidate.document_id.as_str())
+                .chain(candidate.source_document_ids.iter().map(String::as_str))
+                .chain(candidate.episode_id.iter().map(String::as_str))
+                .filter(|id| !id.is_empty())
+            {
+                if !self.document_reference_is_active(connection, control, document_id)? {
+                    return Ok(false);
+                }
+            }
+        }
+        for selection in &trace.state_selections {
+            if let Some(span) = &selection.evidence_span {
+                if span.event_id.is_empty() {
+                    return Err(RetrievalError::CorruptIndex(
+                        "state trace 缺少权威来源".into(),
+                    ));
+                }
+                if !self.trace_span_is_active(connection, control, None, span)? {
+                    return Ok(false);
+                }
+            }
+        }
+        for path in &trace.graph_paths {
+            if !path.target_session_id.is_empty() && path.span.is_none() {
+                return Err(RetrievalError::CorruptIndex(
+                    "graph trace 缺少目标来源片段".into(),
+                ));
+            }
+            if let Some(span) = &path.span {
+                if span.event_id.is_empty() {
+                    return Err(RetrievalError::CorruptIndex(
+                        "graph trace 缺少权威来源".into(),
+                    ));
+                }
+                if !self.trace_span_is_active(
+                    connection,
+                    control,
+                    (!path.target_session_id.is_empty()).then_some(path.target_session_id.as_str()),
+                    span,
+                )? {
+                    return Ok(false);
+                }
+            }
+            for document_id in [&path.seed_document_id, &path.target_document_id]
+                .into_iter()
+                .filter(|id| !id.is_empty())
+            {
+                if !self.document_reference_is_active(connection, control, document_id)? {
+                    return Ok(false);
+                }
+            }
+        }
+        for selected in &trace.selected_evidence {
+            if selected.span.event_id.is_empty() {
+                return Err(RetrievalError::CorruptIndex(
+                    "selected evidence 缺少权威来源".into(),
+                ));
+            }
+            if !self.trace_span_is_active(connection, control, None, &selected.span)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     fn write_session(
@@ -5438,6 +5646,13 @@ impl RetrievalStore {
                 continue;
             }
             if !all_event_by_id.contains_key(&answer_id) {
+                continue;
+            }
+            if !self.retrieval_trace_is_active(
+                transaction,
+                control,
+                &turn.context_trace.retrieval,
+            )? {
                 continue;
             }
             let mut provenance_ids = turn
@@ -6000,8 +6215,25 @@ impl RetrievalStore {
         &self,
         connection: &Connection,
     ) -> RetrievalResult<Vec<(String, RetrievalTrace)>> {
-        let mut expected = BTreeMap::new();
+        let control = self.replay_control_state_under_guard()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT answer_event_id,trace_json FROM retrieval_runs ORDER BY answer_event_id",
+            )
+            .map_err(|error| self.database_error(error))?;
+        let mut stored = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| self.database_error(error))?
+            .collect::<rusqlite::Result<BTreeMap<_, _>>>()
+            .map_err(|error| self.database_error(error))?;
+        drop(statement);
+        let mut validated = Vec::new();
         for source in self.load_all_sources()? {
+            if !control.allows_session(&source.session.id) {
+                continue;
+            }
             self.verify_indexed_session_source_projection(connection, &source.session.id)?;
             for turn in &source.session.turns {
                 if !has_assistant_event(&source.session, turn) {
@@ -6009,61 +6241,56 @@ impl RetrievalStore {
                 }
                 let answer_event_id =
                     event_id(&source.session.id, Some(&turn.id), EventRole::Assistant);
-                if expected
-                    .insert(
-                        answer_event_id.clone(),
-                        turn.context_trace.retrieval.clone(),
-                    )
-                    .is_some()
+                let user_event_id = event_id(&source.session.id, Some(&turn.id), EventRole::User);
+                if !control.allows_event(&source.session.id, &answer_event_id)
+                    || !control.allows_event(&source.session.id, &user_event_id)
                 {
+                    continue;
+                }
+                let canonical_json =
+                    serde_json::to_string(&turn.context_trace.retrieval).map_err(|error| {
+                        RetrievalError::CorruptIndex(format!(
+                            "原始 retrieval run {answer_event_id} 无法规范序列化：{error}"
+                        ))
+                    })?;
+                let json = stored.get(&answer_event_id);
+                if json.is_some_and(|json| json != &canonical_json) {
                     return Err(RetrievalError::CorruptIndex(format!(
-                        "原始 retrieval run {answer_event_id} 重复"
+                        "retrieval run {answer_event_id} 与原始 trace 不一致"
                     )));
                 }
+                if !self.retrieval_trace_is_active(
+                    connection,
+                    &control,
+                    &turn.context_trace.retrieval,
+                )? {
+                    if json.is_some() {
+                        return Err(RetrievalError::CorruptIndex(
+                            "受控 retrieval run 不应被物化".into(),
+                        ));
+                    }
+                    continue;
+                }
+                let json = stored.remove(&answer_event_id).ok_or_else(|| {
+                    RetrievalError::CorruptIndex(format!(
+                        "回答 {answer_event_id} 缺少 retrieval run"
+                    ))
+                })?;
+                let mut actual: RetrievalTrace = serde_json::from_str(&json).map_err(|error| {
+                    RetrievalError::CorruptIndex(format!(
+                        "retrieval run {answer_event_id} JSON 无效：{error}"
+                    ))
+                })?;
+                actual.normalize_usage();
+                validated.push((answer_event_id, actual));
             }
         }
-        let mut statement = connection
-            .prepare(
-                "SELECT answer_event_id,trace_json FROM retrieval_runs ORDER BY answer_event_id",
-            )
-            .map_err(|error| self.database_error(error))?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(|error| self.database_error(error))?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(|error| self.database_error(error))?;
-        if rows.len() != expected.len() {
+        if !stored.is_empty() {
             return Err(RetrievalError::CorruptIndex(
-                "retrieval_runs 与原始回答集合数量不一致".into(),
+                "retrieval_runs 包含未绑定的回答".into(),
             ));
         }
-        for (answer_event_id, json) in rows {
-            let wanted = expected.remove(&answer_event_id).ok_or_else(|| {
-                RetrievalError::CorruptIndex(format!(
-                    "retrieval run {answer_event_id} 未绑定原始 assistant 回答"
-                ))
-            })?;
-            let canonical_json = serde_json::to_string(&wanted).map_err(|error| {
-                RetrievalError::CorruptIndex(format!(
-                    "原始 retrieval run {answer_event_id} 无法规范序列化：{error}"
-                ))
-            })?;
-            if json != canonical_json {
-                return Err(RetrievalError::CorruptIndex(format!(
-                    "retrieval run {answer_event_id} 与原始 trace 不一致"
-                )));
-            }
-            let mut actual: RetrievalTrace = serde_json::from_str(&json).map_err(|error| {
-                RetrievalError::CorruptIndex(format!(
-                    "retrieval run {answer_event_id} JSON 无效：{error}"
-                ))
-            })?;
-            actual.normalize_usage();
-            expected.insert(answer_event_id, actual);
-        }
-        Ok(expected.into_iter().collect())
+        Ok(validated)
     }
 }
 
@@ -6959,10 +7186,41 @@ pub(crate) fn load_leaf_embedding_snapshot(
         }
     }
     expected.sort_by(|a, b| a.0.cmp(&b.0));
-    let all_actual_ids = connection.prepare("SELECT document_id FROM retrieval_documents WHERE granularity IN ('message','fragment') ORDER BY document_id")
-        .and_then(|mut s| s.query_map([], |r| r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()).map_err(|e| RetrievalError::CorruptIndex(format!("读取 retrieval leaf catalog 失败：{e}")))?;
+    let all_actual_ids = connection
+        .prepare(
+            "SELECT r.document_id,e.session_id,r.event_id
+         FROM retrieval_documents r LEFT JOIN events e ON e.event_id=r.event_id
+         WHERE r.granularity IN ('message','fragment') ORDER BY r.document_id",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .map_err(|error| {
+            RetrievalError::CorruptIndex(format!("读取 retrieval leaf catalog 失败：{error}"))
+        })?;
     let mut actual_ids = Vec::new();
-    for id in all_actual_ids {
+    for (id, session_id, event_id) in all_actual_ids {
+        if control.event_is_excluded(&event_id)
+            || session_id
+                .as_deref()
+                .is_some_and(|session_id| !control.allows_session(session_id))
+        {
+            continue;
+        }
+        let session_id = session_id.ok_or_else(|| {
+            RetrievalError::CorruptIndex(format!("retrieval leaf {id} 缺少权威事件"))
+        })?;
+        if !control.allows_event(&session_id, &event_id) {
+            continue;
+        }
         if store.memory_document_is_active(connection, &control, &id)? {
             actual_ids.push(id);
         }
