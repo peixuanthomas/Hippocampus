@@ -2582,6 +2582,7 @@ fn apply_trace(
         context_sha256: Some(plan.context_sha256.clone()),
         request: Some(request),
         identity_instruction: Some(plan.identity_instruction.clone()),
+        untrusted_history_wrapped: plan.untrusted_history_wrapped,
         provenance_quality: ProvenanceQuality::Exact,
         retrieval: plan.retrieval_trace.clone(),
         knowledge: plan.knowledge_trace.clone(),

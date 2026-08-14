@@ -12,6 +12,7 @@ use thiserror::Error;
 
 use crate::config::MemoryConfig;
 use crate::consolidation::{normalize_match, validate_full_derived_integrity};
+use crate::context::matches_wrapped_history_item;
 use crate::episode::{
     EMBEDDING_COSINE_SIMILARITY_THRESHOLD, EPISODE_ALGORITHM_VERSION, EpisodeBoundaryDecision,
     EpisodeBoundarySuggestion, EpisodeDocument, EpisodeInputMessage, EpisodeMaterializationReport,
@@ -2821,7 +2822,21 @@ impl RetrievalStore {
                 self.get_session_from_connection(&connection, &source_event.session_id)?;
             self.verify_fresh(&source_session)?;
             verify_event_hash(&source_event)?;
-            if source_event.role != role {
+            let wrapped_source_role = turn
+                .context_trace
+                .untrusted_history_wrapped
+                .then(|| {
+                    matches_wrapped_history_item(
+                        &ContextItemTrace {
+                            role,
+                            span: span.clone(),
+                            content_sha256: expected_hash.clone(),
+                        },
+                        &turn.context_trace.retrieval.selected_evidence,
+                    )
+                })
+                .flatten();
+            if source_event.role != role && wrapped_source_role != Some(source_event.role) {
                 return Err(RetrievalError::CorruptIndex(
                     "回答上下文角色与原始事件不匹配".into(),
                 ));
@@ -2834,7 +2849,8 @@ impl RetrievalStore {
                     span.event_id
                 )));
             }
-            if !inserted_generated && role != EventRole::System {
+            let generated_before_item = wrapped_source_role.is_some();
+            if !inserted_generated && (role != EventRole::System || generated_before_item) {
                 push_generated_messages(
                     &mut messages,
                     answer.identity_instruction.as_deref(),
@@ -2846,7 +2862,7 @@ impl RetrievalStore {
                 role: role.as_str().to_owned(),
                 content: content.clone(),
             });
-            if !inserted_generated && role == EventRole::System {
+            if !inserted_generated && role == EventRole::System && !generated_before_item {
                 push_generated_messages(
                     &mut messages,
                     answer.identity_instruction.as_deref(),
@@ -3036,7 +3052,16 @@ impl RetrievalStore {
                 let indexed = transaction.query_row("SELECT session_id, title, created_at, updated_at, source_file, source_sha256, source_schema_version FROM indexed_sessions WHERE session_id=?1", [&event.session_id], map_session).map_err(|e| self.database_error(e))?;
                 self.verify_fresh(&indexed)?;
                 verify_event_hash(event)?;
-                if item.role != event.role {
+                let wrapped_source_role = derived
+                    .untrusted_history_wrapped
+                    .then(|| {
+                        matches_wrapped_history_item(
+                            item,
+                            &turn.context_trace.retrieval.selected_evidence,
+                        )
+                    })
+                    .flatten();
+                if item.role != event.role && wrapped_source_role != Some(event.role) {
                     return Err(RetrievalError::InvalidSource {
                         path: source.path.clone(),
                         message: format!(
@@ -3056,7 +3081,9 @@ impl RetrievalStore {
                         ),
                     });
                 }
-                if !inserted_generated && item.role != EventRole::System {
+                let generated_before_item = wrapped_source_role.is_some();
+                if !inserted_generated && (item.role != EventRole::System || generated_before_item)
+                {
                     push_generated_messages(
                         &mut context_messages,
                         derived.identity_instruction.as_deref(),
@@ -3068,7 +3095,7 @@ impl RetrievalStore {
                     role: item.role.as_str().to_owned(),
                     content: selected.clone(),
                 });
-                if !inserted_generated && item.role == EventRole::System {
+                if !inserted_generated && item.role == EventRole::System && !generated_before_item {
                     push_generated_messages(
                         &mut context_messages,
                         derived.identity_instruction.as_deref(),
@@ -5769,6 +5796,7 @@ struct DerivedContext {
     provenance_quality: ProvenanceQuality,
     request: Option<ModelRequestTrace>,
     identity_instruction: Option<String>,
+    untrusted_history_wrapped: bool,
     knowledge_trace: KnowledgeTrace,
 }
 
@@ -5884,6 +5912,7 @@ fn derive_context(
             provenance_quality: ProvenanceQuality::Exact,
             request: Some(request),
             identity_instruction: turn.context_trace.identity_instruction.clone(),
+            untrusted_history_wrapped: turn.context_trace.untrusted_history_wrapped,
             knowledge_trace: turn.context_trace.knowledge.clone(),
         });
     }
@@ -5924,6 +5953,7 @@ fn derive_context(
         provenance_quality: ProvenanceQuality::LegacyInferred,
         request: None,
         identity_instruction: None,
+        untrusted_history_wrapped: false,
         knowledge_trace: KnowledgeTrace::default(),
     })
 }

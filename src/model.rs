@@ -958,6 +958,8 @@ pub struct ContextTrace {
     pub request: Option<ModelRequestTrace>,
     #[serde(default)]
     pub identity_instruction: Option<String>,
+    #[serde(default)]
+    pub untrusted_history_wrapped: bool,
     #[serde(default = "legacy_inferred")]
     pub provenance_quality: ProvenanceQuality,
     #[serde(default)]
@@ -987,6 +989,7 @@ impl Default for ContextTrace {
             context_sha256: None,
             request: None,
             identity_instruction: None,
+            untrusted_history_wrapped: false,
             provenance_quality: ProvenanceQuality::Exact,
             retrieval: RetrievalTrace::default(),
             knowledge: KnowledgeTrace::default(),
@@ -1260,6 +1263,7 @@ pub struct ContextPlan {
     pub exact_input_tokens: Option<u64>,
     pub input_budget: u64,
     pub identity_instruction: String,
+    pub untrusted_history_wrapped: bool,
     pub retrieval_trace: RetrievalTrace,
     pub evidence: Vec<SelectedEvidence>,
     pub knowledge_trace: KnowledgeTrace,
