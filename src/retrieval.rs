@@ -1,10 +1,10 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -21,11 +21,11 @@ use crate::episode::{
 };
 use crate::knowledge::{KnowledgeStore, KnowledgeTrace};
 use crate::model::{
-    BudgetAllocationTrace, ChannelTrace, ChatMessage, ContextItemTrace, EventRole, EvidenceKind,
-    FusionCandidateTrace, ModelRequestTrace, ProvenanceQuality, QueryKind, RankedCandidate,
-    RetrievalChannel, RetrievalConfig, RetrievalDocumentGranularity, RetrievalTrace,
-    SCHEMA_VERSION, SelectedEvidence, Session, SourceSpan, Turn, TurnStatus, WebTrace,
-    content_sha256, context_sha256, event_id,
+    BudgetAllocationTrace, ChannelTrace, ChatMessage, ContextItemTrace, EntityMatchTrace,
+    EventRole, EvidenceKind, FusionCandidateTrace, ModelRequestTrace, ProvenanceQuality, QueryKind,
+    RankedCandidate, RetrievalChannel, RetrievalConfig, RetrievalDocumentGranularity,
+    RetrievalTrace, SCHEMA_VERSION, SelectedEvidence, Session, SourceSpan, StateSelectionTrace,
+    Turn, TurnStatus, WebTrace, content_sha256, context_sha256, event_id,
 };
 use crate::ollama::{ChatBackend, EmbeddingRequest};
 use crate::vector::{
@@ -448,6 +448,30 @@ struct FusedRawCandidate {
     selected: bool,
     reason: String,
     vector: Option<Vec<f32>>,
+}
+
+struct StateEvidenceCandidate {
+    trace: StateSelectionTrace,
+    content: String,
+    content_sha256: String,
+    episode_id: Option<String>,
+    conflict_group: Vec<String>,
+}
+
+struct StateSidecar {
+    entity_matches: Vec<EntityMatchTrace>,
+    candidates: Vec<StateEvidenceCandidate>,
+    warnings: Vec<String>,
+    entity_ms: u64,
+    state_ms: u64,
+}
+
+struct ClaimEvidenceSelection {
+    evidence_id: String,
+    span: SourceSpan,
+    role: EventRole,
+    content: String,
+    content_sha256: String,
 }
 
 #[cfg(test)]
@@ -1844,6 +1868,8 @@ impl RetrievalStore {
                     None,
                 ),
                 channel_trace(RetrievalChannel::Vector, "disabled", 0, 0, None),
+                channel_trace(RetrievalChannel::Entity, "disabled", 0, 0, None),
+                channel_trace(RetrievalChannel::State, "disabled", 0, 0, None),
             ];
             result.trace.elapsed_ms = elapsed_ms(started);
             return Ok(result);
@@ -1898,6 +1924,8 @@ impl RetrievalStore {
 
         let mut fallback = bm25.clone();
         let fusion_store = self.clone();
+        let fusion_query = raw_query.to_owned();
+        let fusion_scope = session_filter.map(str::to_owned);
         let fusion_current = current_user_event_id.to_owned();
         let fusion_recent = recent_event_ids.to_vec();
         let retrieval = retrieval_config.clone();
@@ -1905,10 +1933,12 @@ impl RetrievalStore {
         let fused_task = tokio::task::spawn_blocking(move || {
             fusion_store.fuse_vector_recall(
                 bm25,
+                &fusion_query,
                 vector_input.0,
                 vector_input.1,
                 &fusion_current,
                 &fusion_recent,
+                fusion_scope.as_deref(),
                 retrieval,
                 memory,
                 bm25_ms,
@@ -1918,12 +1948,22 @@ impl RetrievalStore {
         let mut result = match join_blocking(fused_task).await {
             Ok(result) => result,
             Err(error) => {
-                apply_vector_fallback(
-                    &mut fallback,
-                    bm25_ms,
-                    elapsed_ms(embed_started),
-                    error.to_string(),
-                );
+                let message = error.to_string();
+                if message.contains("entity/state recall") {
+                    apply_sidecar_fallback(
+                        &mut fallback,
+                        bm25_ms,
+                        elapsed_ms(embed_started),
+                        message,
+                    );
+                } else {
+                    apply_vector_fallback(
+                        &mut fallback,
+                        bm25_ms,
+                        elapsed_ms(embed_started),
+                        message,
+                    );
+                }
                 fallback.trace.elapsed_ms = elapsed_ms(started);
                 return Ok(fallback);
             }
@@ -1988,10 +2028,12 @@ impl RetrievalStore {
     fn fuse_vector_recall(
         &self,
         bm25: RecallResult,
+        raw_query: &str,
         query_vector: Vec<f32>,
         index: Arc<HnswVectorIndex>,
         current_user_event_id: &str,
         recent_event_ids: &[String],
+        session_filter: Option<&str>,
         retrieval_config: RetrievalConfig,
         memory_config: MemoryConfig,
         bm25_ms: u64,
@@ -2209,6 +2251,19 @@ impl RetrievalStore {
                 .then_with(|| left.span.end_char.cmp(&right.span.end_char))
                 .then_with(|| left.reason.cmp(&right.reason))
         });
+        let sidecar = self
+            .load_state_sidecar(
+                &connection,
+                raw_query,
+                current_user_event_id,
+                recent_event_ids,
+                session_filter,
+                bm25.trace.query_kind,
+                memory_config.candidate_limit,
+            )
+            .map_err(|error| {
+                RetrievalError::CorruptIndex(format!("entity/state recall: {error}"))
+            })?;
         self.select_fused_candidates(
             &connection,
             candidates,
@@ -2221,6 +2276,7 @@ impl RetrievalStore {
             vector_candidate_count,
             capped_candidates,
             excluded_vectors,
+            sidecar,
         )
     }
 
@@ -2469,6 +2525,427 @@ impl RetrievalStore {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn load_state_sidecar(
+        &self,
+        connection: &Connection,
+        raw_query: &str,
+        current_user_event_id: &str,
+        recent_event_ids: &[String],
+        session_filter: Option<&str>,
+        query_kind: QueryKind,
+        candidate_limit: usize,
+    ) -> RetrievalResult<StateSidecar> {
+        let entity_started = Instant::now();
+        validate_full_derived_integrity(connection)?;
+        let normalized_query = normalize_match(raw_query);
+        let mut groups = BTreeMap::<(u8, String), (BTreeSet<String>, BTreeSet<String>)>::new();
+        let mut statement = connection
+            .prepare(
+                "SELECT e.entity_id,e.canonical_name,e.normalized_name
+                 FROM memory_entities e
+                 WHERE EXISTS (SELECT 1 FROM memory_entity_mentions m
+                     WHERE m.entity_id=e.entity_id AND m.entity_status='resolved'
+                       AND (?1 IS NULL OR m.session_id=?1))
+                 ORDER BY e.entity_id",
+            )
+            .map_err(|error| self.database_error(error))?;
+        let rows = statement
+            .query_map([session_filter], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|error| self.database_error(error))?;
+        for row in rows {
+            let (id, text, normalized) = row.map_err(|error| self.database_error(error))?;
+            if id != "ent_self"
+                && !is_generic_pronoun(&normalized)
+                && query_contains_match(&normalized_query, &normalized)
+            {
+                let group = groups.entry((3, normalized)).or_default();
+                group.0.insert(id);
+                group.1.insert(text);
+            }
+        }
+        drop(statement);
+        let mut statement = connection
+            .prepare(
+                "SELECT a.entity_id,a.alias_text,a.normalized_alias,a.alias_kind
+                 FROM memory_entity_aliases a JOIN memory_entities e ON e.entity_id=a.entity_id
+                 WHERE (?1 IS NULL OR a.session_id=?1)
+                   AND EXISTS (SELECT 1 FROM memory_entity_mentions m
+                       WHERE m.entity_id=a.entity_id AND m.entity_status='resolved')
+                 ORDER BY a.alias_id",
+            )
+            .map_err(|error| self.database_error(error))?;
+        let rows = statement
+            .query_map([session_filter], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(|error| self.database_error(error))?;
+        for row in rows {
+            let (id, text, normalized, basis) = row.map_err(|error| self.database_error(error))?;
+            if !is_generic_pronoun(&normalized)
+                && query_contains_match(&normalized_query, &normalized)
+            {
+                let priority = if basis == "stable_identifier" { 0 } else { 1 };
+                let group = groups.entry((priority, normalized)).or_default();
+                group.0.insert(id);
+                group.1.insert(text);
+            }
+        }
+        drop(statement);
+        let self_eligible = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM memory_entity_mentions WHERE entity_id='ent_self'
+                 AND entity_status='resolved' AND (?1 IS NULL OR session_id=?1))",
+                [session_filter],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|error| self.database_error(error))?;
+        if self_eligible {
+            for pronoun in ["我", "本人", "i", "me", "my"] {
+                if query_contains_match(&normalized_query, pronoun) {
+                    let group = groups.entry((2, pronoun.into())).or_default();
+                    group.0.insert("ent_self".into());
+                    group.1.insert(pronoun.into());
+                }
+            }
+        }
+        let mut selected_entities = BTreeSet::new();
+        let mut entity_matches = Vec::new();
+        for ((priority, normalized), (owners, texts)) in groups {
+            let candidates = owners.into_iter().collect::<Vec<_>>();
+            let selected = (candidates.len() == 1).then(|| candidates[0].clone());
+            if let Some(id) = &selected {
+                selected_entities.insert(id.clone());
+            }
+            entity_matches.push(EntityMatchTrace {
+                matched_text: texts.into_iter().next().unwrap_or_default(),
+                normalized_text: normalized,
+                match_basis: match priority {
+                    0 => "stable_identifier",
+                    1 => "explicit_alias",
+                    2 => "ent_self",
+                    _ => "canonical_name",
+                }
+                .into(),
+                candidate_entity_ids: candidates,
+                selected_entity_id: selected.clone(),
+                reason: if selected.is_some() {
+                    "unique"
+                } else {
+                    "ambiguous"
+                }
+                .into(),
+            });
+        }
+        let entity_ms = elapsed_ms(entity_started);
+        let state_started = Instant::now();
+        let current = self.get_event_from_connection(connection, current_user_event_id)?;
+        let current_reference = DateTime::parse_from_rfc3339(&current.created_at)
+            .map_err(|_| RetrievalError::CorruptIndex("当前查询事件时间损坏".into()))?
+            .with_timezone(&Utc);
+        let (explicit_reference, invalid_date) = explicit_query_date(&normalized_query);
+        let reference = explicit_reference.unwrap_or(current_reference);
+        let historical = has_historical_cue(&normalized_query);
+        let mut warnings = Vec::new();
+        if invalid_date {
+            warnings.push("查询包含无效日期，已使用时间提示模式".into());
+        }
+        let future_reference = explicit_reference.is_some_and(|value| value > current_reference);
+        let terms = query_terms(raw_query)
+            .into_iter()
+            .map(|term| normalize_match(&term))
+            .filter(|term| !term.is_empty())
+            .collect::<BTreeSet<_>>();
+        let mut related = BTreeMap::<String, BTreeSet<String>>::new();
+        let mut conflicts = BTreeMap::<String, BTreeSet<String>>::new();
+        let mut statement = connection
+            .prepare(
+                "SELECT claim_id,related_claim_id,reason FROM memory_claim_transitions
+                 WHERE related_claim_id IS NOT NULL ORDER BY claim_id,ordinal,related_claim_id",
+            )
+            .map_err(|error| self.database_error(error))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|error| self.database_error(error))?;
+        for row in rows {
+            let (claim, other, reason) = row.map_err(|error| self.database_error(error))?;
+            related
+                .entry(claim.clone())
+                .or_default()
+                .insert(other.clone());
+            if reason == "conflicted" {
+                conflicts
+                    .entry(claim.clone())
+                    .or_default()
+                    .insert(other.clone());
+                conflicts.entry(other).or_default().insert(claim);
+            }
+        }
+        drop(statement);
+        let mut statement = connection
+            .prepare(
+                "SELECT c.claim_id,c.subject_entity_id,c.object_entity_id,c.predicate_key,
+                        c.normalized_relation,c.normalized_object,c.object_kind,c.state,c.certainty,
+                        c.asserted_at,c.event_time,c.valid_from,c.valid_to,c.reference_time
+                 FROM memory_claims c ORDER BY c.claim_id",
+            )
+            .map_err(|error| self.database_error(error))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, String>(11)?,
+                    row.get::<_, Option<String>>(12)?,
+                    row.get::<_, String>(13)?,
+                ))
+            })
+            .map_err(|error| self.database_error(error))?;
+        let mut candidates = Vec::new();
+        for row in rows {
+            let (
+                claim_id,
+                subject,
+                object,
+                predicate,
+                relation,
+                object_text,
+                object_kind,
+                state,
+                certainty,
+                asserted,
+                event_time,
+                valid_from,
+                valid_to,
+                reference_time,
+            ) = row.map_err(|error| self.database_error(error))?;
+            let mut reason = "eligible".to_owned();
+            let lexical = claim_overlap(&terms, &predicate, &relation, &object_text);
+            let from = parse_retrieval_time(&valid_from, "claim.valid_from")?;
+            let to = valid_to
+                .as_deref()
+                .map(|value| parse_retrieval_time(value, "claim.valid_to"))
+                .transpose()?;
+            let object_resolved = if object_kind == "entity" {
+                object
+                    .as_deref()
+                    .map(|id| entity_is_resolved(connection, id))
+                    .transpose()?
+                    .unwrap_or(false)
+            } else {
+                true
+            };
+            if !selected_entities.contains(&subject) {
+                reason = "subject_not_selected".into();
+            } else if !object_resolved {
+                reason = "pending_object".into();
+            } else if future_reference {
+                reason = "future_reference".into();
+            } else if query_kind != QueryKind::TemporalState && lexical == 0 {
+                reason = "no_claim_overlap".into();
+            } else if !historical
+                && (!(from <= reference && to.is_none_or(|value| value >= reference))
+                    || explicit_reference.is_none()
+                        && !matches!(state.as_str(), "active" | "conflicted" | "uncertain"))
+            {
+                reason = "not_applicable".into();
+            }
+            let related_ids: Vec<String> = related
+                .get(&claim_id)
+                .map(|ids| ids.iter().cloned().collect())
+                .unwrap_or_default();
+            let mut trace = StateSelectionTrace {
+                claim_id: claim_id.clone(),
+                subject_entity_id: subject,
+                object_entity_id: object,
+                predicate_key: predicate,
+                state: state.clone(),
+                certainty,
+                asserted_at: asserted,
+                event_time,
+                valid_from,
+                valid_to,
+                reference_time,
+                related_claim_ids: related_ids.clone(),
+                reason: reason.clone(),
+                ..Default::default()
+            };
+            let mut content = String::new();
+            let mut hash = String::new();
+            let mut episode = None;
+            if reason == "eligible" {
+                if let Some(evidence) = self.load_claim_evidence(
+                    connection,
+                    &claim_id,
+                    query_kind,
+                    current_user_event_id,
+                    recent_event_ids,
+                    session_filter,
+                )? {
+                    trace.evidence_id = Some(evidence.evidence_id);
+                    trace.evidence_span = Some(evidence.span.clone());
+                    trace.evidence_role = Some(evidence.role);
+                    content = evidence.content;
+                    hash = evidence.content_sha256;
+                    episode = self.resolve_episode_id(connection, &evidence.span.event_id)?;
+                } else {
+                    trace.reason = "no_eligible_user_evidence".into();
+                }
+            }
+            candidates.push((
+                lexical,
+                from,
+                StateEvidenceCandidate {
+                    trace,
+                    content,
+                    content_sha256: hash,
+                    episode_id: episode,
+                    conflict_group: if state == "conflicted" {
+                        complete_conflict_group(&conflicts, &claim_id)
+                    } else {
+                        vec![claim_id]
+                    },
+                },
+            ));
+        }
+        candidates.sort_by(|left, right| {
+            (right.0 > 0)
+                .cmp(&(left.0 > 0))
+                .then_with(|| right.0.cmp(&left.0))
+                .then_with(|| {
+                    state_priority(&left.2.trace.state).cmp(&state_priority(&right.2.trace.state))
+                })
+                .then_with(|| right.1.cmp(&left.1))
+                .then_with(|| left.2.trace.claim_id.cmp(&right.2.trace.claim_id))
+        });
+        for (index, (_, _, candidate)) in candidates.iter_mut().enumerate() {
+            candidate.trace.rank = index + 1;
+            if index >= candidate_limit && candidate.trace.reason == "eligible" {
+                candidate.trace.reason = "candidate_limit".into();
+            }
+        }
+        Ok(StateSidecar {
+            entity_matches,
+            candidates: candidates.into_iter().map(|(_, _, value)| value).collect(),
+            warnings,
+            entity_ms,
+            state_ms: elapsed_ms(state_started),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn load_claim_evidence(
+        &self,
+        connection: &Connection,
+        claim_id: &str,
+        query_kind: QueryKind,
+        current_user_event_id: &str,
+        recent_event_ids: &[String],
+        session_filter: Option<&str>,
+    ) -> RetrievalResult<Option<ClaimEvidenceSelection>> {
+        let temporal_first = query_kind == QueryKind::TemporalState;
+        let mut statement = connection
+            .prepare(
+                "SELECT v.evidence_id,v.event_id,v.start_char,v.end_char,v.content_sha256,e.role
+             FROM memory_claim_evidence v JOIN events e ON e.event_id=v.event_id
+             WHERE v.claim_id=?1 AND v.role='user' AND (?2 IS NULL OR e.session_id=?2)
+             ORDER BY CASE v.kind
+                WHEN 'temporal' THEN ?3 WHEN 'correction' THEN ?4
+                WHEN 'user_confirmation' THEN ?5 ELSE ?6 END,
+                v.sequence DESC,v.start_char,v.end_char,v.evidence_id",
+            )
+            .map_err(|error| self.database_error(error))?;
+        let priorities = if temporal_first {
+            (0, 1, 2, 3)
+        } else {
+            (3, 0, 1, 2)
+        };
+        let rows = statement
+            .query_map(
+                params![
+                    claim_id,
+                    session_filter,
+                    priorities.0,
+                    priorities.1,
+                    priorities.2,
+                    priorities.3
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .map_err(|error| self.database_error(error))?;
+        for row in rows {
+            let (id, event_id, start, end, stored_hash, role) =
+                row.map_err(|error| self.database_error(error))?;
+            if event_id == current_user_event_id
+                || recent_event_ids.iter().any(|recent| recent == &event_id)
+            {
+                continue;
+            }
+            let event = self.get_event_from_connection(connection, &event_id)?;
+            let session = self.get_session_from_connection(connection, &event.session_id)?;
+            self.verify_fresh(&session)?;
+            verify_event_hash(&event)?;
+            if role != "user" || event.role != EventRole::User {
+                continue;
+            }
+            let span = SourceSpan {
+                event_id,
+                start_char: i64_to_usize(start).map_err(|error| self.database_error(error))?,
+                end_char: i64_to_usize(end).map_err(|error| self.database_error(error))?,
+            };
+            let content = slice_chars(&event.content, &span)?;
+            let hash = content_sha256(&content);
+            if hash != stored_hash {
+                return Err(RetrievalError::CorruptIndex(format!(
+                    "声明证据 {id} 与原文不一致"
+                )));
+            }
+            return Ok(Some(ClaimEvidenceSelection {
+                evidence_id: id,
+                span,
+                role: EventRole::User,
+                content,
+                content_sha256: hash,
+            }));
+        }
+        Ok(None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn select_fused_candidates(
         &self,
         connection: &Connection,
@@ -2482,6 +2959,7 @@ impl RetrievalStore {
         vector_candidate_count: usize,
         capped_candidates: Vec<FusedRawCandidate>,
         excluded_vectors: Vec<FusionCandidateTrace>,
+        mut sidecar: StateSidecar,
     ) -> RetrievalResult<RecallResult> {
         let mut processing_order = (0..candidates.len()).collect::<Vec<_>>();
         processing_order.sort_by_key(|&index| !candidates[index].protected_exact);
@@ -2537,7 +3015,163 @@ impl RetrievalStore {
             candidates[index].reason = "protected_exact".into();
             selected.push(index);
         }
-        while selected.len() < retrieval_config.max_selected && !eligible.is_empty() {
+        let mut state_only = Vec::new();
+        let mut state_slots = 0usize;
+        let target_state_slots = retrieval_config
+            .max_selected
+            .saturating_mul(usize::from(
+                bm25.trace.budget_allocation.exact_or_state_percent,
+            ))
+            .div_ceil(100)
+            .max(1)
+            .min(retrieval_config.max_selected.saturating_sub(selected.len()));
+        let mut selected_events = selected
+            .iter()
+            .map(|&index| candidates[index].span.event_id.clone())
+            .collect::<HashSet<_>>();
+        let mut selected_hashes = selected
+            .iter()
+            .map(|&index| candidates[index].content_sha256.clone())
+            .collect::<HashSet<_>>();
+        let mut selected_episodes = selected
+            .iter()
+            .filter_map(|&index| candidates[index].episode_id.clone())
+            .collect::<HashSet<_>>();
+        let mut handled_groups = BTreeSet::new();
+        for index in 0..sidecar.candidates.len() {
+            if sidecar.candidates[index].trace.reason != "eligible" {
+                continue;
+            }
+            let group = sidecar.candidates[index].conflict_group.clone();
+            let group_key = group.join("\0");
+            if !handled_groups.insert(group_key) {
+                continue;
+            }
+            let member_indexes = group
+                .iter()
+                .filter_map(|claim| {
+                    sidecar
+                        .candidates
+                        .iter()
+                        .position(|candidate| candidate.trace.claim_id == *claim)
+                })
+                .collect::<Vec<_>>();
+            if member_indexes.len() != group.len()
+                || member_indexes.iter().any(|&member| {
+                    sidecar.candidates[member].trace.reason != "eligible"
+                        || sidecar.candidates[member].trace.evidence_span.is_none()
+                })
+            {
+                for member in member_indexes {
+                    sidecar.candidates[member].trace.reason = "incomplete_conflict_group".into();
+                }
+                continue;
+            }
+            let additional = member_indexes
+                .iter()
+                .filter(|&&member| {
+                    let item = &sidecar.candidates[member];
+                    !selected_events.contains(&item.trace.evidence_span.as_ref().unwrap().event_id)
+                        && !selected_hashes.contains(&item.content_sha256)
+                        && item
+                            .episode_id
+                            .as_ref()
+                            .is_none_or(|episode| !selected_episodes.contains(episode))
+                })
+                .count();
+            let chars = member_indexes
+                .iter()
+                .filter(|&&member| {
+                    let item = &sidecar.candidates[member];
+                    !selected_events.contains(&item.trace.evidence_span.as_ref().unwrap().event_id)
+                        && !selected_hashes.contains(&item.content_sha256)
+                        && item
+                            .episode_id
+                            .as_ref()
+                            .is_none_or(|episode| !selected_episodes.contains(episode))
+                })
+                .map(|&member| sidecar.candidates[member].content.chars().count())
+                .sum::<usize>();
+            if state_slots + additional > target_state_slots
+                || selected.len() + state_only.len() + additional > retrieval_config.max_selected
+            {
+                for member in member_indexes {
+                    sidecar.candidates[member].trace.reason = "state_slot_limit".into();
+                }
+                continue;
+            }
+            if selected_chars + chars > retrieval_config.evidence_char_budget {
+                for member in member_indexes {
+                    sidecar.candidates[member].trace.reason = "evidence_budget".into();
+                }
+                continue;
+            }
+            for member in member_indexes {
+                let item = &mut sidecar.candidates[member];
+                let span = item.trace.evidence_span.as_ref().unwrap();
+                if let Some(candidate_index) = candidates
+                    .iter()
+                    .position(|candidate| candidate.span == *span)
+                {
+                    candidates[candidate_index].selected = true;
+                    candidates[candidate_index].reason = "selected_state".into();
+                    if !selected.contains(&candidate_index) {
+                        selected.push(candidate_index);
+                        if let Some(position) =
+                            eligible.iter().position(|value| *value == candidate_index)
+                        {
+                            eligible.remove(position);
+                        }
+                    }
+                    item.trace.selected = true;
+                    item.trace.reason = format!("selected_state:{}", item.trace.claim_id);
+                } else if selected_events.contains(&span.event_id)
+                    || selected_hashes.contains(&item.content_sha256)
+                    || item
+                        .episode_id
+                        .as_ref()
+                        .is_some_and(|episode| selected_episodes.contains(episode))
+                {
+                    item.trace.selected = true;
+                    item.trace.reason =
+                        format!("selected_state_deduplicated:{}", item.trace.claim_id);
+                    continue;
+                } else {
+                    state_only.push(member);
+                    item.trace.selected = true;
+                    item.trace.reason = format!("selected_state:{}", item.trace.claim_id);
+                }
+                selected_events.insert(span.event_id.clone());
+                selected_hashes.insert(item.content_sha256.clone());
+                if let Some(episode) = &item.episode_id {
+                    selected_episodes.insert(episode.clone());
+                }
+                selected_chars += item.content.chars().count();
+                state_slots += 1;
+            }
+        }
+        eligible.retain(|&index| {
+            let candidate = &mut candidates[index];
+            if selected_events.contains(&candidate.span.event_id) {
+                candidate.reason = "duplicate_state_event".into();
+                false
+            } else if selected_hashes.contains(&candidate.content_sha256) {
+                candidate.reason = "duplicate_state_content".into();
+                false
+            } else if candidate
+                .episode_id
+                .as_ref()
+                .is_some_and(|episode| selected_episodes.contains(episode))
+            {
+                candidate.reason = "duplicate_state_episode".into();
+                false
+            } else {
+                true
+            }
+        });
+        while selected.len() + state_only.len() < retrieval_config.max_selected
+            && !eligible.is_empty()
+        {
             let best_position = eligible
                 .iter()
                 .enumerate()
@@ -2578,18 +3212,31 @@ impl RetrievalStore {
         }
         let mut evidence = Vec::new();
         let mut selected_evidence = Vec::new();
-        let mut expansion_events = HashSet::new();
-        let mut expansion_hashes = HashSet::new();
+        let mut expansion_events = selected_events;
+        let mut expansion_hashes = selected_hashes;
         for &index in &selected {
             let candidate = &candidates[index];
+            if candidate.reason == "selected_state" && !candidate.protected_exact {
+                continue;
+            }
             let rank = candidate.pre_cap_rank;
+            let evidence_reason = if candidate.reason == "selected_state" {
+                sidecar
+                    .candidates
+                    .iter()
+                    .find(|state| state.trace.evidence_span.as_ref() == Some(&candidate.span))
+                    .map(|state| state.trace.reason.clone())
+                    .unwrap_or_else(|| candidate.reason.clone())
+            } else {
+                candidate.reason.clone()
+            };
             let selected_item = SelectedEvidence {
                 span: candidate.span.clone(),
                 content_sha256: candidate.content_sha256.clone(),
                 role: candidate.role,
                 kind: EvidenceKind::Core,
                 originating_candidate_rank: Some(rank),
-                reason: candidate.reason.clone(),
+                reason: evidence_reason,
             };
             expansion_events.insert(candidate.span.event_id.clone());
             expansion_hashes.insert(candidate.content_sha256.clone());
@@ -2602,6 +3249,8 @@ impl RetrievalStore {
         bm25.trace.status = "ok".into();
         bm25.trace.config = retrieval_config;
         bm25.trace.selected_evidence = selected_evidence;
+        bm25.trace.entity_matches = sidecar.entity_matches;
+        bm25.trace.warnings.append(&mut sidecar.warnings);
         bm25.trace.fusion_candidates = candidates
             .iter()
             .chain(capped_candidates.iter())
@@ -2644,6 +3293,28 @@ impl RetrievalStore {
                 vector_ms,
                 None,
             ),
+            channel_trace(
+                RetrievalChannel::Entity,
+                if bm25.trace.entity_matches.is_empty() {
+                    "empty"
+                } else {
+                    "ok"
+                },
+                bm25.trace.entity_matches.len(),
+                sidecar.entity_ms,
+                None,
+            ),
+            channel_trace(
+                RetrievalChannel::State,
+                if sidecar.candidates.is_empty() {
+                    "empty"
+                } else {
+                    "ok"
+                },
+                sidecar.candidates.len(),
+                sidecar.state_ms,
+                None,
+            ),
         ];
         let recent = recent_event_ids.iter().map(String::as_str).collect();
         self.expand_context(
@@ -2655,6 +3326,40 @@ impl RetrievalStore {
             &mut expansion_events,
             &mut expansion_hashes,
         )?;
+        let mut selected_states = sidecar
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.trace.selected)
+            .collect::<Vec<_>>();
+        selected_states.sort_by_key(|candidate| candidate.trace.rank);
+        for candidate in selected_states {
+            let span = candidate.trace.evidence_span.clone().unwrap();
+            if evidence.iter().any(|item| item.selected.span == span) {
+                continue;
+            }
+            let fused_rank = candidates
+                .iter()
+                .find(|fused| fused.span == span && fused.reason == "selected_state")
+                .map(|fused| fused.pre_cap_rank);
+            let selected = SelectedEvidence {
+                span,
+                content_sha256: candidate.content_sha256.clone(),
+                role: EventRole::User,
+                kind: EvidenceKind::Core,
+                originating_candidate_rank: fused_rank,
+                reason: candidate.trace.reason.clone(),
+            };
+            bm25.trace.selected_evidence.push(selected.clone());
+            evidence.push(RecalledEvidence {
+                selected,
+                content: candidate.content.clone(),
+            });
+        }
+        bm25.trace.state_selections = sidecar
+            .candidates
+            .into_iter()
+            .map(|candidate| candidate.trace)
+            .collect();
         bm25.evidence = evidence;
         Ok(bm25)
     }
@@ -7131,8 +7836,194 @@ fn apply_vector_fallback(result: &mut RecallResult, bm25_ms: u64, vector_ms: u64
             vector_ms,
             Some(error.clone()),
         ),
+        channel_trace(RetrievalChannel::Entity, "skipped", 0, 0, None),
+        channel_trace(RetrievalChannel::State, "skipped", 0, 0, None),
     ];
     result.trace.warnings.push(error);
+}
+
+fn apply_sidecar_fallback(result: &mut RecallResult, bm25_ms: u64, vector_ms: u64, error: String) {
+    result.trace.status = "bm25_fallback".into();
+    result.trace.fusion_candidates.clear();
+    result.trace.entity_matches.clear();
+    result.trace.state_selections.clear();
+    result.trace.channels = vec![
+        channel_trace(
+            RetrievalChannel::Bm25,
+            "ok",
+            result.trace.candidates.len(),
+            bm25_ms,
+            None,
+        ),
+        channel_trace(
+            RetrievalChannel::Vector,
+            "discarded",
+            0,
+            vector_ms,
+            Some("advanced evidence discarded".into()),
+        ),
+        channel_trace(RetrievalChannel::Entity, "error", 0, 0, Some(error.clone())),
+        channel_trace(RetrievalChannel::State, "error", 0, 0, Some(error.clone())),
+    ];
+    result.trace.warnings.push(error);
+}
+
+fn is_generic_pronoun(value: &str) -> bool {
+    matches!(
+        value,
+        "我" | "本人"
+            | "你"
+            | "您"
+            | "他"
+            | "她"
+            | "它"
+            | "他们"
+            | "她们"
+            | "它们"
+            | "i"
+            | "me"
+            | "my"
+            | "you"
+            | "he"
+            | "him"
+            | "she"
+            | "her"
+            | "it"
+            | "they"
+            | "them"
+    )
+}
+
+fn query_contains_match(query: &str, term: &str) -> bool {
+    if term.trim().is_empty() {
+        return false;
+    }
+    if term.is_ascii() {
+        query.match_indices(term).any(|(start, _)| {
+            let before = query[..start].chars().next_back();
+            let end = start + term.len();
+            let after = query[end..].chars().next();
+            !before.is_some_and(|character| character.is_ascii_alphanumeric() || character == '_')
+                && !after
+                    .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_')
+        })
+    } else {
+        query.contains(term)
+    }
+}
+
+fn explicit_query_date(query: &str) -> (Option<DateTime<Utc>>, bool) {
+    let bytes = query.as_bytes();
+    let mut invalid = false;
+    for start in 0..bytes.len().saturating_sub(9) {
+        let value = &bytes[start..start + 10];
+        if !(value[0..4].iter().all(u8::is_ascii_digit)
+            && value[4] == b'-'
+            && value[5..7].iter().all(u8::is_ascii_digit)
+            && value[7] == b'-'
+            && value[8..10].iter().all(u8::is_ascii_digit))
+        {
+            continue;
+        }
+        let before_ok = start == 0 || !bytes[start - 1].is_ascii_alphanumeric();
+        let after_ok = start + 10 == bytes.len() || !bytes[start + 10].is_ascii_alphanumeric();
+        if !before_ok || !after_ok {
+            continue;
+        }
+        let text = std::str::from_utf8(value).unwrap_or_default();
+        if let Ok(date) = NaiveDate::parse_from_str(text, "%Y-%m-%d") {
+            let next = date.succ_opt().unwrap_or(date);
+            let instant = Utc.from_utc_datetime(&next.and_hms_opt(0, 0, 0).unwrap())
+                - chrono::Duration::nanoseconds(1);
+            return (Some(instant), invalid);
+        }
+        invalid = true;
+    }
+    (None, invalid)
+}
+
+fn has_historical_cue(query: &str) -> bool {
+    [
+        "曾经",
+        "以前",
+        "过去",
+        "原来",
+        "当时",
+        "后来",
+        "什么时候",
+        "何时",
+    ]
+    .iter()
+    .any(|cue| query.contains(cue))
+        || [
+            "formerly",
+            "previously",
+            "before",
+            "after",
+            "used to",
+            "when",
+        ]
+        .iter()
+        .any(|cue| query_contains_match(query, cue))
+}
+
+fn parse_retrieval_time(value: &str, label: &str) -> RetrievalResult<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|time| time.with_timezone(&Utc))
+        .map_err(|_| RetrievalError::CorruptIndex(format!("{label} 时间损坏")))
+}
+
+fn claim_overlap(terms: &BTreeSet<String>, predicate: &str, relation: &str, object: &str) -> usize {
+    let fields = [
+        normalize_match(predicate),
+        normalize_match(relation),
+        normalize_match(object),
+    ];
+    terms
+        .iter()
+        .filter(|term| {
+            fields
+                .iter()
+                .any(|field| query_contains_match(field, term) || query_contains_match(term, field))
+        })
+        .count()
+}
+
+fn entity_is_resolved(connection: &Connection, entity_id: &str) -> RetrievalResult<bool> {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM memory_entity_mentions WHERE entity_id=?1 AND entity_status='resolved')",
+            [entity_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| RetrievalError::CorruptIndex(format!("实体状态查询失败：{error}")))
+}
+
+fn state_priority(state: &str) -> u8 {
+    match state {
+        "active" => 0,
+        "conflicted" => 1,
+        "uncertain" => 2,
+        _ => 3,
+    }
+}
+
+fn complete_conflict_group(
+    conflicts: &BTreeMap<String, BTreeSet<String>>,
+    claim_id: &str,
+) -> Vec<String> {
+    let mut found = BTreeSet::from([claim_id.to_owned()]);
+    let mut pending = vec![claim_id.to_owned()];
+    while let Some(current) = pending.pop() {
+        if let Some(neighbors) = conflicts.get(&current) {
+            for neighbor in neighbors {
+                if found.insert(neighbor.clone()) {
+                    pending.push(neighbor.clone());
+                }
+            }
+        }
+    }
+    found.into_iter().collect()
 }
 
 fn granularity_name(granularity: RetrievalDocumentGranularity) -> &'static str {

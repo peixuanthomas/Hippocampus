@@ -297,6 +297,62 @@ pub struct SelectedEvidence {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct EntityMatchTrace {
+    #[serde(default)]
+    pub matched_text: String,
+    #[serde(default)]
+    pub normalized_text: String,
+    #[serde(default)]
+    pub match_basis: String,
+    #[serde(default)]
+    pub candidate_entity_ids: Vec<String>,
+    #[serde(default)]
+    pub selected_entity_id: Option<String>,
+    #[serde(default)]
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct StateSelectionTrace {
+    #[serde(default)]
+    pub rank: usize,
+    #[serde(default)]
+    pub claim_id: String,
+    #[serde(default)]
+    pub subject_entity_id: String,
+    #[serde(default)]
+    pub object_entity_id: Option<String>,
+    #[serde(default)]
+    pub predicate_key: String,
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub certainty: String,
+    #[serde(default)]
+    pub asserted_at: String,
+    #[serde(default)]
+    pub event_time: Option<String>,
+    #[serde(default)]
+    pub valid_from: String,
+    #[serde(default)]
+    pub valid_to: Option<String>,
+    #[serde(default)]
+    pub reference_time: String,
+    #[serde(default)]
+    pub related_claim_ids: Vec<String>,
+    #[serde(default)]
+    pub evidence_id: Option<String>,
+    #[serde(default)]
+    pub evidence_span: Option<SourceSpan>,
+    #[serde(default)]
+    pub evidence_role: Option<EventRole>,
+    #[serde(default)]
+    pub selected: bool,
+    #[serde(default)]
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RetrievalTrace {
     pub status: String,
@@ -309,6 +365,10 @@ pub struct RetrievalTrace {
     pub candidates: Vec<RankedCandidate>,
     #[serde(default)]
     pub fusion_candidates: Vec<FusionCandidateTrace>,
+    #[serde(default)]
+    pub entity_matches: Vec<EntityMatchTrace>,
+    #[serde(default)]
+    pub state_selections: Vec<StateSelectionTrace>,
     #[serde(default)]
     pub selected_evidence: Vec<SelectedEvidence>,
     #[serde(default)]
@@ -336,6 +396,8 @@ impl Default for RetrievalTrace {
             config: RetrievalConfig::default(),
             candidates: Vec::new(),
             fusion_candidates: Vec::new(),
+            entity_matches: Vec::new(),
+            state_selections: Vec::new(),
             selected_evidence: Vec::new(),
             error: None,
             query_kind: QueryKind::default(),
