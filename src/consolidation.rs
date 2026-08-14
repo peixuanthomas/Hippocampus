@@ -757,6 +757,32 @@ impl RetrievalStore {
             self.replay_session_from_connection_with_state(&transaction, session_id, &control)?;
         let watermark = self.consolidation_watermark_from_connection(&transaction, session_id)?;
         let start_index = validated_resume_index(&source_events, &watermark)?;
+        if watermark.through_sequence > 0 {
+            let watermark_event_id = watermark
+                .through_event_id
+                .as_deref()
+                .ok_or(RetrievalError::ControlProjectionStale)?;
+            let watermark_event = source_events
+                .iter()
+                .find(|event| event.id == watermark_event_id)
+                .ok_or(RetrievalError::ControlProjectionStale)?;
+            if !control.allows_event(session_id, &watermark_event.id)
+                || watermark_event
+                    .turn_id
+                    .as_deref()
+                    .is_some_and(|turn_id| !control.allows_turn(session_id, turn_id))
+                || source_events.iter().any(|event| {
+                    event.sequence <= watermark.through_sequence
+                        && (!control.allows_event(session_id, &event.id)
+                            || event
+                                .turn_id
+                                .as_deref()
+                                .is_some_and(|turn_id| !control.allows_turn(session_id, turn_id)))
+                })
+            {
+                return Err(RetrievalError::ControlProjectionStale);
+            }
+        }
 
         let mut events = Vec::new();
         let mut turn_count = 0_usize;

@@ -800,6 +800,36 @@ impl RetrievalStore {
         Ok(())
     }
 
+    fn validate_recall_input_id(
+        &self,
+        connection: &Connection,
+        state: &ControlState,
+        event_id: &str,
+        session_filter: Option<&str>,
+    ) -> RetrievalResult<()> {
+        if state.event_is_excluded(event_id) {
+            return Err(RetrievalError::ExcludedEvent(event_id.to_owned()));
+        }
+        let event = connection
+            .query_row(
+                "SELECT event_id, session_id, turn_id, sequence, role, created_at, content,
+                        content_sha256, reply_to_event_id, token_count, turn_status, done_reason, error
+                 FROM events WHERE event_id=?1",
+                [event_id],
+                map_event,
+            )
+            .optional()
+            .map_err(|error| self.database_error(error))?;
+        let Some(event) = event else { return Ok(()) };
+        Self::require_active_event(state, &event)?;
+        if session_filter.is_some_and(|scope| scope != event.session_id) {
+            return Err(RetrievalError::CorruptIndex(
+                "检索输入事件不属于限定会话".into(),
+            ));
+        }
+        verify_event_hash(&event)
+    }
+
     pub(crate) fn memory_document_is_active(
         &self,
         connection: &Connection,
@@ -808,44 +838,109 @@ impl RetrievalStore {
     ) -> RetrievalResult<bool> {
         let row = connection
             .query_row(
-                "SELECT session_id,granularity,event_id FROM memory_documents WHERE document_id=?1",
+                "SELECT session_id,granularity,source_sha256,start_sequence,end_sequence,member_count
+                 FROM memory_documents WHERE document_id=?1",
                 [document_id],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(2)?,
+                        i64_to_usize(row.get(3)?)?,
+                        i64_to_usize(row.get(4)?)?,
+                        i64_to_usize(row.get(5)?)?,
                     ))
                 },
             )
             .optional()
             .map_err(|error| self.database_error(error))?;
-        let Some((session_id, granularity, event_id)) = row else {
+        let Some((
+            session_id,
+            granularity,
+            document_source,
+            start_sequence,
+            end_sequence,
+            member_count,
+        )) = row
+        else {
             return Ok(false);
         };
         if !state.allows_session(&session_id) {
             return Ok(false);
         }
-        if matches!(granularity.as_str(), "message" | "fragment") {
-            return Ok(event_id.is_some_and(|id| state.allows_event(&session_id, &id)));
-        }
-        let mut statement = connection.prepare(
-            "SELECT event_id FROM memory_document_members WHERE document_id=?1 ORDER BY ordinal"
-        ).map_err(|error| self.database_error(error))?;
-        let members = statement
-            .query_map([document_id], |row| row.get::<_, String>(0))
+        let mut statement = connection
+            .prepare(
+                "SELECT m.ordinal,m.event_id,m.start_char,m.end_char,m.content_sha256,
+                    e.session_id,e.sequence,s.content_sha256
+             FROM memory_document_members m
+             JOIN events e ON e.event_id=m.event_id
+             JOIN source_spans s ON s.event_id=m.event_id
+                AND s.start_char=m.start_char AND s.end_char=m.end_char
+             WHERE m.document_id=?1 ORDER BY m.ordinal",
+            )
             .map_err(|error| self.database_error(error))?;
-        let mut saw_member = false;
-        for member in members {
-            saw_member = true;
-            if !state.allows_event(
-                &session_id,
-                &member.map_err(|error| self.database_error(error))?,
-            ) {
+        let members = statement
+            .query_map([document_id], |row| {
+                Ok((
+                    i64_to_usize(row.get(0)?)?,
+                    row.get::<_, String>(1)?,
+                    i64_to_usize(row.get(2)?)?,
+                    i64_to_usize(row.get(3)?)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    i64_to_usize(row.get(6)?)?,
+                    row.get::<_, String>(7)?,
+                ))
+            })
+            .map_err(|error| self.database_error(error))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| self.database_error(error))?;
+        if members.len() != member_count
+            || members.iter().enumerate().any(|(ordinal, member)| {
+                member.0 != ordinal
+                    || member.5 != session_id
+                    || member.4 != member.7
+                    || member.2 > member.3
+            })
+        {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "文档 {document_id} 的成员来源不规范"
+            )));
+        }
+        if matches!(granularity.as_str(), "message" | "fragment")
+            && (members.len() != 1
+                || members[0].6 != start_sequence
+                || members[0].6 != end_sequence
+                || members[0].4 != document_source
+                || document_id != format!("{}:{}:{}", members[0].1, members[0].2, members[0].3))
+        {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "leaf 文档 {document_id} 的成员来源不规范"
+            )));
+        }
+        if matches!(granularity.as_str(), "episode" | "session")
+            && (members.first().map(|member| member.6) != Some(start_sequence)
+                || members.last().map(|member| member.6) != Some(end_sequence)
+                || members.windows(2).any(|pair| pair[0].6 >= pair[1].6))
+        {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "aggregate 文档 {document_id} 的成员来源不规范"
+            )));
+        }
+        if !matches!(
+            granularity.as_str(),
+            "message" | "fragment" | "episode" | "session"
+        ) {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "文档 {document_id} 的粒度无效"
+            )));
+        }
+        for member in &members {
+            if !state.allows_event(&session_id, &member.1) {
                 return Ok(false);
             }
         }
-        Ok(saw_member)
+        Ok(!members.is_empty())
     }
 
     fn active_memory_document_count(
@@ -2080,11 +2175,9 @@ impl RetrievalStore {
         config: RetrievalConfig,
         control: &ControlState,
     ) -> RetrievalResult<RecallResult> {
-        let current = self.get_event_from_connection(connection, current_user_event_id)?;
-        Self::require_active_event(control, &current)?;
+        self.validate_recall_input_id(connection, control, current_user_event_id, session_filter)?;
         for event_id in recent_event_ids {
-            let event = self.get_event_from_connection(connection, event_id)?;
-            Self::require_active_event(control, &event)?;
+            self.validate_recall_input_id(connection, control, event_id, session_filter)?;
         }
         config
             .validate()
@@ -5185,6 +5278,43 @@ impl RetrievalStore {
         Ok(answer)
     }
 
+    fn authoritative_event_is_active(
+        &self,
+        connection: &Connection,
+        control: &ControlState,
+        local_events: &HashMap<String, &StoredEvent>,
+        event_id: &str,
+    ) -> RetrievalResult<Option<bool>> {
+        if control.event_is_excluded(event_id) {
+            return Ok(Some(false));
+        }
+        if let Some(event) = local_events.get(event_id) {
+            return Ok(Some(control.allows_event(&event.session_id, &event.id)));
+        }
+        if let Some(event) = connection
+            .query_row(
+                "SELECT event_id, session_id, turn_id, sequence, role, created_at, content,
+                        content_sha256, reply_to_event_id, token_count, turn_status, done_reason, error
+                 FROM events WHERE event_id=?1",
+                [event_id],
+                map_event,
+            )
+            .optional()
+            .map_err(|error| self.database_error(error))?
+        {
+            return Ok(Some(control.allows_event(&event.session_id, &event.id)));
+        }
+        for source in self.load_all_sources()? {
+            if let Some(event) = derive_events(&source.session)
+                .into_iter()
+                .find(|event| event.id == event_id)
+            {
+                return Ok(Some(control.allows_event(&event.session_id, &event.id)));
+            }
+        }
+        Ok(None)
+    }
+
     fn write_session(
         &self,
         transaction: &Transaction<'_>,
@@ -5227,15 +5357,15 @@ impl RetrievalStore {
             .map_err(|error| self.database_error(error))?;
 
         let all_events = derive_events(&source.session);
+        let all_event_by_id = all_events
+            .iter()
+            .map(|event| (event.id.clone(), event))
+            .collect::<HashMap<_, _>>();
         let events = all_events
             .iter()
             .filter(|event| control.allows_event(&event.session_id, &event.id))
             .cloned()
             .collect::<Vec<_>>();
-        let event_by_id = events
-            .iter()
-            .map(|event| (event.id.clone(), event))
-            .collect::<HashMap<_, _>>();
         let expected_ids: HashSet<_> = events.iter().map(|event| event.id.as_str()).collect();
         let mut existing_statement = transaction
             .prepare("SELECT event_id FROM events WHERE session_id=?1")
@@ -5307,13 +5437,49 @@ impl RetrievalStore {
             {
                 continue;
             }
-            if !event_by_id.contains_key(&answer_id) {
+            if !all_event_by_id.contains_key(&answer_id) {
+                continue;
+            }
+            let mut provenance_ids = turn
+                .context_trace
+                .context_items
+                .iter()
+                .map(|item| item.span.event_id.as_str())
+                .chain(
+                    turn.context_trace
+                        .retrieval
+                        .selected_evidence
+                        .iter()
+                        .map(|item| item.span.event_id.as_str()),
+                );
+            let mut skip_answer = false;
+            for event_id in provenance_ids.by_ref() {
+                match self.authoritative_event_is_active(
+                    transaction,
+                    control,
+                    &all_event_by_id,
+                    event_id,
+                )? {
+                    Some(false) => {
+                        skip_answer = true;
+                        break;
+                    }
+                    Some(true) => {}
+                    None => {
+                        return Err(RetrievalError::InvalidSource {
+                            path: source.path.clone(),
+                            message: format!("回答 {} 引用了不存在的权威来源事件", turn.id),
+                        });
+                    }
+                }
+            }
+            if skip_answer {
                 continue;
             }
             let derived = derive_context(
                 &source.session,
                 turn,
-                &event_by_id,
+                &all_event_by_id,
                 source.legacy,
                 &source.path,
             )?;
@@ -5368,7 +5534,7 @@ impl RetrievalStore {
             let session_system_end = source.session.system_prompt.chars().count();
             let session_system_hash = content_sha256(&source.session.system_prompt);
             for (ordinal, item) in derived.items.iter().enumerate() {
-                let local = event_by_id.get(&item.span.event_id).copied();
+                let local = all_event_by_id.get(&item.span.event_id).copied();
                 let external = if local.is_none() {
                     transaction.query_row("SELECT event_id, session_id, turn_id, sequence, role, created_at, content, content_sha256, reply_to_event_id, token_count, turn_status, done_reason, error FROM events WHERE event_id=?1", [&item.span.event_id], map_event).optional().map_err(|e| self.database_error(e))?
                 } else {
