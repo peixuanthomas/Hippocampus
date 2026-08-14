@@ -183,6 +183,20 @@ pub struct BudgetStageLatencyTrace {
     pub elapsed_ms: u64,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BudgetProbeTrace {
+    #[serde(default)]
+    pub stage: String,
+    #[serde(default)]
+    pub request_sha256: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub usage: TokenUsage,
+    #[serde(default)]
+    pub cache_hit: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BudgetAllocationTrace {
     #[serde(default)]
@@ -211,6 +225,8 @@ pub struct BudgetAllocationTrace {
     pub exclusions: Vec<BudgetExclusionTrace>,
     #[serde(default)]
     pub stage_latencies: Vec<BudgetStageLatencyTrace>,
+    #[serde(default)]
+    pub probes: Vec<BudgetProbeTrace>,
 }
 
 const fn default_recent_history_percent() -> u8 {
@@ -269,6 +285,7 @@ impl BudgetAllocationTrace {
             reflow: Vec::new(),
             exclusions: Vec::new(),
             stage_latencies: Vec::new(),
+            probes: Vec::new(),
         }
     }
 }

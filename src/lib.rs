@@ -48,11 +48,12 @@ pub use graph::{
 pub use knowledge::{KnowledgeRecall, KnowledgeStore, KnowledgeSyncReport, KnowledgeTrace};
 pub use model::{
     AgentChatRequest, AgentMessage, AgentRoundResult, BudgetAllocationTrace, BudgetBucket,
-    BudgetConfig, BudgetExclusionTrace, BudgetReflowTrace, BudgetStageLatencyTrace,
-    BudgetTokenBreakdown, ChannelTrace, EntityMatchTrace, EventRole, EvidenceKind,
-    FusionCandidateTrace, GraphPathTrace, ProvenanceQuality, QueryKind, RetrievalChannel,
-    RetrievalConfig, RetrievalTrace, Session, SourceSpan, StateSelectionTrace, TokenUsage,
-    ToolCall, ToolDefinition, ToolResultTrace, ToolRoundTrace, Turn, WebSourceTrace, WebTrace,
+    BudgetConfig, BudgetExclusionTrace, BudgetProbeTrace, BudgetReflowTrace,
+    BudgetStageLatencyTrace, BudgetTokenBreakdown, ChannelTrace, EntityMatchTrace, EventRole,
+    EvidenceKind, FusionCandidateTrace, GraphPathTrace, ProvenanceQuality, QueryKind,
+    RetrievalChannel, RetrievalConfig, RetrievalTrace, Session, SourceSpan, StateSelectionTrace,
+    TokenUsage, ToolCall, ToolDefinition, ToolResultTrace, ToolRoundTrace, Turn, WebSourceTrace,
+    WebTrace,
 };
 pub use ollama::{
     ModelInfo, OllamaClient, WebFetchResponse, WebSearchResponse, WebSearchResult,

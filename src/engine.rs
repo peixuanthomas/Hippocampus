@@ -16,8 +16,8 @@ use crate::context::ContextAssembler;
 use crate::knowledge::{KnowledgeRecall, KnowledgeTrace};
 use crate::model::{
     AgentChatRequest, AgentMessage, AgentRoundResult, BudgetBucket, BudgetExclusionTrace,
-    BudgetReflowTrace, BudgetStageLatencyTrace, BudgetTokenBreakdown, ChatEvent, ChatEventKind,
-    ContextPlan, ContextTrace, EvidenceKind, ModelRequestTrace, ProvenanceQuality,
+    BudgetProbeTrace, BudgetReflowTrace, BudgetStageLatencyTrace, BudgetTokenBreakdown, ChatEvent,
+    ChatEventKind, ContextPlan, ContextTrace, EvidenceKind, ModelRequestTrace, ProvenanceQuality,
     RetrievalChannel, RetrievalDocumentGranularity, Session, SessionStatus, TokenUsage, ToolCall,
     ToolDefinition, ToolFunctionDefinition, ToolResultTrace, ToolRoundTrace, Turn, TurnStatus,
     WebSourceTrace, WebTrace, agent_context_sha256, content_sha256, utc_now,
@@ -167,17 +167,25 @@ struct BudgetEvidenceGroup {
     evidence: Vec<RecalledEvidence>,
 }
 
+#[derive(Debug, Default)]
+struct PreparationProbeCache {
+    usages: HashMap<String, TokenUsage>,
+    traces: Vec<BudgetProbeTrace>,
+}
+
 #[derive(Debug, Clone)]
 enum AcceptedBudgetUnit {
     Recent {
         index: usize,
-        increment: u64,
+        metric_before: u64,
+        metric_after: u64,
         reflow: bool,
     },
     Evidence {
         id: String,
         bucket: BudgetBucket,
-        increment: u64,
+        metric_before: u64,
+        metric_after: u64,
         reflow: bool,
     },
 }
@@ -190,9 +198,18 @@ impl AcceptedBudgetUnit {
         }
     }
 
-    fn increment(&self) -> u64 {
+    fn metrics(&self) -> (u64, u64) {
         match self {
-            Self::Recent { increment, .. } | Self::Evidence { increment, .. } => *increment,
+            Self::Recent {
+                metric_before,
+                metric_after,
+                ..
+            }
+            | Self::Evidence {
+                metric_before,
+                metric_after,
+                ..
+            } => (*metric_before, *metric_after),
         }
     }
 
@@ -1289,6 +1306,49 @@ impl<B: ChatBackend> ChatEngine<B> {
         session.turns[turn_index].context_trace.decision = "retrieval_completed".into();
         session.turns[turn_index].touch();
         self.store.save(session)?;
+        let mut probe_cache = PreparationProbeCache::default();
+        let mut full_groups = Vec::new();
+        for group in budget_evidence_groups(&recall) {
+            if hard_exclusion_reason(
+                &full_groups,
+                &group,
+                &session.retrieval,
+                self.config.memory.graph_candidate_limit,
+            )
+            .is_none()
+            {
+                full_groups.push(group);
+            }
+        }
+        let full_recall = recall_for_groups(&recall, &full_groups);
+        let full_plan = self
+            .assemble_and_probe(
+                session,
+                turn_index,
+                &history,
+                &user_content,
+                &full_recall,
+                &knowledge,
+                &mut probe_cache,
+                "full_candidate_probe",
+            )
+            .await;
+        let full_plan = match full_plan {
+            Ok(plan) => plan,
+            Err(error) => {
+                session.turns[turn_index].context_trace.decision =
+                    if error.to_string().starts_with("render_failed:") {
+                        "render_failed"
+                    } else {
+                        "probe_failed"
+                    }
+                    .into();
+                session.turns[turn_index].touch();
+                self.store.save(session)?;
+                return Err(error);
+            }
+        };
+        let full_metric = plan_metric(&full_plan)?;
         let plan = match self
             .allocate_adaptive_plan(
                 session,
@@ -1298,12 +1358,24 @@ impl<B: ChatBackend> ChatEngine<B> {
                 &recall,
                 &knowledge,
                 classify_elapsed,
+                &mut probe_cache,
+                if full_metric >= session.budget.warning_threshold() {
+                    session.budget.trim_target()
+                } else {
+                    session.budget.input_budget()
+                },
             )
             .await
         {
             Ok(plan) => plan,
             Err(error) => {
-                session.turns[turn_index].context_trace.decision = "probe_failed".into();
+                session.turns[turn_index].context_trace.decision =
+                    if error.to_string().starts_with("render_failed:") {
+                        "render_failed"
+                    } else {
+                        "probe_failed"
+                    }
+                    .into();
                 let mut failed_trace = recall.trace.clone();
                 failed_trace
                     .budget_allocation
@@ -1345,19 +1417,7 @@ impl<B: ChatBackend> ChatEngine<B> {
             return self.block_mandatory(session, turn_index, plan, start_before);
         }
 
-        if plan_metric(&plan)? >= session.budget.warning_threshold() {
-            let mut mandatory = self.assembler.assemble_with_recall_and_knowledge(
-                session,
-                &user_content,
-                Some(&[]),
-                Some(turn_index),
-                Some(&recall),
-                Some(&knowledge),
-            );
-            self.probe_plan(session, turn_index, &mut mandatory).await?;
-            if plan_metric(&mandatory)? > session.budget.input_budget() {
-                return self.block_mandatory(session, turn_index, mandatory, start_before);
-            }
+        if full_metric >= session.budget.warning_threshold() {
             apply_trace(
                 session,
                 turn_index,
@@ -1419,88 +1479,9 @@ impl<B: ChatBackend> ChatEngine<B> {
             return Ok(ended);
         }
 
-        let history = prepared.plan.selected_history_indices.clone();
-        let mut cache = HashMap::from([(history.len(), prepared.plan.clone())]);
-        let user_content = session.turns[prepared.turn_index].user_content.clone();
-        let recall = self.recall_from_plan(&prepared.plan)?;
-        let knowledge = self.knowledge_from_plan(&prepared.plan)?;
-        let mut mandatory = self.assembler.assemble_with_recall_and_knowledge(
-            session,
-            &user_content,
-            Some(&[]),
-            Some(prepared.turn_index),
-            Some(&recall),
-            Some(&knowledge),
-        );
-        self.probe_plan(session, prepared.turn_index, &mut mandatory)
-            .await?;
-        cache.insert(0, mandatory.clone());
-        let mandatory_tokens = plan_metric(&mandatory)?;
-        if mandatory_tokens > session.budget.input_budget() {
-            return self.block_mandatory(session, prepared.turn_index, mandatory, start_before);
-        }
-        if mandatory_tokens > session.budget.trim_target() {
-            apply_trace(
-                session,
-                prepared.turn_index,
-                &mandatory,
-                "mandatory_above_trim_target",
-                start_before,
-                start_before,
-            );
-            let turn = &mut session.turns[prepared.turn_index];
-            turn.status = TurnStatus::Blocked;
-            turn.error =
-                Some("系统提示与当前输入超过 80% 安全裁剪目标，请缩短系统提示或当前输入".into());
-            turn.touch();
-            session.status = SessionStatus::Paused;
-            self.store.save(session)?;
-            return Ok(self.prepared(
-                session,
-                prepared.turn_index,
-                mandatory,
-                PreparationStatus::Blocked,
-                "系统提示与当前输入超过 80% 安全裁剪目标，请缩短系统提示或当前输入",
-            ));
-        }
-
-        let target = session.budget.trim_target();
-        let mut low = 0_usize;
-        let mut high = history.len();
-        let mut best_count = 0_usize;
-        while low <= high {
-            let middle = (low + high) / 2;
-            let candidate_metric = if let Some(candidate) = cache.get(&middle) {
-                plan_metric(candidate)?
-            } else {
-                let start = history.len().saturating_sub(middle);
-                let mut candidate = self.assembler.assemble_with_recall_and_knowledge(
-                    session,
-                    &user_content,
-                    Some(&history[start..]),
-                    Some(prepared.turn_index),
-                    Some(&recall),
-                    Some(&knowledge),
-                );
-                self.probe_plan(session, prepared.turn_index, &mut candidate)
-                    .await?;
-                let metric = plan_metric(&candidate)?;
-                cache.insert(middle, candidate);
-                metric
-            };
-            if candidate_metric <= target {
-                best_count = middle;
-                low = middle + 1;
-            } else if middle == 0 {
-                break;
-            } else {
-                high = middle - 1;
-            }
-        }
-        let selected_plan = cache
-            .remove(&best_count)
-            .ok_or_else(|| anyhow!("内部错误：裁剪结果缺失"))?;
-        let new_start = if best_count > 0 {
+        let selected_plan = prepared.plan.clone();
+        let retained = selected_plan.selected_history_indices.len();
+        let new_start = if retained > 0 {
             *selected_plan
                 .selected_history_indices
                 .first()
@@ -1525,7 +1506,7 @@ impl<B: ChatBackend> ChatEngine<B> {
             prepared.turn_index,
             selected_plan,
             PreparationStatus::Ready,
-            &format!("已保留最近 {best_count} 个完整轮次并继续。"),
+            &format!("已保留最近 {retained} 个完整轮次并继续。"),
         ))
     }
 
@@ -1914,9 +1895,33 @@ impl<B: ChatBackend> ChatEngine<B> {
         });
         self.persist_web_trace(session, turn_index, trace)
             .map_err(|error| OllamaError::Other(format!("无法保存工具请求：{error:#}")))?;
-        let probe = tokio::select! {
-            _ = cancellation.cancelled() => Err(OllamaError::Cancelled { live_output_tokens: 0 }),
-            result = self.client.probe_agent(&request) => result,
+        let request_sha256 = content_sha256(
+            &serde_json::to_string(&request).expect("agent request is serializable"),
+        );
+        let prepared_probe = (round == 1)
+            .then(|| {
+                session.turns[turn_index]
+                    .context_trace
+                    .retrieval
+                    .budget_allocation
+                    .probes
+                    .iter()
+                    .rev()
+                    .find(|probe| {
+                        probe.stage == "final_probe"
+                            && probe.kind == "agent"
+                            && probe.request_sha256 == request_sha256
+                    })
+                    .map(|probe| probe.usage)
+            })
+            .flatten();
+        let probe = if let Some(usage) = prepared_probe {
+            Ok(usage)
+        } else {
+            tokio::select! {
+                _ = cancellation.cancelled() => Err(OllamaError::Cancelled { live_output_tokens: 0 }),
+                result = self.client.probe_agent(&request) => result,
+            }
         };
         let probe = match probe {
             Ok(probe) => probe,
@@ -1929,7 +1934,9 @@ impl<B: ChatBackend> ChatEngine<B> {
                 return Err(error);
             }
         };
-        session.turns[turn_index].probe_usage.add(probe);
+        if prepared_probe.is_none() {
+            session.turns[turn_index].probe_usage.add(probe);
+        }
         trace
             .steps
             .last_mut()
@@ -2296,6 +2303,8 @@ impl<B: ChatBackend> ChatEngine<B> {
         user_content: &str,
         recall: &RecallResult,
         knowledge: &KnowledgeRecall,
+        cache: &mut PreparationProbeCache,
+        stage: &str,
     ) -> Result<ContextPlan> {
         let mut plan = self.assembler.assemble_with_recall_and_knowledge(
             session,
@@ -2305,7 +2314,8 @@ impl<B: ChatBackend> ChatEngine<B> {
             Some(recall),
             Some(knowledge),
         );
-        self.probe_plan(session, turn_index, &mut plan).await?;
+        self.budget_probe_plan(session, &mut plan, cache, stage)
+            .await?;
         Ok(plan)
     }
 
@@ -2319,6 +2329,8 @@ impl<B: ChatBackend> ChatEngine<B> {
         recall: &RecallResult,
         knowledge: &KnowledgeRecall,
         classify_elapsed: u64,
+        probe_cache: &mut PreparationProbeCache,
+        allocation_limit: u64,
     ) -> Result<ContextPlan> {
         let empty_recall = RecallResult {
             trace: recall.trace.clone(),
@@ -2333,11 +2345,13 @@ impl<B: ChatBackend> ChatEngine<B> {
                 user_content,
                 &empty_recall,
                 knowledge,
+                probe_cache,
+                "mandatory_probe",
             )
             .await?;
         let mandatory_tokens = plan_metric(&mandatory)?;
         let input_budget = session.budget.input_budget();
-        let available = input_budget.saturating_sub(mandatory_tokens);
+        let available = allocation_limit.saturating_sub(mandatory_tokens);
         let mut budget = recall.trace.budget_allocation.clone();
         budget.mandatory_input_tokens = mandatory_tokens;
         budget.available_input_tokens = available;
@@ -2361,11 +2375,44 @@ impl<B: ChatBackend> ChatEngine<B> {
         });
         if mandatory_tokens > input_budget {
             let mut blocked = mandatory;
+            budget.probes = probe_cache.traces.clone();
+            if let Some(probe) = budget.probes.last() {
+                session.turns[turn_index].probe_usage.add(probe.usage);
+            }
             blocked.retrieval_trace.budget_allocation = budget;
             return Ok(blocked);
         }
 
         let groups = budget_evidence_groups(recall);
+        for evidence in recall
+            .evidence
+            .iter()
+            .filter(|evidence| evidence.selected.kind == EvidenceKind::Context)
+        {
+            if !groups.iter().any(|group| {
+                group
+                    .evidence
+                    .iter()
+                    .any(|candidate| candidate.selected.span == evidence.selected.span)
+            }) {
+                budget.exclusions.push(BudgetExclusionTrace {
+                    bucket: BudgetBucket::ExactOrState,
+                    candidate_group_id: format!(
+                        "grp_{}",
+                        content_sha256(&format!(
+                            "hippocampus:budget-orphan-context:v1\0{}\0{}\0{}\0{}",
+                            evidence.selected.span.event_id,
+                            evidence.selected.span.start_char,
+                            evidence.selected.span.end_char,
+                            evidence.selected.content_sha256
+                        ))
+                    ),
+                    stage: "hard".into(),
+                    reason: "dependency_not_selected".into(),
+                    exact_increment_tokens: None,
+                });
+            }
+        }
         let mut accepted_history = Vec::<usize>::new();
         let mut accepted_groups = Vec::<BudgetEvidenceGroup>::new();
         let mut current_tokens = mandatory_tokens;
@@ -2387,10 +2434,12 @@ impl<B: ChatBackend> ChatEngine<B> {
                     user_content,
                     &empty_recall,
                     knowledge,
+                    probe_cache,
+                    "initial_recent",
                 )
                 .await?;
             let tokens = plan_metric(&candidate)?;
-            if tokens <= recent_limit && tokens <= input_budget {
+            if tokens <= recent_limit && tokens <= allocation_limit {
                 accepted_history = proposed;
                 budget.actual_tokens.recent_history = budget
                     .actual_tokens
@@ -2398,7 +2447,8 @@ impl<B: ChatBackend> ChatEngine<B> {
                     .saturating_add(tokens.saturating_sub(current_tokens));
                 acceptance_log.push(AcceptedBudgetUnit::Recent {
                     index: *index,
-                    increment: tokens.saturating_sub(current_tokens),
+                    metric_before: current_tokens,
+                    metric_after: tokens,
                     reflow: false,
                 });
                 current_tokens = tokens;
@@ -2451,17 +2501,20 @@ impl<B: ChatBackend> ChatEngine<B> {
                         user_content,
                         &proposed_recall,
                         knowledge,
+                        probe_cache,
+                        &format!("initial_{}", budget_bucket_name(bucket)),
                     )
                     .await?;
                 let tokens = plan_metric(&candidate)?;
                 let increment = tokens.saturating_sub(current_tokens);
-                if tokens <= input_budget && tokens.saturating_sub(bucket_base) <= share {
+                if tokens <= allocation_limit && tokens.saturating_sub(bucket_base) <= share {
                     accepted_groups = proposed_groups;
                     add_breakdown(&mut budget.actual_tokens, bucket, increment);
                     acceptance_log.push(AcceptedBudgetUnit::Evidence {
                         id: group.id.clone(),
                         bucket,
-                        increment,
+                        metric_before: current_tokens,
+                        metric_after: tokens,
                         reflow: false,
                     });
                     current_tokens = tokens;
@@ -2500,16 +2553,19 @@ impl<B: ChatBackend> ChatEngine<B> {
                             user_content,
                             &proposed_recall,
                             knowledge,
+                            probe_cache,
+                            "reflow_recent",
                         )
                         .await?;
                     let tokens = plan_metric(&candidate)?;
                     let increment = tokens.saturating_sub(current_tokens);
-                    if tokens <= input_budget && increment <= reflow_pool {
+                    if tokens <= allocation_limit && increment <= reflow_pool {
                         accepted_history = proposed;
                         add_breakdown(&mut budget.actual_tokens, bucket, increment);
                         acceptance_log.push(AcceptedBudgetUnit::Recent {
                             index: *index,
-                            increment,
+                            metric_before: current_tokens,
+                            metric_after: tokens,
                             reflow: true,
                         });
                         reflow_pool = reflow_pool.saturating_sub(increment);
@@ -2548,17 +2604,20 @@ impl<B: ChatBackend> ChatEngine<B> {
                             user_content,
                             &proposed_recall,
                             knowledge,
+                            probe_cache,
+                            &format!("reflow_{}", budget_bucket_name(bucket)),
                         )
                         .await?;
                     let tokens = plan_metric(&candidate)?;
                     let increment = tokens.saturating_sub(current_tokens);
-                    if tokens <= input_budget && increment <= reflow_pool {
+                    if tokens <= allocation_limit && increment <= reflow_pool {
                         accepted_groups = proposed_groups;
                         add_breakdown(&mut budget.actual_tokens, bucket, increment);
                         acceptance_log.push(AcceptedBudgetUnit::Evidence {
                             id: group.id.clone(),
                             bucket,
-                            increment,
+                            metric_before: current_tokens,
+                            metric_after: tokens,
                             reflow: true,
                         });
                         reflow_pool = reflow_pool.saturating_sub(increment);
@@ -2625,10 +2684,12 @@ impl<B: ChatBackend> ChatEngine<B> {
                 user_content,
                 &final_recall,
                 knowledge,
+                probe_cache,
+                "final_probe",
             )
             .await?;
         current_tokens = plan_metric(&current)?;
-        while current_tokens > input_budget {
+        while current_tokens > allocation_limit {
             let Some(removed) = acceptance_log.pop() else {
                 budget.mandatory_input_tokens = current_tokens;
                 budget.available_input_tokens = 0;
@@ -2636,23 +2697,27 @@ impl<B: ChatBackend> ChatEngine<B> {
             };
             let (bucket, group_id, removed_increment) = match removed {
                 AcceptedBudgetUnit::Recent {
-                    index, increment, ..
+                    index,
+                    metric_before,
+                    metric_after,
+                    ..
                 } => {
                     accepted_history.retain(|candidate| *candidate != index);
                     (
                         BudgetBucket::RecentHistory,
                         format!("turn:{}", session.turns[index].id),
-                        increment,
+                        metric_after.saturating_sub(metric_before),
                     )
                 }
                 AcceptedBudgetUnit::Evidence {
                     id,
                     bucket,
-                    increment,
+                    metric_before,
+                    metric_after,
                     ..
                 } => {
                     accepted_groups.retain(|group| group.id != id);
-                    (bucket, id, increment)
+                    (bucket, id, metric_after.saturating_sub(metric_before))
                 }
             };
             budget.exclusions.retain(|exclusion| {
@@ -2678,22 +2743,54 @@ impl<B: ChatBackend> ChatEngine<B> {
                     user_content,
                     &final_recall,
                     knowledge,
+                    probe_cache,
+                    "final_probe",
                 )
                 .await?;
             current_tokens = plan_metric(&current)?;
         }
         budget.actual_tokens = BudgetTokenBreakdown::default();
+        let mut attributed = Vec::<(BudgetBucket, bool, u64)>::new();
         for accepted in &acceptance_log {
-            add_breakdown(
-                &mut budget.actual_tokens,
-                accepted.bucket(),
-                accepted.increment(),
-            );
+            let (before, after) = accepted.metrics();
+            if after >= before {
+                attributed.push((accepted.bucket(), accepted.is_reflow(), after - before));
+            } else {
+                let mut credit = before - after;
+                for (_, _, amount) in attributed.iter_mut().rev() {
+                    let applied = credit.min(*amount);
+                    *amount -= applied;
+                    credit -= applied;
+                    if credit == 0 {
+                        break;
+                    }
+                }
+            }
         }
-        let initial_consumed = acceptance_log
+        let target_actual = current_tokens.saturating_sub(budget.mandatory_input_tokens);
+        let attributed_total = attributed.iter().map(|(_, _, amount)| *amount).sum::<u64>();
+        if attributed_total > target_actual {
+            let mut credit = attributed_total - target_actual;
+            for (_, _, amount) in attributed.iter_mut().rev() {
+                let applied = credit.min(*amount);
+                *amount -= applied;
+                credit -= applied;
+                if credit == 0 {
+                    break;
+                }
+            }
+        } else if attributed_total < target_actual
+            && let Some(last) = attributed.last_mut()
+        {
+            last.2 = last.2.saturating_add(target_actual - attributed_total);
+        }
+        for (bucket, _, amount) in &attributed {
+            add_breakdown(&mut budget.actual_tokens, *bucket, *amount);
+        }
+        let initial_consumed = attributed
             .iter()
-            .filter(|accepted| !accepted.is_reflow())
-            .map(AcceptedBudgetUnit::increment)
+            .filter(|(_, reflow, _)| !reflow)
+            .map(|(_, _, amount)| *amount)
             .sum::<u64>();
         let mut remaining = available.saturating_sub(initial_consumed);
         budget.reflow.clear();
@@ -2704,10 +2801,10 @@ impl<B: ChatBackend> ChatEngine<B> {
             BudgetBucket::Graph,
         ] {
             let offered = remaining;
-            let consumed = acceptance_log
+            let consumed = attributed
                 .iter()
-                .filter(|accepted| accepted.is_reflow() && accepted.bucket() == bucket)
-                .map(AcceptedBudgetUnit::increment)
+                .filter(|(accepted_bucket, reflow, _)| *reflow && *accepted_bucket == bucket)
+                .map(|(_, _, amount)| *amount)
                 .sum::<u64>();
             remaining = remaining.saturating_sub(consumed);
             budget.reflow.push(BudgetReflowTrace {
@@ -2723,20 +2820,27 @@ impl<B: ChatBackend> ChatEngine<B> {
             elapsed_ms: elapsed_millis(final_started),
         });
         apply_budget_exclusion_reasons(&mut current.retrieval_trace, &groups, &budget.exclusions);
+        budget.probes = probe_cache.traces.clone();
+        if let Some(probe) = budget
+            .probes
+            .iter()
+            .rev()
+            .find(|probe| probe.stage == "final_probe")
+        {
+            session.turns[turn_index].probe_usage.add(probe.usage);
+        }
         current.retrieval_trace.budget_allocation = budget;
         Ok(current)
     }
 
-    async fn probe_plan(
+    async fn budget_probe_plan(
         &self,
-        session: &mut Session,
-        turn_index: usize,
+        session: &Session,
         plan: &mut ContextPlan,
+        cache: &mut PreparationProbeCache,
+        stage: &str,
     ) -> Result<()> {
-        if plan.exact_input_tokens.is_some() {
-            return Ok(());
-        }
-        let result = if self.config.web_search.enabled {
+        let (request_sha256, kind, usage) = if self.config.web_search.enabled {
             let mut messages = plan
                 .messages
                 .iter()
@@ -2752,37 +2856,119 @@ impl<B: ChatBackend> ChatEngine<B> {
                     tool_name: None,
                 },
             );
-            self.client
-                .probe_agent(&AgentChatRequest {
-                    model: session.model.clone(),
-                    messages,
-                    tools: web_tool_definitions(self.config.web_search.max_results),
-                    think: session.think,
-                    num_ctx: session.budget.context_window,
-                    num_predict: session.budget.max_output_tokens,
-                })
-                .await
+            let request = AgentChatRequest {
+                model: session.model.clone(),
+                messages,
+                tools: web_tool_definitions(self.config.web_search.max_results),
+                think: session.think,
+                num_ctx: session.budget.context_window,
+                num_predict: session.budget.max_output_tokens,
+            };
+            let request_sha256 = content_sha256(
+                &serde_json::to_string(&request).expect("agent request is serializable"),
+            );
+            if let Some(usage) = cache.usages.get(&request_sha256).copied() {
+                (request_sha256, "agent", usage)
+            } else {
+                let rendered_messages = request
+                    .messages
+                    .iter()
+                    .map(|message| crate::model::ChatMessage {
+                        role: message.role.clone(),
+                        content: message.content.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                match self
+                    .client
+                    .render_prompt(
+                        &session.model,
+                        &rendered_messages,
+                        session.think,
+                        session.budget.context_window,
+                    )
+                    .await
+                {
+                    Ok(Some(rendered)) => {
+                        ContextAssembler::apply_rendered_upper_bound(plan, &rendered)
+                    }
+                    Ok(None) => {}
+                    Err(error) => return Err(anyhow!("render_failed: {error}")),
+                }
+                let usage = match self.client.probe_agent(&request).await {
+                    Ok(usage) => usage,
+                    Err(OllamaError::ContextLength { prompt_tokens, .. }) => TokenUsage::new(
+                        Some(prompt_tokens.unwrap_or(session.budget.context_window + 1)),
+                        Some(0),
+                    ),
+                    Err(error) => return Err(error.into()),
+                };
+                cache.usages.insert(request_sha256.clone(), usage);
+                (request_sha256, "agent", usage)
+            }
         } else {
-            self.client
-                .probe(
-                    &session.model,
-                    &plan.messages,
-                    session.think,
-                    session.budget.context_window,
-                )
-                .await
+            let request_sha256 = content_sha256(
+                &serde_json::to_string(&json!({
+                    "kind": "normal",
+                    "model": session.model,
+                    "messages": plan.messages,
+                    "think": session.think,
+                    "num_ctx": session.budget.context_window,
+                    "num_predict": session.budget.max_output_tokens,
+                }))
+                .expect("normal request is serializable"),
+            );
+            if let Some(usage) = cache.usages.get(&request_sha256).copied() {
+                (request_sha256, "normal", usage)
+            } else {
+                match self
+                    .client
+                    .render_prompt(
+                        &session.model,
+                        &plan.messages,
+                        session.think,
+                        session.budget.context_window,
+                    )
+                    .await
+                {
+                    Ok(Some(rendered)) => {
+                        ContextAssembler::apply_rendered_upper_bound(plan, &rendered)
+                    }
+                    Ok(None) => {}
+                    Err(error) => return Err(anyhow!("render_failed: {error}")),
+                }
+                let usage = match self
+                    .client
+                    .probe(
+                        &session.model,
+                        &plan.messages,
+                        session.think,
+                        session.budget.context_window,
+                    )
+                    .await
+                {
+                    Ok(usage) => usage,
+                    Err(OllamaError::ContextLength { prompt_tokens, .. }) => TokenUsage::new(
+                        Some(prompt_tokens.unwrap_or(session.budget.context_window + 1)),
+                        Some(0),
+                    ),
+                    Err(error) => return Err(error.into()),
+                };
+                cache.usages.insert(request_sha256.clone(), usage);
+                (request_sha256, "normal", usage)
+            }
         };
-        match result {
-            Ok(usage) => {
-                plan.exact_input_tokens = usage.input_tokens;
-                session.turns[turn_index].probe_usage.add(usage);
-            }
-            Err(OllamaError::ContextLength { prompt_tokens, .. }) => {
-                plan.exact_input_tokens =
-                    Some(prompt_tokens.unwrap_or(session.budget.context_window + 1));
-            }
-            Err(error) => return Err(error.into()),
-        }
+        let cache_hit = cache
+            .traces
+            .iter()
+            .any(|trace| trace.request_sha256 == request_sha256);
+        cache.traces.push(BudgetProbeTrace {
+            stage: stage.into(),
+            request_sha256,
+            kind: kind.into(),
+            usage,
+            cache_hit,
+        });
+        plan.exact_input_tokens = usage.input_tokens;
         Ok(())
     }
 
@@ -2902,31 +3088,6 @@ impl<B: ChatBackend> ChatEngine<B> {
             status,
             message: message.to_owned(),
         }
-    }
-
-    fn recall_from_plan(&self, plan: &ContextPlan) -> Result<RecallResult> {
-        let evidence = plan
-            .evidence
-            .iter()
-            .map(|selected| {
-                let content = self.store.retrieval().resolve_span(&selected.span)?.content;
-                Ok::<RecalledEvidence, anyhow::Error>(RecalledEvidence {
-                    selected: selected.clone(),
-                    content,
-                })
-            })
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(RecallResult {
-            trace: plan.retrieval_trace.clone(),
-            evidence,
-        })
-    }
-
-    fn knowledge_from_plan(&self, plan: &ContextPlan) -> Result<KnowledgeRecall> {
-        self.store.knowledge().verify_trace(&plan.knowledge_trace)?;
-        Ok(KnowledgeRecall {
-            trace: plan.knowledge_trace.clone(),
-        })
     }
 }
 
@@ -3342,28 +3503,36 @@ fn budget_evidence_groups(recall: &RecallResult) -> Vec<BudgetEvidenceGroup> {
             })
         })
         .collect::<HashMap<_, _>>();
-    let graph_documents = recall
-        .trace
-        .graph_paths
-        .iter()
-        .map(|path| path.target_document_id.as_str())
-        .collect::<HashSet<_>>();
     let mut groups = Vec::<BudgetEvidenceGroup>::new();
-    let mut last_group: Option<usize> = None;
     for evidence in &recall.evidence {
         if evidence.selected.kind == EvidenceKind::Context {
-            if let Some(parent) = last_group.and_then(|index| groups.get_mut(index)) {
-                parent.evidence.push(evidence.clone());
+            let matching = groups
+                .iter()
+                .enumerate()
+                .filter(|(_, group)| {
+                    group.evidence.first().is_some_and(|core| {
+                        core.selected.kind == EvidenceKind::Core
+                            && core.selected.originating_candidate_rank
+                                == evidence.selected.originating_candidate_rank
+                    })
+                })
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            if let [parent] = matching.as_slice() {
+                groups[*parent].evidence.push(evidence.clone());
             }
             continue;
         }
-        let fusion = recall.trace.fusion_candidates.iter().find(|candidate| {
-            candidate.span == evidence.selected.span
-                || candidate
-                    .source_document_ids
-                    .iter()
-                    .any(|source| graph_documents.contains(source.as_str()))
-        });
+        let fusion_matches = recall
+            .trace
+            .fusion_candidates
+            .iter()
+            .filter(|candidate| candidate.span == evidence.selected.span)
+            .collect::<Vec<_>>();
+        let fusion = match fusion_matches.as_slice() {
+            [candidate] => Some(*candidate),
+            _ => None,
+        };
         let graph_path = recall.trace.graph_paths.iter().find(|path| {
             path.span.as_ref() == Some(&evidence.selected.span)
                 || fusion.is_some_and(|candidate| {
@@ -3373,10 +3542,10 @@ fn budget_evidence_groups(recall: &RecallResult) -> Vec<BudgetEvidenceGroup> {
                             .contains(&path.target_document_id)
                 })
         });
-        let bucket = if graph_path.is_some() {
-            BudgetBucket::Graph
-        } else if state_spans.contains_key(&evidence.selected.span) {
+        let bucket = if state_spans.contains_key(&evidence.selected.span) {
             BudgetBucket::ExactOrState
+        } else if graph_path.is_some() {
+            BudgetBucket::Graph
         } else if fusion.is_some_and(|candidate| {
             matches!(
                 candidate.granularity,
@@ -3431,7 +3600,6 @@ fn budget_evidence_groups(recall: &RecallResult) -> Vec<BudgetEvidenceGroup> {
         };
         if let Some(index) = groups.iter().position(|group| group.id == id) {
             groups[index].evidence.push(evidence.clone());
-            last_group = Some(index);
             continue;
         }
         groups.push(BudgetEvidenceGroup {
@@ -3440,7 +3608,6 @@ fn budget_evidence_groups(recall: &RecallResult) -> Vec<BudgetEvidenceGroup> {
             order: groups.len(),
             evidence: vec![evidence.clone()],
         });
-        last_group = Some(groups.len() - 1);
     }
     groups
 }
@@ -4441,7 +4608,7 @@ mod tests {
             .await
             .unwrap();
         assert!(prepared.ready());
-        assert_eq!(*client.probes.lock().unwrap(), 0);
+        assert_eq!(*client.probes.lock().unwrap(), 1);
         engine
             .stream_turn(&mut session, &prepared, CancellationToken::new(), |_| {})
             .await

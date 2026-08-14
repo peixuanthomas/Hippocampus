@@ -1745,9 +1745,13 @@ impl RetrievalStore {
         session_filter: Option<&str>,
         config: RetrievalConfig,
     ) -> RetrievalResult<RecallResult> {
-        let connection = self.open_connection()?;
+        let _guard = self.acquire_root_read()?;
+        let mut connection = self.open_connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(|error| self.database_error(error))?;
         let mut result = self.keyword_recall_core_from_connection(
-            &connection,
+            &transaction,
             raw_query,
             current_user_event_id,
             recent_event_ids,
@@ -1766,7 +1770,7 @@ impl RetrievalStore {
             .map(|item| item.selected.content_sha256.clone())
             .collect();
         self.expand_context(
-            &connection,
+            &transaction,
             &mut result.trace,
             &mut result.evidence,
             current_user_event_id,
@@ -1775,6 +1779,9 @@ impl RetrievalStore {
             &mut used_hashes,
             session_filter,
         )?;
+        transaction
+            .commit()
+            .map_err(|error| self.database_error(error))?;
         Ok(result)
     }
 
@@ -1819,44 +1826,34 @@ impl RetrievalStore {
                     e.role, e.session_id, e.created_at, bm25(retrieval_documents_fts) AS score
              FROM retrieval_documents_fts JOIN retrieval_documents d ON d.rowid = retrieval_documents_fts.rowid
              JOIN events e ON e.event_id = d.event_id
-             WHERE retrieval_documents_fts MATCH ?1 AND (?3 IS NULL OR e.session_id=?3)
-             ORDER BY score ASC, d.document_id ASC LIMIT ?2"
+             WHERE retrieval_documents_fts MATCH ?1 AND (?2 IS NULL OR e.session_id=?2)
+             ORDER BY score ASC, d.document_id ASC"
         ).map_err(|e| self.database_error(e))?;
         let rows = statement
-            .query_map(
-                params![
-                    expression,
-                    (trace.config.candidate_limit * 4) as i64,
-                    session_filter
-                ],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        i64_to_usize(row.get(3)?)?,
-                        i64_to_usize(row.get(4)?)?,
-                        row.get::<_, String>(5)?,
-                        row.get::<_, String>(6)?,
-                        parse_role(&row.get::<_, String>(7)?)?,
-                        row.get::<_, String>(8)?,
-                        row.get::<_, String>(9)?,
-                        row.get::<_, f64>(10)?,
-                    ))
-                },
-            )
+            .query_map(params![expression, session_filter], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    i64_to_usize(row.get(3)?)?,
+                    i64_to_usize(row.get(4)?)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    parse_role(&row.get::<_, String>(7)?)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, f64>(10)?,
+                ))
+            })
             .map_err(|e| self.database_error(e))?;
-        let fetched = rows
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| self.database_error(e))?;
-        drop(statement);
         let recent: HashSet<&str> = recent_event_ids.iter().map(String::as_str).collect();
         let mut used_events = HashSet::new();
         let mut used_hashes = HashSet::new();
         let mut core_chars = 0usize;
         // Keep the entire deterministic overfetch in the trace. Exclusions
         // must not consume the usable candidate pool.
-        for (idx, row) in fetched.into_iter().enumerate() {
+        for (idx, row) in rows.enumerate() {
+            let row = row.map_err(|error| self.database_error(error))?;
             let (
                 document_id,
                 granularity,
@@ -1896,6 +1893,8 @@ impl RetrievalStore {
                 candidate.reason = "current_message".into();
             } else if recent.contains(event_id_value.as_str()) {
                 candidate.reason = "recent_context".into();
+            } else if role == EventRole::System {
+                candidate.reason = "system_message".into();
             } else if used_events.contains(&event_id_value) {
                 candidate.reason = "duplicate_event".into();
             } else if used_hashes.contains(&hash) {
@@ -1951,7 +1950,13 @@ impl RetrievalStore {
                 }
             }
             trace.candidates.push(candidate);
+            if final_hard_limit(trace.config.max_selected).is_none()
+                && trace.selected_evidence.len() >= trace.config.candidate_limit
+            {
+                break;
+            }
         }
+        drop(statement);
         let mut evidence = Vec::new();
         for selected in trace.selected_evidence.clone() {
             let event = self.get_event_from_connection(connection, &selected.span.event_id)?;
@@ -3649,10 +3654,17 @@ impl RetrievalStore {
                 .then_with(|| right.1.cmp(&left.1))
                 .then_with(|| left.2.trace.claim_id.cmp(&right.2.trace.claim_id))
         });
+        let mut eligible_groups = BTreeSet::new();
         for (index, (_, _, candidate)) in candidates.iter_mut().enumerate() {
             candidate.trace.rank = index + 1;
-            if index >= candidate_limit && candidate.trace.reason == "eligible" {
-                candidate.trace.reason = "candidate_limit".into();
+            if candidate.trace.reason == "eligible" {
+                let group_key = candidate.conflict_group.join("\0");
+                if !eligible_groups.contains(&group_key) && eligible_groups.len() >= candidate_limit
+                {
+                    candidate.trace.reason = "candidate_limit".into();
+                } else {
+                    eligible_groups.insert(group_key);
+                }
             }
         }
         Ok(StateSidecar {
