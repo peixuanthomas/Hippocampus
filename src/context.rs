@@ -244,6 +244,9 @@ impl<'a> WrappedHistoryCursor<'a> {
             let mut spans = HashSet::new();
             let mut hashes = HashSet::new();
             for selected in evidence {
+                if selected.role == EventRole::System {
+                    return Err("不可信历史检索证据不能来自系统事件");
+                }
                 if !event_ids.insert(selected.span.event_id.as_str()) {
                     return Err("不可信历史检索证据包含重复事件");
                 }

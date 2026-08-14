@@ -2834,6 +2834,8 @@ impl RetrievalStore {
         )
         .map_err(|message| RetrievalError::CorruptIndex(message.into()))?;
         let session_system_event_id = event_id(&session.id, None, EventRole::System);
+        let session_system_end = source.session.system_prompt.chars().count();
+        let session_system_hash = content_sha256(&source.session.system_prompt);
         for row in rows {
             let (ordinal, role, span, expected_hash, content) =
                 row.map_err(|source| self.database_error(source))?;
@@ -2842,7 +2844,12 @@ impl RetrievalStore {
                 self.get_session_from_connection(&connection, &source_event.session_id)?;
             self.verify_fresh(&source_session)?;
             verify_event_hash(&source_event)?;
-            let is_session_system_prompt = ordinal == 0 && span.event_id == session_system_event_id;
+            let is_session_system_prompt = !source.session.system_prompt.is_empty()
+                && ordinal == 0
+                && span.event_id == session_system_event_id
+                && span.start_char == 0
+                && span.end_char == session_system_end
+                && expected_hash == session_system_hash;
             let wrapped_source_role = wrapped_history
                 .consume(
                     &ContextItemTrace {
@@ -3077,6 +3084,8 @@ impl RetrievalStore {
                 message: message.into(),
             })?;
             let session_system_event_id = event_id(&source.session.id, None, EventRole::System);
+            let session_system_end = source.session.system_prompt.chars().count();
+            let session_system_hash = content_sha256(&source.session.system_prompt);
             for (ordinal, item) in derived.items.iter().enumerate() {
                 let local = event_by_id.get(&item.span.event_id).copied();
                 let external = if local.is_none() {
@@ -3097,8 +3106,12 @@ impl RetrievalStore {
                 let indexed = transaction.query_row("SELECT session_id, title, created_at, updated_at, source_file, source_sha256, source_schema_version FROM indexed_sessions WHERE session_id=?1", [&event.session_id], map_session).map_err(|e| self.database_error(e))?;
                 self.verify_fresh(&indexed)?;
                 verify_event_hash(event)?;
-                let is_session_system_prompt =
-                    ordinal == 0 && item.span.event_id == session_system_event_id;
+                let is_session_system_prompt = !source.session.system_prompt.is_empty()
+                    && ordinal == 0
+                    && item.span.event_id == session_system_event_id
+                    && item.span.start_char == 0
+                    && item.span.end_char == session_system_end
+                    && item.content_sha256 == session_system_hash;
                 let wrapped_source_role = wrapped_history
                     .consume(item, is_session_system_prompt)
                     .map_err(|message| RetrievalError::InvalidSource {
