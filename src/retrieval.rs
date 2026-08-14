@@ -2620,7 +2620,6 @@ impl RetrievalStore {
                 current_user_event_id,
                 recent_event_ids,
                 session_filter,
-                &memory_config,
                 &graph_seed_documents,
                 &vector_aggregate_sources,
                 graph,
@@ -2642,6 +2641,7 @@ impl RetrievalStore {
                 excluded_vectors,
                 sidecar,
                 graph_sidecar,
+                memory_config.graph_candidate_limit,
             )
             .map_err(|error| HybridRecallFailure::new(HybridRecallStage::EntityState, error))?;
         let recent = recent_event_ids.iter().map(String::as_str).collect();
@@ -2686,7 +2686,6 @@ impl RetrievalStore {
         current_user_event_id: &str,
         recent_event_ids: &[String],
         session_filter: Option<&str>,
-        memory_config: &MemoryConfig,
         seed_documents: &BTreeSet<String>,
         vector_aggregate_sources: &BTreeSet<String>,
         mut graph: crate::graph::GraphRecallResult,
@@ -2697,7 +2696,6 @@ impl RetrievalStore {
             .iter()
             .map(String::as_str)
             .collect::<HashSet<_>>();
-        let mut eligible = 0usize;
         let mut aggregate_sources = vector_aggregate_sources.clone();
         let mut candidates = Vec::new();
         for (path_index, path) in graph.paths.iter_mut().enumerate() {
@@ -2753,11 +2751,6 @@ impl RetrievalStore {
             }
             .into();
             if path.reason != "eligible" {
-                continue;
-            }
-            eligible += 1;
-            if eligible > memory_config.graph_candidate_limit {
-                path.reason = "candidate_limit".into();
                 continue;
             }
             candidates.push(GraphEvidenceCandidate { path_index, raw });
@@ -3770,6 +3763,7 @@ impl RetrievalStore {
         excluded_vectors: Vec<FusionCandidateTrace>,
         mut sidecar: StateSidecar,
         mut graph: GraphSidecar,
+        graph_candidate_limit: usize,
     ) -> RetrievalResult<RecallResult> {
         let mut processing_order = (0..candidates.len()).collect::<Vec<_>>();
         processing_order.sort_by_key(|&index| !candidates[index].protected_exact);
@@ -3990,6 +3984,7 @@ impl RetrievalStore {
         let mut graph_only = Vec::new();
         let mut graph_slots = 0usize;
         let mut graph_chars = 0usize;
+        let mut graph_candidates_selected = 0usize;
         for graph_index in 0..graph.candidates.len() {
             let item = &graph.candidates[graph_index];
             let path = &mut graph.paths[item.path_index];
@@ -4015,11 +4010,16 @@ impl RetrievalStore {
                     && candidate.reason != "selected_state"
                     && candidate.reason != "selected_graph"
             }) {
+                if graph_candidates_selected >= graph_candidate_limit {
+                    path.reason = "candidate_limit".into();
+                    continue;
+                }
                 path.selected = true;
                 path.reason = "selected_coalesced".into();
                 candidates[candidate_index].selected = true;
                 graph_slots += 1;
                 graph_chars += raw_chars;
+                graph_candidates_selected += 1;
                 continue;
             }
             let duplicate_reason = if selected_events.contains(&raw.span.event_id) {
@@ -4048,6 +4048,10 @@ impl RetrievalStore {
                 path.reason = "evidence_budget".into();
                 continue;
             }
+            if graph_candidates_selected >= graph_candidate_limit {
+                path.reason = "candidate_limit".into();
+                continue;
+            }
             if let Some(candidate_index) = candidates
                 .iter()
                 .position(|candidate| candidate.span == raw.span && candidate.reason == "eligible")
@@ -4070,6 +4074,7 @@ impl RetrievalStore {
             selected_chars += raw_chars;
             graph_slots += 1;
             graph_chars += raw_chars;
+            graph_candidates_selected += 1;
             path.selected = true;
             path.reason = "selected_graph".into();
         }
