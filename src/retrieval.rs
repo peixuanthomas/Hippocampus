@@ -2538,7 +2538,7 @@ impl RetrievalStore {
         let entity_started = Instant::now();
         validate_full_derived_integrity(connection)?;
         let normalized_query = normalize_match(raw_query);
-        let mut groups = BTreeMap::<(u8, String), (BTreeSet<String>, BTreeSet<String>)>::new();
+        let mut groups = BTreeMap::<String, (BTreeSet<String>, BTreeSet<(u8, String)>)>::new();
         let mut statement = connection
             .prepare(
                 "SELECT e.entity_id,e.canonical_name,e.normalized_name
@@ -2564,9 +2564,9 @@ impl RetrievalStore {
                 && !is_generic_pronoun(&normalized)
                 && query_contains_match(&normalized_query, &normalized)
             {
-                let group = groups.entry((3, normalized)).or_default();
+                let group = groups.entry(normalized).or_default();
                 group.0.insert(id);
-                group.1.insert(text);
+                group.1.insert((3, text));
             }
         }
         drop(statement);
@@ -2596,9 +2596,9 @@ impl RetrievalStore {
                 && query_contains_match(&normalized_query, &normalized)
             {
                 let priority = if basis == "stable_identifier" { 0 } else { 1 };
-                let group = groups.entry((priority, normalized)).or_default();
+                let group = groups.entry(normalized).or_default();
                 group.0.insert(id);
-                group.1.insert(text);
+                group.1.insert((priority, text));
             }
         }
         drop(statement);
@@ -2613,22 +2613,23 @@ impl RetrievalStore {
         if self_eligible {
             for pronoun in ["我", "本人", "i", "me", "my"] {
                 if query_contains_match(&normalized_query, pronoun) {
-                    let group = groups.entry((2, pronoun.into())).or_default();
+                    let group = groups.entry(pronoun.into()).or_default();
                     group.0.insert("ent_self".into());
-                    group.1.insert(pronoun.into());
+                    group.1.insert((2, pronoun.into()));
                 }
             }
         }
         let mut selected_entities = BTreeSet::new();
         let mut entity_matches = Vec::new();
-        for ((priority, normalized), (owners, texts)) in groups {
+        for (normalized, (owners, surfaces)) in groups {
             let candidates = owners.into_iter().collect::<Vec<_>>();
             let selected = (candidates.len() == 1).then(|| candidates[0].clone());
+            let (priority, matched_text) = surfaces.into_iter().next().unwrap_or_default();
             if let Some(id) = &selected {
                 selected_entities.insert(id.clone());
             }
             entity_matches.push(EntityMatchTrace {
-                matched_text: texts.into_iter().next().unwrap_or_default(),
+                matched_text,
                 normalized_text: normalized,
                 match_basis: match priority {
                     0 => "stable_identifier",
@@ -3074,31 +3075,59 @@ impl RetrievalStore {
                 }
                 continue;
             }
-            let additional = member_indexes
-                .iter()
-                .filter(|&&member| {
-                    let item = &sidecar.candidates[member];
-                    !selected_events.contains(&item.trace.evidence_span.as_ref().unwrap().event_id)
-                        && !selected_hashes.contains(&item.content_sha256)
-                        && item
-                            .episode_id
-                            .as_ref()
-                            .is_none_or(|episode| !selected_episodes.contains(episode))
-                })
-                .count();
-            let chars = member_indexes
-                .iter()
-                .filter(|&&member| {
-                    let item = &sidecar.candidates[member];
-                    !selected_events.contains(&item.trace.evidence_span.as_ref().unwrap().event_id)
-                        && !selected_hashes.contains(&item.content_sha256)
-                        && item
-                            .episode_id
-                            .as_ref()
-                            .is_none_or(|episode| !selected_episodes.contains(episode))
-                })
-                .map(|&member| sidecar.candidates[member].content.chars().count())
-                .sum::<usize>();
+            let mut group_events = selected_events.clone();
+            let mut group_hashes = selected_hashes.clone();
+            let mut group_episodes = selected_episodes.clone();
+            let mut actions = Vec::new();
+            let mut additional = 0usize;
+            let mut chars = 0usize;
+            let mut duplicate_reason = None;
+            for &member in &member_indexes {
+                let item = &sidecar.candidates[member];
+                let span = item.trace.evidence_span.as_ref().unwrap();
+                let exact = candidates.iter().position(|candidate| {
+                    candidate.span == *span
+                        && (candidate.reason == "eligible"
+                            || candidate.protected_exact && candidate.selected)
+                });
+                let already_selected_exact = exact.is_some_and(|candidate_index| {
+                    candidates[candidate_index].protected_exact
+                        && candidates[candidate_index].selected
+                });
+                if !already_selected_exact {
+                    duplicate_reason = if group_events.contains(&span.event_id) {
+                        Some("duplicate_state_event")
+                    } else if group_hashes.contains(&item.content_sha256) {
+                        Some("duplicate_state_content")
+                    } else if item
+                        .episode_id
+                        .as_ref()
+                        .is_some_and(|episode| group_episodes.contains(episode))
+                    {
+                        Some("duplicate_state_episode")
+                    } else {
+                        None
+                    };
+                    if duplicate_reason.is_some() {
+                        break;
+                    }
+                    group_events.insert(span.event_id.clone());
+                    group_hashes.insert(item.content_sha256.clone());
+                    if let Some(episode) = &item.episode_id {
+                        group_episodes.insert(episode.clone());
+                    }
+                    additional += 1;
+                    chars += item.content.chars().count();
+                }
+                actions.push((member, exact, already_selected_exact));
+            }
+            if let Some(reason) = duplicate_reason {
+                for member in member_indexes {
+                    sidecar.candidates[member].trace.selected = false;
+                    sidecar.candidates[member].trace.reason = reason.into();
+                }
+                continue;
+            }
             if state_slots + additional > target_state_slots
                 || selected.len() + state_only.len() + additional > retrieval_config.max_selected
             {
@@ -3113,26 +3142,10 @@ impl RetrievalStore {
                 }
                 continue;
             }
-            for member in member_indexes {
+            for (member, exact, already_selected_exact) in actions {
                 let item = &mut sidecar.candidates[member];
                 let span = item.trace.evidence_span.as_ref().unwrap();
-                if let Some(candidate_index) = candidates.iter().position(|candidate| {
-                    if candidate.span != *span
-                        || !(candidate.reason == "eligible"
-                            || candidate.protected_exact && candidate.selected)
-                    {
-                        return false;
-                    }
-                    if candidate.protected_exact && candidate.selected {
-                        return true;
-                    }
-                    !selected_events.contains(&candidate.span.event_id)
-                        && !selected_hashes.contains(&candidate.content_sha256)
-                        && candidate
-                            .episode_id
-                            .as_ref()
-                            .is_none_or(|episode| !selected_episodes.contains(episode))
-                }) {
+                if let Some(candidate_index) = exact {
                     candidates[candidate_index].selected = true;
                     candidates[candidate_index].reason = "selected_state".into();
                     if !selected.contains(&candidate_index) {
@@ -3145,29 +3158,20 @@ impl RetrievalStore {
                     }
                     item.trace.selected = true;
                     item.trace.reason = format!("selected_state:{}", item.trace.claim_id);
-                } else if selected_events.contains(&span.event_id)
-                    || selected_hashes.contains(&item.content_sha256)
-                    || item
-                        .episode_id
-                        .as_ref()
-                        .is_some_and(|episode| selected_episodes.contains(episode))
-                {
-                    item.trace.selected = true;
-                    item.trace.reason =
-                        format!("selected_state_deduplicated:{}", item.trace.claim_id);
-                    continue;
                 } else {
                     state_only.push(member);
                     item.trace.selected = true;
                     item.trace.reason = format!("selected_state:{}", item.trace.claim_id);
                 }
-                selected_events.insert(span.event_id.clone());
-                selected_hashes.insert(item.content_sha256.clone());
-                if let Some(episode) = &item.episode_id {
-                    selected_episodes.insert(episode.clone());
+                if !already_selected_exact {
+                    selected_events.insert(span.event_id.clone());
+                    selected_hashes.insert(item.content_sha256.clone());
+                    if let Some(episode) = &item.episode_id {
+                        selected_episodes.insert(episode.clone());
+                    }
+                    selected_chars += item.content.chars().count();
+                    state_slots += 1;
                 }
-                selected_chars += item.content.chars().count();
-                state_slots += 1;
             }
         }
         eligible.retain(|&index| {
@@ -3346,34 +3350,153 @@ impl RetrievalStore {
             &mut expansion_events,
             &mut expansion_hashes,
         )?;
-        let mut selected_states = sidecar
+        let mut emitted_events = evidence
+            .iter()
+            .map(|item| item.selected.span.event_id.clone())
+            .collect::<HashSet<_>>();
+        let mut emitted_hashes = evidence
+            .iter()
+            .map(|item| item.selected.content_sha256.clone())
+            .collect::<HashSet<_>>();
+        let mut emitted_episodes = HashSet::new();
+        for item in &evidence {
+            if let Some(episode) =
+                self.resolve_episode_id(connection, &item.selected.span.event_id)?
+            {
+                emitted_episodes.insert(episode);
+            }
+        }
+        let mut emitted_core_slots = evidence
+            .iter()
+            .filter(|item| item.selected.kind == EvidenceKind::Core)
+            .count();
+        let mut emitted_core_chars = evidence
+            .iter()
+            .filter(|item| item.selected.kind == EvidenceKind::Core)
+            .map(|item| item.content.chars().count())
+            .sum::<usize>();
+        let mut final_groups = sidecar
             .candidates
             .iter()
             .filter(|candidate| candidate.trace.selected)
+            .map(|candidate| (candidate.trace.rank, candidate.conflict_group.clone()))
             .collect::<Vec<_>>();
-        selected_states.sort_by_key(|candidate| candidate.trace.rank);
-        for candidate in selected_states {
-            let span = candidate.trace.evidence_span.clone().unwrap();
-            if evidence.iter().any(|item| item.selected.span == span) {
+        final_groups.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+        let mut final_handled = BTreeSet::new();
+        for (_, group) in final_groups {
+            if !final_handled.insert(group.clone()) {
                 continue;
             }
-            let fused_rank = candidates
+            let member_indexes = group
                 .iter()
-                .find(|fused| fused.span == span && fused.reason == "selected_state")
-                .map(|fused| fused.pre_cap_rank);
-            let selected = SelectedEvidence {
-                span,
-                content_sha256: candidate.content_sha256.clone(),
-                role: EventRole::User,
-                kind: EvidenceKind::Core,
-                originating_candidate_rank: fused_rank,
-                reason: candidate.trace.reason.clone(),
-            };
-            bm25.trace.selected_evidence.push(selected.clone());
-            evidence.push(RecalledEvidence {
-                selected,
-                content: candidate.content.clone(),
-            });
+                .filter_map(|claim| {
+                    sidecar
+                        .candidates
+                        .iter()
+                        .position(|candidate| candidate.trace.claim_id == *claim)
+                })
+                .collect::<Vec<_>>();
+            if member_indexes.len() != group.len()
+                || member_indexes
+                    .iter()
+                    .any(|&member| !sidecar.candidates[member].trace.selected)
+            {
+                continue;
+            }
+            let pending = member_indexes
+                .iter()
+                .copied()
+                .filter(|&member| {
+                    let span = sidecar.candidates[member]
+                        .trace
+                        .evidence_span
+                        .as_ref()
+                        .unwrap();
+                    !evidence.iter().any(|item| item.selected.span == *span)
+                })
+                .collect::<Vec<_>>();
+            let mut group_events = emitted_events.clone();
+            let mut group_hashes = emitted_hashes.clone();
+            let mut group_episodes = emitted_episodes.clone();
+            let mut exclusion = None;
+            for &member in &pending {
+                let candidate = &sidecar.candidates[member];
+                let span = candidate.trace.evidence_span.as_ref().unwrap();
+                exclusion = if !group_events.insert(span.event_id.clone()) {
+                    Some("final_duplicate_state_event")
+                } else if !group_hashes.insert(candidate.content_sha256.clone()) {
+                    Some("final_duplicate_state_content")
+                } else if candidate
+                    .episode_id
+                    .as_ref()
+                    .is_some_and(|episode| !group_episodes.insert(episode.clone()))
+                {
+                    Some("final_duplicate_state_episode")
+                } else {
+                    None
+                };
+                if exclusion.is_some() {
+                    break;
+                }
+            }
+            let pending_chars = pending
+                .iter()
+                .map(|&member| sidecar.candidates[member].content.chars().count())
+                .sum::<usize>();
+            if exclusion.is_none()
+                && emitted_core_slots + pending.len() > bm25.trace.config.max_selected
+            {
+                exclusion = Some("final_state_slot_limit");
+            }
+            if exclusion.is_none()
+                && emitted_core_chars + pending_chars > bm25.trace.config.evidence_char_budget
+            {
+                exclusion = Some("final_state_evidence_budget");
+            }
+            if let Some(reason) = exclusion {
+                for member in member_indexes {
+                    let state = &mut sidecar.candidates[member];
+                    state.trace.selected = false;
+                    state.trace.reason = reason.into();
+                    if let Some(span) = &state.trace.evidence_span
+                        && let Some(fused) = bm25
+                            .trace
+                            .fusion_candidates
+                            .iter_mut()
+                            .find(|fused| fused.span == *span && !fused.protected_exact)
+                    {
+                        fused.selected = false;
+                        fused.reason = reason.into();
+                    }
+                }
+                continue;
+            }
+            for &member in &pending {
+                let candidate = &sidecar.candidates[member];
+                let span = candidate.trace.evidence_span.clone().unwrap();
+                let fused_rank = candidates
+                    .iter()
+                    .find(|fused| fused.span == span && fused.reason == "selected_state")
+                    .map(|fused| fused.pre_cap_rank);
+                let selected = SelectedEvidence {
+                    span,
+                    content_sha256: candidate.content_sha256.clone(),
+                    role: EventRole::User,
+                    kind: EvidenceKind::Core,
+                    originating_candidate_rank: fused_rank,
+                    reason: candidate.trace.reason.clone(),
+                };
+                bm25.trace.selected_evidence.push(selected.clone());
+                evidence.push(RecalledEvidence {
+                    selected,
+                    content: candidate.content.clone(),
+                });
+            }
+            emitted_events = group_events;
+            emitted_hashes = group_hashes;
+            emitted_episodes = group_episodes;
+            emitted_core_slots += pending.len();
+            emitted_core_chars += pending_chars;
         }
         bm25.trace.state_selections = sidecar
             .candidates
