@@ -4599,10 +4599,7 @@ impl RetrievalStore {
                 |row| row.get::<_, String>(0),
             )
             .optional()
-            .map_err(|e| self.database_error(e))?
-            .ok_or_else(|| {
-                RetrievalError::CorruptIndex(format!("回答 {answer_event_id} 缺少 retrieval run"))
-            })?;
+            .map_err(|e| self.database_error(e))?;
         let source = self.read_source(&self.root.join(&session.source_file))?;
         let event_turn_id = event
             .turn_id
@@ -4631,23 +4628,33 @@ impl RetrievalStore {
                     "回答 {answer_event_id} 在原始会话中缺少对应轮次"
                 ))
             })?;
-        let canonical_retrieval_trace = serde_json::to_string(&turn.context_trace.retrieval)
-            .map_err(|error| {
-                RetrievalError::CorruptIndex(format!(
-                    "回答 {answer_event_id} 的来源 retrieval trace 无法规范序列化：{error}"
-                ))
-            })?;
-        if retrieval_trace_json != canonical_retrieval_trace {
+        answer.retrieval_trace = if let Some(retrieval_trace_json) = retrieval_trace_json {
+            let canonical_retrieval_trace = serde_json::to_string(&turn.context_trace.retrieval)
+                .map_err(|error| {
+                    RetrievalError::CorruptIndex(format!(
+                        "回答 {answer_event_id} 的来源 retrieval trace 无法规范序列化：{error}"
+                    ))
+                })?;
+            if retrieval_trace_json != canonical_retrieval_trace {
+                return Err(RetrievalError::CorruptIndex(format!(
+                    "回答 {answer_event_id} 的 retrieval run 与来源 trace 原始字节不一致"
+                )));
+            }
+            let mut trace =
+                serde_json::from_str::<RetrievalTrace>(&retrieval_trace_json).map_err(|error| {
+                    RetrievalError::CorruptIndex(format!(
+                        "回答 {answer_event_id} 的 retrieval run JSON 无效：{error}"
+                    ))
+                })?;
+            trace.normalize_usage();
+            trace
+        } else if turn.context_trace.retrieval == RetrievalTrace::default() {
+            RetrievalTrace::default()
+        } else {
             return Err(RetrievalError::CorruptIndex(format!(
-                "回答 {answer_event_id} 的 retrieval run 与来源 trace 原始字节不一致"
+                "回答 {answer_event_id} 缺少 retrieval run"
             )));
-        }
-        answer.retrieval_trace = serde_json::from_str(&retrieval_trace_json).map_err(|error| {
-            RetrievalError::CorruptIndex(format!(
-                "回答 {answer_event_id} 的 retrieval run JSON 无效：{error}"
-            ))
-        })?;
-        answer.retrieval_trace.normalize_usage();
+        };
         let source_events = derive_events(&source.session);
         let source_event_by_id = source_events
             .iter()
