@@ -943,6 +943,63 @@ impl RetrievalStore {
         Ok(active && !members.is_empty())
     }
 
+    fn authoritative_indexed_event(
+        &self,
+        connection: &Connection,
+        event_id: &str,
+    ) -> RetrievalResult<StoredEvent> {
+        let indexed_event = connection
+            .query_row(
+                "SELECT event_id, session_id, turn_id, sequence, role, created_at, content,
+                        content_sha256, reply_to_event_id, token_count, turn_status, done_reason, error
+                 FROM events WHERE event_id=?1",
+                [event_id],
+                map_event,
+            )
+            .optional()
+            .map_err(|error| self.database_error(error))?
+            .ok_or_else(|| {
+                RetrievalError::CorruptIndex("派生来源事件缺少权威索引绑定".into())
+            })?;
+        verify_event_hash(&indexed_event)?;
+        let indexed_session = connection
+            .query_row(
+                "SELECT session_id, title, created_at, updated_at, source_file, source_sha256,
+                        source_schema_version
+                 FROM indexed_sessions WHERE session_id=?1",
+                [&indexed_event.session_id],
+                map_session,
+            )
+            .optional()
+            .map_err(|error| self.database_error(error))?
+            .ok_or_else(|| RetrievalError::CorruptIndex("派生来源事件缺少权威会话绑定".into()))?;
+        self.verify_fresh(&indexed_session)?;
+        let source = self.read_source(&self.root.join(&indexed_session.source_file))?;
+        if source.sha256 != indexed_session.source_sha256
+            || source.session.id != indexed_session.id
+            || source.session.title != indexed_session.title
+            || source.session.created_at != indexed_session.created_at
+            || source.session.updated_at != indexed_session.updated_at
+            || source.session.schema_version != indexed_session.source_schema_version
+        {
+            return Err(RetrievalError::CorruptIndex(
+                "权威会话元数据与派生索引不一致".into(),
+            ));
+        }
+        let mut matches = derive_events(&source.session)
+            .into_iter()
+            .filter(|event| event.id == event_id);
+        let authoritative = matches
+            .next()
+            .ok_or_else(|| RetrievalError::CorruptIndex("派生来源事件在权威会话中不存在".into()))?;
+        if matches.next().is_some() || authoritative != indexed_event {
+            return Err(RetrievalError::CorruptIndex(
+                "派生来源事件与权威会话不一致".into(),
+            ));
+        }
+        Ok(authoritative)
+    }
+
     fn document_reference_is_active(
         &self,
         connection: &Connection,
@@ -951,47 +1008,89 @@ impl RetrievalStore {
     ) -> RetrievalResult<bool> {
         let raw = connection
             .query_row(
-                "SELECT r.event_id,e.session_id,r.start_char,r.end_char,r.granularity,r.content_sha256
+                "SELECT r.event_id,e.session_id,r.start_char,r.end_char,r.granularity,
+                        r.content_sha256,r.exact_content
                  FROM retrieval_documents r
              LEFT JOIN events e ON e.event_id=r.event_id WHERE r.document_id=?1",
                 [document_id],
-                |row| Ok((
-                    row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?,
-                    i64_to_usize(row.get(2)?)?, i64_to_usize(row.get(3)?)?,
-                    row.get::<_, String>(4)?, row.get::<_, String>(5)?,
-                )),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        i64_to_usize(row.get(2)?)?,
+                        i64_to_usize(row.get(3)?)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                },
             )
             .optional()
             .map_err(|error| self.database_error(error))?;
-        let mut active = true;
-        if let Some((event_id, session_id, _, _, _, _)) = &raw {
-            if session_id.is_none() {
-                return Err(RetrievalError::CorruptIndex(
-                    "派生文档缺少权威来源事件".into(),
-                ));
-            }
-            active &= !control.event_is_excluded(event_id)
-                && session_id
-                    .as_deref()
-                    .is_some_and(|session| control.allows_session(session));
+        if let Some((_, session_id, _, _, _, _, _)) = &raw
+            && session_id.is_none()
+        {
+            return Err(RetrievalError::CorruptIndex(
+                "派生文档缺少权威来源事件".into(),
+            ));
         }
         let memory = connection.query_row(
-            "SELECT session_id,granularity,source_sha256 FROM memory_documents WHERE document_id=?1",
+            "SELECT session_id,granularity,source_sha256,start_sequence,end_sequence,member_count
+             FROM memory_documents WHERE document_id=?1",
             [document_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+            |row| Ok((
+                row.get::<_, String>(0)?, row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?, i64_to_usize(row.get(3)?)?,
+                i64_to_usize(row.get(4)?)?, i64_to_usize(row.get(5)?)?,
+            )),
         ).optional().map_err(|error| self.database_error(error))?
             .ok_or_else(|| RetrievalError::CorruptIndex(
                 "trace 文档引用缺少 memory_documents 来源".into()
             ))?;
         match memory.1.as_str() {
             "message" | "fragment" => {
-                active &= self.memory_document_is_active(connection, control, document_id)?;
-                let (event_id, session_id, start, end, granularity, hash) =
-                    raw.ok_or_else(|| {
+                let memory_active =
+                    self.memory_document_is_active(connection, control, document_id)?;
+                let (event_id, session_id, start, end, granularity, hash, exact_content) = raw
+                    .ok_or_else(|| {
                         RetrievalError::CorruptIndex(
                             "active leaf 文档缺少 retrieval_documents 来源".into(),
                         )
                     })?;
+                let authoritative = self.authoritative_indexed_event(connection, &event_id)?;
+                if authoritative.role == EventRole::System
+                    || authoritative.content.trim().is_empty()
+                {
+                    return Err(RetrievalError::CorruptIndex(
+                        "leaf 文档绑定了不可索引的权威事件".into(),
+                    ));
+                }
+                let expected = document_spans(&authoritative)
+                    .into_iter()
+                    .filter(|(_, span)| {
+                        document_id
+                            == format!("{}:{}:{}", authoritative.id, span.start_char, span.end_char)
+                    })
+                    .collect::<Vec<_>>();
+                if expected.len() != 1 {
+                    return Err(RetrievalError::CorruptIndex(
+                        "leaf 文档不是权威事件的 canonical 文档".into(),
+                    ));
+                }
+                let (expected_granularity, expected_span) = expected
+                    .into_iter()
+                    .next()
+                    .expect("checked one canonical leaf document");
+                let expected_granularity = match expected_granularity {
+                    RetrievalDocumentGranularity::Message => "message",
+                    RetrievalDocumentGranularity::Fragment => "fragment",
+                    RetrievalDocumentGranularity::Episode
+                    | RetrievalDocumentGranularity::Session => {
+                        unreachable!("document_spans only derives leaf documents")
+                    }
+                };
+                let expected_content = slice_chars(&authoritative.content, &expected_span)?;
+                let expected_hash = content_sha256(&expected_content);
                 let member = connection
                     .query_row(
                         "SELECT event_id,start_char,end_char,content_sha256
@@ -1008,26 +1107,60 @@ impl RetrievalStore {
                     )
                     .map_err(|error| self.database_error(error))?;
                 if session_id.as_deref() != Some(memory.0.as_str())
+                    || authoritative.session_id != memory.0
                     || event_id != member.0
                     || start != member.1
                     || end != member.2
                     || granularity != memory.1
                     || hash != memory.2
                     || hash != member.3
+                    || memory.3 != authoritative.sequence
+                    || memory.4 != authoritative.sequence
+                    || memory.5 != 1
+                    || event_id != authoritative.id
+                    || start != expected_span.start_char
+                    || end != expected_span.end_char
+                    || granularity != expected_granularity
+                    || memory.1 != expected_granularity
+                    || hash != expected_hash
+                    || exact_content != expected_content
                 {
                     return Err(RetrievalError::CorruptIndex(
                         "active leaf 文档的 retrieval/memory 来源不一致".into(),
                     ));
                 }
+                let span_count: i64 = connection
+                    .query_row(
+                        "SELECT count(*) FROM source_spans
+                         WHERE event_id=?1 AND start_char=?2 AND end_char=?3
+                           AND content_sha256=?4",
+                        params![
+                            authoritative.id,
+                            usize_to_i64(expected_span.start_char)
+                                .map_err(|error| self.database_error(error))?,
+                            usize_to_i64(expected_span.end_char)
+                                .map_err(|error| self.database_error(error))?,
+                            expected_hash,
+                        ],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| self.database_error(error))?;
+                if span_count != 1 {
+                    return Err(RetrievalError::CorruptIndex(
+                        "leaf 文档缺少 canonical source span".into(),
+                    ));
+                }
+                Ok(memory_active
+                    && control.allows_event(&authoritative.session_id, &authoritative.id))
             }
             "episode" | "session" => {
                 let aggregate =
                     load_persisted_aggregate_document(connection, document_id, &memory.0)?;
-                active &= control.allows_session(&aggregate.session_id)
+                let active = control.allows_session(&aggregate.session_id)
                     && aggregate.members.iter().all(|member| {
                         control.allows_event(&aggregate.session_id, &member.event_id)
                     });
-                if let Some((event_id, session_id, start, end, granularity, hash)) = raw {
+                if let Some((event_id, session_id, start, end, granularity, hash, _)) = raw {
                     let member_count: i64 = connection
                         .query_row(
                             "SELECT count(*) FROM memory_document_members
@@ -1053,14 +1186,12 @@ impl RetrievalStore {
                         ));
                     }
                 }
+                Ok(active)
             }
-            _ => {
-                return Err(RetrievalError::CorruptIndex(
-                    "trace 文档引用包含无效粒度".into(),
-                ));
-            }
+            _ => Err(RetrievalError::CorruptIndex(
+                "trace 文档引用包含无效粒度".into(),
+            )),
         }
-        Ok(active)
     }
 
     fn ranked_candidate_document_is_active(
@@ -1090,7 +1221,8 @@ impl RetrievalStore {
                 AND s.start_char=r.start_char AND s.end_char=r.end_char
              WHERE r.document_id=?1 AND e.session_id=?2 AND r.event_id=?3
                AND r.start_char=?4 AND r.end_char=?5 AND r.granularity=?6
-               AND r.content_sha256=?7 AND s.content_sha256=?7 AND e.role=?8",
+               AND r.content_sha256=?7 AND s.content_sha256=?7 AND e.role=?8
+               AND e.created_at=?9",
                 params![
                     candidate.document_id,
                     candidate.session_id,
@@ -1101,7 +1233,8 @@ impl RetrievalStore {
                         .map_err(|error| self.database_error(error))?,
                     granularity,
                     candidate.content_sha256,
-                    candidate.role.as_str()
+                    candidate.role.as_str(),
+                    candidate.created_at,
                 ],
                 |row| row.get(0),
             )
@@ -5160,7 +5293,7 @@ impl RetrievalStore {
             .map_err(|error| self.database_error(error))?;
         let connection: &Connection = &transaction;
         let event = self.get_event_from_connection(connection, answer_event_id)?;
-        Self::require_active_event(&state, &event)?;
+        let mut answer_active = state.allows_event(&event.session_id, &event.id);
         let session = self.get_session_from_connection(connection, &event.session_id)?;
         self.verify_fresh(&session)?;
         verify_event_hash(&event)?;
@@ -5216,9 +5349,7 @@ impl RetrievalStore {
                 ))
             })?;
         let structural_user_id = event_id(&source.session.id, Some(&turn.id), EventRole::User);
-        if !state.allows_event(&source.session.id, &structural_user_id) {
-            return Err(RetrievalError::ExcludedEvent(structural_user_id));
-        }
+        answer_active &= state.allows_event(&source.session.id, &structural_user_id);
         answer.retrieval_trace = if let Some(retrieval_trace_json) = retrieval_trace_json {
             let canonical_retrieval_trace = serde_json::to_string(&turn.context_trace.retrieval)
                 .map_err(|error| {
@@ -5279,9 +5410,8 @@ impl RetrievalStore {
                 "回答上下文索引元数据与来源 trace 不匹配".into(),
             ));
         }
-        if !self.retrieval_trace_is_active(connection, &state, &answer.retrieval_trace)? {
-            return Err(RetrievalError::ExcludedEvent(answer_event_id.to_owned()));
-        }
+        answer_active &=
+            self.retrieval_trace_is_active(connection, &state, &answer.retrieval_trace)?;
         if turn.context_trace.untrusted_history_wrapped {
             let expected_identity = wrapped_history_identity(
                 &source.session.ai_name,
@@ -5356,12 +5486,7 @@ impl RetrievalStore {
                     "回答上下文索引片段与来源 trace 不匹配".into(),
                 ));
             }
-            let source_event = self.get_event_from_connection(connection, &span.event_id)?;
-            Self::require_active_event(&state, &source_event)?;
-            let source_session =
-                self.get_session_from_connection(connection, &source_event.session_id)?;
-            self.verify_fresh(&source_session)?;
-            verify_event_hash(&source_event)?;
+            let source_event = self.authoritative_indexed_event(connection, &span.event_id)?;
             let is_session_system_prompt = !source.session.system_prompt.is_empty()
                 && ordinal == 0
                 && span.event_id == session_system_event_id
@@ -5395,6 +5520,7 @@ impl RetrievalStore {
                     span.event_id
                 )));
             }
+            answer_active &= state.allows_event(&source_event.session_id, &source_event.id);
             let generated_before_item = wrapped_source_role.is_some();
             if !inserted_generated && (role != EventRole::System || generated_before_item) {
                 push_generated_messages(
@@ -5441,60 +5567,30 @@ impl RetrievalStore {
         }
         drop(statement);
         self.require_unchanged_control_state(&state)?;
+        if !answer_active {
+            return Err(RetrievalError::ExcludedEvent(answer_event_id.to_owned()));
+        }
         transaction
             .commit()
             .map_err(|error| self.database_error(error))?;
         Ok(answer)
     }
 
-    fn authoritative_event_is_active(
+    fn authoritative_source_span_is_active(
         &self,
         connection: &Connection,
         control: &ControlState,
         local_events: &HashMap<String, &StoredEvent>,
-        event_id: &str,
-    ) -> RetrievalResult<Option<bool>> {
-        if control.event_is_excluded(event_id) {
-            return Ok(Some(false));
-        }
-        if let Some(event) = local_events.get(event_id) {
-            return Ok(Some(control.allows_event(&event.session_id, &event.id)));
-        }
-        if let Some(event) = connection
-            .query_row(
-                "SELECT event_id, session_id, turn_id, sequence, role, created_at, content,
-                        content_sha256, reply_to_event_id, token_count, turn_status, done_reason, error
-                 FROM events WHERE event_id=?1",
-                [event_id],
-                map_event,
-            )
-            .optional()
-            .map_err(|error| self.database_error(error))?
-        {
-            return Ok(Some(control.allows_event(&event.session_id, &event.id)));
-        }
-        for source in self.load_all_sources()? {
-            if let Some(event) = derive_events(&source.session)
-                .into_iter()
-                .find(|event| event.id == event_id)
-            {
-                return Ok(Some(control.allows_event(&event.session_id, &event.id)));
-            }
-        }
-        Ok(None)
-    }
-
-    fn trace_span_is_active(
-        &self,
-        connection: &Connection,
-        control: &ControlState,
-        expected_session: Option<&str>,
         span: &SourceSpan,
-    ) -> RetrievalResult<bool> {
+        expected_hash: &str,
+        expected_role: EventRole,
+    ) -> RetrievalResult<Option<bool>> {
         if span.event_id.is_empty() {
-            return Ok(true);
+            return Err(RetrievalError::CorruptIndex(
+                "回答 provenance 缺少权威事件".into(),
+            ));
         }
-        let event = connection
+        let indexed = connection
             .query_row(
                 "SELECT event_id, session_id, turn_id, sequence, role, created_at, content,
                         content_sha256, reply_to_event_id, token_count, turn_status, done_reason, error
@@ -5503,15 +5599,89 @@ impl RetrievalStore {
                 map_event,
             )
             .optional()
-            .map_err(|error| self.database_error(error))?
-            .ok_or_else(|| RetrievalError::CorruptIndex("trace 来源事件不存在".into()))?;
+            .map_err(|error| self.database_error(error))?;
+        let has_indexed = indexed.is_some();
+        let local = local_events.get(&span.event_id).copied();
+        let authoritative = if let Some(indexed) = indexed {
+            let authoritative = self.authoritative_indexed_event(connection, &span.event_id)?;
+            if indexed != authoritative || local.is_some_and(|event| event != &authoritative) {
+                return Err(RetrievalError::CorruptIndex(
+                    "回答 provenance 的 indexed/raw 事件不一致".into(),
+                ));
+            }
+            Some(authoritative)
+        } else if let Some(local) = local {
+            Some(local.clone())
+        } else {
+            let mut matches = self
+                .load_all_sources()?
+                .into_iter()
+                .flat_map(|source| derive_events(&source.session))
+                .filter(|event| event.id == span.event_id);
+            let event = matches.next();
+            if matches.next().is_some() {
+                return Err(RetrievalError::CorruptIndex(
+                    "回答 provenance 事件未唯一绑定权威来源".into(),
+                ));
+            }
+            event
+        };
+        let Some(authoritative) = authoritative else {
+            return Ok(None);
+        };
+        verify_event_hash(&authoritative)?;
+        let selected = slice_chars(&authoritative.content, span)?;
+        if authoritative.role != expected_role || content_sha256(&selected) != expected_hash {
+            return Err(RetrievalError::CorruptIndex(
+                "回答 provenance 与权威事件的角色或片段哈希不一致".into(),
+            ));
+        }
+        if has_indexed {
+            let stored_hash = connection
+                .query_row(
+                    "SELECT content_sha256 FROM source_spans
+                     WHERE event_id=?1 AND start_char=?2 AND end_char=?3",
+                    params![
+                        span.event_id,
+                        usize_to_i64(span.start_char).map_err(|error| self.database_error(error))?,
+                        usize_to_i64(span.end_char).map_err(|error| self.database_error(error))?,
+                    ],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|error| self.database_error(error))?;
+            if stored_hash.is_some_and(|hash| hash != expected_hash) {
+                return Err(RetrievalError::CorruptIndex(
+                    "回答 provenance 的持久化片段哈希不一致".into(),
+                ));
+            }
+        }
+        Ok(Some(control.allows_event(
+            &authoritative.session_id,
+            &authoritative.id,
+        )))
+    }
+
+    fn trace_span_is_active(
+        &self,
+        connection: &Connection,
+        control: &ControlState,
+        expected_session: Option<&str>,
+        span: &SourceSpan,
+        expected_hash: Option<&str>,
+        expected_role: Option<EventRole>,
+    ) -> RetrievalResult<bool> {
+        if span.event_id.is_empty() {
+            return Ok(true);
+        }
+        let event = self.authoritative_indexed_event(connection, &span.event_id)?;
         if expected_session.is_some_and(|session| session != event.session_id) {
             return Err(RetrievalError::CorruptIndex(
                 "trace 来源事件属于错误会话".into(),
             ));
         }
-        verify_event_hash(&event)?;
         let content = slice_chars(&event.content, span)?;
+        let actual_hash = content_sha256(&content);
         let stored_hash = connection
             .query_row(
                 "SELECT content_sha256 FROM source_spans
@@ -5525,7 +5695,10 @@ impl RetrievalStore {
             )
             .optional()
             .map_err(|error| self.database_error(error))?;
-        if stored_hash.as_deref() != Some(content_sha256(&content).as_str()) {
+        if stored_hash.as_deref() != Some(actual_hash.as_str())
+            || expected_hash.is_some_and(|hash| hash != actual_hash)
+            || expected_role.is_some_and(|role| role != event.role)
+        {
             return Err(RetrievalError::CorruptIndex(
                 "trace 来源片段与权威原文不一致".into(),
             ));
@@ -5566,6 +5739,8 @@ impl RetrievalStore {
                 control,
                 Some(&candidate.session_id),
                 &candidate.span,
+                Some(&candidate.content_sha256),
+                Some(candidate.role),
             )?;
             let document_active =
                 self.ranked_candidate_document_is_active(connection, control, candidate)?;
@@ -5587,6 +5762,8 @@ impl RetrievalStore {
                 control,
                 (!candidate.session_id.is_empty()).then_some(candidate.session_id.as_str()),
                 &candidate.span,
+                None,
+                None,
             )?;
             for document_id in std::iter::once(candidate.document_id.as_str())
                 .chain(candidate.source_document_ids.iter().map(String::as_str))
@@ -5603,7 +5780,7 @@ impl RetrievalStore {
                         "state trace 缺少权威来源".into(),
                     ));
                 }
-                active &= self.trace_span_is_active(connection, control, None, span)?;
+                active &= self.trace_span_is_active(connection, control, None, span, None, None)?;
             }
         }
         for path in &trace.graph_paths {
@@ -5623,6 +5800,8 @@ impl RetrievalStore {
                     control,
                     (!path.target_session_id.is_empty()).then_some(path.target_session_id.as_str()),
                     span,
+                    None,
+                    None,
                 )?;
             }
             for document_id in [&path.seed_document_id, &path.target_document_id]
@@ -5638,7 +5817,14 @@ impl RetrievalStore {
                     "selected evidence 缺少权威来源".into(),
                 ));
             }
-            active &= self.trace_span_is_active(connection, control, None, &selected.span)?;
+            active &= self.trace_span_is_active(
+                connection,
+                control,
+                None,
+                &selected.span,
+                Some(&selected.content_sha256),
+                Some(selected.role),
+            )?;
         }
         Ok(active)
     }
@@ -5760,46 +5946,50 @@ impl RetrievalStore {
         for turn in &source.session.turns {
             let answer_id = event_id(&source.session.id, Some(&turn.id), EventRole::Assistant);
             let user_id = event_id(&source.session.id, Some(&turn.id), EventRole::User);
-            if !control.allows_event(&source.session.id, &answer_id)
-                || !control.allows_event(&source.session.id, &user_id)
-            {
-                continue;
-            }
             if !all_event_by_id.contains_key(&answer_id) {
                 continue;
             }
-            if !self.retrieval_trace_is_active(
+            let mut answer_active = control.allows_event(&source.session.id, &answer_id)
+                && control.allows_event(&source.session.id, &user_id);
+            answer_active &= self.retrieval_trace_is_active(
                 transaction,
                 control,
                 &turn.context_trace.retrieval,
-            )? {
-                continue;
-            }
-            let mut provenance_ids = turn
-                .context_trace
-                .context_items
-                .iter()
-                .map(|item| item.span.event_id.as_str())
-                .chain(
-                    turn.context_trace
-                        .retrieval
-                        .selected_evidence
-                        .iter()
-                        .map(|item| item.span.event_id.as_str()),
-                );
-            let mut skip_answer = false;
-            for event_id in provenance_ids.by_ref() {
-                match self.authoritative_event_is_active(
+            )?;
+            let mut wrapped_history = WrappedHistoryCursor::new(
+                turn.context_trace.untrusted_history_wrapped,
+                &turn.context_trace.retrieval.selected_evidence,
+            )
+            .map_err(|message| RetrievalError::InvalidSource {
+                path: source.path.clone(),
+                message: message.into(),
+            })?;
+            let session_system_event_id = event_id(&source.session.id, None, EventRole::System);
+            let session_system_end = source.session.system_prompt.chars().count();
+            let session_system_hash = content_sha256(&source.session.system_prompt);
+            for (ordinal, item) in turn.context_trace.context_items.iter().enumerate() {
+                let is_session_system_prompt = !source.session.system_prompt.is_empty()
+                    && ordinal == 0
+                    && item.span.event_id == session_system_event_id
+                    && item.span.start_char == 0
+                    && item.span.end_char == session_system_end
+                    && item.content_sha256 == session_system_hash;
+                let expected_role = wrapped_history
+                    .consume(item, is_session_system_prompt)
+                    .map_err(|message| RetrievalError::InvalidSource {
+                        path: source.path.clone(),
+                        message: message.into(),
+                    })?
+                    .unwrap_or(item.role);
+                match self.authoritative_source_span_is_active(
                     transaction,
                     control,
                     &all_event_by_id,
-                    event_id,
+                    &item.span,
+                    &item.content_sha256,
+                    expected_role,
                 )? {
-                    Some(false) => {
-                        skip_answer = true;
-                        break;
-                    }
-                    Some(true) => {}
+                    Some(item_active) => answer_active &= item_active,
                     None => {
                         return Err(RetrievalError::InvalidSource {
                             path: source.path.clone(),
@@ -5808,7 +5998,31 @@ impl RetrievalStore {
                     }
                 }
             }
-            if skip_answer {
+            wrapped_history
+                .finish()
+                .map_err(|message| RetrievalError::InvalidSource {
+                    path: source.path.clone(),
+                    message: message.into(),
+                })?;
+            for selected in &turn.context_trace.retrieval.selected_evidence {
+                match self.authoritative_source_span_is_active(
+                    transaction,
+                    control,
+                    &all_event_by_id,
+                    &selected.span,
+                    &selected.content_sha256,
+                    selected.role,
+                )? {
+                    Some(item_active) => answer_active &= item_active,
+                    None => {
+                        return Err(RetrievalError::InvalidSource {
+                            path: source.path.clone(),
+                            message: format!("回答 {} 引用了不存在的权威来源事件", turn.id),
+                        });
+                    }
+                }
+            }
+            if !answer_active {
                 continue;
             }
             let derived = derive_context(
