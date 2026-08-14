@@ -820,14 +820,28 @@ impl RetrievalStore {
             )
             .optional()
             .map_err(|error| self.database_error(error))?;
-        let Some(event) = event else { return Ok(()) };
+        let Some(event) = event else {
+            let Some(authoritative) = self.authoritative_raw_event(event_id)? else {
+                return Ok(());
+            };
+            Self::require_active_event(state, &authoritative)?;
+            if session_filter.is_some_and(|scope| scope != authoritative.session_id) {
+                return Err(RetrievalError::CorruptIndex(
+                    "检索输入事件不属于限定会话".into(),
+                ));
+            }
+            return Err(RetrievalError::StaleIndex {
+                session_id: authoritative.session_id,
+            });
+        };
         Self::require_active_event(state, &event)?;
         if session_filter.is_some_and(|scope| scope != event.session_id) {
             return Err(RetrievalError::CorruptIndex(
                 "检索输入事件不属于限定会话".into(),
             ));
         }
-        verify_event_hash(&event)
+        self.authoritative_indexed_event(connection, event_id)?;
+        Ok(())
     }
 
     pub(crate) fn memory_document_is_active(
@@ -1010,6 +1024,24 @@ impl RetrievalStore {
         Ok(authoritative)
     }
 
+    fn authoritative_raw_event(&self, event_id: &str) -> RetrievalResult<Option<StoredEvent>> {
+        let mut matches = self
+            .load_all_sources()?
+            .into_iter()
+            .flat_map(|source| derive_events(&source.session))
+            .filter(|event| event.id == event_id);
+        let authoritative = matches.next();
+        if matches.next().is_some() {
+            return Err(RetrievalError::CorruptIndex(
+                "event ID 未唯一绑定权威 raw event".into(),
+            ));
+        }
+        if let Some(event) = &authoritative {
+            verify_event_hash(event)?;
+        }
+        Ok(authoritative)
+    }
+
     fn authoritative_trace_query_event(
         &self,
         connection: &Connection,
@@ -1027,20 +1059,9 @@ impl RetrievalStore {
             return self.authoritative_indexed_event(connection, event_id);
         }
 
-        let mut matches = self
-            .load_all_sources()?
-            .into_iter()
-            .flat_map(|source| derive_events(&source.session))
-            .filter(|event| event.id == event_id);
-        let authoritative = matches.next().ok_or_else(|| {
+        let authoritative = self.authoritative_raw_event(event_id)?.ok_or_else(|| {
             RetrievalError::CorruptIndex("entity trace current query 缺少权威 raw event".into())
         })?;
-        if matches.next().is_some() {
-            return Err(RetrievalError::CorruptIndex(
-                "entity trace current query 未唯一绑定权威 raw event".into(),
-            ));
-        }
-        verify_event_hash(&authoritative)?;
         if control.allows_event(&authoritative.session_id, &authoritative.id) {
             return Err(RetrievalError::CorruptIndex(
                 "active entity trace current query 缺少 indexed event".into(),
