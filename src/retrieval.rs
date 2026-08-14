@@ -6149,14 +6149,18 @@ impl RetrievalStore {
         let (global_matches, _) = self.load_entity_matches(connection, &current.content, None)?;
         let (session_matches, _) =
             self.load_entity_matches(connection, &current.content, Some(&current.session_id))?;
-        for stored in &trace.entity_matches {
-            if !global_matches.iter().any(|current| current == stored)
-                && !session_matches.iter().any(|current| current == stored)
-            {
-                return Err(RetrievalError::CorruptIndex(
-                    "entity trace 与 current safe projection matcher 不一致".into(),
-                ));
-            }
+        let all_stored_entries_match_global_scope = trace
+            .entity_matches
+            .iter()
+            .all(|stored| global_matches.iter().any(|current| current == stored));
+        let all_stored_entries_match_session_scope = trace
+            .entity_matches
+            .iter()
+            .all(|stored| session_matches.iter().any(|current| current == stored));
+        if !all_stored_entries_match_global_scope && !all_stored_entries_match_session_scope {
+            return Err(RetrievalError::CorruptIndex(
+                "entity trace 未整体匹配同一 current safe projection scope".into(),
+            ));
         }
 
         for matched in &trace.entity_matches {
