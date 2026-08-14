@@ -67,8 +67,8 @@ pub use ollama::{
 pub use retrieval::{
     AggregateEmbeddingDocument, AggregateEmbeddingSnapshot, AnswerContext, AnswerContextItem,
     DirectMessageEmbedding, EmbeddingPublishReport, IndexedSession, LeafEmbeddingDocument,
-    LeafEmbeddingSnapshot, RecallResult, RecalledEvidence, ResolvedSpan, RetrievalError,
-    RetrievalStore, StoredEvent, SyncReport, classify_query,
+    LeafEmbeddingSnapshot, RebuildOptions, RebuildReport, RecallResult, RecalledEvidence,
+    ResolvedSpan, RetrievalError, RetrievalStore, StoredEvent, SyncReport, classify_query,
 };
 pub use store::{IndexSyncAfterSourceCommit, SessionStore};
 pub use vector::{

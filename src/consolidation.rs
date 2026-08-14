@@ -2107,14 +2107,553 @@ pub(crate) fn validate_full_derived_integrity(connection: &Connection) -> Retrie
     validate_memory_v2_semantics_and_history(connection)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConsolidationLedgerSnapshot {
+    pub row_count: usize,
+    digest_sha256: String,
+}
+
+pub(crate) struct PreparedConsolidationReplay {
+    attempts: Vec<PreparedReplayAttempt>,
+    skipped_inactive: usize,
+    skipped_dependency: usize,
+    unavailable_entity_creates: HashSet<String>,
+    unavailable_claim_creates: HashSet<String>,
+}
+
+struct PreparedReplayAttempt {
+    attempt: ConsolidationAttemptRecord,
+    batch: ConsolidationInputBatch,
+    candidates: ConsolidationCandidateSnapshot,
+    plan: ValidatedPlan,
+}
+
+pub(crate) struct ConsolidationReplayReport {
+    pub replayed: usize,
+    pub skipped_inactive: usize,
+    pub skipped_dependency: usize,
+}
+
+pub(crate) fn consolidation_ledger_snapshot(
+    connection: &Connection,
+) -> RetrievalResult<ConsolidationLedgerSnapshot> {
+    let mut hasher = Sha256::new();
+    hash_length_delimited(&mut hasher, b"hippocampus-consolidation-ledger-v1");
+    let mut statement = connection
+        .prepare(
+            "SELECT attempt_id,batch_key,session_id,from_sequence,through_sequence,trigger,
+                    model,request_json,request_sha256,input_event_ids,input_event_hashes,
+                    response_json,response_sha256,status,input_tokens,output_tokens,latency_ms,
+                    started_at,completed_at,validation_json,error_json,projection_schema_version
+             FROM consolidation_batches ORDER BY attempt_id",
+        )
+        .map_err(candidate_database_error)?;
+    let columns = statement.column_count();
+    let mut rows = statement.query([]).map_err(candidate_database_error)?;
+    let mut row_count = 0usize;
+    while let Some(row) = rows.next().map_err(candidate_database_error)? {
+        row_count += 1;
+        for index in 0..columns {
+            match row.get_ref(index).map_err(candidate_database_error)? {
+                ValueRef::Null => hash_length_delimited(&mut hasher, b"null"),
+                ValueRef::Integer(value) => {
+                    hash_length_delimited(&mut hasher, b"integer");
+                    hash_length_delimited(&mut hasher, &value.to_le_bytes());
+                }
+                ValueRef::Real(value) => {
+                    hash_length_delimited(&mut hasher, b"real");
+                    hash_length_delimited(&mut hasher, &value.to_bits().to_le_bytes());
+                }
+                ValueRef::Text(value) => {
+                    hash_length_delimited(&mut hasher, b"text");
+                    hash_length_delimited(&mut hasher, value);
+                }
+                ValueRef::Blob(value) => {
+                    hash_length_delimited(&mut hasher, b"blob");
+                    hash_length_delimited(&mut hasher, value);
+                }
+            }
+        }
+    }
+    Ok(ConsolidationLedgerSnapshot {
+        row_count,
+        digest_sha256: format!("{:x}", hasher.finalize()),
+    })
+}
+
+pub(crate) fn prepare_consolidation_replay(
+    connection: &Connection,
+    control: &ControlState,
+    raw_events: &[StoredEvent],
+) -> RetrievalResult<PreparedConsolidationReplay> {
+    let mut raw_by_id = HashMap::new();
+    let mut turn_activity = HashMap::<(String, String), bool>::new();
+    for event in raw_events {
+        if raw_by_id.insert(event.id.clone(), event).is_some() {
+            return Err(RetrievalError::CorruptIndex(
+                "权威 raw source 包含重复 event ID".into(),
+            ));
+        }
+        if let Some(turn_id) = &event.turn_id {
+            turn_activity
+                .entry((event.session_id.clone(), turn_id.clone()))
+                .and_modify(|active| *active &= control.allows_event(&event.session_id, &event.id))
+                .or_insert_with(|| control.allows_event(&event.session_id, &event.id));
+        }
+    }
+
+    let mut statement = connection
+        .prepare(
+            "SELECT attempt_id, batch_key, session_id, from_sequence, through_sequence, trigger,
+                    model, request_json, request_sha256, input_event_ids, input_event_hashes,
+                    response_json, response_sha256, status, input_tokens, output_tokens,
+                    latency_ms, started_at, completed_at, validation_json, error_json
+             FROM consolidation_batches
+             WHERE status='applied' AND projection_schema_version=4
+             ORDER BY completed_at, attempt_id",
+        )
+        .map_err(candidate_database_error)?;
+    let records = statement
+        .query_map([], map_stored_attempt)
+        .map_err(candidate_database_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(candidate_database_error)?;
+    let mut seen_batches = HashSet::new();
+    let mut blocked_sessions = HashSet::new();
+    let mut attempts = Vec::new();
+    let mut skipped_inactive = 0;
+    let mut skipped_dependency = 0;
+    let mut unavailable_entity_creates = HashSet::new();
+    let mut unavailable_claim_creates = HashSet::new();
+    for stored in records {
+        let attempt = decode_stored_attempt(stored)?;
+        if !seen_batches.insert((attempt.session_id.clone(), attempt.batch_key.clone())) {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "会话 {} 的 batch {} 存在重复 applied projection-v4 attempt",
+                attempt.session_id, attempt.batch_key
+            )));
+        }
+        let request: StructuredChatRequest =
+            serde_json::from_str(&attempt.request_json).map_err(|error| {
+                RetrievalError::CorruptIndex(format!("applied 请求解析失败：{error}"))
+            })?;
+        let payload: ConsolidationRequestPayload = serde_json::from_str(
+            request
+                .messages
+                .get(1)
+                .map(|message| message.content.as_str())
+                .unwrap_or(""),
+        )
+        .map_err(|error| {
+            RetrievalError::CorruptIndex(format!("applied 请求载荷解析失败：{error}"))
+        })?;
+        validate_applied_attempt(&payload.batch, &payload.candidate_snapshot, &attempt).map_err(
+            |error| RetrievalError::CorruptIndex(format!("applied 请求契约损坏：{error}")),
+        )?;
+        validate_candidate_snapshot(&payload.candidate_snapshot)?;
+        if candidate_snapshot_hash(
+            &payload.candidate_snapshot.entities,
+            &payload.candidate_snapshot.claims,
+        )? != payload.candidate_snapshot.snapshot_sha256
+        {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "applied batch {} 的候选快照哈希损坏",
+                attempt.batch_key
+            )));
+        }
+        validate_candidate_snapshot_against_raw(&payload.candidate_snapshot, &raw_by_id)?;
+        let response = attempt
+            .response_json
+            .as_deref()
+            .ok_or_else(|| RetrievalError::CorruptIndex("applied 响应缺失".into()))?;
+        let output: StructuredConsolidationOutput =
+            serde_json::from_str(response).map_err(|error| {
+                RetrievalError::CorruptIndex(format!("applied 响应解析失败：{error}"))
+            })?;
+        let plan = validate_structured_output(&payload.batch, &payload.candidate_snapshot, &output)
+            .map_err(|error| {
+                RetrievalError::CorruptIndex(format!("applied 输出重放失败：{error}"))
+            })?;
+
+        let mut inactive = !control.allows_session(&attempt.session_id);
+        for event in &payload.batch.events {
+            let raw = raw_by_id.get(&event.event_id).ok_or_else(|| {
+                RetrievalError::CorruptIndex(format!(
+                    "applied batch {} 引用不存在的权威 raw event {}",
+                    attempt.batch_key, event.event_id
+                ))
+            })?;
+            if raw.session_id != payload.batch.session_id
+                || raw.turn_id.as_deref() != Some(event.turn_id.as_str())
+                || raw.sequence != event.sequence
+                || raw.role != event.role
+                || raw.created_at != event.created_at
+                || raw.content != event.content
+                || raw.content_sha256 != event.content_sha256
+            {
+                return Err(RetrievalError::CorruptIndex(format!(
+                    "applied batch {} 未精确绑定权威 raw event {}",
+                    attempt.batch_key, event.event_id
+                )));
+            }
+            inactive |= !control.allows_event(&attempt.session_id, &event.event_id)
+                || !turn_activity
+                    .get(&(attempt.session_id.clone(), event.turn_id.clone()))
+                    .copied()
+                    .unwrap_or(false);
+        }
+        let excluded_gap = raw_events.iter().any(|event| {
+            event.session_id == attempt.session_id
+                && event.sequence > payload.batch.watermark_before
+                && event.sequence <= payload.batch.through_sequence
+                && !payload
+                    .batch
+                    .events
+                    .iter()
+                    .any(|input| input.event_id == event.id)
+                && !control.allows_event(&event.session_id, &event.id)
+        });
+        let plan_entity_creates = plan
+            .entities
+            .iter()
+            .filter(|entity| entity.create)
+            .map(|entity| entity.entity_id.clone())
+            .collect::<Vec<_>>();
+        let plan_claim_creates = plan
+            .claims
+            .iter()
+            .filter_map(|claim| match &claim.action {
+                ValidatedClaimAction::Create { claim_id, .. } => Some(claim_id.clone()),
+                ValidatedClaimAction::Confirm { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        let skipped = if blocked_sessions.contains(&attempt.session_id) {
+            skipped_dependency += 1;
+            true
+        } else if inactive {
+            blocked_sessions.insert(attempt.session_id.clone());
+            skipped_inactive += 1;
+            true
+        } else if excluded_gap {
+            blocked_sessions.insert(attempt.session_id.clone());
+            skipped_dependency += 1;
+            true
+        } else {
+            attempts.push(PreparedReplayAttempt {
+                attempt,
+                batch: payload.batch,
+                candidates: payload.candidate_snapshot,
+                plan,
+            });
+            false
+        };
+        if skipped {
+            unavailable_entity_creates.extend(plan_entity_creates);
+            unavailable_claim_creates.extend(plan_claim_creates);
+        }
+    }
+    Ok(PreparedConsolidationReplay {
+        attempts,
+        skipped_inactive,
+        skipped_dependency,
+        unavailable_entity_creates,
+        unavailable_claim_creates,
+    })
+}
+
+fn validate_candidate_snapshot_against_raw(
+    snapshot: &ConsolidationCandidateSnapshot,
+    raw_by_id: &HashMap<String, &StoredEvent>,
+) -> RetrievalResult<()> {
+    let verify = |session_id: &str,
+                  event_id: &str,
+                  start: usize,
+                  end: usize,
+                  hash: &str|
+     -> RetrievalResult<()> {
+        let event = raw_by_id.get(event_id).ok_or_else(|| {
+            RetrievalError::CorruptIndex(format!(
+                "候选快照来源 event {event_id} 不存在于权威 raw source"
+            ))
+        })?;
+        if event.session_id != session_id {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "候选快照来源 event {event_id} 会话绑定错误"
+            )));
+        }
+        let text = slice_unicode(&event.content, start, end).ok_or_else(|| {
+            RetrievalError::CorruptIndex(format!("候选快照来源 event {event_id} Unicode 范围无效"))
+        })?;
+        if sha256_bytes(text.as_bytes()) != hash {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "候选快照来源 event {event_id} 哈希不匹配"
+            )));
+        }
+        Ok(())
+    };
+    for entity in &snapshot.entities {
+        verify(
+            &entity.created_session_id,
+            &entity.created_event_id,
+            entity.created_start,
+            entity.created_end,
+            &entity.created_hash,
+        )?;
+        for alias in &entity.aliases {
+            verify(
+                &alias.session_id,
+                &alias.event_id,
+                alias.start_char,
+                alias.end_char,
+                &alias.content_sha256,
+            )?;
+            verify(
+                &alias.session_id,
+                &alias.proof_event_id,
+                alias.proof_start_char,
+                alias.proof_end_char,
+                &alias.proof_sha256,
+            )?;
+            verify(
+                &alias.session_id,
+                &alias.identity_event_id,
+                alias.identity_start_char,
+                alias.identity_end_char,
+                &alias.identity_sha256,
+            )?;
+        }
+    }
+    for claim in &snapshot.claims {
+        for evidence in &claim.evidence {
+            verify(
+                &evidence.session_id,
+                &evidence.event_id,
+                evidence.start_char,
+                evidence.end_char,
+                &evidence.content_sha256,
+            )?;
+            for span in [
+                &evidence.subject_span,
+                &evidence.relation_span,
+                &evidence.object_span,
+            ] {
+                verify(
+                    &evidence.session_id,
+                    &span.event_id,
+                    span.start_char,
+                    span.end_char,
+                    &span.content_sha256,
+                )?;
+            }
+            if let Some(span) = &evidence.speech_act_span {
+                verify(
+                    &evidence.session_id,
+                    &span.event_id,
+                    span.start_char,
+                    span.end_char,
+                    &span.content_sha256,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn replay_prepared_consolidation(
+    transaction: &Transaction<'_>,
+    _control: &ControlState,
+    prepared: PreparedConsolidationReplay,
+) -> RetrievalResult<ConsolidationReplayReport> {
+    let mut pending = prepared.attempts;
+    let mut replayed = 0;
+    let mut skipped_dependency = prepared.skipped_dependency;
+    let mut replay_blocked_sessions = HashSet::new();
+    loop {
+        let mut progress = false;
+        let mut deferred = Vec::new();
+        let pending_entity_creates = pending
+            .iter()
+            .flat_map(|item| item.plan.entities.iter())
+            .filter(|entity| entity.create)
+            .map(|entity| entity.entity_id.clone())
+            .collect::<HashSet<_>>();
+        let pending_claim_creates = pending
+            .iter()
+            .flat_map(|item| item.plan.claims.iter())
+            .filter_map(|claim| match &claim.action {
+                ValidatedClaimAction::Create { claim_id, .. } => Some(claim_id.clone()),
+                ValidatedClaimAction::Confirm { .. } => None,
+            })
+            .collect::<HashSet<_>>();
+        for item in pending {
+            if replay_blocked_sessions.contains(&item.batch.session_id) {
+                skipped_dependency += 1;
+                continue;
+            }
+            verify_batch_rows(transaction, &item.batch)?;
+            if verify_watermark_before(transaction, &item.batch).is_err() {
+                let current_watermark = transaction
+                    .query_row(
+                        "SELECT through_sequence FROM consolidation_watermarks WHERE session_id=?1",
+                        [&item.batch.session_id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()
+                    .map_err(candidate_database_error)?
+                    .map(|value| nonnegative_usize(value, "watermark.through_sequence"))
+                    .transpose()?;
+                if current_watermark.is_some_and(|value| value > item.batch.watermark_before) {
+                    return Err(RetrievalError::CorruptIndex(format!(
+                        "applied batch {} 的水位依赖已被越过",
+                        item.batch.batch_key
+                    )));
+                }
+                deferred.push(item);
+                continue;
+            }
+            let current = load_candidate_snapshot(
+                transaction,
+                item.candidates.entities.len().max(1),
+                item.candidates.claims.len().max(1),
+            )?;
+            if current != item.candidates {
+                let current_entities = current
+                    .entities
+                    .iter()
+                    .map(|entity| (entity.entity_id.as_str(), entity))
+                    .collect::<HashMap<_, _>>();
+                let current_claims = current
+                    .claims
+                    .iter()
+                    .map(|claim| (claim.claim_id.as_str(), claim))
+                    .collect::<HashMap<_, _>>();
+                let missing_entities = item
+                    .candidates
+                    .entities
+                    .iter()
+                    .filter(|entity| !current_entities.contains_key(entity.entity_id.as_str()))
+                    .collect::<Vec<_>>();
+                let missing_claims = item
+                    .candidates
+                    .claims
+                    .iter()
+                    .filter(|claim| !current_claims.contains_key(claim.claim_id.as_str()))
+                    .collect::<Vec<_>>();
+                let exact_intersection = item.candidates.entities.iter().all(|expected| {
+                    current_entities
+                        .get(expected.entity_id.as_str())
+                        .is_none_or(|actual| *actual == expected)
+                }) && item.candidates.claims.iter().all(|expected| {
+                    current_claims
+                        .get(expected.claim_id.as_str())
+                        .is_none_or(|actual| *actual == expected)
+                });
+                let only_missing = current.entities.len() + missing_entities.len()
+                    == item.candidates.entities.len()
+                    && current.claims.len() + missing_claims.len() == item.candidates.claims.len();
+                let provably_pending = !missing_entities.is_empty() || !missing_claims.is_empty();
+                let provably_pending = provably_pending
+                    && missing_entities
+                        .iter()
+                        .all(|entity| pending_entity_creates.contains(&entity.entity_id))
+                    && missing_claims
+                        .iter()
+                        .all(|claim| pending_claim_creates.contains(&claim.claim_id));
+                if exact_intersection && only_missing && provably_pending {
+                    deferred.push(item);
+                    continue;
+                }
+                let provably_unavailable = exact_intersection
+                    && only_missing
+                    && (!missing_entities.is_empty() || !missing_claims.is_empty())
+                    && missing_entities.iter().all(|entity| {
+                        prepared
+                            .unavailable_entity_creates
+                            .contains(&entity.entity_id)
+                    })
+                    && missing_claims
+                        .iter()
+                        .all(|claim| prepared.unavailable_claim_creates.contains(&claim.claim_id));
+                if provably_unavailable {
+                    replay_blocked_sessions.insert(item.batch.session_id.clone());
+                    skipped_dependency += 1;
+                    continue;
+                }
+                return Err(RetrievalError::CorruptIndex(format!(
+                    "applied batch {} 的当前候选快照不一致且不能由待回放依赖解释",
+                    item.batch.batch_key
+                )));
+            }
+            validate_candidate_provenance(transaction, &item.candidates)?;
+            validate_global_stable_aliases(transaction, &item.plan)
+                .map_err(consolidation_apply_to_retrieval)?;
+            validate_plan_against_global_claims(transaction, &item.plan)
+                .map_err(consolidation_apply_to_retrieval)?;
+            let mut report = ConsolidationApplyReport {
+                session_id: item.batch.session_id.clone(),
+                batch_key: item.batch.batch_key.clone(),
+                watermark_before: item.batch.watermark_before,
+                watermark_after: item.batch.through_sequence,
+                entities_created: 0,
+                entities_reused: 0,
+                aliases_created: 0,
+                claims_created: 0,
+                claims_confirmed: 0,
+                claims_superseded: 0,
+                claims_conflicted: 0,
+                evidence_created: 0,
+                mentions_created: 0,
+                boundaries_created: 0,
+            };
+            apply_validated_plan(
+                transaction,
+                &item.batch,
+                &item.attempt,
+                &item.plan,
+                &mut report,
+            )
+            .map_err(candidate_database_error)?;
+            compare_and_swap_watermark(transaction, &item.batch, &item.attempt.completed_at)
+                .map_err(consolidation_apply_to_retrieval)?;
+            replayed += 1;
+            progress = true;
+        }
+        if deferred.is_empty() {
+            return Ok(ConsolidationReplayReport {
+                replayed,
+                skipped_inactive: prepared.skipped_inactive,
+                skipped_dependency,
+            });
+        }
+        if !progress {
+            return Ok(ConsolidationReplayReport {
+                replayed,
+                skipped_inactive: prepared.skipped_inactive,
+                skipped_dependency: skipped_dependency + deferred.len(),
+            });
+        }
+        pending = deferred;
+    }
+}
+
+fn consolidation_apply_to_retrieval(error: ConsolidationApplyError) -> RetrievalError {
+    match error {
+        ConsolidationApplyError::Retrieval(error) => error,
+        error => RetrievalError::CorruptIndex(format!("巩固账本重放验证失败：{error}")),
+    }
+}
+
 fn validate_applied_mention_projection(connection: &Connection) -> RetrievalResult<()> {
     let mut expected_by_batch = BTreeMap::<String, Vec<Vec<String>>>::new();
     let mut statement = connection.prepare(
-        "SELECT attempt_id, batch_key, session_id, from_sequence, through_sequence, trigger, model,
-                request_json, request_sha256, input_event_ids, input_event_hashes, response_json,
-                response_sha256, status, input_tokens, output_tokens, latency_ms, started_at,
-                completed_at, validation_json, error_json
-         FROM consolidation_batches WHERE status='applied' AND projection_schema_version=4
+        "SELECT b.attempt_id,b.batch_key,b.session_id,b.from_sequence,b.through_sequence,b.trigger,b.model,
+                b.request_json,b.request_sha256,b.input_event_ids,b.input_event_hashes,b.response_json,
+                b.response_sha256,b.status,b.input_tokens,b.output_tokens,b.latency_ms,b.started_at,
+                b.completed_at,b.validation_json,b.error_json
+         FROM consolidation_batches b
+         JOIN consolidation_watermarks w ON w.session_id=b.session_id
+                                      AND b.through_sequence<=w.through_sequence
+         WHERE b.status='applied' AND b.projection_schema_version=4
          ORDER BY attempt_id",
     ).map_err(candidate_database_error)?;
     let records = statement
@@ -2218,11 +2757,14 @@ pub(crate) fn original_claim_valid_to_by_id(
     connection: &Connection,
 ) -> RetrievalResult<BTreeMap<String, Option<String>>> {
     let mut statement = connection.prepare(
-        "SELECT attempt_id, batch_key, session_id, from_sequence, through_sequence, trigger, model,
-                request_json, request_sha256, input_event_ids, input_event_hashes, response_json,
-                response_sha256, status, input_tokens, output_tokens, latency_ms, started_at,
-                completed_at, validation_json, error_json
-         FROM consolidation_batches WHERE status='applied' AND projection_schema_version=4
+        "SELECT b.attempt_id,b.batch_key,b.session_id,b.from_sequence,b.through_sequence,b.trigger,b.model,
+                b.request_json,b.request_sha256,b.input_event_ids,b.input_event_hashes,b.response_json,
+                b.response_sha256,b.status,b.input_tokens,b.output_tokens,b.latency_ms,b.started_at,
+                b.completed_at,b.validation_json,b.error_json
+         FROM consolidation_batches b
+         JOIN consolidation_watermarks w ON w.session_id=b.session_id
+                                      AND b.through_sequence<=w.through_sequence
+         WHERE b.status='applied' AND b.projection_schema_version=4
          ORDER BY attempt_id",
     ).map_err(candidate_database_error)?;
     let records = statement

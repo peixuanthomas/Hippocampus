@@ -12,7 +12,8 @@ use thiserror::Error;
 
 use crate::config::{MemoryBudgetConfig, MemoryConfig};
 use crate::consolidation::{
-    normalize_match, original_claim_valid_to_by_id, validate_full_derived_integrity,
+    consolidation_ledger_snapshot, normalize_match, original_claim_valid_to_by_id,
+    prepare_consolidation_replay, replay_prepared_consolidation, validate_full_derived_integrity,
 };
 use crate::context::{WrappedHistoryCursor, wrapped_history_identity};
 use crate::control::{ControlLog, ControlState};
@@ -379,6 +380,44 @@ pub struct SyncReport {
     pub spans: usize,
     pub answer_contexts: usize,
     pub documents: usize,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RebuildOptions {
+    pub reuse_compatible_embeddings: bool,
+}
+
+impl Default for RebuildOptions {
+    fn default() -> Self {
+        Self {
+            reuse_compatible_embeddings: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RebuildReport {
+    pub sync: SyncReport,
+    pub control_generation_sha256: String,
+    pub ledger_attempts_preserved: usize,
+    pub consolidation_attempts_replayed: usize,
+    pub consolidation_attempts_skipped_inactive: usize,
+    pub consolidation_attempts_skipped_dependency: usize,
+    pub embeddings_reused: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ReusableLeafEmbedding {
+    document_id: String,
+    session_id: String,
+    granularity: String,
+    document_source_sha256: String,
+    model: String,
+    dimensions: i64,
+    embedding_source_sha256: String,
+    index_fingerprint: String,
+    vector_blob: Vec<u8>,
+    embedded_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1588,8 +1627,12 @@ impl RetrievalStore {
     }
 
     pub fn rebuild(&self) -> RetrievalResult<SyncReport> {
+        Ok(self.rebuild_with_options(RebuildOptions::default())?.sync)
+    }
+
+    pub fn rebuild_with_options(&self, options: RebuildOptions) -> RetrievalResult<RebuildReport> {
         let _guard = self.acquire_root_write()?;
-        self.rebuild_under_root_write()
+        self.rebuild_under_root_write(options)
     }
 
     pub fn refresh_graph(
@@ -1605,28 +1648,51 @@ impl RetrievalStore {
         crate::graph::refresh_graph(self, config)
     }
 
-    fn rebuild_under_root_write(&self) -> RetrievalResult<SyncReport> {
+    fn rebuild_under_root_write(&self, options: RebuildOptions) -> RetrievalResult<RebuildReport> {
         let state = self.replay_control_state_under_guard()?;
-        let sources = self
-            .load_all_sources()?
+        let all_sources = self.load_all_sources()?;
+        let all_events = all_sources
+            .iter()
+            .flat_map(|source| derive_events(&source.session))
+            .collect::<Vec<_>>();
+        let sources = all_sources
             .into_iter()
             .filter(|source| state.allows_session(&source.session.id))
             .collect::<Vec<_>>();
         let mut connection = self.open_connection()?;
         let transaction = connection
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| self.database_error(source))?;
+        let ledger_before = consolidation_ledger_snapshot(&transaction)?;
+        let replay = prepare_consolidation_replay(&transaction, &state, &all_events)?;
+        let reusable_embeddings = if options.reuse_compatible_embeddings {
+            self.snapshot_reusable_leaf_embeddings(&transaction, &state)?
+        } else {
+            Vec::new()
+        };
         transaction
             .execute_batch(
                 "DELETE FROM memory_graph_edges;
                  DELETE FROM memory_graph_nodes;
                  DELETE FROM memory_graph_materializations;
+                 DELETE FROM memory_episode_materializations;
+                 DELETE FROM memory_episode_boundaries;
+                 DELETE FROM memory_embeddings;
+                 DELETE FROM memory_document_members;
                  DELETE FROM memory_documents;
                  DELETE FROM retrieval_documents_fts;
                  DELETE FROM retrieval_documents;
                  DELETE FROM retrieval_runs;
                  DELETE FROM answer_context_items;
                  DELETE FROM answer_contexts;
+                 DELETE FROM memory_claim_transitions;
+                 DELETE FROM memory_claim_evidence;
+                 DELETE FROM memory_entity_mentions;
+                 DELETE FROM memory_boundary_suggestions;
+                 DELETE FROM memory_claims;
+                 DELETE FROM memory_entity_aliases;
+                 DELETE FROM memory_entities;
+                 DELETE FROM consolidation_watermarks;
                  DELETE FROM source_spans;
                  DELETE FROM events;
                  DELETE FROM indexed_sessions;",
@@ -1646,11 +1712,200 @@ impl RetrievalStore {
             let report = self.write_session(&transaction, source, true, &state)?;
             total.answer_contexts += report.answer_contexts;
         }
+        let replay_report = replay_prepared_consolidation(&transaction, &state, replay)?;
+        let embeddings_reused =
+            self.restore_reusable_leaf_embeddings(&transaction, &state, &reusable_embeddings)?;
+        transaction
+            .execute(
+                "INSERT INTO memory_schema_meta(key,value) VALUES('active_control_generation_sha256',?1)
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                [state.generation_sha256()],
+            )
+            .map_err(|source| self.database_error(source))?;
         self.require_unchanged_control_state(&state)?;
+        let marker: String = transaction
+            .query_row(
+                "SELECT value FROM memory_schema_meta
+                 WHERE key='active_control_generation_sha256'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|source| self.database_error(source))?;
+        if marker != state.generation_sha256() {
+            return Err(RetrievalError::CorruptIndex(
+                "重建后的 active control generation marker 不匹配".into(),
+            ));
+        }
+        validate_full_derived_integrity(&transaction)?;
+        let aggregate_or_graph_rows: i64 = transaction
+            .query_row(
+                "SELECT
+                    (SELECT count(*) FROM memory_graph_edges) +
+                    (SELECT count(*) FROM memory_graph_nodes) +
+                    (SELECT count(*) FROM memory_graph_materializations) +
+                    (SELECT count(*) FROM memory_episode_materializations) +
+                    (SELECT count(*) FROM memory_episode_boundaries) +
+                    (SELECT count(*) FROM memory_documents WHERE granularity IN ('episode','session'))",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|source| self.database_error(source))?;
+        if aggregate_or_graph_rows != 0 {
+            return Err(RetrievalError::CorruptIndex(
+                "重建后 graph、episode 或 session aggregate 投影非空".into(),
+            ));
+        }
+        if !options.reuse_compatible_embeddings {
+            let embeddings: i64 = transaction
+                .query_row("SELECT count(*) FROM memory_embeddings", [], |row| {
+                    row.get(0)
+                })
+                .map_err(|source| self.database_error(source))?;
+            if embeddings != 0 {
+                return Err(RetrievalError::CorruptIndex(
+                    "强制重建后 embedding 投影非空".into(),
+                ));
+            }
+        }
+        let ledger_after = consolidation_ledger_snapshot(&transaction)?;
+        if ledger_before != ledger_after {
+            return Err(RetrievalError::CorruptIndex(
+                "重建期间 immutable consolidation ledger 发生变化".into(),
+            ));
+        }
         transaction
             .commit()
             .map_err(|source| self.database_error(source))?;
-        Ok(total)
+        *self
+            .vector_cache
+            .lock()
+            .map_err(|_| RetrievalError::CorruptIndex("向量缓存锁已损坏".into()))? = None;
+        Ok(RebuildReport {
+            sync: total,
+            control_generation_sha256: state.generation_sha256(),
+            ledger_attempts_preserved: ledger_before.row_count,
+            consolidation_attempts_replayed: replay_report.replayed,
+            consolidation_attempts_skipped_inactive: replay_report.skipped_inactive,
+            consolidation_attempts_skipped_dependency: replay_report.skipped_dependency,
+            embeddings_reused,
+        })
+    }
+
+    fn snapshot_reusable_leaf_embeddings(
+        &self,
+        connection: &Connection,
+        state: &ControlState,
+    ) -> RetrievalResult<Vec<ReusableLeafEmbedding>> {
+        let mut statement = connection
+            .prepare(
+                "SELECT d.document_id,d.session_id,d.granularity,d.source_sha256,
+                        e.model,e.dimensions,e.source_sha256,e.index_fingerprint,
+                        e.vector_blob,e.embedded_at
+                 FROM memory_documents d
+                 JOIN memory_embeddings e ON e.document_id=d.document_id
+                 WHERE d.granularity IN ('message','fragment')
+                 ORDER BY d.document_id",
+            )
+            .map_err(|error| self.database_error(error))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(ReusableLeafEmbedding {
+                    document_id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    granularity: row.get(2)?,
+                    document_source_sha256: row.get(3)?,
+                    model: row.get(4)?,
+                    dimensions: row.get(5)?,
+                    embedding_source_sha256: row.get(6)?,
+                    index_fingerprint: row.get(7)?,
+                    vector_blob: row.get(8)?,
+                    embedded_at: row.get(9)?,
+                })
+            })
+            .map_err(|error| self.database_error(error))?;
+        let mut reusable = Vec::new();
+        for row in rows {
+            let row = row.map_err(|error| self.database_error(error))?;
+            let dimensions = usize::try_from(row.dimensions).ok();
+            let valid = state.allows_session(&row.session_id)
+                && row.document_source_sha256 == row.embedding_source_sha256
+                && !row.model.trim().is_empty()
+                && is_sha256_hex(&row.document_source_sha256)
+                && is_sha256_hex(&row.index_fingerprint)
+                && DateTime::parse_from_rfc3339(&row.embedded_at).is_ok()
+                && dimensions.is_some_and(|value| value > 0)
+                && dimensions
+                    .and_then(|value| value.checked_mul(4))
+                    .is_some_and(|length| length == row.vector_blob.len())
+                && dimensions
+                    .and_then(|value| decode_f32_le(&row.vector_blob, value).ok())
+                    .is_some_and(|vector| is_unit_vector(&vector));
+            let active = match self.memory_document_is_active(connection, state, &row.document_id) {
+                Ok(active) => active,
+                Err(RetrievalError::Database { path, source }) => {
+                    return Err(RetrievalError::Database { path, source });
+                }
+                Err(_) => false,
+            };
+            if valid && active {
+                reusable.push(row);
+            }
+        }
+        Ok(reusable)
+    }
+
+    fn restore_reusable_leaf_embeddings(
+        &self,
+        transaction: &Transaction<'_>,
+        state: &ControlState,
+        candidates: &[ReusableLeafEmbedding],
+    ) -> RetrievalResult<usize> {
+        let mut reused = 0;
+        for candidate in candidates {
+            let current = transaction
+                .query_row(
+                    "SELECT session_id,granularity,source_sha256 FROM memory_documents
+                     WHERE document_id=?1",
+                    [&candidate.document_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|error| self.database_error(error))?;
+            if current.as_ref()
+                != Some(&(
+                    candidate.session_id.clone(),
+                    candidate.granularity.clone(),
+                    candidate.document_source_sha256.clone(),
+                ))
+                || !self.memory_document_is_active(transaction, state, &candidate.document_id)?
+            {
+                continue;
+            }
+            transaction
+                .execute(
+                    "INSERT INTO memory_embeddings
+                     (document_id,model,dimensions,source_sha256,index_fingerprint,vector_blob,embedded_at)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                    params![
+                        candidate.document_id,
+                        candidate.model,
+                        candidate.dimensions,
+                        candidate.embedding_source_sha256,
+                        candidate.index_fingerprint,
+                        candidate.vector_blob,
+                        candidate.embedded_at,
+                    ],
+                )
+                .map_err(|error| self.database_error(error))?;
+            reused += 1;
+        }
+        Ok(reused)
     }
 
     /// Atomically replace the persisted embeddings for a batch of immutable
