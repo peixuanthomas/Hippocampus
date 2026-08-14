@@ -63,13 +63,17 @@ impl Default for RetrievalConfig {
 
 impl RetrievalConfig {
     pub fn validate(&self) -> Result<()> {
+        let deferred_hard_limits = self.max_selected == usize::MAX
+            && self.evidence_char_budget == usize::MAX
+            && self.expansion_char_budget == usize::MAX;
         if self.candidate_limit == 0
             || self.candidate_limit > 512
-            || self.max_selected == 0
-            || self.max_selected > self.candidate_limit
-            || self.evidence_char_budget == 0
-            || self.evidence_char_budget > 32_768
-            || self.expansion_char_budget > 16_384
+            || !deferred_hard_limits
+                && (self.max_selected == 0
+                    || self.max_selected > self.candidate_limit
+                    || self.evidence_char_budget == 0
+                    || self.evidence_char_budget > 32_768
+                    || self.expansion_char_budget > 16_384)
         {
             bail!("检索配置必须为合理的非零有界值");
         }
@@ -123,6 +127,62 @@ pub struct ChannelTrace {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum BudgetBucket {
+    #[default]
+    RecentHistory,
+    ExactOrState,
+    Episode,
+    Graph,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BudgetTokenBreakdown {
+    #[serde(default)]
+    pub recent_history: u64,
+    #[serde(default)]
+    pub exact_or_state: u64,
+    #[serde(default)]
+    pub episode: u64,
+    #[serde(default)]
+    pub graph: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BudgetReflowTrace {
+    #[serde(default)]
+    pub bucket: BudgetBucket,
+    #[serde(default)]
+    pub offered_tokens: u64,
+    #[serde(default)]
+    pub consumed_tokens: u64,
+    #[serde(default)]
+    pub remaining_tokens: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BudgetExclusionTrace {
+    #[serde(default)]
+    pub bucket: BudgetBucket,
+    #[serde(default)]
+    pub candidate_group_id: String,
+    #[serde(default)]
+    pub stage: String,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub exact_increment_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BudgetStageLatencyTrace {
+    #[serde(default)]
+    pub stage: String,
+    #[serde(default)]
+    pub elapsed_ms: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BudgetAllocationTrace {
     #[serde(default)]
@@ -135,6 +195,22 @@ pub struct BudgetAllocationTrace {
     pub episode_percent: u8,
     #[serde(default = "default_graph_percent")]
     pub graph_percent: u8,
+    #[serde(default)]
+    pub mandatory_input_tokens: u64,
+    #[serde(default)]
+    pub available_input_tokens: u64,
+    #[serde(default)]
+    pub initial_tokens: BudgetTokenBreakdown,
+    #[serde(default)]
+    pub actual_tokens: BudgetTokenBreakdown,
+    #[serde(default)]
+    pub final_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub reflow: Vec<BudgetReflowTrace>,
+    #[serde(default)]
+    pub exclusions: Vec<BudgetExclusionTrace>,
+    #[serde(default)]
+    pub stage_latencies: Vec<BudgetStageLatencyTrace>,
 }
 
 const fn default_recent_history_percent() -> u8 {
@@ -175,6 +251,24 @@ impl BudgetAllocationTrace {
             exact_or_state_percent,
             episode_percent,
             graph_percent,
+            mandatory_input_tokens: 0,
+            available_input_tokens: 0,
+            initial_tokens: BudgetTokenBreakdown {
+                recent_history: 0,
+                exact_or_state: 0,
+                episode: 0,
+                graph: 0,
+            },
+            actual_tokens: BudgetTokenBreakdown {
+                recent_history: 0,
+                exact_or_state: 0,
+                episode: 0,
+                graph: 0,
+            },
+            final_input_tokens: None,
+            reflow: Vec::new(),
+            exclusions: Vec::new(),
+            stage_latencies: Vec::new(),
         }
     }
 }
@@ -585,7 +679,7 @@ impl EventRole {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct SourceSpan {
     pub event_id: String,
     pub start_char: usize,

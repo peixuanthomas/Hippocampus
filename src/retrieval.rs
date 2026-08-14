@@ -39,6 +39,11 @@ use crate::vector::{
 pub const INDEX_FILENAME: &str = ".hippocampus-index.sqlite3";
 const INDEX_SCHEMA_VERSION: i64 = 7;
 const MEMORY_STATE_SCHEMA_VERSION: i64 = 4;
+const DEFERRED_HARD_LIMIT: usize = usize::MAX;
+
+fn final_hard_limit(value: usize) -> Option<usize> {
+    (value != DEFERRED_HARD_LIMIT).then_some(value)
+}
 
 pub fn classify_query(raw_query: &str) -> QueryKind {
     let normalized = normalize_match(raw_query);
@@ -1912,30 +1917,37 @@ impl RetrievalStore {
                         candidate.document_id
                     )));
                 }
-                if span_content.chars().count() + core_chars > trace.config.evidence_char_budget {
-                    candidate.reason = "evidence_budget".into();
-                } else if trace
-                    .selected_evidence
-                    .iter()
-                    .filter(|e| e.kind == EvidenceKind::Core)
-                    .count()
-                    >= trace.config.max_selected
+                if final_hard_limit(trace.config.evidence_char_budget)
+                    .is_some_and(|limit| span_content.chars().count() + core_chars > limit)
                 {
-                    candidate.reason = "selection_limit".into();
+                    candidate.reason = "evidence_budget".into();
                 } else {
-                    candidate.selected = true;
-                    candidate.reason = "selected_core".into();
-                    core_chars += span_content.chars().count();
-                    used_events.insert(event_id_value);
-                    used_hashes.insert(hash.clone());
-                    trace.selected_evidence.push(SelectedEvidence {
-                        span,
-                        content_sha256: hash,
-                        role,
-                        kind: EvidenceKind::Core,
-                        originating_candidate_rank: Some(candidate.raw_rank),
-                        reason: "bm25_core".into(),
-                    });
+                    let selected_core_count = trace
+                        .selected_evidence
+                        .iter()
+                        .filter(|e| e.kind == EvidenceKind::Core)
+                        .count();
+                    if selected_core_count >= trace.config.candidate_limit {
+                        candidate.reason = "candidate_limit".into();
+                    } else if selected_core_count
+                        >= final_hard_limit(trace.config.max_selected).unwrap_or(usize::MAX)
+                    {
+                        candidate.reason = "selection_limit".into();
+                    } else {
+                        candidate.selected = true;
+                        candidate.reason = "selected_core".into();
+                        core_chars += span_content.chars().count();
+                        used_events.insert(event_id_value);
+                        used_hashes.insert(hash.clone());
+                        trace.selected_evidence.push(SelectedEvidence {
+                            span,
+                            content_sha256: hash,
+                            role,
+                            kind: EvidenceKind::Core,
+                            originating_candidate_rank: Some(candidate.raw_rank),
+                            reason: "bm25_core".into(),
+                        });
+                    }
                 }
             }
             trace.candidates.push(candidate);
@@ -3821,14 +3833,16 @@ impl RetrievalStore {
         }
         let mut state_only = Vec::new();
         let mut state_slots = 0usize;
-        let target_state_slots = retrieval_config
-            .max_selected
-            .saturating_mul(usize::from(
-                bm25.trace.budget_allocation.exact_or_state_percent,
-            ))
-            .div_ceil(100)
-            .max(1)
-            .min(retrieval_config.max_selected.saturating_sub(selected.len()));
+        let target_state_slots =
+            final_hard_limit(retrieval_config.max_selected).map_or(usize::MAX, |max_selected| {
+                max_selected
+                    .saturating_mul(usize::from(
+                        bm25.trace.budget_allocation.exact_or_state_percent,
+                    ))
+                    .div_ceil(100)
+                    .max(1)
+                    .min(max_selected.saturating_sub(selected.len()))
+            });
         let mut selected_events = selected
             .iter()
             .map(|&index| candidates[index].span.event_id.clone())
@@ -3925,14 +3939,17 @@ impl RetrievalStore {
                 continue;
             }
             if state_slots + additional > target_state_slots
-                || selected.len() + state_only.len() + additional > retrieval_config.max_selected
+                || final_hard_limit(retrieval_config.max_selected)
+                    .is_some_and(|limit| selected.len() + state_only.len() + additional > limit)
             {
                 for member in member_indexes {
                     sidecar.candidates[member].trace.reason = "state_slot_limit".into();
                 }
                 continue;
             }
-            if selected_chars + chars > retrieval_config.evidence_char_budget {
+            if final_hard_limit(retrieval_config.evidence_char_budget)
+                .is_some_and(|limit| selected_chars + chars > limit)
+            {
                 for member in member_indexes {
                     sidecar.candidates[member].trace.reason = "evidence_budget".into();
                 }
@@ -3970,7 +3987,9 @@ impl RetrievalStore {
                 }
             }
         }
-        let graph_slot_budget = if bm25.trace.budget_allocation.graph_percent == 0 {
+        let graph_slot_budget = if final_hard_limit(retrieval_config.max_selected).is_none() {
+            usize::MAX
+        } else if bm25.trace.budget_allocation.graph_percent == 0 {
             0
         } else {
             (retrieval_config.max_selected
@@ -3978,9 +3997,13 @@ impl RetrievalStore {
             .div_ceil(100)
             .max(1)
         };
-        let graph_char_budget = (retrieval_config.evidence_char_budget
-            * usize::from(bm25.trace.budget_allocation.graph_percent))
-        .div_ceil(100);
+        let graph_char_budget = final_hard_limit(retrieval_config.evidence_char_budget).map_or(
+            usize::MAX,
+            |char_budget| {
+                (char_budget * usize::from(bm25.trace.budget_allocation.graph_percent))
+                    .div_ceil(100)
+            },
+        );
         let mut graph_only = Vec::new();
         let mut graph_slots = 0usize;
         let mut graph_chars = 0usize;
@@ -4039,12 +4062,15 @@ impl RetrievalStore {
                 path.reason = reason.into();
                 continue;
             }
-            if selected.len() + state_only.len() + graph_only.len() >= retrieval_config.max_selected
+            if final_hard_limit(retrieval_config.max_selected)
+                .is_some_and(|limit| selected.len() + state_only.len() + graph_only.len() >= limit)
             {
                 path.reason = "selection_limit".into();
                 continue;
             }
-            if selected_chars + raw_chars > retrieval_config.evidence_char_budget {
+            if final_hard_limit(retrieval_config.evidence_char_budget)
+                .is_some_and(|limit| selected_chars + raw_chars > limit)
+            {
                 path.reason = "evidence_budget".into();
                 continue;
             }
@@ -4097,7 +4123,8 @@ impl RetrievalStore {
                 true
             }
         });
-        while selected.len() + state_only.len() + graph_only.len() < retrieval_config.max_selected
+        while final_hard_limit(retrieval_config.max_selected)
+            .is_none_or(|limit| selected.len() + state_only.len() + graph_only.len() < limit)
             && !eligible.is_empty()
         {
             let best_position = eligible
@@ -4126,7 +4153,9 @@ impl RetrievalStore {
                 .expect("non-empty eligible pool has a best candidate");
             let index = eligible.remove(best_position);
             let chars = candidates[index].content.chars().count();
-            if selected_chars + chars > retrieval_config.evidence_char_budget {
+            if final_hard_limit(retrieval_config.evidence_char_budget)
+                .is_some_and(|limit| selected_chars + chars > limit)
+            {
                 candidates[index].reason = "evidence_budget".into();
                 continue;
             }
@@ -4383,12 +4412,14 @@ impl RetrievalStore {
                 .map(|&member| sidecar.candidates[member].content.chars().count())
                 .sum::<usize>();
             if exclusion.is_none()
-                && emitted_core_slots + pending.len() > bm25.trace.config.max_selected
+                && final_hard_limit(bm25.trace.config.max_selected)
+                    .is_some_and(|limit| emitted_core_slots + pending.len() > limit)
             {
                 exclusion = Some("final_state_slot_limit");
             }
             if exclusion.is_none()
-                && emitted_core_chars + pending_chars > bm25.trace.config.evidence_char_budget
+                && final_hard_limit(bm25.trace.config.evidence_char_budget)
+                    .is_some_and(|limit| emitted_core_chars + pending_chars > limit)
             {
                 exclusion = Some("final_state_evidence_budget");
             }
@@ -4498,7 +4529,9 @@ impl RetrievalStore {
                         "扩展上下文片段与原文不一致".into(),
                     ));
                 }
-                if budget + chars > trace.config.expansion_char_budget {
+                if final_hard_limit(trace.config.expansion_char_budget)
+                    .is_some_and(|limit| budget + chars > limit)
+                {
                     continue;
                 }
                 budget += chars;
@@ -9153,6 +9186,19 @@ pub(crate) fn memory_budget_trace(config: &MemoryConfig, kind: QueryKind) -> Bud
         exact_or_state_percent: budget.exact_or_state,
         episode_percent: budget.episode,
         graph_percent: budget.graph,
+        ..Default::default()
+    }
+}
+
+/// Builds the bounded, fully materialized candidate-pool limits used by the
+/// engine's exact-token allocator. Public recall callers keep their legacy
+/// final-selection limits.
+pub(crate) fn candidate_pool_config(config: &RetrievalConfig) -> RetrievalConfig {
+    RetrievalConfig {
+        candidate_limit: config.candidate_limit,
+        max_selected: DEFERRED_HARD_LIMIT,
+        evidence_char_budget: DEFERRED_HARD_LIMIT,
+        expansion_char_budget: DEFERRED_HARD_LIMIT,
     }
 }
 
