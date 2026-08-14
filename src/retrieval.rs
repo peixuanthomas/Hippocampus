@@ -48,6 +48,74 @@ const INDEX_SCHEMA_VERSION: i64 = 7;
 const MEMORY_STATE_SCHEMA_VERSION: i64 = 4;
 const DEFERRED_HARD_LIMIT: usize = usize::MAX;
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct RecallChannels {
+    pub bm25: bool,
+    pub vector: bool,
+    pub entity: bool,
+    pub state: bool,
+    pub episode: bool,
+    pub graph: bool,
+}
+
+impl RecallChannels {
+    pub const fn all() -> Self {
+        Self {
+            bm25: true,
+            vector: true,
+            entity: true,
+            state: true,
+            episode: true,
+            graph: true,
+        }
+    }
+
+    pub const fn bm25_only() -> Self {
+        Self {
+            bm25: true,
+            vector: false,
+            entity: false,
+            state: false,
+            episode: false,
+            graph: false,
+        }
+    }
+
+    pub fn validate(self) -> Result<(), &'static str> {
+        if !(self.bm25 || self.vector || self.entity || self.state || self.episode || self.graph) {
+            return Err("at least one recall channel must be enabled");
+        }
+        if (self.entity || self.state || self.episode || self.graph) && !self.vector {
+            return Err("entity, state, episode, and graph recall require vector recall");
+        }
+        Ok(())
+    }
+}
+
+impl Default for RecallChannels {
+    fn default() -> Self {
+        Self::all()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RecallQueryOrigin {
+    #[default]
+    IndexedEvent,
+    Synthetic {
+        reference_time: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct HybridRecallOptions {
+    pub channels: RecallChannels,
+    pub query_origin: RecallQueryOrigin,
+}
+
 fn final_hard_limit(value: usize) -> Option<usize> {
     (value != DEFERRED_HARD_LIMIT).then_some(value)
 }
@@ -753,6 +821,11 @@ struct ClaimSnapshot {
     related_claim_ids: Vec<String>,
 }
 
+enum RecallMoment {
+    Indexed(Box<StoredEvent>),
+    Synthetic(DateTime<Utc>),
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConsolidationHookPoint {
@@ -1274,6 +1347,25 @@ impl RetrievalStore {
             ));
         }
         self.authoritative_indexed_event(connection, event_id)?;
+        Ok(())
+    }
+
+    fn validate_synthetic_sentinel(
+        &self,
+        connection: &Connection,
+        event_id: &str,
+    ) -> RetrievalResult<()> {
+        let indexed = connection
+            .query_row("SELECT 1 FROM events WHERE event_id=?1", [event_id], |_| {
+                Ok(())
+            })
+            .optional()
+            .map_err(|error| self.database_error(error))?;
+        if indexed.is_some() || self.authoritative_raw_event(event_id)?.is_some() {
+            return Err(RetrievalError::CorruptIndex(
+                "synthetic current_user_event_id must not identify a real event".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -3378,6 +3470,25 @@ impl RetrievalStore {
         session_filter: Option<&str>,
         config: RetrievalConfig,
     ) -> RetrievalResult<RecallResult> {
+        self.keyword_recall_scoped_with_origin(
+            raw_query,
+            current_user_event_id,
+            recent_event_ids,
+            session_filter,
+            config,
+            &RecallQueryOrigin::IndexedEvent,
+        )
+    }
+
+    fn keyword_recall_scoped_with_origin(
+        &self,
+        raw_query: &str,
+        current_user_event_id: &str,
+        recent_event_ids: &[String],
+        session_filter: Option<&str>,
+        config: RetrievalConfig,
+        query_origin: &RecallQueryOrigin,
+    ) -> RetrievalResult<RecallResult> {
         let _guard = self.acquire_root_read()?;
         let state = self.replay_control_state_under_guard()?;
         Self::require_active_session(&state, session_filter.unwrap_or_default()).or_else(
@@ -3393,6 +3504,13 @@ impl RetrievalStore {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Deferred)
             .map_err(|error| self.database_error(error))?;
+        if matches!(query_origin, RecallQueryOrigin::Synthetic { .. }) {
+            self.validate_synthetic_sentinel(&transaction, current_user_event_id)?;
+            if let Some(scope) = session_filter {
+                let session = self.get_session_from_connection(&transaction, scope)?;
+                self.verify_fresh(&session)?;
+            }
+        }
         let mut result = self.keyword_recall_core_from_connection(
             &transaction,
             raw_query,
@@ -3655,21 +3773,59 @@ impl RetrievalStore {
         retrieval_config: RetrievalConfig,
         memory_config: &MemoryConfig,
     ) -> RetrievalResult<RecallResult> {
+        self.hybrid_recall_with_options(
+            backend,
+            raw_query,
+            current_user_event_id,
+            recent_event_ids,
+            session_filter,
+            retrieval_config,
+            memory_config,
+            HybridRecallOptions::default(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn hybrid_recall_with_options<B: ChatBackend>(
+        &self,
+        backend: &B,
+        raw_query: &str,
+        current_user_event_id: &str,
+        recent_event_ids: &[String],
+        session_filter: Option<&str>,
+        retrieval_config: RetrievalConfig,
+        memory_config: &MemoryConfig,
+        options: HybridRecallOptions,
+    ) -> RetrievalResult<RecallResult> {
         retrieval_config
             .validate()
             .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
         memory_config
             .validate()
             .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+        options
+            .channels
+            .validate()
+            .map_err(|error| RetrievalError::CorruptIndex(error.into()))?;
         let started = Instant::now();
+        if let RecallQueryOrigin::Synthetic { reference_time } = &options.query_origin {
+            parse_retrieval_time(reference_time, "synthetic reference_time")?;
+        }
         if !memory_config.enabled {
+            if options.channels != RecallChannels::bm25_only() {
+                return Err(RetrievalError::CorruptIndex(
+                    "memory.enabled=false only supports BM25-only recall".into(),
+                ));
+            }
             let channel_started = Instant::now();
-            let mut result = self.keyword_recall_scoped(
+            let mut result = self.keyword_recall_scoped_with_origin(
                 raw_query,
                 current_user_event_id,
                 recent_event_ids,
                 session_filter,
                 retrieval_config,
+                &options.query_origin,
             )?;
             let bm25_ms = elapsed_ms(channel_started);
             let query_kind = classify_query(raw_query);
@@ -3693,6 +3849,29 @@ impl RetrievalStore {
             return Ok(result);
         }
 
+        if options.channels == RecallChannels::bm25_only() {
+            let channel_started = Instant::now();
+            let mut result = self.keyword_recall_scoped_with_origin(
+                raw_query,
+                current_user_event_id,
+                recent_event_ids,
+                session_filter,
+                retrieval_config,
+                &options.query_origin,
+            )?;
+            let query_kind = classify_query(raw_query);
+            result.trace.query_kind = query_kind;
+            result.trace.budget_allocation = memory_budget_trace(memory_config, query_kind);
+            result.trace.channels = requested_channel_traces(
+                options.channels,
+                "ok",
+                result.trace.candidates.len(),
+                elapsed_ms(channel_started),
+            );
+            result.trace.elapsed_ms = elapsed_ms(started);
+            return Ok(result);
+        }
+
         {
             let _guard = self.acquire_root_read()?;
             let control = self.replay_control_state_under_guard()?;
@@ -3703,12 +3882,22 @@ impl RetrievalStore {
             let transaction = connection
                 .transaction_with_behavior(TransactionBehavior::Deferred)
                 .map_err(|error| self.database_error(error))?;
-            self.validate_recall_input_id(
-                &transaction,
-                &control,
-                current_user_event_id,
-                session_filter,
-            )?;
+            match &options.query_origin {
+                RecallQueryOrigin::IndexedEvent => self.validate_recall_input_id(
+                    &transaction,
+                    &control,
+                    current_user_event_id,
+                    session_filter,
+                )?,
+                RecallQueryOrigin::Synthetic { reference_time } => {
+                    parse_retrieval_time(reference_time, "synthetic reference_time")?;
+                    self.validate_synthetic_sentinel(&transaction, current_user_event_id)?;
+                    if let Some(scope) = session_filter {
+                        let session = self.get_session_from_connection(&transaction, scope)?;
+                        self.verify_fresh(&session)?;
+                    }
+                }
+            }
             for event_id in recent_event_ids {
                 self.validate_recall_input_id(&transaction, &control, event_id, session_filter)?;
             }
@@ -3737,18 +3926,28 @@ impl RetrievalStore {
         let query_vector = match validate_query_embedding(embedded, &spec) {
             Ok(input) => input,
             Err(error) => {
+                if !options.channels.bm25 {
+                    return Err(error);
+                }
                 let bm25_started = Instant::now();
-                let mut fallback = self.keyword_recall_scoped(
+                let mut fallback = self.keyword_recall_scoped_with_origin(
                     raw_query,
                     current_user_event_id,
                     recent_event_ids,
                     session_filter,
                     retrieval_config,
+                    &options.query_origin,
                 )?;
                 let bm25_ms = elapsed_ms(bm25_started);
                 fallback.trace.query_kind = query_kind;
                 fallback.trace.budget_allocation = decided_budget;
-                apply_vector_fallback(&mut fallback, bm25_ms, vector_elapsed, error.to_string());
+                apply_vector_fallback(
+                    &mut fallback,
+                    bm25_ms,
+                    vector_elapsed,
+                    error.to_string(),
+                    options.channels,
+                );
                 fallback.trace.elapsed_ms = elapsed_ms(started);
                 return Ok(fallback);
             }
@@ -3761,6 +3960,7 @@ impl RetrievalStore {
         let retrieval = retrieval_config.clone();
         let memory = memory_config.clone();
         let fusion_spec = spec.clone();
+        let fusion_options = options.clone();
         let fused_task = tokio::task::spawn_blocking(move || {
             fusion_store
                 .fuse_vector_recall(
@@ -3773,6 +3973,7 @@ impl RetrievalStore {
                     retrieval,
                     memory,
                     vector_elapsed,
+                    fusion_options,
                 )
                 .map_err(|error| match error {
                     RetrievalError::HybridRecall(_) => error,
@@ -3785,13 +3986,17 @@ impl RetrievalStore {
         let mut result = match join_blocking(fused_task).await {
             Ok(result) => result,
             Err(error) => {
+                if !options.channels.bm25 {
+                    return Err(error);
+                }
                 let bm25_started = Instant::now();
-                let mut fallback = self.keyword_recall_scoped(
+                let mut fallback = self.keyword_recall_scoped_with_origin(
                     raw_query,
                     current_user_event_id,
                     recent_event_ids,
                     session_filter,
                     retrieval_config,
+                    &options.query_origin,
                 )?;
                 let bm25_ms = elapsed_ms(bm25_started);
                 fallback.trace.query_kind = query_kind;
@@ -3809,6 +4014,7 @@ impl RetrievalStore {
                         elapsed_ms(embed_started),
                         graph_elapsed,
                         message,
+                        options.channels,
                     );
                 } else if matches!(&error, RetrievalError::HybridRecall(failure) if failure.stage == HybridRecallStage::EntityState)
                 {
@@ -3817,6 +4023,7 @@ impl RetrievalStore {
                         bm25_ms,
                         elapsed_ms(embed_started),
                         message,
+                        options.channels,
                     );
                 } else {
                     apply_vector_fallback(
@@ -3824,6 +4031,7 @@ impl RetrievalStore {
                         bm25_ms,
                         elapsed_ms(embed_started),
                         message,
+                        options.channels,
                     );
                 }
                 fallback.trace.elapsed_ms = elapsed_ms(started);
@@ -3937,6 +4145,7 @@ impl RetrievalStore {
         retrieval_config: RetrievalConfig,
         memory_config: MemoryConfig,
         vector_ms: u64,
+        options: HybridRecallOptions,
     ) -> RetrievalResult<RecallResult> {
         let _guard = self.acquire_root_read()?;
         let control = self.replay_control_state_under_guard()?;
@@ -3944,17 +4153,43 @@ impl RetrievalStore {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Deferred)
             .map_err(|error| self.database_error(error))?;
+        match &options.query_origin {
+            RecallQueryOrigin::IndexedEvent => self.validate_recall_input_id(
+                &transaction,
+                &control,
+                current_user_event_id,
+                session_filter,
+            )?,
+            RecallQueryOrigin::Synthetic { .. } => {
+                self.validate_synthetic_sentinel(&transaction, current_user_event_id)?;
+                if let Some(scope) = session_filter {
+                    let session = self.get_session_from_connection(&transaction, scope)?;
+                    self.verify_fresh(&session)?;
+                }
+            }
+        }
+        for event_id in recent_event_ids {
+            self.validate_recall_input_id(&transaction, &control, event_id, session_filter)?;
+        }
         let bm25_started = Instant::now();
-        let mut bm25 = self.keyword_recall_core_from_connection(
-            &transaction,
-            raw_query,
-            current_user_event_id,
-            recent_event_ids,
-            session_filter,
-            retrieval_config.clone(),
-            &control,
-        )?;
-        let bm25_ms = elapsed_ms(bm25_started);
+        let mut bm25 = if options.channels.bm25 {
+            self.keyword_recall_core_from_connection(
+                &transaction,
+                raw_query,
+                current_user_event_id,
+                recent_event_ids,
+                session_filter,
+                retrieval_config.clone(),
+                &control,
+            )?
+        } else {
+            empty_recall_base(raw_query, current_user_event_id, retrieval_config.clone())
+        };
+        let bm25_ms = if options.channels.bm25 {
+            elapsed_ms(bm25_started)
+        } else {
+            0
+        };
         self.require_current_control_projection(&transaction, &control)?;
         bm25.trace.budget_allocation = memory_budget_trace(&memory_config, bm25.trace.query_kind);
         let (index, pending_vector_cache) =
@@ -3962,9 +4197,17 @@ impl RetrievalStore {
         if index.is_empty() {
             return Err(RetrievalError::CorruptIndex("没有兼容的向量索引".into()));
         }
-        let hits = index
+        let mut hits = index
             .search(&query_vector, memory_config.vector_candidate_limit)
             .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+        if !options.channels.episode {
+            hits.retain(|hit| {
+                !matches!(
+                    hit.granularity,
+                    RetrievalDocumentGranularity::Episode | RetrievalDocumentGranularity::Session
+                )
+            });
+        }
         let vector_aggregate_sources = hits
             .iter()
             .filter(|hit| {
@@ -4036,6 +4279,11 @@ impl RetrievalStore {
                 rank_index + 1,
                 usize::MAX,
             )?;
+            if !options.channels.episode {
+                for projection in &mut hit_projection {
+                    projection.episode_id = None;
+                }
+            }
             let blocked = hit_projection.iter().any(|raw| {
                 raw.span.event_id == current_user_event_id
                     || recent_set.contains(raw.span.event_id.as_str())
@@ -4079,7 +4327,11 @@ impl RetrievalStore {
             let content = slice_chars(&event.content, &candidate.span)?;
             let key = raw_candidate_key(&candidate.span);
             let is_protected = protected_span.as_ref() == Some(&candidate.span);
-            let episode_id = self.resolve_episode_id(&transaction, &candidate.span.event_id)?;
+            let episode_id = if options.channels.episode {
+                self.resolve_episode_id(&transaction, &candidate.span.event_id)?
+            } else {
+                None
+            };
             let entry = fused.entry(key).or_insert_with(|| FusedRawCandidate {
                 pre_cap_rank: 0,
                 document_id: candidate.document_id.clone(),
@@ -4257,8 +4509,8 @@ impl RetrievalStore {
                 .then_with(|| left.span.end_char.cmp(&right.span.end_char))
                 .then_with(|| left.reason.cmp(&right.reason))
         });
-        let sidecar = self
-            .load_state_sidecar(
+        let mut sidecar = if options.channels.state {
+            self.load_state_sidecar(
                 &transaction,
                 raw_query,
                 current_user_event_id,
@@ -4266,28 +4518,59 @@ impl RetrievalStore {
                 session_filter,
                 bm25.trace.query_kind,
                 memory_config.candidate_limit,
+                &options.query_origin,
+                options.channels.episode,
             )
-            .map_err(|error| HybridRecallFailure::new(HybridRecallStage::EntityState, error))?;
-        graph_seeds.extend(entity_graph_seeds(&sidecar.entity_matches));
+            .map_err(|error| HybridRecallFailure::new(HybridRecallStage::EntityState, error))?
+        } else if options.channels.entity {
+            let entity_started = Instant::now();
+            let (entity_matches, _) = self
+                .load_entity_matches(&transaction, raw_query, session_filter)
+                .map_err(|error| HybridRecallFailure::new(HybridRecallStage::EntityState, error))?;
+            StateSidecar {
+                entity_matches,
+                candidates: Vec::new(),
+                warnings: Vec::new(),
+                entity_ms: elapsed_ms(entity_started),
+                state_ms: 0,
+            }
+        } else {
+            empty_state_sidecar()
+        };
+        if !options.channels.state {
+            sidecar.candidates.clear();
+        }
+        if !options.channels.episode {
+            for candidate in &mut sidecar.candidates {
+                candidate.episode_id = None;
+            }
+        }
+        if options.channels.entity {
+            graph_seeds.extend(entity_graph_seeds(&sidecar.entity_matches));
+        } else {
+            sidecar.entity_matches.clear();
+            sidecar.entity_ms = 0;
+        }
         let graph_started = Instant::now();
         let graph_seed_documents = graph_seeds
             .iter()
             .filter_map(|seed| seed.document_id.clone())
             .collect::<BTreeSet<_>>();
-        let graph = crate::graph::recall_graph_from_connection(
-            self,
-            &transaction,
-            &memory_config,
-            &graph_seeds,
-            session_filter,
-        )
-        .map_err(|error| {
-            HybridRecallFailure::timed(HybridRecallStage::Graph, error, graph_started)
-        })?;
-        let graph_ms = elapsed_ms(graph_started);
-        bm25.trace.budget_allocation = memory_budget_trace(&memory_config, bm25.trace.query_kind);
-        let graph_sidecar = self
-            .prepare_graph_candidates(
+        let mut graph_sidecar = if options.channels.graph {
+            let graph = crate::graph::recall_graph_from_connection(
+                self,
+                &transaction,
+                &memory_config,
+                &graph_seeds,
+                session_filter,
+            )
+            .map_err(|error| {
+                HybridRecallFailure::timed(HybridRecallStage::Graph, error, graph_started)
+            })?;
+            let graph_ms = elapsed_ms(graph_started);
+            bm25.trace.budget_allocation =
+                memory_budget_trace(&memory_config, bm25.trace.query_kind);
+            self.prepare_graph_candidates(
                 &transaction,
                 &index,
                 &query_vector,
@@ -4298,10 +4581,17 @@ impl RetrievalStore {
                 &vector_aggregate_sources,
                 graph,
                 graph_ms,
+                options.channels.episode,
             )
             .map_err(|error| {
                 HybridRecallFailure::timed(HybridRecallStage::Graph, error, graph_started)
-            })?;
+            })?
+        } else {
+            empty_graph_sidecar()
+        };
+        if options.channels.episode && !options.channels.graph {
+            graph_sidecar.aggregate_source_count = vector_aggregate_sources.len();
+        }
         let mut result = self
             .select_fused_candidates(
                 &transaction,
@@ -4316,6 +4606,7 @@ impl RetrievalStore {
                 sidecar,
                 graph_sidecar,
                 memory_config.graph_candidate_limit,
+                options.channels,
             )
             .map_err(|error| HybridRecallFailure::new(HybridRecallStage::EntityState, error))?;
         let recent = recent_event_ids.iter().map(String::as_str).collect();
@@ -4367,8 +4658,8 @@ impl RetrievalStore {
         vector_aggregate_sources: &BTreeSet<String>,
         mut graph: crate::graph::GraphRecallResult,
         graph_ms: u64,
+        episode_enabled: bool,
     ) -> RetrievalResult<GraphSidecar> {
-        let candidate_count = graph.paths.len();
         let recent = recent_event_ids
             .iter()
             .map(String::as_str)
@@ -4382,6 +4673,15 @@ impl RetrievalStore {
             }
             let row = connection.query_row("SELECT session_id,granularity,source_sha256 FROM memory_documents WHERE document_id=?1", [path.target_document_id.as_str()], |row| Ok((row.get::<_,String>(0)?, row.get::<_,String>(1)?, row.get::<_,String>(2)?))).optional().map_err(|error| self.database_error(error))?.ok_or_else(|| RetrievalError::CorruptIndex(format!("图 target 文档缺失：{}", path.target_document_id)))?;
             let granularity = parse_granularity(&row.1)?;
+            if !episode_enabled
+                && matches!(
+                    granularity,
+                    RetrievalDocumentGranularity::Episode | RetrievalDocumentGranularity::Session
+                )
+            {
+                path.reason = "episode_channel_disabled".into();
+                continue;
+            }
             if matches!(
                 granularity,
                 RetrievalDocumentGranularity::Episode | RetrievalDocumentGranularity::Session
@@ -4432,6 +4732,12 @@ impl RetrievalStore {
             }
             candidates.push(GraphEvidenceCandidate { path_index, raw });
         }
+        if !episode_enabled {
+            graph
+                .paths
+                .retain(|path| path.reason != "episode_channel_disabled");
+        }
+        let candidate_count = graph.paths.len();
         Ok(GraphSidecar {
             paths: graph.paths,
             candidates,
@@ -5146,6 +5452,8 @@ impl RetrievalStore {
         session_filter: Option<&str>,
         query_kind: QueryKind,
         candidate_limit: usize,
+        query_origin: &RecallQueryOrigin,
+        episode_enabled: bool,
     ) -> RetrievalResult<StateSidecar> {
         let entity_started = Instant::now();
         validate_full_derived_integrity(connection)?;
@@ -5155,20 +5463,32 @@ impl RetrievalStore {
             self.load_entity_matches(connection, raw_query, session_filter)?;
         let entity_ms = elapsed_ms(entity_started);
         let state_started = Instant::now();
-        let current = self.get_event_from_connection(connection, current_user_event_id)?;
-        if current.role != EventRole::User
-            || session_filter.is_some_and(|session_id| current.session_id != session_id)
-        {
-            return Err(RetrievalError::CorruptIndex(
-                "当前查询事件角色或会话范围不匹配".into(),
-            ));
-        }
-        let current_session = self.get_session_from_connection(connection, &current.session_id)?;
-        self.verify_fresh(&current_session)?;
-        verify_event_hash(&current)?;
-        let current_reference = DateTime::parse_from_rfc3339(&current.created_at)
-            .map_err(|_| RetrievalError::CorruptIndex("当前查询事件时间损坏".into()))?
-            .with_timezone(&Utc);
+        let moment = match query_origin {
+            RecallQueryOrigin::IndexedEvent => {
+                let current = self.get_event_from_connection(connection, current_user_event_id)?;
+                if current.role != EventRole::User
+                    || session_filter.is_some_and(|session_id| current.session_id != session_id)
+                {
+                    return Err(RetrievalError::CorruptIndex(
+                        "当前查询事件角色或会话范围不匹配".into(),
+                    ));
+                }
+                let current_session =
+                    self.get_session_from_connection(connection, &current.session_id)?;
+                self.verify_fresh(&current_session)?;
+                verify_event_hash(&current)?;
+                RecallMoment::Indexed(Box::new(current))
+            }
+            RecallQueryOrigin::Synthetic { reference_time } => RecallMoment::Synthetic(
+                parse_retrieval_time(reference_time, "synthetic reference_time")?,
+            ),
+        };
+        let current_reference = match &moment {
+            RecallMoment::Indexed(current) => {
+                parse_retrieval_time(&current.created_at, "current query event")?
+            }
+            RecallMoment::Synthetic(reference) => *reference,
+        };
         let (explicit_reference, invalid_date) = explicit_query_date(&normalized_query);
         let visibility_upper = explicit_reference
             .map(|value| value.min(current_reference))
@@ -5468,7 +5788,7 @@ impl RetrievalStore {
                     connection,
                     &claim_id,
                     query_kind,
-                    &current,
+                    &moment,
                     visibility_upper,
                     recent_event_ids,
                     session_filter,
@@ -5478,7 +5798,9 @@ impl RetrievalStore {
                     trace.evidence_role = Some(evidence.role);
                     content = evidence.content;
                     hash = evidence.content_sha256;
-                    episode = self.resolve_episode_id(connection, &evidence.span.event_id)?;
+                    if episode_enabled {
+                        episode = self.resolve_episode_id(connection, &evidence.span.event_id)?;
+                    }
                 } else {
                     trace.reason = "no_eligible_user_evidence".into();
                 }
@@ -5537,7 +5859,7 @@ impl RetrievalStore {
         connection: &Connection,
         claim_id: &str,
         query_kind: QueryKind,
-        current: &StoredEvent,
+        moment: &RecallMoment,
         visibility_upper: DateTime<Utc>,
         recent_event_ids: &[String],
         session_filter: Option<&str>,
@@ -5590,10 +5912,11 @@ impl RetrievalStore {
                 row.map_err(|error| self.database_error(error))?;
             let created = parse_retrieval_time(&created_at, "claim_evidence.created_at")?;
             if created > visibility_upper
-                || event_session == current.session_id
+                || matches!(moment, RecallMoment::Indexed(current)
+                    if event_session == current.session_id
                     && i64_to_usize(sequence).map_err(|error| self.database_error(error))?
-                        >= current.sequence
-                || event_id == current.id
+                        >= current.sequence)
+                || matches!(moment, RecallMoment::Indexed(current) if event_id == current.id)
                 || recent_event_ids.iter().any(|recent| recent == &event_id)
             {
                 continue;
@@ -5643,6 +5966,7 @@ impl RetrievalStore {
         mut sidecar: StateSidecar,
         mut graph: GraphSidecar,
         graph_candidate_limit: usize,
+        channels: RecallChannels,
     ) -> RetrievalResult<RecallResult> {
         let mut processing_order = (0..candidates.len()).collect::<Vec<_>>();
         processing_order.sort_by_key(|&index| !candidates[index].protected_exact);
@@ -6124,21 +6448,23 @@ impl RetrievalStore {
         bm25.trace.channels = vec![
             channel_trace(
                 RetrievalChannel::Bm25,
-                "ok",
+                if channels.bm25 { "ok" } else { "disabled" },
                 bm25.trace.candidates.len(),
                 bm25_ms,
                 None,
             ),
             channel_trace(
                 RetrievalChannel::Vector,
-                "ok",
+                if channels.vector { "ok" } else { "disabled" },
                 vector_candidate_count,
                 vector_ms,
                 None,
             ),
             channel_trace(
                 RetrievalChannel::Entity,
-                if bm25.trace.entity_matches.is_empty() {
+                if !channels.entity {
+                    "disabled"
+                } else if bm25.trace.entity_matches.is_empty() {
                     "empty"
                 } else {
                     "ok"
@@ -6149,7 +6475,9 @@ impl RetrievalStore {
             ),
             channel_trace(
                 RetrievalChannel::State,
-                if sidecar.candidates.is_empty() {
+                if !channels.state {
+                    "disabled"
+                } else if sidecar.candidates.is_empty() {
                     "empty"
                 } else {
                     "ok"
@@ -6160,7 +6488,9 @@ impl RetrievalStore {
             ),
             channel_trace(
                 RetrievalChannel::Episode,
-                if graph.aggregate_source_count == 0 {
+                if !channels.episode {
+                    "disabled"
+                } else if graph.aggregate_source_count == 0 {
                     "empty"
                 } else {
                     "ok"
@@ -6171,7 +6501,9 @@ impl RetrievalStore {
             ),
             channel_trace(
                 RetrievalChannel::Graph,
-                if graph.candidate_count == 0 {
+                if !channels.graph {
+                    "disabled"
+                } else if graph.candidate_count == 0 {
                     "empty"
                 } else {
                     "ok"
@@ -6194,11 +6526,13 @@ impl RetrievalStore {
             .map(|item| item.selected.content_sha256.clone())
             .collect::<HashSet<_>>();
         let mut emitted_episodes = HashSet::new();
-        for item in &evidence {
-            if let Some(episode) =
-                self.resolve_episode_id(connection, &item.selected.span.event_id)?
-            {
-                emitted_episodes.insert(episode);
+        if channels.episode {
+            for item in &evidence {
+                if let Some(episode) =
+                    self.resolve_episode_id(connection, &item.selected.span.event_id)?
+                {
+                    emitted_episodes.insert(episode);
+                }
             }
         }
         let mut emitted_core_slots = evidence
@@ -12243,6 +12577,72 @@ fn channel_trace(
     }
 }
 
+fn requested_channel_traces(
+    channels: RecallChannels,
+    bm25_status: &str,
+    bm25_count: usize,
+    bm25_ms: u64,
+) -> Vec<ChannelTrace> {
+    [
+        (RetrievalChannel::Bm25, channels.bm25),
+        (RetrievalChannel::Vector, channels.vector),
+        (RetrievalChannel::Entity, channels.entity),
+        (RetrievalChannel::State, channels.state),
+        (RetrievalChannel::Episode, channels.episode),
+        (RetrievalChannel::Graph, channels.graph),
+    ]
+    .into_iter()
+    .map(|(channel, enabled)| {
+        if channel == RetrievalChannel::Bm25 && enabled {
+            channel_trace(channel, bm25_status, bm25_count, bm25_ms, None)
+        } else {
+            channel_trace(channel, if enabled { "ok" } else { "disabled" }, 0, 0, None)
+        }
+    })
+    .collect()
+}
+
+fn empty_recall_base(
+    raw_query: &str,
+    current_user_event_id: &str,
+    config: RetrievalConfig,
+) -> RecallResult {
+    let query_kind = classify_query(raw_query);
+    RecallResult {
+        trace: RetrievalTrace {
+            status: "ok".into(),
+            current_query_event_id: current_user_event_id.into(),
+            query_terms: query_terms(raw_query),
+            config,
+            query_kind,
+            budget_allocation: BudgetAllocationTrace::for_query_kind(query_kind),
+            ..Default::default()
+        },
+        evidence: Vec::new(),
+    }
+}
+
+fn empty_state_sidecar() -> StateSidecar {
+    StateSidecar {
+        entity_matches: Vec::new(),
+        candidates: Vec::new(),
+        warnings: Vec::new(),
+        entity_ms: 0,
+        state_ms: 0,
+    }
+}
+
+fn empty_graph_sidecar() -> GraphSidecar {
+    GraphSidecar {
+        paths: Vec::new(),
+        candidates: Vec::new(),
+        candidate_count: 0,
+        aggregate_source_count: 0,
+        elapsed_ms: 0,
+        warning: None,
+    }
+}
+
 fn memory_budget_for_query(config: &MemoryConfig, kind: QueryKind) -> MemoryBudgetConfig {
     match kind {
         QueryKind::ExactFact => config.budgets.exact_fact,
@@ -12289,7 +12689,13 @@ fn parse_granularity(value: &str) -> RetrievalResult<RetrievalDocumentGranularit
     }
 }
 
-fn apply_vector_fallback(result: &mut RecallResult, bm25_ms: u64, vector_ms: u64, error: String) {
+fn apply_vector_fallback(
+    result: &mut RecallResult,
+    bm25_ms: u64,
+    vector_ms: u64,
+    error: String,
+    channels: RecallChannels,
+) {
     result.trace.status = "bm25_fallback".into();
     result.trace.channels = vec![
         channel_trace(
@@ -12312,9 +12718,16 @@ fn apply_vector_fallback(result: &mut RecallResult, bm25_ms: u64, vector_ms: u64
         channel_trace(RetrievalChannel::Graph, "skipped", 0, 0, None),
     ];
     result.trace.warnings.push(error);
+    disable_unrequested_channels(&mut result.trace.channels, channels);
 }
 
-fn apply_sidecar_fallback(result: &mut RecallResult, bm25_ms: u64, vector_ms: u64, error: String) {
+fn apply_sidecar_fallback(
+    result: &mut RecallResult,
+    bm25_ms: u64,
+    vector_ms: u64,
+    error: String,
+    channels: RecallChannels,
+) {
     result.trace.status = "bm25_fallback".into();
     result.trace.fusion_candidates.clear();
     result.trace.entity_matches.clear();
@@ -12340,6 +12753,7 @@ fn apply_sidecar_fallback(result: &mut RecallResult, bm25_ms: u64, vector_ms: u6
         channel_trace(RetrievalChannel::Graph, "skipped", 0, 0, None),
     ];
     result.trace.warnings.push(error);
+    disable_unrequested_channels(&mut result.trace.channels, channels);
 }
 
 fn apply_graph_fallback(
@@ -12348,6 +12762,7 @@ fn apply_graph_fallback(
     vector_ms: u64,
     graph_ms: u64,
     error: String,
+    channels: RecallChannels,
 ) {
     result.trace.status = "bm25_fallback".into();
     result.trace.fusion_candidates.clear();
@@ -12381,6 +12796,23 @@ fn apply_graph_fallback(
         ),
     ];
     result.trace.warnings.push(error);
+    disable_unrequested_channels(&mut result.trace.channels, channels);
+}
+
+fn disable_unrequested_channels(traces: &mut [ChannelTrace], channels: RecallChannels) {
+    for trace in traces {
+        let enabled = match trace.channel {
+            RetrievalChannel::Bm25 => channels.bm25,
+            RetrievalChannel::Vector => channels.vector,
+            RetrievalChannel::Entity => channels.entity,
+            RetrievalChannel::State => channels.state,
+            RetrievalChannel::Episode => channels.episode,
+            RetrievalChannel::Graph => channels.graph,
+        };
+        if !enabled {
+            *trace = channel_trace(trace.channel, "disabled", 0, 0, None);
+        }
+    }
 }
 
 fn is_generic_pronoun(value: &str) -> bool {

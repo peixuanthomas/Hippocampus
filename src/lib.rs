@@ -67,10 +67,11 @@ pub use ollama::{
 };
 pub use retrieval::{
     AggregateEmbeddingDocument, AggregateEmbeddingSnapshot, AnswerContext, AnswerContextItem,
-    DirectMessageEmbedding, EmbeddingPublishReport, IndexedSession, LeafEmbeddingDocument,
-    LeafEmbeddingSnapshot, MemoryAttemptCounts, MemoryLatencyPercentiles, MemoryStatus,
-    MemoryStatusMetrics, RebuildOptions, RebuildReport, RecallResult, RecalledEvidence,
-    ResolvedSpan, RetrievalError, RetrievalStore, StoredEvent, SyncReport, classify_query,
+    DirectMessageEmbedding, EmbeddingPublishReport, HybridRecallOptions, IndexedSession,
+    LeafEmbeddingDocument, LeafEmbeddingSnapshot, MemoryAttemptCounts, MemoryLatencyPercentiles,
+    MemoryStatus, MemoryStatusMetrics, RebuildOptions, RebuildReport, RecallChannels,
+    RecallQueryOrigin, RecallResult, RecalledEvidence, ResolvedSpan, RetrievalError,
+    RetrievalStore, StoredEvent, SyncReport, classify_query,
 };
 pub use store::{IndexSyncAfterSourceCommit, SessionStore};
 pub use vector::{
