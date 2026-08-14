@@ -943,6 +943,38 @@ impl RetrievalStore {
         Ok(active && !members.is_empty())
     }
 
+    fn authoritative_indexed_session_source(
+        &self,
+        connection: &Connection,
+        session_id: &str,
+    ) -> RetrievalResult<SessionSource> {
+        let indexed_session = connection
+            .query_row(
+                "SELECT session_id, title, created_at, updated_at, source_file, source_sha256,
+                        source_schema_version
+                 FROM indexed_sessions WHERE session_id=?1",
+                [session_id],
+                map_session,
+            )
+            .optional()
+            .map_err(|error| self.database_error(error))?
+            .ok_or_else(|| RetrievalError::CorruptIndex("派生来源事件缺少权威会话绑定".into()))?;
+        self.verify_fresh(&indexed_session)?;
+        let source = self.read_source(&self.root.join(&indexed_session.source_file))?;
+        if source.sha256 != indexed_session.source_sha256
+            || source.session.id != indexed_session.id
+            || source.session.title != indexed_session.title
+            || source.session.created_at != indexed_session.created_at
+            || source.session.updated_at != indexed_session.updated_at
+            || source.session.schema_version != indexed_session.source_schema_version
+        {
+            return Err(RetrievalError::CorruptIndex(
+                "权威会话元数据与派生索引不一致".into(),
+            ));
+        }
+        Ok(source)
+    }
+
     fn authoritative_indexed_event(
         &self,
         connection: &Connection,
@@ -962,30 +994,8 @@ impl RetrievalStore {
                 RetrievalError::CorruptIndex("派生来源事件缺少权威索引绑定".into())
             })?;
         verify_event_hash(&indexed_event)?;
-        let indexed_session = connection
-            .query_row(
-                "SELECT session_id, title, created_at, updated_at, source_file, source_sha256,
-                        source_schema_version
-                 FROM indexed_sessions WHERE session_id=?1",
-                [&indexed_event.session_id],
-                map_session,
-            )
-            .optional()
-            .map_err(|error| self.database_error(error))?
-            .ok_or_else(|| RetrievalError::CorruptIndex("派生来源事件缺少权威会话绑定".into()))?;
-        self.verify_fresh(&indexed_session)?;
-        let source = self.read_source(&self.root.join(&indexed_session.source_file))?;
-        if source.sha256 != indexed_session.source_sha256
-            || source.session.id != indexed_session.id
-            || source.session.title != indexed_session.title
-            || source.session.created_at != indexed_session.created_at
-            || source.session.updated_at != indexed_session.updated_at
-            || source.session.schema_version != indexed_session.source_schema_version
-        {
-            return Err(RetrievalError::CorruptIndex(
-                "权威会话元数据与派生索引不一致".into(),
-            ));
-        }
+        let source =
+            self.authoritative_indexed_session_source(connection, &indexed_event.session_id)?;
         let mut matches = derive_events(&source.session)
             .into_iter()
             .filter(|event| event.id == event_id);
@@ -998,6 +1008,94 @@ impl RetrievalStore {
             ));
         }
         Ok(authoritative)
+    }
+
+    fn authoritative_trace_aggregate_document(
+        &self,
+        connection: &Connection,
+        control: &ControlState,
+        document_id: &str,
+        expected_session: &str,
+    ) -> RetrievalResult<(EpisodeDocument, bool)> {
+        let aggregate =
+            load_persisted_aggregate_document(connection, document_id, expected_session)?;
+        let source = self.authoritative_indexed_session_source(connection, expected_session)?;
+        let mut authoritative_events = HashMap::new();
+        for event in derive_events(&source.session) {
+            if authoritative_events
+                .insert(event.id.clone(), event)
+                .is_some()
+            {
+                return Err(RetrievalError::CorruptIndex(
+                    "权威会话包含重复事件 ID".into(),
+                ));
+            }
+        }
+
+        for member in &aggregate.members {
+            let authoritative = authoritative_events.get(&member.event_id).ok_or_else(|| {
+                RetrievalError::CorruptIndex("aggregate member 在权威会话中不存在".into())
+            })?;
+            let indexed = connection
+                .query_row(
+                    "SELECT event_id, session_id, turn_id, sequence, role, created_at, content,
+                            content_sha256, reply_to_event_id, token_count, turn_status,
+                            done_reason, error
+                     FROM events WHERE event_id=?1",
+                    [&member.event_id],
+                    map_event,
+                )
+                .optional()
+                .map_err(|error| self.database_error(error))?
+                .ok_or_else(|| {
+                    RetrievalError::CorruptIndex("aggregate member 缺少权威索引事件".into())
+                })?;
+            verify_event_hash(&indexed)?;
+            let end_char = authoritative.content.chars().count();
+            let expected_document_id = format!("{}:0:{end_char}", authoritative.id);
+            let sequence = u64::try_from(authoritative.sequence).map_err(|_| {
+                RetrievalError::CorruptIndex("aggregate member sequence 溢出".into())
+            })?;
+            if indexed != *authoritative
+                || authoritative.session_id != expected_session
+                || !matches!(authoritative.role, EventRole::User | EventRole::Assistant)
+                || authoritative.content.trim().is_empty()
+                || member.document_id != expected_document_id
+                || member.event_id != authoritative.id
+                || member.sequence != sequence
+                || member.role != authoritative.role
+                || member.span.event_id != authoritative.id
+                || member.span.start_char != 0
+                || member.span.end_char != end_char
+                || member.content_sha256 != authoritative.content_sha256
+            {
+                return Err(RetrievalError::CorruptIndex(
+                    "aggregate member 与权威会话来源不一致".into(),
+                ));
+            }
+        }
+
+        let first_event_id = &aggregate
+            .members
+            .first()
+            .expect("strict aggregate loader rejects empty members")
+            .event_id;
+        let expected_document_id = if aggregate.granularity == "episode" {
+            trace_episode_document_id(expected_session, first_event_id)
+        } else {
+            session_document_id(expected_session)
+        };
+        if aggregate.document_id != expected_document_id {
+            return Err(RetrievalError::CorruptIndex(
+                "aggregate document ID 与权威成员来源不一致".into(),
+            ));
+        }
+        let active = control.allows_session(expected_session)
+            && aggregate
+                .members
+                .iter()
+                .all(|member| control.allows_event(expected_session, &member.event_id));
+        Ok((aggregate, active))
     }
 
     fn document_reference_is_active(
@@ -1154,12 +1252,12 @@ impl RetrievalStore {
                     && control.allows_event(&authoritative.session_id, &authoritative.id))
             }
             "episode" | "session" => {
-                let aggregate =
-                    load_persisted_aggregate_document(connection, document_id, &memory.0)?;
-                let active = control.allows_session(&aggregate.session_id)
-                    && aggregate.members.iter().all(|member| {
-                        control.allows_event(&aggregate.session_id, &member.event_id)
-                    });
+                let (_, active) = self.authoritative_trace_aggregate_document(
+                    connection,
+                    control,
+                    document_id,
+                    &memory.0,
+                )?;
                 if let Some((event_id, session_id, start, end, granularity, hash, _)) = raw {
                     let member_count: i64 = connection
                         .query_row(
@@ -11468,6 +11566,16 @@ fn trace_graph_hash_parts(domain: &str, parts: &[&[u8]]) -> String {
         hasher.update(part);
     }
     format!("{:x}", hasher.finalize())
+}
+
+fn trace_episode_document_id(session_id: &str, first_event_id: &str) -> String {
+    format!(
+        "episode_{}",
+        trace_graph_hash_parts(
+            "hippocampus-episode-document-v1",
+            &[session_id.as_bytes(), first_event_id.as_bytes()],
+        )
+    )
 }
 
 fn trace_graph_id_is_valid(value: &str, prefix: &str) -> bool {
