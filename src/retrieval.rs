@@ -4777,27 +4777,22 @@ impl RetrievalStore {
             ));
         }
         for (answer_event_id, json) in rows {
-            let actual_value: serde_json::Value = serde_json::from_str(&json).map_err(|error| {
-                RetrievalError::CorruptIndex(format!(
-                    "retrieval run {answer_event_id} JSON 无效：{error}"
-                ))
-            })?;
             let wanted = expected.remove(&answer_event_id).ok_or_else(|| {
                 RetrievalError::CorruptIndex(format!(
                     "retrieval run {answer_event_id} 未绑定原始 assistant 回答"
                 ))
             })?;
-            let wanted_value = serde_json::to_value(&wanted).map_err(|error| {
+            let canonical_json = serde_json::to_string(&wanted).map_err(|error| {
                 RetrievalError::CorruptIndex(format!(
                     "原始 retrieval run {answer_event_id} 无法规范序列化：{error}"
                 ))
             })?;
-            if actual_value != wanted_value {
+            if json != canonical_json {
                 return Err(RetrievalError::CorruptIndex(format!(
                     "retrieval run {answer_event_id} 与原始 trace 不一致"
                 )));
             }
-            let actual: RetrievalTrace = serde_json::from_value(actual_value).map_err(|error| {
+            let actual: RetrievalTrace = serde_json::from_str(&json).map_err(|error| {
                 RetrievalError::CorruptIndex(format!(
                     "retrieval run {answer_event_id} JSON 无效：{error}"
                 ))
