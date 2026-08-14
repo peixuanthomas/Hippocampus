@@ -2768,16 +2768,66 @@ impl RetrievalStore {
             .transpose()?
             .unwrap_or_default();
         let source = self.read_source(&self.root.join(&session.source_file))?;
+        let event_turn_id = event
+            .turn_id
+            .as_deref()
+            .ok_or_else(|| RetrievalError::CorruptIndex("回答事件缺少轮次标识".into()))?;
+        if event.session_id != source.session.id
+            || event.role != EventRole::Assistant
+            || event.id
+                != event_id(
+                    &source.session.id,
+                    Some(event_turn_id),
+                    EventRole::Assistant,
+                )
+        {
+            return Err(RetrievalError::CorruptIndex(
+                "回答事件不是来源会话的规范 Assistant 事件".into(),
+            ));
+        }
         let turn = source
             .session
             .turns
             .iter()
-            .find(|turn| turn.id == answer.turn_id)
+            .find(|turn| turn.id == event_turn_id)
             .ok_or_else(|| {
                 RetrievalError::CorruptIndex(format!(
                     "回答 {answer_event_id} 在原始会话中缺少对应轮次"
                 ))
             })?;
+        let source_events = derive_events(&source.session);
+        let source_event_by_id = source_events
+            .iter()
+            .map(|event| (event.id.clone(), event))
+            .collect::<HashMap<_, _>>();
+        if source_event_by_id.get(answer_event_id).copied() != Some(&event) {
+            return Err(RetrievalError::CorruptIndex(
+                "回答事件索引与来源会话不匹配".into(),
+            ));
+        }
+        let authoritative = derive_context(
+            &source.session,
+            turn,
+            &source_event_by_id,
+            source.legacy,
+            &source.path,
+        )
+        .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+        if answer.turn_id != turn.id
+            || answer.context_sha256 != authoritative.context_sha256
+            || answer.estimated_upper_tokens != turn.context_trace.estimated_upper_tokens
+            || answer.exact_input_tokens != turn.context_trace.exact_input_tokens
+            || answer.input_budget != turn.context_trace.input_budget
+            || answer.decision != turn.context_trace.decision
+            || answer.provenance_quality != authoritative.provenance_quality
+            || answer.request != authoritative.request
+            || answer.identity_instruction != authoritative.identity_instruction
+            || answer.retrieval_trace != turn.context_trace.retrieval
+        {
+            return Err(RetrievalError::CorruptIndex(
+                "回答上下文索引元数据与来源 trace 不匹配".into(),
+            ));
+        }
         if turn.context_trace.untrusted_history_wrapped {
             let expected_identity = wrapped_history_identity(
                 &source.session.ai_name,
@@ -2839,6 +2889,19 @@ impl RetrievalStore {
         for row in rows {
             let (ordinal, role, span, expected_hash, content) =
                 row.map_err(|source| self.database_error(source))?;
+            let authoritative_item = authoritative
+                .items
+                .get(answer.items.len())
+                .ok_or_else(|| RetrievalError::CorruptIndex("回答上下文索引包含多余片段".into()))?;
+            if ordinal != answer.items.len()
+                || role != authoritative_item.role
+                || span != authoritative_item.span
+                || expected_hash != authoritative_item.content_sha256
+            {
+                return Err(RetrievalError::CorruptIndex(
+                    "回答上下文索引片段与来源 trace 不匹配".into(),
+                ));
+            }
             let source_event = self.get_event_from_connection(&connection, &span.event_id)?;
             let source_session =
                 self.get_session_from_connection(&connection, &source_event.session_id)?;
@@ -2911,6 +2974,11 @@ impl RetrievalStore {
         wrapped_history
             .finish()
             .map_err(|message| RetrievalError::CorruptIndex(message.into()))?;
+        if answer.items.len() != authoritative.items.len() {
+            return Err(RetrievalError::CorruptIndex(
+                "回答上下文索引缺少来源 trace 片段".into(),
+            ));
+        }
         if context_sha256(&messages) != answer.context_sha256 {
             return Err(RetrievalError::CorruptIndex(format!(
                 "回答 {answer_event_id} 的整体上下文哈希不匹配"
@@ -5945,6 +6013,82 @@ fn has_assistant_event(session: &Session, turn: &Turn) -> bool {
                 || turn.usage.output_tokens.is_some()))
 }
 
+fn canonical_exact_context_items(
+    session: &Session,
+    turn: &Turn,
+) -> Result<Vec<ContextItemTrace>, String> {
+    let current_index = session
+        .turns
+        .iter()
+        .position(|candidate| candidate.id == turn.id)
+        .ok_or_else(|| format!("回答 {} 不属于来源会话", turn.id))?;
+    let mut items = Vec::new();
+    if !session.system_prompt.is_empty() {
+        items.push(ContextItemTrace {
+            role: EventRole::System,
+            span: SourceSpan {
+                event_id: event_id(&session.id, None, EventRole::System),
+                start_char: 0,
+                end_char: session.system_prompt.chars().count(),
+            },
+            content_sha256: content_sha256(&session.system_prompt),
+        });
+    }
+    if turn.context_trace.untrusted_history_wrapped {
+        items.extend(
+            turn.context_trace
+                .retrieval
+                .selected_evidence
+                .iter()
+                .map(|selected| ContextItemTrace {
+                    role: EventRole::System,
+                    span: selected.span.clone(),
+                    content_sha256: selected.content_sha256.clone(),
+                }),
+        );
+    }
+    let mut included = HashSet::new();
+    let mut previous_index = None;
+    for included_turn_id in &turn.context_trace.included_turn_ids {
+        if !included.insert(included_turn_id.as_str()) {
+            return Err(format!("回答 {} 包含重复历史轮次", turn.id));
+        }
+        let index = session
+            .turns
+            .iter()
+            .position(|candidate| candidate.id == *included_turn_id)
+            .ok_or_else(|| format!("回答 {} 引用了非本会话历史轮次", turn.id))?;
+        if index >= current_index || previous_index.is_some_and(|previous| index <= previous) {
+            return Err(format!("回答 {} 的历史轮次顺序无效", turn.id));
+        }
+        previous_index = Some(index);
+        let included_turn = &session.turns[index];
+        items.push(full_turn_item(session, included_turn, EventRole::User));
+        if has_assistant_event(session, included_turn) {
+            items.push(full_turn_item(session, included_turn, EventRole::Assistant));
+        }
+    }
+    items.push(full_turn_item(session, turn, EventRole::User));
+    Ok(items)
+}
+
+fn full_turn_item(session: &Session, turn: &Turn, role: EventRole) -> ContextItemTrace {
+    let content = match role {
+        EventRole::User => &turn.user_content,
+        EventRole::Assistant => &turn.assistant_content,
+        EventRole::System => unreachable!("turn items are user or assistant"),
+    };
+    ContextItemTrace {
+        role,
+        span: SourceSpan {
+            event_id: event_id(&session.id, Some(&turn.id), role),
+            start_char: 0,
+            end_char: content.chars().count(),
+        },
+        content_sha256: content_sha256(content),
+    }
+}
+
 fn derive_context(
     session: &Session,
     turn: &Turn,
@@ -5973,8 +6117,20 @@ fn derive_context(
                     path: source_path.to_path_buf(),
                     message: format!("回答 {} 缺少 v2 请求元数据", turn.id),
                 })?;
+        let canonical_items = canonical_exact_context_items(session, turn).map_err(|message| {
+            RetrievalError::InvalidSource {
+                path: source_path.to_path_buf(),
+                message,
+            }
+        })?;
+        if turn.context_trace.context_items != canonical_items {
+            return Err(RetrievalError::InvalidSource {
+                path: source_path.to_path_buf(),
+                message: format!("回答 {} 的精确上下文序列不规范", turn.id),
+            });
+        }
         return Ok(DerivedContext {
-            items: turn.context_trace.context_items.clone(),
+            items: canonical_items,
             context_sha256: context_hash,
             provenance_quality: ProvenanceQuality::Exact,
             request: Some(request),
@@ -11761,17 +11917,13 @@ CREATE INDEX memory_boundary_suggestions_session_event
             ..Default::default()
         };
         b.turns.push(turn);
-        store.save(&mut b).unwrap();
-        let b_answer = event_id(&b.id, Some(&b.turns[0].id), EventRole::Assistant);
-        let before = store.retrieval().answer_context(&b_answer).unwrap();
-        append_complete_turn(&mut a, "新增", "A新增", "");
-        store.save(&mut a).unwrap();
-        let after = store.retrieval().answer_context(&b_answer).unwrap();
-        assert_eq!(before.context_sha256, after.context_sha256);
-        assert_eq!(
-            before.items[1].resolved.content,
-            after.items[1].resolved.content
-        );
+        let error = store.save(&mut b).unwrap_err();
+        assert!(matches!(
+            error
+                .downcast_ref::<crate::store::IndexSyncAfterSourceCommit>()
+                .map(|error| &error.source),
+            Some(RetrievalError::InvalidSource { .. })
+        ));
     }
 
     #[test]
@@ -11857,25 +12009,11 @@ CREATE INDEX memory_boundary_suggestions_session_event
             ..Default::default()
         };
         b.turns.push(turn);
-        store.save(&mut b).unwrap();
-        let answer = event_id(&b.id, Some(&b.turns[0].id), EventRole::Assistant);
-        let before = store.retrieval().answer_context(&answer).unwrap();
-        let report = store.retrieval().rebuild().unwrap();
-        assert_eq!(report.sessions, 2);
-        let after = store.retrieval().answer_context(&answer).unwrap();
-        assert_eq!(after.context_sha256, before.context_sha256);
-        assert_eq!(
-            after
-                .items
-                .iter()
-                .map(|i| &i.resolved.content)
-                .collect::<Vec<_>>(),
-            before
-                .items
-                .iter()
-                .map(|i| &i.resolved.content)
-                .collect::<Vec<_>>()
-        );
+        assert!(store.save(&mut b).is_err());
+        assert!(matches!(
+            store.retrieval().rebuild(),
+            Err(RetrievalError::InvalidSource { .. })
+        ));
     }
 
     #[test]
