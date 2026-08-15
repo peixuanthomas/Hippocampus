@@ -8228,6 +8228,36 @@ impl RetrievalStore {
                 self.ranked_candidate_document_is_active(connection, control, candidate)?;
             active &= span_active && document_active;
         }
+        let episode_enabled = if trace.channels.is_empty() {
+            true
+        } else {
+            const CHANNELS: [RetrievalChannel; 6] = [
+                RetrievalChannel::Bm25,
+                RetrievalChannel::Vector,
+                RetrievalChannel::Entity,
+                RetrievalChannel::State,
+                RetrievalChannel::Episode,
+                RetrievalChannel::Graph,
+            ];
+            const STATUSES: [&str; 6] =
+                ["ok", "empty", "disabled", "skipped", "discarded", "error"];
+            if trace.channels.len() != CHANNELS.len()
+                || trace
+                    .channels
+                    .iter()
+                    .zip(CHANNELS)
+                    .any(|(actual, expected)| {
+                        actual.channel != expected
+                            || actual.status.is_empty()
+                            || !STATUSES.contains(&actual.status.as_str())
+                    })
+            {
+                return Err(RetrievalError::CorruptIndex(
+                    "retrieval trace channels 不符合 canonical producer".into(),
+                ));
+            }
+            trace.channels[4].status != "disabled"
+        };
         for candidate in &trace.fusion_candidates {
             if candidate == &FusionCandidateTrace::default() {
                 continue;
@@ -8340,21 +8370,31 @@ impl RetrievalStore {
                     false,
                 )?;
             }
-            let expected_episode = self.resolve_episode_id(connection, &candidate.span.event_id)?;
-            if candidate.episode_id != expected_episode {
-                return Err(RetrievalError::CorruptIndex(
-                    "fusion episode_id 与 raw event membership 不一致".into(),
-                ));
-            }
-            let episode_active = if let Some(episode_id) = &candidate.episode_id {
-                self.episode_reference_is_active(
-                    connection,
-                    control,
-                    episode_id,
-                    &candidate.session_id,
-                    &candidate.span.event_id,
-                )?
+            let episode_active = if episode_enabled {
+                let expected_episode =
+                    self.resolve_episode_id(connection, &candidate.span.event_id)?;
+                if candidate.episode_id != expected_episode {
+                    return Err(RetrievalError::CorruptIndex(
+                        "fusion episode_id 与 raw event membership 不一致".into(),
+                    ));
+                }
+                if let Some(episode_id) = &candidate.episode_id {
+                    self.episode_reference_is_active(
+                        connection,
+                        control,
+                        episode_id,
+                        &candidate.session_id,
+                        &candidate.span.event_id,
+                    )?
+                } else {
+                    true
+                }
             } else {
+                if candidate.episode_id.is_some() {
+                    return Err(RetrievalError::CorruptIndex(
+                        "disabled Episode channel 的 fusion candidate 包含 episode_id".into(),
+                    ));
+                }
                 true
             };
             active &= span_active && primary_active && sources_active && episode_active;
