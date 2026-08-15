@@ -51,9 +51,9 @@ pub use episode::{
 pub use eval::{
     EVAL_SCHEMA_VERSION, EvalAggregate, EvalBenchmark, EvalCase, EvalCorpus, EvalEvidenceRef,
     EvalFingerprintInput, EvalJsonl, EvalMessage, EvalQuestionClass, EvalRecord, EvalRecordMetrics,
-    EvalSession, EvalSummary, eval_mrr, eval_recall_at_k, eval_run_fingerprint, eval_token_f1,
-    load_eval_corpus, normalize_eval_answer, score_eval_case, summarize_eval_records,
-    validate_eval_paths, write_eval_summary,
+    EvalRunOptions, EvalRunReport, EvalSession, EvalSummary, eval_mrr, eval_recall_at_k,
+    eval_run_fingerprint, eval_token_f1, load_eval_corpus, normalize_eval_answer, run_evaluation,
+    score_eval_case, summarize_eval_records, validate_eval_paths, write_eval_summary,
 };
 pub use graph::{
     GRAPH_ALGORITHM_VERSION, GRAPH_SCHEMA_VERSION, GraphEdgeType, GraphMaterializationReport,
