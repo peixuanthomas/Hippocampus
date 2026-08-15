@@ -889,6 +889,20 @@ struct ClaimEvidenceSelection {
     content_sha256: String,
 }
 
+struct KeywordRecallRow {
+    document_id: String,
+    granularity: String,
+    event_id: String,
+    start: usize,
+    end: usize,
+    hash: String,
+    exact_content: String,
+    role: EventRole,
+    session_id: String,
+    created_at: String,
+    score: f64,
+}
+
 struct RecallTransition {
     to_state: String,
     reason: String,
@@ -3646,6 +3660,198 @@ impl RetrievalStore {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn indexed_keyword_rows(
+        &self,
+        connection: &Connection,
+        expression: &str,
+        session_filter: Option<&str>,
+    ) -> RetrievalResult<Vec<KeywordRecallRow>> {
+        let mut statement = connection.prepare(
+            "SELECT d.document_id, d.granularity, d.event_id, d.start_char, d.end_char, d.content_sha256, d.exact_content,
+                    e.role, e.session_id, e.created_at, bm25(retrieval_documents_fts) AS score
+             FROM retrieval_documents_fts JOIN retrieval_documents d ON d.rowid = retrieval_documents_fts.rowid
+             JOIN events e ON e.event_id = d.event_id
+             WHERE retrieval_documents_fts MATCH ?1 AND (?2 IS NULL OR e.session_id=?2)
+             ORDER BY score ASC, d.document_id ASC"
+        ).map_err(|error| self.database_error(error))?;
+        let rows = statement
+            .query_map(params![expression, session_filter], |row| {
+                Ok(KeywordRecallRow {
+                    document_id: row.get(0)?,
+                    granularity: row.get(1)?,
+                    event_id: row.get(2)?,
+                    start: i64_to_usize(row.get(3)?)?,
+                    end: i64_to_usize(row.get(4)?)?,
+                    hash: row.get(5)?,
+                    exact_content: row.get(6)?,
+                    role: parse_role(&row.get::<_, String>(7)?)?,
+                    session_id: row.get(8)?,
+                    created_at: row.get(9)?,
+                    score: row.get(10)?,
+                })
+            })
+            .map_err(|error| self.database_error(error))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| self.database_error(error))
+    }
+
+    fn synthetic_keyword_rows(
+        &self,
+        connection: &Connection,
+        control: &ControlState,
+        visibility: &RecallVisibility,
+        expression: &str,
+        session_filter: Option<&str>,
+    ) -> RetrievalResult<Vec<KeywordRecallRow>> {
+        let document_count = connection
+            .query_row("SELECT count(*) FROM retrieval_documents", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map_err(|error| self.database_error(error))?;
+        let fts_count = connection
+            .query_row("SELECT count(*) FROM retrieval_documents_fts", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map_err(|error| self.database_error(error))?;
+        if document_count != fts_count {
+            return Err(RetrievalError::CorruptIndex(
+                "retrieval documents 与 FTS catalog 行数不一致".into(),
+            ));
+        }
+
+        let mut statement = connection
+            .prepare(
+                "SELECT d.rowid,d.document_id,d.lexical_content,d.ngram_content,d.exact_content,
+                        f.lexical_content,f.ngram_content
+                 FROM retrieval_documents d
+                 LEFT JOIN retrieval_documents_fts f ON f.rowid=d.rowid
+                 ORDER BY d.document_id",
+            )
+            .map_err(|error| self.database_error(error))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            })
+            .map_err(|error| self.database_error(error))?;
+        let mut corpus = Vec::new();
+        for row in rows {
+            let (_rowid, document_id, stored_lexical, stored_ngram, exact, fts_lexical, fts_ngram) =
+                row.map_err(|error| self.database_error(error))?;
+            if stored_lexical != lexical_field(&exact)
+                || stored_ngram != ngram_field(&exact)
+                || fts_lexical.as_deref() != Some(stored_lexical.as_str())
+                || fts_ngram.as_deref() != Some(stored_ngram.as_str())
+            {
+                return Err(RetrievalError::CorruptIndex(format!(
+                    "检索文档 {document_id} 的 FTS catalog 不一致"
+                )));
+            }
+            let active = self.document_reference_is_active(connection, control, &document_id)?;
+            let event = connection
+                .query_row(
+                    "SELECT session_id,created_at FROM events e JOIN retrieval_documents d
+                     ON d.event_id=e.event_id WHERE d.document_id=?1",
+                    [&document_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()
+                .map_err(|error| self.database_error(error))?
+                .ok_or_else(|| {
+                    RetrievalError::CorruptIndex(format!("检索文档 {document_id} 缺少 event"))
+                })?;
+            if active
+                && session_filter.is_none_or(|scope| scope == event.0)
+                && visibility.event_created_at_is_visible(&event.1)?
+            {
+                corpus.push((document_id, stored_lexical, stored_ngram));
+            }
+        }
+        drop(statement);
+
+        let mut temporary =
+            Connection::open_in_memory().map_err(|error| self.database_error(error))?;
+        temporary
+            .execute_batch(
+                "CREATE TABLE docs(rowid INTEGER PRIMARY KEY,document_id TEXT NOT NULL UNIQUE);
+             CREATE VIRTUAL TABLE recall_fts USING fts5(
+                 lexical_content,ngram_content,tokenize='unicode61');",
+            )
+            .map_err(|error| self.database_error(error))?;
+        let transaction = temporary
+            .transaction()
+            .map_err(|error| self.database_error(error))?;
+        for (index, (document_id, lexical, ngram)) in corpus.iter().enumerate() {
+            let rowid = usize_to_i64(index + 1).map_err(|error| self.database_error(error))?;
+            transaction
+                .execute(
+                    "INSERT INTO docs(rowid,document_id) VALUES(?1,?2)",
+                    params![rowid, document_id],
+                )
+                .map_err(|error| self.database_error(error))?;
+            transaction
+                .execute(
+                    "INSERT INTO recall_fts(rowid,lexical_content,ngram_content) VALUES(?1,?2,?3)",
+                    params![rowid, lexical, ngram],
+                )
+                .map_err(|error| self.database_error(error))?;
+        }
+        transaction
+            .commit()
+            .map_err(|error| self.database_error(error))?;
+
+        let mut scores = BTreeMap::new();
+        let mut statement = temporary
+            .prepare(
+                "SELECT d.document_id,bm25(recall_fts) AS score
+             FROM recall_fts JOIN docs d ON d.rowid=recall_fts.rowid
+             WHERE recall_fts MATCH ?1 ORDER BY score ASC,d.document_id ASC",
+            )
+            .map_err(|error| self.database_error(error))?;
+        let rows = statement
+            .query_map([expression], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+            })
+            .map_err(|error| self.database_error(error))?;
+        for row in rows {
+            let (document_id, score) = row.map_err(|error| self.database_error(error))?;
+            scores.insert(document_id, score);
+        }
+        drop(statement);
+
+        let persistent = self.indexed_keyword_rows(connection, expression, session_filter)?;
+        let mut visible = Vec::new();
+        let mut excluded = Vec::new();
+        for mut row in persistent {
+            if let Some(score) = scores.remove(&row.document_id) {
+                row.score = score;
+                visible.push(row);
+            } else {
+                excluded.push(row);
+            }
+        }
+        if !scores.is_empty() {
+            return Err(RetrievalError::CorruptIndex(
+                "temporary FTS 返回未知文档".into(),
+            ));
+        }
+        visible.sort_by(|left, right| {
+            left.score
+                .total_cmp(&right.score)
+                .then_with(|| left.document_id.cmp(&right.document_id))
+        });
+        visible.extend(excluded);
+        Ok(visible)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn keyword_recall_core_from_connection(
         &self,
         connection: &Connection,
@@ -3698,31 +3904,18 @@ impl RetrievalStore {
             .map(|term| format!("\"{}\"", term.replace('"', "")))
             .collect::<Vec<_>>()
             .join(" OR ");
-        let mut statement = connection.prepare(
-            "SELECT d.document_id, d.granularity, d.event_id, d.start_char, d.end_char, d.content_sha256, d.exact_content,
-                    e.role, e.session_id, e.created_at, bm25(retrieval_documents_fts) AS score
-             FROM retrieval_documents_fts JOIN retrieval_documents d ON d.rowid = retrieval_documents_fts.rowid
-             JOIN events e ON e.event_id = d.event_id
-             WHERE retrieval_documents_fts MATCH ?1 AND (?2 IS NULL OR e.session_id=?2)
-             ORDER BY score ASC, d.document_id ASC"
-        ).map_err(|e| self.database_error(e))?;
-        let rows = statement
-            .query_map(params![expression, session_filter], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    i64_to_usize(row.get(3)?)?,
-                    i64_to_usize(row.get(4)?)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, String>(6)?,
-                    parse_role(&row.get::<_, String>(7)?)?,
-                    row.get::<_, String>(8)?,
-                    row.get::<_, String>(9)?,
-                    row.get::<_, f64>(10)?,
-                ))
-            })
-            .map_err(|e| self.database_error(e))?;
+        let rows = match query_origin {
+            RecallQueryOrigin::IndexedEvent => {
+                self.indexed_keyword_rows(connection, &expression, session_filter)?
+            }
+            RecallQueryOrigin::Synthetic { .. } => self.synthetic_keyword_rows(
+                connection,
+                control,
+                visibility,
+                &expression,
+                session_filter,
+            )?,
+        };
         let recent: HashSet<&str> = recent_event_ids.iter().map(String::as_str).collect();
         let mut used_events = HashSet::new();
         let mut used_hashes = HashSet::new();
@@ -3731,20 +3924,19 @@ impl RetrievalStore {
         // Keep the entire deterministic overfetch in the trace. Exclusions
         // must not consume the usable candidate pool.
         for row in rows {
-            let row = row.map_err(|error| self.database_error(error))?;
-            let (
+            let KeywordRecallRow {
                 document_id,
                 granularity,
-                event_id_value,
+                event_id: event_id_value,
                 start,
                 end,
                 hash,
-                stored_content,
+                exact_content: stored_content,
                 role,
                 session_id,
                 created_at,
                 score,
-            ) = row;
+            } = row;
             let span = SourceSpan {
                 event_id: event_id_value.clone(),
                 start_char: start,
@@ -3843,7 +4035,6 @@ impl RetrievalStore {
                 break;
             }
         }
-        drop(statement);
         let mut evidence = Vec::new();
         for selected in trace.selected_evidence.clone() {
             let event = self.get_event_from_connection(connection, &selected.span.event_id)?;
@@ -6046,11 +6237,17 @@ impl RetrievalStore {
                 .as_deref()
                 .map(|value| parse_retrieval_time(value, "claim.event_time"))
                 .transpose()?;
+            let time_visible = asserted_time <= visibility_upper
+                && claim_reference <= visibility_upper
+                && from <= visibility_upper
+                && claim_event_time.is_none_or(|value| value <= visibility_upper);
             let to = valid_to
                 .as_deref()
                 .map(|value| parse_retrieval_time(value, "claim.valid_to"))
                 .transpose()?;
-            let object_resolved = if object_kind == "entity" {
+            let object_resolved = if !time_visible {
+                true
+            } else if object_kind == "entity" {
                 object
                     .as_deref()
                     .map(|id| {
@@ -6061,16 +6258,12 @@ impl RetrievalStore {
             } else {
                 true
             };
-            if !selected_entities.contains(&subject) {
+            if !time_visible {
+                reason = "not_yet_visible".into();
+            } else if !selected_entities.contains(&subject) {
                 reason = "subject_not_selected".into();
             } else if !object_resolved {
                 reason = "pending_object".into();
-            } else if asserted_time > visibility_upper
-                || claim_reference > visibility_upper
-                || from > visibility_upper
-                || claim_event_time.is_some_and(|value| value > visibility_upper)
-            {
-                reason = "not_yet_visible".into();
             } else if query_kind != QueryKind::TemporalState && lexical == 0 {
                 reason = "no_claim_overlap".into();
             } else if !historical
@@ -6149,8 +6342,14 @@ impl RetrievalStore {
                 .then_with(|| left.2.trace.claim_id.cmp(&right.2.trace.claim_id))
         });
         let mut eligible_groups = BTreeSet::new();
-        for (index, (_, _, candidate)) in candidates.iter_mut().enumerate() {
-            candidate.trace.rank = index + 1;
+        let mut visible_rank = 0usize;
+        for (_, _, candidate) in &mut candidates {
+            if candidate.trace.reason == "not_yet_visible" {
+                candidate.trace.rank = 0;
+                continue;
+            }
+            visible_rank += 1;
+            candidate.trace.rank = visible_rank;
             if candidate.trace.reason == "eligible" {
                 let group_key = candidate.conflict_group.join("\0");
                 if !eligible_groups.contains(&group_key) && eligible_groups.len() >= candidate_limit
