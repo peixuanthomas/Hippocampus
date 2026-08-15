@@ -896,59 +896,41 @@ fn hash(b: &[u8]) -> String {
         .map(|x| format!("{x:02x}"))
         .collect()
 }
-fn abs(p: &Path) -> Result<PathBuf> {
-    let p = if p.is_absolute() {
-        p.into()
-    } else {
-        std::env::current_dir()?.join(p)
-    };
-    let mut o = PathBuf::new();
-    for c in p.components() {
-        match c {
-            Component::RootDir => o.push("/"),
-            Component::Normal(x) => o.push(x),
-            Component::ParentDir => {
-                o.pop();
-            }
-            Component::Prefix(x) => o.push(x.as_os_str()),
-            Component::CurDir => {}
-        }
-    }
-    Ok(o)
-}
 fn resolve_eval_path(path: &Path) -> Result<PathBuf> {
-    let absolute = abs(path)?;
-    let mut candidate = absolute.as_path();
-    let mut suffix = Vec::new();
-    loop {
-        match fs::symlink_metadata(candidate) {
-            Ok(_) => {
-                let mut resolved = fs::canonicalize(candidate).with_context(|| {
-                    format!("cannot resolve evaluation path {}", candidate.display())
-                })?;
-                for component in suffix.iter().rev() {
-                    resolved.push(component);
+    let mut resolved = if path.is_absolute() {
+        PathBuf::new()
+    } else {
+        fs::canonicalize(std::env::current_dir()?)?
+    };
+    for component in path.components() {
+        match component {
+            Component::RootDir => resolved.push(Path::new("/")),
+            Component::Prefix(prefix) => resolved.push(prefix.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            Component::Normal(part) => {
+                let candidate = resolved.join(part);
+                match fs::symlink_metadata(&candidate) {
+                    Ok(_) => {
+                        resolved = fs::canonicalize(&candidate).with_context(|| {
+                            format!("cannot resolve evaluation path {}", candidate.display())
+                        })?;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        resolved.push(part);
+                    }
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("cannot inspect evaluation path {}", candidate.display())
+                        });
+                    }
                 }
-                return Ok(resolved);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                suffix.push(
-                    candidate
-                        .file_name()
-                        .context("evaluation path has no existing ancestor")?
-                        .to_os_string(),
-                );
-                candidate = candidate
-                    .parent()
-                    .context("evaluation path has no existing ancestor")?;
-            }
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("cannot inspect evaluation path {}", candidate.display())
-                });
             }
         }
     }
+    Ok(resolved)
 }
 fn eval_summary_path(output: &Path) -> Result<PathBuf> {
     let mut filename = OsString::from(output.file_name().context("output filename missing")?);
