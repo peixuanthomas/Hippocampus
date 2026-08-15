@@ -207,13 +207,23 @@ pub fn eval_run_fingerprint(i: &EvalFingerprintInput) -> Result<String> {
     )?))
 }
 pub fn validate_eval_paths(dataset: Option<&Path>, output: &Path, workspace: &Path) -> Result<()> {
-    let o = abs(output)?;
-    let w = abs(workspace)?;
-    ensure!(!o.starts_with(&w), "output must not be inside workspace");
+    let summary = resolve_eval_path(&eval_summary_path(output)?)?;
+    let output = resolve_eval_path(output)?;
+    let workspace = resolve_eval_path(workspace)?;
+    ensure!(
+        !output.starts_with(&workspace) && !summary.starts_with(&workspace),
+        "evaluation output must not be inside workspace"
+    );
     if let Some(d) = dataset {
-        let d = abs(d)?;
-        ensure!(d != o, "dataset and output must differ");
-        ensure!(!d.starts_with(&w), "dataset must not be inside workspace")
+        let dataset = resolve_eval_path(d)?;
+        ensure!(
+            dataset != output && dataset != summary,
+            "dataset, output, and summary paths must differ"
+        );
+        ensure!(
+            !dataset.starts_with(&workspace),
+            "dataset must not be inside workspace"
+        )
     }
     Ok(())
 }
@@ -488,9 +498,7 @@ impl EvalJsonl {
     }
 }
 pub fn write_eval_summary(output: &Path, s: &EvalSummary) -> Result<PathBuf> {
-    let mut filename = OsString::from(output.file_name().context("output filename missing")?);
-    filename.push(".summary.json");
-    let target = output.with_file_name(filename);
+    let target = eval_summary_path(output)?;
     let parent = target.parent().unwrap_or(Path::new("."));
     fs::create_dir_all(parent)?;
     let mut temporary_name = OsString::from(".");
@@ -734,7 +742,10 @@ fn locomo(bytes: &[u8]) -> Result<Vec<EvalCase>> {
             else {
                 continue;
             };
-            ensure!(value.is_array(), "{key} must be an array");
+            let session = value
+                .as_array()
+                .with_context(|| format!("{key} must be an array"))?;
+            ensure!(!session.is_empty(), "{key} must not be empty");
             keys.push((number, key.clone()));
         }
         keys.sort_by_key(|x| x.0);
@@ -813,20 +824,35 @@ fn locomo(bytes: &[u8]) -> Result<Vec<EvalCase>> {
             let cat = scalar(&q.category, "category")?.parse::<u8>()?;
             ensure!((1..=5).contains(&cat), "invalid category");
             let (mut gold, unresolved) = resolve(&q.evidence, &known);
-            let no = cat == 5;
+            let answer = q
+                .answer
+                .as_ref()
+                .map(|value| {
+                    let answer = scalar(value, "answer")?;
+                    ensure!(!answer.trim().is_empty(), "answer empty");
+                    Ok(answer)
+                })
+                .transpose()?;
+            ensure!(
+                cat == 5 || answer.is_some(),
+                "categories 1-4 require an answer"
+            );
+            let no = answer.is_none();
             let negative = if no {
                 std::mem::take(&mut gold)
             } else {
                 vec![]
             };
-            let answer = if no {
-                None
-            } else {
-                let a = scalar(q.answer.as_ref().context("answer missing")?, "answer")?;
-                ensure!(!a.trim().is_empty(), "answer empty");
-                Some(a)
+            let class = match cat {
+                1 => EvalQuestionClass::ExactFact,
+                2 => EvalQuestionClass::Temporal,
+                3 => EvalQuestionClass::MultiHop,
+                4 => EvalQuestionClass::General,
+                5 if no => EvalQuestionClass::NoAnswer,
+                5 => EvalQuestionClass::ExactFact,
+                _ => unreachable!(),
             };
-            out.push(EvalCase{id:format!("{sample}-{qi}"),group_id:sample.clone(),question:q.question,expected_answer:answer,class:match cat{1=>EvalQuestionClass::ExactFact,2=>EvalQuestionClass::Temporal,3=>EvalQuestionClass::MultiHop,4=>EvalQuestionClass::General,_=>EvalQuestionClass::NoAnswer},reference_time:reference.clone(),sessions:sessions.clone(),gold_evidence:gold,unresolved_gold_evidence:unresolved,stale_evidence:vec![],negative_evidence:negative,source_metadata:json!({"sample_id":sample,"qa_index":qi,"category":cat,"adversarial_answer":q.adversarial_answer})})
+            out.push(EvalCase{id:format!("{sample}-{qi}"),group_id:sample.clone(),question:q.question,expected_answer:answer,class,reference_time:reference.clone(),sessions:sessions.clone(),gold_evidence:gold,unresolved_gold_evidence:unresolved,stale_evidence:vec![],negative_evidence:negative,source_metadata:json!({"sample_id":sample,"qa_index":qi,"category":cat,"adversarial_answer":q.adversarial_answer})})
         }
     }
     Ok(out)
@@ -889,6 +915,45 @@ fn abs(p: &Path) -> Result<PathBuf> {
         }
     }
     Ok(o)
+}
+fn resolve_eval_path(path: &Path) -> Result<PathBuf> {
+    let absolute = abs(path)?;
+    let mut candidate = absolute.as_path();
+    let mut suffix = Vec::new();
+    loop {
+        match fs::symlink_metadata(candidate) {
+            Ok(_) => {
+                let mut resolved = fs::canonicalize(candidate).with_context(|| {
+                    format!("cannot resolve evaluation path {}", candidate.display())
+                })?;
+                for component in suffix.iter().rev() {
+                    resolved.push(component);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                suffix.push(
+                    candidate
+                        .file_name()
+                        .context("evaluation path has no existing ancestor")?
+                        .to_os_string(),
+                );
+                candidate = candidate
+                    .parent()
+                    .context("evaluation path has no existing ancestor")?;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("cannot inspect evaluation path {}", candidate.display())
+                });
+            }
+        }
+    }
+}
+fn eval_summary_path(output: &Path) -> Result<PathBuf> {
+    let mut filename = OsString::from(output.file_name().context("output filename missing")?);
+    filename.push(".summary.json");
+    Ok(output.with_file_name(filename))
 }
 fn aggregate<I: Iterator<Item = Option<f64>>>(i: I) -> EvalAggregate {
     let mut v = i.flatten().filter(|x| x.is_finite()).collect::<Vec<_>>();
