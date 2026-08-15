@@ -903,6 +903,15 @@ struct KeywordRecallRow {
     score: f64,
 }
 
+struct ValidatedFtsDocument {
+    document_id: String,
+    lexical_content: String,
+    ngram_content: String,
+    session_id: String,
+    created_at: String,
+    active: bool,
+}
+
 struct CanonicalLeafDocument {
     document_id: String,
     session_id: String,
@@ -3708,14 +3717,11 @@ impl RetrievalStore {
             .map_err(|error| self.database_error(error))
     }
 
-    fn synthetic_keyword_rows(
+    fn validate_fts_catalog(
         &self,
         connection: &Connection,
         control: &ControlState,
-        visibility: &RecallVisibility,
-        expression: &str,
-        session_filter: Option<&str>,
-    ) -> RetrievalResult<Vec<KeywordRecallRow>> {
+    ) -> RetrievalResult<Vec<ValidatedFtsDocument>> {
         let document_count = connection
             .query_row("SELECT count(*) FROM retrieval_documents", [], |row| {
                 row.get::<_, i64>(0)
@@ -3735,9 +3741,10 @@ impl RetrievalStore {
         let mut statement = connection
             .prepare(
                 "SELECT d.rowid,d.document_id,d.lexical_content,d.ngram_content,d.exact_content,
-                        f.lexical_content,f.ngram_content
+                        f.lexical_content,f.ngram_content,e.session_id,e.created_at
                  FROM retrieval_documents d
                  LEFT JOIN retrieval_documents_fts f ON f.rowid=d.rowid
+                 LEFT JOIN events e ON e.event_id=d.event_id
                  ORDER BY d.document_id",
             )
             .map_err(|error| self.database_error(error))?;
@@ -3751,13 +3758,24 @@ impl RetrievalStore {
                     row.get::<_, String>(4)?,
                     row.get::<_, Option<String>>(5)?,
                     row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
                 ))
             })
             .map_err(|error| self.database_error(error))?;
-        let mut corpus = Vec::new();
+        let mut catalog = Vec::new();
         for row in rows {
-            let (_rowid, document_id, stored_lexical, stored_ngram, exact, fts_lexical, fts_ngram) =
-                row.map_err(|error| self.database_error(error))?;
+            let (
+                _rowid,
+                document_id,
+                stored_lexical,
+                stored_ngram,
+                exact,
+                fts_lexical,
+                fts_ngram,
+                session_id,
+                created_at,
+            ) = row.map_err(|error| self.database_error(error))?;
             if stored_lexical != lexical_field(&exact)
                 || stored_ngram != ngram_field(&exact)
                 || fts_lexical.as_deref() != Some(stored_lexical.as_str())
@@ -3767,27 +3785,45 @@ impl RetrievalStore {
                     "检索文档 {document_id} 的 FTS catalog 不一致"
                 )));
             }
-            let active = self.document_reference_is_active(connection, control, &document_id)?;
-            let event = connection
-                .query_row(
-                    "SELECT session_id,created_at FROM events e JOIN retrieval_documents d
-                     ON d.event_id=e.event_id WHERE d.document_id=?1",
-                    [&document_id],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-                )
-                .optional()
-                .map_err(|error| self.database_error(error))?
-                .ok_or_else(|| {
-                    RetrievalError::CorruptIndex(format!("检索文档 {document_id} 缺少 event"))
-                })?;
-            if active
-                && session_filter.is_none_or(|scope| scope == event.0)
-                && visibility.event_created_at_is_visible(&event.1)?
+            let session_id = session_id.ok_or_else(|| {
+                RetrievalError::CorruptIndex(format!("检索文档 {document_id} 缺少 event"))
+            })?;
+            let created_at = created_at.ok_or_else(|| {
+                RetrievalError::CorruptIndex(format!("检索文档 {document_id} 缺少 event"))
+            })?;
+            catalog.push(ValidatedFtsDocument {
+                active: self.document_reference_is_active(connection, control, &document_id)?,
+                document_id,
+                lexical_content: stored_lexical,
+                ngram_content: stored_ngram,
+                session_id,
+                created_at,
+            });
+        }
+        Ok(catalog)
+    }
+
+    fn synthetic_keyword_rows(
+        &self,
+        connection: &Connection,
+        catalog: &[ValidatedFtsDocument],
+        visibility: &RecallVisibility,
+        expression: &str,
+        session_filter: Option<&str>,
+    ) -> RetrievalResult<Vec<KeywordRecallRow>> {
+        let mut corpus = Vec::new();
+        for document in catalog {
+            if document.active
+                && session_filter.is_none_or(|scope| scope == document.session_id)
+                && visibility.event_created_at_is_visible(&document.created_at)?
             {
-                corpus.push((document_id, stored_lexical, stored_ngram));
+                corpus.push((
+                    &document.document_id,
+                    &document.lexical_content,
+                    &document.ngram_content,
+                ));
             }
         }
-        drop(statement);
 
         let mut temporary =
             Connection::open_in_memory().map_err(|error| self.database_error(error))?;
@@ -3892,6 +3928,7 @@ impl RetrievalStore {
             self.validate_recall_input_id(connection, control, event_id, session_filter)?;
         }
         load_canonical_leaf_catalog(self, connection, control)?;
+        let fts_catalog = self.validate_fts_catalog(connection, control)?;
         config
             .validate()
             .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
@@ -3924,7 +3961,7 @@ impl RetrievalStore {
             }
             RecallQueryOrigin::Synthetic { .. } => self.synthetic_keyword_rows(
                 connection,
-                control,
+                &fts_catalog,
                 visibility,
                 &expression,
                 session_filter,
