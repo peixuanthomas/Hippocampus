@@ -314,7 +314,7 @@ pub fn score_eval_case(
         stale_state_false_recall: (!c.stale_evidence.is_empty())
             .then_some(r.iter().take(10).any(|x| c.stale_evidence.contains(x)) as u8 as f64),
         no_answer_false_recall: (c.class == EvalQuestionClass::NoAnswer)
-            .then_some(r.iter().take(10).next().is_some() as u8 as f64),
+            .then_some(r.iter().take(10).any(|x| c.negative_evidence.contains(x)) as u8 as f64),
         retrieval_elapsed_ms: elapsed,
         retrieval_wall_ms: wall,
     }
@@ -711,16 +711,17 @@ fn locomo(bytes: &[u8]) -> Result<Vec<EvalCase>> {
             !speaker_a.trim().is_empty() && !speaker_b.trim().is_empty() && speaker_a != speaker_b,
             "LoCoMo speaker_a and speaker_b must be distinct and nonempty"
         );
-        let mut keys = x
-            .conversation
-            .iter()
-            .filter_map(|(k, v)| {
-                k.strip_prefix("session_")
-                    .and_then(|n| n.parse::<usize>().ok())
-                    .filter(|_| v.is_array())
-                    .map(|n| (n, k.clone()))
-            })
-            .collect::<Vec<_>>();
+        let mut keys = Vec::new();
+        for (key, value) in &x.conversation {
+            let Some(number) = key
+                .strip_prefix("session_")
+                .and_then(|suffix| suffix.parse::<usize>().ok())
+            else {
+                continue;
+            };
+            ensure!(value.is_array(), "{key} must be an array");
+            keys.push((number, key.clone()));
+        }
         keys.sort_by_key(|x| x.0);
         let mut known = HashSet::new();
         let mut sessions = Vec::new();
@@ -810,7 +811,7 @@ fn locomo(bytes: &[u8]) -> Result<Vec<EvalCase>> {
                 ensure!(!a.trim().is_empty(), "answer empty");
                 Some(a)
             };
-            out.push(EvalCase{id:format!("{sample}-{qi}"),group_id:sample.clone(),question:q.question,expected_answer:answer,class:match cat{1=>EvalQuestionClass::MultiHop,2=>EvalQuestionClass::Temporal,3=>EvalQuestionClass::General,4=>EvalQuestionClass::ExactFact,_=>EvalQuestionClass::NoAnswer},reference_time:reference.clone(),sessions:sessions.clone(),gold_evidence:gold,unresolved_gold_evidence:unresolved,stale_evidence:vec![],negative_evidence:negative,source_metadata:json!({"sample_id":sample,"qa_index":qi,"category":cat,"adversarial_answer":q.adversarial_answer})})
+            out.push(EvalCase{id:format!("{sample}-{qi}"),group_id:sample.clone(),question:q.question,expected_answer:answer,class:match cat{1=>EvalQuestionClass::ExactFact,2=>EvalQuestionClass::Temporal,3=>EvalQuestionClass::MultiHop,4=>EvalQuestionClass::General,_=>EvalQuestionClass::NoAnswer},reference_time:reference.clone(),sessions:sessions.clone(),gold_evidence:gold,unresolved_gold_evidence:unresolved,stale_evidence:vec![],negative_evidence:negative,source_metadata:json!({"sample_id":sample,"qa_index":qi,"category":cat,"adversarial_answer":q.adversarial_answer})})
         }
     }
     Ok(out)
