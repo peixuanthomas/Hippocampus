@@ -903,6 +903,19 @@ struct KeywordRecallRow {
     score: f64,
 }
 
+struct CanonicalLeafDocument {
+    document_id: String,
+    session_id: String,
+    granularity: RetrievalDocumentGranularity,
+    source_sha256: String,
+    content: String,
+    event_id: String,
+    start: usize,
+    end: usize,
+    message_document_id: String,
+    sequence: i64,
+}
+
 struct RecallTransition {
     to_state: String,
     reason: String,
@@ -3703,6 +3716,7 @@ impl RetrievalStore {
         expression: &str,
         session_filter: Option<&str>,
     ) -> RetrievalResult<Vec<KeywordRecallRow>> {
+        load_canonical_leaf_catalog(self, connection, control)?;
         let document_count = connection
             .query_row("SELECT count(*) FROM retrieval_documents", [], |row| {
                 row.get::<_, i64>(0)
@@ -10203,31 +10217,30 @@ pub(crate) fn load_leaf_embedding_snapshot(
     load_leaf_embedding_snapshot_with_control(store, connection, spec, &control)
 }
 
-pub(crate) fn load_leaf_embedding_snapshot_with_control(
+fn load_canonical_leaf_catalog(
     store: &RetrievalStore,
     connection: &Connection,
-    spec: &VectorIndexSpec,
     control: &ControlState,
-) -> RetrievalResult<LeafEmbeddingSnapshot> {
-    let fingerprint = embedding_fingerprint(spec)?;
-    let mut hasher = Sha256::new();
-    hash_string(&mut hasher, "hippocampus.embedding.catalog.leaf");
-    hash_field(
-        &mut hasher,
-        &EMBEDDING_CATALOG_ALGORITHM_VERSION.to_be_bytes(),
-    );
-    hash_string(&mut hasher, &fingerprint);
-    let control_generation_sha256 = control.generation_sha256();
-    hash_string(&mut hasher, &control_generation_sha256);
-    let session_ids = hash_session_catalog(store, connection, &mut hasher)?
+) -> RetrievalResult<Vec<CanonicalLeafDocument>> {
+    let session_ids = connection
+        .prepare("SELECT session_id FROM indexed_sessions ORDER BY session_id")
+        .and_then(|mut statement| {
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .map_err(|error| store.database_error(error))?;
+    for session_id in session_ids
         .into_iter()
         .filter(|id| control.allows_session(id))
-        .collect::<Vec<_>>();
-    for session_id in &session_ids {
+    {
         store.verify_indexed_session_source_projection_with_control(
-            connection, session_id, control,
+            connection,
+            &session_id,
+            control,
         )?;
     }
+
     let mut expected = Vec::new();
     let mut events = connection.prepare("SELECT event_id,session_id,sequence,role,content,content_sha256 FROM events ORDER BY session_id,sequence,event_id")
         .map_err(|error| store.database_error(error))?;
@@ -10262,7 +10275,7 @@ pub(crate) fn load_leaf_embedding_snapshot_with_control(
             session_id: session_id.clone(),
             turn_id: None,
             sequence: i64_to_usize(sequence)
-                .map_err(|e| RetrievalError::CorruptIndex(e.to_string()))?,
+                .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?,
             role: EventRole::User,
             created_at: String::new(),
             content: content.clone(),
@@ -10273,31 +10286,30 @@ pub(crate) fn load_leaf_embedding_snapshot_with_control(
             done_reason: None,
             error: None,
         };
-        let message_id = format!("{}:0:{}", event_id, content.chars().count());
+        let message_document_id = format!("{}:0:{}", event_id, content.chars().count());
         for (granularity, span) in document_spans(&event) {
             let part = slice_chars(&content, &span)?;
-            let source = content_sha256(&part);
-            let document_id = format!("{}:{}:{}", event_id, span.start_char, span.end_char);
-            expected.push((
-                document_id,
-                session_id.clone(),
+            expected.push(CanonicalLeafDocument {
+                document_id: format!("{}:{}:{}", event_id, span.start_char, span.end_char),
+                session_id: session_id.clone(),
                 granularity,
-                source,
-                part,
-                event_id.clone(),
-                span.start_char,
-                span.end_char,
-                message_id.clone(),
+                source_sha256: content_sha256(&part),
+                content: part,
+                event_id: event_id.clone(),
+                start: span.start_char,
+                end: span.end_char,
+                message_document_id: message_document_id.clone(),
                 sequence,
-            ));
+            });
         }
     }
-    expected.sort_by(|a, b| a.0.cmp(&b.0));
-    let all_actual_ids = connection
+    expected.sort_by(|left, right| left.document_id.cmp(&right.document_id));
+
+    let all_retrieval = connection
         .prepare(
             "SELECT r.document_id,e.session_id,r.event_id
-         FROM retrieval_documents r LEFT JOIN events e ON e.event_id=r.event_id
-         WHERE r.granularity IN ('message','fragment') ORDER BY r.document_id",
+             FROM retrieval_documents r LEFT JOIN events e ON e.event_id=r.event_id
+             WHERE r.granularity IN ('message','fragment') ORDER BY r.document_id",
         )
         .and_then(|mut statement| {
             statement
@@ -10311,12 +10323,12 @@ pub(crate) fn load_leaf_embedding_snapshot_with_control(
                 .collect::<rusqlite::Result<Vec<_>>>()
         })
         .map_err(|error| store.database_error(error))?;
-    let mut actual_ids = Vec::new();
-    for (id, session_id, event_id) in all_actual_ids {
+    let mut retrieval_ids = Vec::new();
+    for (id, session_id, event_id) in all_retrieval {
         if control.event_is_excluded(&event_id)
             || session_id
                 .as_deref()
-                .is_some_and(|session_id| !control.allows_session(session_id))
+                .is_some_and(|session| !control.allows_session(session))
         {
             continue;
         }
@@ -10327,45 +10339,87 @@ pub(crate) fn load_leaf_embedding_snapshot_with_control(
             continue;
         }
         if store.memory_document_is_active(connection, control, &id)? {
-            actual_ids.push(id);
+            retrieval_ids.push(id);
         }
     }
-    if actual_ids != expected.iter().map(|row| row.0.clone()).collect::<Vec<_>>() {
+    let expected_ids = expected
+        .iter()
+        .map(|document| document.document_id.clone())
+        .collect::<Vec<_>>();
+    if retrieval_ids != expected_ids {
         return Err(RetrievalError::CorruptIndex(
             "retrieval leaf catalog 集合不规范".into(),
         ));
     }
-    let all_memory_ids = connection.prepare("SELECT document_id FROM memory_documents WHERE granularity IN ('message','fragment') ORDER BY document_id")
+
+    let all_memory = connection.prepare("SELECT document_id FROM memory_documents WHERE granularity IN ('message','fragment') ORDER BY document_id")
         .and_then(|mut statement| statement.query_map([], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>())
         .map_err(|error| store.database_error(error))?;
     let mut memory_ids = Vec::new();
-    for id in all_memory_ids {
+    for id in all_memory {
         if store.memory_document_is_active(connection, control, &id)? {
             memory_ids.push(id);
         }
     }
-    if memory_ids != actual_ids {
+    if memory_ids != retrieval_ids {
         return Err(RetrievalError::CorruptIndex(
             "memory leaf catalog 集合不规范".into(),
         ));
     }
-    let mut documents = Vec::with_capacity(expected.len());
-    for (id, session, granularity, source, content, event, start, end, message_id, sequence) in
-        expected
-    {
-        let granularity_str = match granularity {
+
+    for document in &expected {
+        let granularity = match document.granularity {
             RetrievalDocumentGranularity::Message => "message",
             RetrievalDocumentGranularity::Fragment => "fragment",
             _ => unreachable!(),
         };
-        let count:i64=connection.query_row("SELECT count(*) FROM memory_documents d JOIN memory_document_members m ON m.document_id=d.document_id JOIN retrieval_documents r ON r.document_id=d.document_id JOIN source_spans s ON s.event_id=m.event_id AND s.start_char=m.start_char AND s.end_char=m.end_char WHERE d.document_id=?1 AND d.session_id=?2 AND d.granularity=?3 AND d.source_sha256=?4 AND d.start_sequence=?5 AND d.end_sequence=?5 AND d.member_count=1 AND m.ordinal=0 AND m.event_id=?6 AND m.start_char=?7 AND m.end_char=?8 AND m.content_sha256=?4 AND r.event_id=?6 AND r.start_char=?7 AND r.end_char=?8 AND r.granularity=?3 AND r.content_sha256=?4 AND r.exact_content=?9 AND s.content_sha256=?4", params![id,session,granularity_str,source,sequence,event,usize_to_i64(start).map_err(|e|store.database_error(e))?,usize_to_i64(end).map_err(|e|store.database_error(e))?,content], |r|r.get(0)).map_err(|e|store.database_error(e))?;
+        let count:i64=connection.query_row("SELECT count(*) FROM memory_documents d JOIN memory_document_members m ON m.document_id=d.document_id JOIN retrieval_documents r ON r.document_id=d.document_id JOIN source_spans s ON s.event_id=m.event_id AND s.start_char=m.start_char AND s.end_char=m.end_char WHERE d.document_id=?1 AND d.session_id=?2 AND d.granularity=?3 AND d.source_sha256=?4 AND d.start_sequence=?5 AND d.end_sequence=?5 AND d.member_count=1 AND m.ordinal=0 AND m.event_id=?6 AND m.start_char=?7 AND m.end_char=?8 AND m.content_sha256=?4 AND r.event_id=?6 AND r.start_char=?7 AND r.end_char=?8 AND r.granularity=?3 AND r.content_sha256=?4 AND r.exact_content=?9 AND s.content_sha256=?4", params![document.document_id,document.session_id,granularity,document.source_sha256,document.sequence,document.event_id,usize_to_i64(document.start).map_err(|error|store.database_error(error))?,usize_to_i64(document.end).map_err(|error|store.database_error(error))?,document.content], |row|row.get(0)).map_err(|error|store.database_error(error))?;
         if count != 1 {
             return Err(RetrievalError::CorruptIndex(format!(
-                "leaf document {id} provenance 不规范"
+                "leaf document {} provenance 不规范",
+                document.document_id
             )));
         }
-        let reusable_vector = raw_embedding(connection, &id)?.and_then(|row| {
-            if embedding_equals(Some(&row), spec, &fingerprint, &source, &row.vector_blob) {
+    }
+    Ok(expected)
+}
+
+pub(crate) fn load_leaf_embedding_snapshot_with_control(
+    store: &RetrievalStore,
+    connection: &Connection,
+    spec: &VectorIndexSpec,
+    control: &ControlState,
+) -> RetrievalResult<LeafEmbeddingSnapshot> {
+    let fingerprint = embedding_fingerprint(spec)?;
+    let mut hasher = Sha256::new();
+    hash_string(&mut hasher, "hippocampus.embedding.catalog.leaf");
+    hash_field(
+        &mut hasher,
+        &EMBEDDING_CATALOG_ALGORITHM_VERSION.to_be_bytes(),
+    );
+    hash_string(&mut hasher, &fingerprint);
+    let control_generation_sha256 = control.generation_sha256();
+    hash_string(&mut hasher, &control_generation_sha256);
+    let session_ids = hash_session_catalog(store, connection, &mut hasher)?
+        .into_iter()
+        .filter(|id| control.allows_session(id))
+        .collect::<Vec<_>>();
+    let expected = load_canonical_leaf_catalog(store, connection, control)?;
+    let mut documents = Vec::with_capacity(expected.len());
+    for document in expected {
+        let granularity_str = match document.granularity {
+            RetrievalDocumentGranularity::Message => "message",
+            RetrievalDocumentGranularity::Fragment => "fragment",
+            _ => unreachable!(),
+        };
+        let reusable_vector = raw_embedding(connection, &document.document_id)?.and_then(|row| {
+            if embedding_equals(
+                Some(&row),
+                spec,
+                &fingerprint,
+                &document.source_sha256,
+                &row.vector_blob,
+            ) {
                 decode_f32_le(&row.vector_blob, spec.dimensions)
                     .ok()
                     .filter(|v| is_unit_vector(v))
@@ -10374,29 +10428,29 @@ pub(crate) fn load_leaf_embedding_snapshot_with_control(
             }
         });
         for value in [
-            &id,
-            &session,
+            &document.document_id,
+            &document.session_id,
             granularity_str,
-            &source,
-            &content,
-            &event,
-            &message_id,
+            &document.source_sha256,
+            &document.content,
+            &document.event_id,
+            &document.message_document_id,
         ] {
             hash_string(&mut hasher, value);
         }
-        hash_usize(&mut hasher, start);
-        hash_usize(&mut hasher, end);
-        hash_field(&mut hasher, &sequence.to_be_bytes());
+        hash_usize(&mut hasher, document.start);
+        hash_usize(&mut hasher, document.end);
+        hash_field(&mut hasher, &document.sequence.to_be_bytes());
         documents.push(LeafEmbeddingDocument {
-            document_id: id,
-            session_id: session,
-            granularity,
-            source_sha256: source,
-            content,
-            source_event_id: event,
-            start_char: start,
-            end_char: end,
-            message_document_id: message_id,
+            document_id: document.document_id,
+            session_id: document.session_id,
+            granularity: document.granularity,
+            source_sha256: document.source_sha256,
+            content: document.content,
+            source_event_id: document.event_id,
+            start_char: document.start,
+            end_char: document.end,
+            message_document_id: document.message_document_id,
             reusable_vector,
         });
     }
