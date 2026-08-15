@@ -402,7 +402,8 @@ impl EvalJsonl {
     pub fn open(path: &Path, fp: &str, b: EvalBenchmark, d: &str) -> Result<Self> {
         let mut records = Vec::new();
         let mut ids = HashSet::new();
-        if path.exists() {
+        let existed = path.exists();
+        if existed {
             let bytes = fs::read(path)?;
             ensure!(
                 bytes.is_empty() || bytes.last() == Some(&b'\n'),
@@ -429,11 +430,17 @@ impl EvalJsonl {
                 records.push(r)
             }
         }
-        if let Some(p) = path.parent() {
-            fs::create_dir_all(p)?
+        let parent = path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)?;
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        if !existed {
+            File::open(parent)?.sync_all()?;
         }
         Ok(Self {
-            file: OpenOptions::new().create(true).append(true).open(path)?,
+            file,
             records,
             ids,
             run_fingerprint: fp.to_owned(),
@@ -632,15 +639,23 @@ fn lme(bytes: &[u8]) -> Result<Vec<EvalCase>> {
             })
         }
         let no = x.question_id.ends_with("_abs");
-        ensure!(
-            x.answer_session_ids.iter().all(|id| sids.contains(id)),
-            "answer_session_id must name an imported haystack session"
-        );
         let original_answer_session_ids = x.answer_session_ids.clone();
         let mut negative_evidence = BTreeSet::new();
         if no {
-            negative_evidence.extend(original_answer_session_ids.iter().cloned());
+            negative_evidence.extend(
+                original_answer_session_ids
+                    .iter()
+                    .filter(|id| sids.contains(*id))
+                    .cloned(),
+            );
             negative_evidence.extend(has_answer_session_ids);
+        } else {
+            ensure!(
+                original_answer_session_ids
+                    .iter()
+                    .all(|id| sids.contains(id)),
+                "answer_session_id must name an imported haystack session"
+            );
         }
         let class = if no {
             EvalQuestionClass::NoAnswer
