@@ -396,6 +396,7 @@ pub struct EvalJsonl {
     run_fingerprint: String,
     benchmark: EvalBenchmark,
     dataset_sha256: String,
+    poisoned: bool,
 }
 impl EvalJsonl {
     pub fn open(path: &Path, fp: &str, b: EvalBenchmark, d: &str) -> Result<Self> {
@@ -409,9 +410,11 @@ impl EvalJsonl {
             );
             for (i, line) in BufReader::new(File::open(path)?).lines().enumerate() {
                 let line = line?;
-                if line.trim().is_empty() {
-                    continue;
-                }
+                ensure!(
+                    !line.trim().is_empty(),
+                    "empty evaluation JSONL line {}",
+                    i + 1
+                );
                 let r: EvalRecord = serde_json::from_str(&line)
                     .with_context(|| format!("malformed JSONL line {}", i + 1))?;
                 ensure!(
@@ -436,12 +439,14 @@ impl EvalJsonl {
             run_fingerprint: fp.to_owned(),
             benchmark: b,
             dataset_sha256: d.to_owned(),
+            poisoned: false,
         })
     }
     pub fn contains(&self, id: &str) -> bool {
         self.ids.contains(id)
     }
     pub fn append(&mut self, r: EvalRecord) -> Result<()> {
+        ensure!(!self.poisoned, "evaluation JSONL writer is poisoned");
         ensure!(
             r.schema_version == EVAL_SCHEMA_VERSION
                 && r.run_fingerprint == self.run_fingerprint
@@ -449,14 +454,28 @@ impl EvalJsonl {
                 && r.dataset_sha256 == self.dataset_sha256,
             "incompatible evaluation record"
         );
-        ensure!(
-            self.ids.insert(r.question_id.clone()),
-            "duplicate question ID"
-        );
-        serde_json::to_writer(&mut self.file, &r)?;
-        self.file.write_all(b"\n")?;
-        self.file.flush()?;
-        self.file.sync_all()?;
+        ensure!(!self.ids.contains(&r.question_id), "duplicate question ID");
+        let mut encoded = serde_json::to_vec(&r)?;
+        encoded.push(b'\n');
+        let previous_len = match self.file.metadata() {
+            Ok(metadata) => metadata.len(),
+            Err(error) => {
+                self.poisoned = true;
+                return Err(error.into());
+            }
+        };
+        let written = self
+            .file
+            .write_all(&encoded)
+            .and_then(|()| self.file.flush())
+            .and_then(|()| self.file.sync_all());
+        if let Err(error) = written {
+            let _ = self.file.set_len(previous_len);
+            let _ = self.file.sync_all();
+            self.poisoned = true;
+            return Err(error.into());
+        }
+        self.ids.insert(r.question_id.clone());
         self.records.push(r);
         Ok(())
     }
@@ -565,6 +584,8 @@ fn lme(bytes: &[u8]) -> Result<Vec<EvalCase>> {
         );
         let mut sids = HashSet::new();
         let mut sessions = Vec::new();
+        let mut has_answer_message_ids = Vec::new();
+        let mut has_answer_session_ids = BTreeSet::new();
         for ((sid, date), msgs) in x
             .haystack_session_ids
             .iter()
@@ -588,21 +609,17 @@ fn lme(bytes: &[u8]) -> Result<Vec<EvalCase>> {
                     "assistant" => EventRole::Assistant,
                     _ => bail!("invalid LongMemEval role"),
                 };
-                let required = if i % 2 == 0 {
-                    EventRole::User
-                } else {
-                    EventRole::Assistant
-                };
-                ensure!(
-                    role == required,
-                    "LongMemEval messages must alternate user then assistant"
-                );
+                let external_id = format!("{sid}:{i}");
+                if m.has_answer == Some(true) {
+                    has_answer_message_ids.push(external_id.clone());
+                    has_answer_session_ids.insert(sid.clone());
+                }
                 messages.push(EvalMessage {
                     role,
                     speaker: m.role.clone(),
                     content: m.content.clone(),
                     evidence: EvalEvidenceRef {
-                        external_id: format!("{sid}:{i}"),
+                        external_id,
                         source_session_id: sid.clone(),
                         has_answer: m.has_answer,
                     },
@@ -619,18 +636,11 @@ fn lme(bytes: &[u8]) -> Result<Vec<EvalCase>> {
             x.answer_session_ids.iter().all(|id| sids.contains(id)),
             "answer_session_id must name an imported haystack session"
         );
+        let original_answer_session_ids = x.answer_session_ids.clone();
+        let mut negative_evidence = BTreeSet::new();
         if no {
-            ensure!(
-                x.answer_session_ids.is_empty(),
-                "_abs case cannot have answer_session_ids"
-            );
-            ensure!(
-                x.haystack_sessions
-                    .iter()
-                    .flatten()
-                    .all(|message| message.has_answer != Some(true)),
-                "_abs case cannot mark any message has_answer=true"
-            );
+            negative_evidence.extend(original_answer_session_ids.iter().cloned());
+            negative_evidence.extend(has_answer_session_ids);
         }
         let class = if no {
             EvalQuestionClass::NoAnswer
@@ -659,11 +669,19 @@ fn lme(bytes: &[u8]) -> Result<Vec<EvalCase>> {
             class,
             reference_time: time(&x.question_date, "%Y/%m/%d (%a) %H:%M")?,
             sessions,
-            gold_evidence: dedup(x.answer_session_ids),
+            gold_evidence: if no {
+                Vec::new()
+            } else {
+                dedup(x.answer_session_ids)
+            },
             unresolved_gold_evidence: vec![],
             stale_evidence: vec![],
-            negative_evidence: vec![],
-            source_metadata: json!({"question_type":x.question_type}),
+            negative_evidence: negative_evidence.into_iter().collect(),
+            source_metadata: json!({
+                "question_type":x.question_type,
+                "answer_session_ids":original_answer_session_ids,
+                "has_answer_message_ids":has_answer_message_ids,
+            }),
         })
     }
     Ok(out)
