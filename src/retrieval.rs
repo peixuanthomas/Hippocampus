@@ -2219,8 +2219,26 @@ impl RetrievalStore {
         state: &ControlState,
         session_filter: Option<&str>,
     ) -> RetrievalResult<usize> {
+        self.active_memory_document_count_filtered(connection, state, session_filter, true)
+    }
+
+    fn active_memory_document_count_filtered(
+        &self,
+        connection: &Connection,
+        state: &ControlState,
+        session_filter: Option<&str>,
+        allow_aggregate_documents: bool,
+    ) -> RetrievalResult<usize> {
+        let granularity_clause = if allow_aggregate_documents {
+            ""
+        } else {
+            " WHERE granularity IN ('message','fragment')"
+        };
         let mut statement = connection
-            .prepare("SELECT document_id,session_id FROM memory_documents ORDER BY document_id")
+            .prepare(&format!(
+                "SELECT document_id,session_id FROM memory_documents{granularity_clause}
+                 ORDER BY document_id"
+            ))
             .map_err(|error| self.database_error(error))?;
         let rows = statement
             .query_map([], |row| {
@@ -3066,10 +3084,34 @@ impl RetrievalStore {
         session_filter: Option<&str>,
         control: &ControlState,
     ) -> RetrievalResult<Vec<StoredEmbedding>> {
+        self.compatible_embeddings_from_connection_filtered(
+            connection,
+            spec,
+            fingerprint,
+            session_filter,
+            control,
+            true,
+        )
+    }
+
+    fn compatible_embeddings_from_connection_filtered(
+        &self,
+        connection: &Connection,
+        spec: &VectorIndexSpec,
+        fingerprint: &str,
+        session_filter: Option<&str>,
+        control: &ControlState,
+        allow_aggregate_documents: bool,
+    ) -> RetrievalResult<Vec<StoredEmbedding>> {
         let scope_clause = if session_filter.is_some() {
             " AND d.session_id=?4"
         } else {
             ""
+        };
+        let granularity_clause = if allow_aggregate_documents {
+            ""
+        } else {
+            " AND d.granularity IN ('message','fragment')"
         };
         let mut statement = connection
             .prepare(&format!(
@@ -3077,7 +3119,8 @@ impl RetrievalStore {
                         e.source_sha256, e.model, e.dimensions, e.index_fingerprint,
                         e.vector_blob, e.embedded_at
                  FROM memory_documents d JOIN memory_embeddings e ON e.document_id=d.document_id
-                 WHERE e.model=?1 AND e.dimensions=?2 AND e.index_fingerprint=?3{scope_clause}
+                 WHERE e.model=?1 AND e.dimensions=?2 AND e.index_fingerprint=?3
+                       {granularity_clause}{scope_clause}
                  ORDER BY d.document_id ASC"
             ))
             .map_err(|error| self.database_error(error))?;
@@ -4516,15 +4559,22 @@ impl RetrievalStore {
             .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
         let control = self.replay_control_state_under_guard()?;
         load_canonical_leaf_catalog(self, connection, &control)?;
-        let total = self.active_memory_document_count(connection, &control, session_filter)?;
+        let total = self.active_memory_document_count_filtered(
+            connection,
+            &control,
+            session_filter,
+            visibility.allow_aggregate_documents,
+        )?;
         let fingerprint = spec
             .fingerprint()
             .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
-        let rows = self.compatible_embeddings_from_connection(
+        let rows = self.compatible_embeddings_from_connection_filtered(
             connection,
             spec,
             &fingerprint,
             session_filter,
+            &control,
+            visibility.allow_aggregate_documents,
         )?;
         if total != rows.len() {
             return Err(RetrievalError::CorruptIndex(format!(
