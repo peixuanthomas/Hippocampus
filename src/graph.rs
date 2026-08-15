@@ -112,6 +112,12 @@ pub(crate) struct GraphRecallSeed {
     pub score: f64,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GraphRecallFilter {
+    pub cutoff: Option<DateTime<Utc>>,
+    pub allow_aggregate_documents: bool,
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct GraphRecallResult {
     pub paths: Vec<GraphPathTrace>,
@@ -662,6 +668,7 @@ pub(crate) fn recall_graph_from_connection(
     config: &MemoryConfig,
     seeds: &[GraphRecallSeed],
     session_filter: Option<&str>,
+    filter: GraphRecallFilter,
 ) -> RetrievalResult<GraphRecallResult> {
     config
         .validate()
@@ -749,9 +756,16 @@ pub(crate) fn recall_graph_from_connection(
         .iter()
         .map(|node| (node.id.as_str(), node))
         .collect::<BTreeMap<_, _>>();
+    let mut visible_nodes = BTreeSet::new();
+    for node in &nodes {
+        if graph_node_is_visible(store, connection, node, filter)? {
+            visible_nodes.insert(node.id.as_str());
+        }
+    }
     let allowed = |node: &Node| {
-        node.kind == GraphNodeKind::Entity
-            || session_filter.is_none_or(|scope| node.session_id.as_deref() == Some(scope))
+        visible_nodes.contains(node.id.as_str())
+            && (node.kind == GraphNodeKind::Entity
+                || session_filter.is_none_or(|scope| node.session_id.as_deref() == Some(scope)))
     };
     let channel_key = |channel| match channel {
         RetrievalChannel::Bm25 => 0_u8,
@@ -762,13 +776,31 @@ pub(crate) fn recall_graph_from_connection(
         RetrievalChannel::Graph => 5,
     };
     let mut channel_counts = BTreeMap::<u8, f64>::new();
+    let mut eligible_seeds = Vec::new();
     for seed in seeds {
+        let kind = if seed.channel == RetrievalChannel::Entity {
+            GraphNodeKind::Entity
+        } else {
+            GraphNodeKind::Document
+        };
+        let id = node_id(kind, &seed.source_id);
+        let node = by_id
+            .get(id.as_str())
+            .ok_or_else(|| RetrievalError::CorruptIndex(format!("图 seed 节点缺失：{id}")))?;
+        if allowed(node) {
+            eligible_seeds.push(seed);
+        }
+    }
+    if eligible_seeds.is_empty() {
+        return Ok(GraphRecallResult::default());
+    }
+    for seed in &eligible_seeds {
         *channel_counts.entry(channel_key(seed.channel)).or_default() += 1.0 / seed.rank as f64;
     }
     let active_channels = channel_counts.len() as f64;
     let mut seed_rows = Vec::new();
     let mut personalization = BTreeMap::<String, f64>::new();
-    for seed in seeds {
+    for seed in eligible_seeds {
         let kind = if seed.channel == RetrievalChannel::Entity {
             GraphNodeKind::Entity
         } else {
@@ -803,7 +835,10 @@ pub(crate) fn recall_graph_from_connection(
         let target = by_id
             .get(edge.target.as_str())
             .ok_or_else(|| RetrievalError::CorruptIndex(format!("图边 {} target 缺失", edge.id)))?;
-        if allowed(source) && allowed(target) {
+        if allowed(source)
+            && allowed(target)
+            && graph_edge_is_visible(store, connection, edge, filter)?
+        {
             incident.entry(edge.source.clone()).or_default().push(edge);
             incident.entry(edge.target.clone()).or_default().push(edge);
         }
@@ -1042,6 +1077,226 @@ pub(crate) fn recall_graph_from_connection(
         paths,
         warning: (!converged).then(|| "graph PPR did not converge after 50 iterations".into()),
     })
+}
+
+fn graph_time_is_visible(value: &str, cutoff: Option<DateTime<Utc>>) -> RetrievalResult<bool> {
+    cutoff.map_or(Ok(true), |cutoff| {
+        DateTime::parse_from_rfc3339(value)
+            .map(|time| time.with_timezone(&Utc) <= cutoff)
+            .map_err(|_| RetrievalError::CorruptIndex("图 visibility 时间损坏".into()))
+    })
+}
+
+fn graph_event_is_visible(
+    store: &RetrievalStore,
+    connection: &Connection,
+    event_id: &str,
+    cutoff: Option<DateTime<Utc>>,
+) -> RetrievalResult<bool> {
+    let created_at = connection
+        .query_row(
+            "SELECT created_at FROM events WHERE event_id=?1",
+            [event_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| store.database_error(error))?
+        .ok_or_else(|| {
+            RetrievalError::CorruptIndex(format!("图 provenance 事件缺失：{event_id}"))
+        })?;
+    graph_time_is_visible(&created_at, cutoff)
+}
+
+fn graph_document_is_visible(
+    store: &RetrievalStore,
+    connection: &Connection,
+    document_id: &str,
+    filter: GraphRecallFilter,
+) -> RetrievalResult<bool> {
+    let granularity = connection
+        .query_row(
+            "SELECT granularity FROM memory_documents WHERE document_id=?1",
+            [document_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| store.database_error(error))?
+        .ok_or_else(|| RetrievalError::CorruptIndex(format!("图文档缺失：{document_id}")))?;
+    if matches!(granularity.as_str(), "episode" | "session") && !filter.allow_aggregate_documents {
+        return Ok(false);
+    }
+    let mut statement = connection
+        .prepare(
+            "SELECT e.created_at FROM memory_document_members m
+             JOIN events e ON e.event_id=m.event_id
+             WHERE m.document_id=?1 ORDER BY m.ordinal",
+        )
+        .map_err(|error| store.database_error(error))?;
+    let rows = statement
+        .query_map([document_id], |row| row.get::<_, String>(0))
+        .map_err(|error| store.database_error(error))?;
+    let mut count = 0usize;
+    for row in rows {
+        count += 1;
+        if !graph_time_is_visible(
+            &row.map_err(|error| store.database_error(error))?,
+            filter.cutoff,
+        )? {
+            return Ok(false);
+        }
+    }
+    if count == 0 {
+        return Err(RetrievalError::CorruptIndex(format!(
+            "图文档 {document_id} 缺少 ordered members"
+        )));
+    }
+    Ok(true)
+}
+
+fn graph_node_is_visible(
+    store: &RetrievalStore,
+    connection: &Connection,
+    node: &Node,
+    filter: GraphRecallFilter,
+) -> RetrievalResult<bool> {
+    if filter.cutoff.is_none() && filter.allow_aggregate_documents {
+        return Ok(true);
+    }
+    match node.kind {
+        GraphNodeKind::Document => {
+            graph_document_is_visible(store, connection, &node.source_id, filter)
+        }
+        GraphNodeKind::Entity => {
+            let event_id = connection
+                .query_row(
+                    "SELECT created_event_id FROM memory_entities WHERE entity_id=?1",
+                    [&node.source_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|error| store.database_error(error))?
+                .ok_or_else(|| RetrievalError::CorruptIndex("图 entity 来源缺失".into()))?;
+            graph_event_is_visible(store, connection, &event_id, filter.cutoff)
+        }
+        GraphNodeKind::Claim => {
+            let row = connection
+                .query_row(
+                    "SELECT asserted_at,reference_time,valid_from FROM memory_claims WHERE claim_id=?1",
+                    [&node.source_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|error| store.database_error(error))?
+                .ok_or_else(|| RetrievalError::CorruptIndex("图 claim 来源缺失".into()))?;
+            let created_transition = connection
+                .query_row(
+                    "SELECT created_at FROM memory_claim_transitions
+                     WHERE claim_id=?1 AND reason='created' ORDER BY ordinal LIMIT 1",
+                    [&node.source_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|error| store.database_error(error))?
+                .ok_or_else(|| {
+                    RetrievalError::CorruptIndex("图 claim created transition 缺失".into())
+                })?;
+            for value in [&created_transition, &row.0, &row.1, &row.2] {
+                if !graph_time_is_visible(value, filter.cutoff)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+    }
+}
+
+fn graph_record_is_visible(
+    store: &RetrievalStore,
+    connection: &Connection,
+    record_id: &str,
+    filter: GraphRecallFilter,
+) -> RetrievalResult<bool> {
+    if connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM memory_documents WHERE document_id=?1)",
+            [record_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| store.database_error(error))?
+    {
+        return graph_document_is_visible(store, connection, record_id, filter);
+    }
+    for (table, id_column, has_event) in [
+        ("memory_entity_mentions", "mention_id", true),
+        ("memory_claim_evidence", "evidence_id", true),
+        ("memory_claim_transitions", "transition_id", false),
+    ] {
+        let sql = if has_event {
+            format!("SELECT created_at,event_id FROM {table} WHERE {id_column}=?1")
+        } else {
+            format!("SELECT created_at,NULL FROM {table} WHERE {id_column}=?1")
+        };
+        let row = connection
+            .query_row(&sql, [record_id], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            })
+            .optional()
+            .map_err(|error| store.database_error(error))?;
+        if let Some((time, event)) = row {
+            let time = time.ok_or_else(|| {
+                RetrievalError::CorruptIndex("图 record created_at binding 缺失".into())
+            })?;
+            if !graph_time_is_visible(&time, filter.cutoff)? {
+                return Ok(false);
+            }
+            return if has_event {
+                graph_event_is_visible(
+                    store,
+                    connection,
+                    event.as_deref().ok_or_else(|| {
+                        RetrievalError::CorruptIndex("图 record event binding 缺失".into())
+                    })?,
+                    filter.cutoff,
+                )
+            } else {
+                Ok(true)
+            };
+        }
+    }
+    graph_event_is_visible(store, connection, record_id, filter.cutoff)
+}
+
+fn graph_edge_is_visible(
+    store: &RetrievalStore,
+    connection: &Connection,
+    edge: &Edge,
+    filter: GraphRecallFilter,
+) -> RetrievalResult<bool> {
+    if filter.cutoff.is_none() && filter.allow_aggregate_documents {
+        return Ok(true);
+    }
+    let provenance: Provenance = serde_json::from_str(&edge.provenance_json)
+        .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+    for span in &provenance.spans {
+        if !graph_event_is_visible(store, connection, &span.event_id, filter.cutoff)? {
+            return Ok(false);
+        }
+    }
+    for record_id in &provenance.record_ids {
+        if !graph_record_is_visible(store, connection, record_id, filter)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn validate_graph_embeddings(embeddings: &[StoredEmbedding]) -> RetrievalResult<()> {

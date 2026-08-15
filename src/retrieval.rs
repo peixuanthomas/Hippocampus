@@ -116,6 +116,88 @@ pub struct HybridRecallOptions {
     pub query_origin: RecallQueryOrigin,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RecallVisibility {
+    cutoff: Option<DateTime<Utc>>,
+    allow_aggregate_documents: bool,
+}
+
+impl RecallVisibility {
+    fn from_options(options: &HybridRecallOptions) -> RetrievalResult<Self> {
+        let cutoff = match &options.query_origin {
+            RecallQueryOrigin::IndexedEvent => None,
+            RecallQueryOrigin::Synthetic { reference_time } => Some(parse_retrieval_time(
+                reference_time,
+                "synthetic reference_time",
+            )?),
+        };
+        Ok(Self {
+            cutoff,
+            allow_aggregate_documents: options.channels.episode,
+        })
+    }
+
+    fn event_created_at_is_visible(&self, created_at: &str) -> RetrievalResult<bool> {
+        self.cutoff.map_or(Ok(true), |cutoff| {
+            parse_retrieval_time(created_at, "event.created_at").map(|time| time <= cutoff)
+        })
+    }
+
+    fn document_is_visible(
+        &self,
+        store: &RetrievalStore,
+        connection: &Connection,
+        document_id: &str,
+        granularity: RetrievalDocumentGranularity,
+    ) -> RetrievalResult<bool> {
+        if matches!(
+            granularity,
+            RetrievalDocumentGranularity::Episode | RetrievalDocumentGranularity::Session
+        ) && !self.allow_aggregate_documents
+        {
+            return Ok(false);
+        }
+        let Some(cutoff) = self.cutoff else {
+            return Ok(true);
+        };
+        let mut statement = connection
+            .prepare(
+                "SELECT e.created_at FROM memory_document_members m
+                 JOIN events e ON e.event_id=m.event_id
+                 WHERE m.document_id=?1 ORDER BY m.ordinal",
+            )
+            .map_err(|error| store.database_error(error))?;
+        let rows = statement
+            .query_map([document_id], |row| row.get::<_, String>(0))
+            .map_err(|error| store.database_error(error))?;
+        let mut count = 0usize;
+        for row in rows {
+            count += 1;
+            if parse_retrieval_time(
+                &row.map_err(|error| store.database_error(error))?,
+                "event.created_at",
+            )? > cutoff
+            {
+                return Ok(false);
+            }
+        }
+        if count == 0 {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "文档 {document_id} 缺少 ordered members"
+            )));
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn cutoff(&self) -> Option<DateTime<Utc>> {
+        self.cutoff
+    }
+
+    pub(crate) fn allows_aggregate_documents(&self) -> bool {
+        self.allow_aggregate_documents
+    }
+}
+
 fn final_hard_limit(value: usize) -> Option<usize> {
     (value != DEFERRED_HARD_LIMIT).then_some(value)
 }
@@ -3511,6 +3593,16 @@ impl RetrievalStore {
                 self.verify_fresh(&session)?;
             }
         }
+        let visibility = RecallVisibility {
+            cutoff: match query_origin {
+                RecallQueryOrigin::IndexedEvent => None,
+                RecallQueryOrigin::Synthetic { reference_time } => Some(parse_retrieval_time(
+                    reference_time,
+                    "synthetic reference_time",
+                )?),
+            },
+            allow_aggregate_documents: false,
+        };
         let mut result = self.keyword_recall_core_from_connection(
             &transaction,
             raw_query,
@@ -3519,6 +3611,7 @@ impl RetrievalStore {
             session_filter,
             config,
             &state,
+            &visibility,
         )?;
         let recent = recent_event_ids.iter().map(String::as_str).collect();
         let mut used_events = result
@@ -3541,8 +3634,9 @@ impl RetrievalStore {
             &mut used_hashes,
             session_filter,
             &state,
+            &visibility,
         )?;
-        self.validate_recall_evidence_active(&transaction, &state, &result)?;
+        self.validate_recall_evidence_active(&transaction, &state, &result, &visibility)?;
         self.require_unchanged_control_state(&state)?;
         transaction
             .commit()
@@ -3560,6 +3654,7 @@ impl RetrievalStore {
         session_filter: Option<&str>,
         config: RetrievalConfig,
         control: &ControlState,
+        visibility: &RecallVisibility,
     ) -> RetrievalResult<RecallResult> {
         self.validate_recall_input_id(connection, control, current_user_event_id, session_filter)?;
         for event_id in recent_event_ids {
@@ -3644,11 +3739,12 @@ impl RetrievalStore {
                 end_char: end,
             };
             let active = control.allows_event(&session_id, &event_id_value);
-            if active {
+            let visible = visibility.event_created_at_is_visible(&created_at)?;
+            if active && visible {
                 active_rank += 1;
             }
             let mut candidate = RankedCandidate {
-                raw_rank: if active { active_rank } else { 0 },
+                raw_rank: if active && visible { active_rank } else { 0 },
                 document_id,
                 granularity: if granularity == "fragment" {
                     RetrievalDocumentGranularity::Fragment
@@ -3666,6 +3762,8 @@ impl RetrievalStore {
             };
             if !active {
                 candidate.reason = "control_excluded".into();
+            } else if !visible {
+                candidate.reason = "future_event".into();
             } else if event_id_value == current_user_event_id {
                 candidate.reason = "current_message".into();
             } else if recent.contains(event_id_value.as_str()) {
@@ -3749,15 +3847,28 @@ impl RetrievalStore {
         connection: &Connection,
         control: &ControlState,
         result: &RecallResult,
+        visibility: &RecallVisibility,
     ) -> RetrievalResult<()> {
         for selected in &result.trace.selected_evidence {
             let event = self.get_event_from_connection(connection, &selected.span.event_id)?;
             Self::require_active_event(control, &event)?;
+            if !visibility.event_created_at_is_visible(&event.created_at)? {
+                return Err(RetrievalError::CorruptIndex(format!(
+                    "召回证据 {} 超出 reference_time",
+                    event.id
+                )));
+            }
         }
         for evidence in &result.evidence {
             let event =
                 self.get_event_from_connection(connection, &evidence.selected.span.event_id)?;
             Self::require_active_event(control, &event)?;
+            if !visibility.event_created_at_is_visible(&event.created_at)? {
+                return Err(RetrievalError::CorruptIndex(format!(
+                    "召回证据 {} 超出 reference_time",
+                    event.id
+                )));
+            }
         }
         Ok(())
     }
@@ -4055,6 +4166,7 @@ impl RetrievalStore {
         connection: &Connection,
         spec: &VectorIndexSpec,
         session_filter: Option<&str>,
+        visibility: &RecallVisibility,
     ) -> RetrievalResult<(Arc<HnswVectorIndex>, Option<PendingVectorIndexCache>)> {
         spec.validate()
             .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
@@ -4074,6 +4186,24 @@ impl RetrievalStore {
                 "向量目录不完整：文档总数 {total}，兼容 embedding 数 {}",
                 rows.len()
             )));
+        }
+        let query_filtered = visibility.cutoff.is_some() || !visibility.allow_aggregate_documents;
+        if query_filtered {
+            let mut filtered = Vec::with_capacity(rows.len());
+            for row in rows {
+                if visibility.document_is_visible(
+                    self,
+                    connection,
+                    &row.document_id,
+                    row.granularity,
+                )? {
+                    filtered.push(row);
+                }
+            }
+            return HnswVectorIndex::rebuild(spec.clone(), filtered)
+                .map(Arc::new)
+                .map(|index| (index, None))
+                .map_err(|error| RetrievalError::CorruptIndex(error.to_string()));
         }
         if session_filter.is_some() {
             return HnswVectorIndex::rebuild(spec.clone(), rows)
@@ -4147,6 +4277,7 @@ impl RetrievalStore {
         vector_ms: u64,
         options: HybridRecallOptions,
     ) -> RetrievalResult<RecallResult> {
+        let visibility = RecallVisibility::from_options(&options)?;
         let _guard = self.acquire_root_read()?;
         let control = self.replay_control_state_under_guard()?;
         let mut connection = self.open_connection()?;
@@ -4181,6 +4312,7 @@ impl RetrievalStore {
                 session_filter,
                 retrieval_config.clone(),
                 &control,
+                &visibility,
             )?
         } else {
             empty_recall_base(raw_query, current_user_event_id, retrieval_config.clone())
@@ -4192,22 +4324,18 @@ impl RetrievalStore {
         };
         self.require_current_control_projection(&transaction, &control)?;
         bm25.trace.budget_allocation = memory_budget_trace(&memory_config, bm25.trace.query_kind);
-        let (index, pending_vector_cache) =
-            self.load_vector_index_from_connection(&transaction, spec, session_filter)?;
+        let (index, pending_vector_cache) = self.load_vector_index_from_connection(
+            &transaction,
+            spec,
+            session_filter,
+            &visibility,
+        )?;
         if index.is_empty() {
             return Err(RetrievalError::CorruptIndex("没有兼容的向量索引".into()));
         }
-        let mut hits = index
+        let hits = index
             .search(&query_vector, memory_config.vector_candidate_limit)
             .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
-        if !options.channels.episode {
-            hits.retain(|hit| {
-                !matches!(
-                    hit.granularity,
-                    RetrievalDocumentGranularity::Episode | RetrievalDocumentGranularity::Session
-                )
-            });
-        }
         let vector_aggregate_sources = hits
             .iter()
             .filter(|hit| {
@@ -4520,12 +4648,13 @@ impl RetrievalStore {
                 memory_config.candidate_limit,
                 &options.query_origin,
                 options.channels.episode,
+                &visibility,
             )
             .map_err(|error| HybridRecallFailure::new(HybridRecallStage::EntityState, error))?
         } else if options.channels.entity {
             let entity_started = Instant::now();
             let (entity_matches, _) = self
-                .load_entity_matches(&transaction, raw_query, session_filter)
+                .load_entity_matches(&transaction, raw_query, session_filter, &visibility)
                 .map_err(|error| HybridRecallFailure::new(HybridRecallStage::EntityState, error))?;
             StateSidecar {
                 entity_matches,
@@ -4563,6 +4692,10 @@ impl RetrievalStore {
                 &memory_config,
                 &graph_seeds,
                 session_filter,
+                crate::graph::GraphRecallFilter {
+                    cutoff: visibility.cutoff(),
+                    allow_aggregate_documents: visibility.allows_aggregate_documents(),
+                },
             )
             .map_err(|error| {
                 HybridRecallFailure::timed(HybridRecallStage::Graph, error, graph_started)
@@ -4630,11 +4763,12 @@ impl RetrievalStore {
             &mut expansion_hashes,
             session_filter,
             &control,
+            &visibility,
         )
         .map_err(|error| {
             HybridRecallFailure::timed(HybridRecallStage::Graph, error, graph_started)
         })?;
-        self.validate_recall_evidence_active(&transaction, &control, &result)?;
+        self.validate_recall_evidence_active(&transaction, &control, &result, &visibility)?;
         self.require_unchanged_control_state(&control)?;
         transaction
             .commit()
@@ -5284,6 +5418,7 @@ impl RetrievalStore {
         connection: &Connection,
         raw_query: &str,
         session_filter: Option<&str>,
+        visibility: &RecallVisibility,
     ) -> RetrievalResult<(Vec<EntityMatchTrace>, BTreeSet<String>)> {
         let normalized_query = normalize_match(raw_query);
         let identity_tokens = identity_token_ranges(&normalized_query);
@@ -5316,6 +5451,9 @@ impl RetrievalStore {
             .map_err(|error| self.database_error(error))?;
         for row in rows {
             let (id, text, normalized) = row.map_err(|error| self.database_error(error))?;
+            if !self.entity_is_visible(connection, &id, visibility)? {
+                continue;
+            }
             let occurrences =
                 identity_match_ranges(&normalized_query, &normalized, &identity_tokens);
             if id != "ent_self" && !is_generic_pronoun(&normalized) && !occurrences.is_empty() {
@@ -5349,6 +5487,9 @@ impl RetrievalStore {
             .map_err(|error| self.database_error(error))?;
         for row in rows {
             let (id, text, normalized, basis) = row.map_err(|error| self.database_error(error))?;
+            if !self.entity_is_visible(connection, &id, visibility)? {
+                continue;
+            }
             let occurrences =
                 identity_match_ranges(&normalized_query, &normalized, &identity_tokens);
             if !is_generic_pronoun(&normalized) && !occurrences.is_empty() {
@@ -5368,7 +5509,7 @@ impl RetrievalStore {
                 |row| row.get::<_, bool>(0),
             )
             .map_err(|error| self.database_error(error))?;
-        if self_eligible {
+        if self_eligible && self.entity_is_visible(connection, "ent_self", visibility)? {
             for pronoun in ["我", "本人", "i", "me", "my"] {
                 let occurrences =
                     identity_match_ranges(&normalized_query, pronoun, &identity_tokens);
@@ -5442,6 +5583,25 @@ impl RetrievalStore {
         Ok((entity_matches, selected_entities))
     }
 
+    fn entity_is_visible(
+        &self,
+        connection: &Connection,
+        entity_id: &str,
+        visibility: &RecallVisibility,
+    ) -> RetrievalResult<bool> {
+        let created_event_id = connection
+            .query_row(
+                "SELECT created_event_id FROM memory_entities WHERE entity_id=?1",
+                [entity_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| self.database_error(error))?
+            .ok_or_else(|| RetrievalError::CorruptIndex(format!("实体 {entity_id} 缺失")))?;
+        let event = self.get_event_from_connection(connection, &created_event_id)?;
+        visibility.event_created_at_is_visible(&event.created_at)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn load_state_sidecar(
         &self,
@@ -5454,13 +5614,14 @@ impl RetrievalStore {
         candidate_limit: usize,
         query_origin: &RecallQueryOrigin,
         episode_enabled: bool,
+        visibility: &RecallVisibility,
     ) -> RetrievalResult<StateSidecar> {
         let entity_started = Instant::now();
         validate_full_derived_integrity(connection)?;
         let original_valid_to = original_claim_valid_to_by_id(connection)?;
         let normalized_query = normalize_match(raw_query);
         let (entity_matches, selected_entities) =
-            self.load_entity_matches(connection, raw_query, session_filter)?;
+            self.load_entity_matches(connection, raw_query, session_filter, visibility)?;
         let entity_ms = elapsed_ms(entity_started);
         let state_started = Instant::now();
         let moment = match query_origin {
@@ -5922,6 +6083,9 @@ impl RetrievalStore {
                 continue;
             }
             let event = self.get_event_from_connection(connection, &event_id)?;
+            if parse_retrieval_time(&event.created_at, "event.created_at")? > visibility_upper {
+                continue;
+            }
             let session = self.get_session_from_connection(connection, &event.session_id)?;
             self.verify_fresh(&session)?;
             verify_event_hash(&event)?;
@@ -6692,6 +6856,7 @@ impl RetrievalStore {
         used_hashes: &mut HashSet<String>,
         session_filter: Option<&str>,
         control: &ControlState,
+        visibility: &RecallVisibility,
     ) -> RetrievalResult<()> {
         let mut budget = 0usize;
         let cores = evidence.clone();
@@ -6714,6 +6879,9 @@ impl RetrievalStore {
                 }
                 let adjacent = self.get_event_from_connection(connection, &id)?;
                 if !control.allows_event(&adjacent.session_id, &adjacent.id) {
+                    continue;
+                }
+                if !visibility.event_created_at_is_visible(&adjacent.created_at)? {
                     continue;
                 }
                 if session_filter.is_some_and(|scope| adjacent.session_id != scope) {
@@ -7214,9 +7382,18 @@ impl RetrievalStore {
             ));
         }
 
-        let (global_matches, _) = self.load_entity_matches(connection, &current.content, None)?;
-        let (session_matches, _) =
-            self.load_entity_matches(connection, &current.content, Some(&current.session_id))?;
+        let indexed_visibility = RecallVisibility {
+            cutoff: None,
+            allow_aggregate_documents: true,
+        };
+        let (global_matches, _) =
+            self.load_entity_matches(connection, &current.content, None, &indexed_visibility)?;
+        let (session_matches, _) = self.load_entity_matches(
+            connection,
+            &current.content,
+            Some(&current.session_id),
+            &indexed_visibility,
+        )?;
         let all_stored_entries_match_global_scope = trace
             .entity_matches
             .iter()
