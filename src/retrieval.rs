@@ -8189,6 +8189,192 @@ impl RetrievalStore {
         Ok(active)
     }
 
+    fn validate_retrieval_channel_contract(
+        &self,
+        connection: &Connection,
+        trace: &RetrievalTrace,
+    ) -> RetrievalResult<bool> {
+        if trace.channels.is_empty() {
+            return Ok(true);
+        }
+        const CHANNELS: [RetrievalChannel; 6] = [
+            RetrievalChannel::Bm25,
+            RetrievalChannel::Vector,
+            RetrievalChannel::Entity,
+            RetrievalChannel::State,
+            RetrievalChannel::Episode,
+            RetrievalChannel::Graph,
+        ];
+        if trace.channels.len() != CHANNELS.len()
+            || trace
+                .channels
+                .iter()
+                .zip(CHANNELS)
+                .any(|(actual, expected)| actual.channel != expected)
+        {
+            return Err(RetrievalError::CorruptIndex(
+                "retrieval trace channels 不符合 canonical producer".into(),
+            ));
+        }
+
+        let bm25_count = trace.candidates.len();
+        let vector_count = trace
+            .fusion_candidates
+            .iter()
+            .filter(|candidate| {
+                *candidate != &FusionCandidateTrace::default() && candidate.vector_rank.is_some()
+            })
+            .count();
+        let entity_count = trace
+            .entity_matches
+            .iter()
+            .filter(|matched| *matched != &EntityMatchTrace::default())
+            .count();
+        let state_count = trace
+            .state_selections
+            .iter()
+            .filter(|selection| *selection != &StateSelectionTrace::default())
+            .count();
+        let graph_count = trace
+            .graph_paths
+            .iter()
+            .filter(|path| *path != &crate::model::GraphPathTrace::default())
+            .count();
+        let mut aggregate_document_ids = BTreeSet::new();
+        let mut include_aggregate = |document_id: &str| -> RetrievalResult<()> {
+            if document_id.is_empty() {
+                return Err(RetrievalError::CorruptIndex(
+                    "retrieval trace aggregate document ID 为空".into(),
+                ));
+            }
+            let granularity = connection
+                .query_row(
+                    "SELECT granularity FROM memory_documents WHERE document_id=?1",
+                    [document_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|error| self.database_error(error))?
+                .ok_or_else(|| {
+                    RetrievalError::CorruptIndex(
+                        "retrieval trace aggregate source document 不存在".into(),
+                    )
+                })?;
+            if matches!(
+                parse_granularity(&granularity)?,
+                RetrievalDocumentGranularity::Episode | RetrievalDocumentGranularity::Session
+            ) {
+                aggregate_document_ids.insert(document_id.to_owned());
+            }
+            Ok(())
+        };
+        for candidate in trace
+            .fusion_candidates
+            .iter()
+            .filter(|candidate| *candidate != &FusionCandidateTrace::default())
+        {
+            for document_id in &candidate.source_document_ids {
+                include_aggregate(document_id)?;
+            }
+        }
+        for path in trace
+            .graph_paths
+            .iter()
+            .filter(|path| *path != &crate::model::GraphPathTrace::default())
+        {
+            include_aggregate(&path.target_document_id)?;
+        }
+        let derived_counts = [
+            bm25_count,
+            vector_count,
+            entity_count,
+            state_count,
+            aggregate_document_ids.len(),
+            graph_count,
+        ];
+
+        for (index, channel) in trace.channels.iter().enumerate() {
+            let status = channel.status.as_str();
+            let error_nonempty = channel
+                .error
+                .as_deref()
+                .is_some_and(|error| !error.is_empty());
+            let common_valid = match status {
+                "disabled" => {
+                    channel.candidate_count == 0
+                        && channel.elapsed_ms == 0
+                        && channel.error.is_none()
+                }
+                "empty" | "skipped" => channel.candidate_count == 0 && channel.error.is_none(),
+                "error" => channel.candidate_count == 0 && error_nonempty,
+                "ok" => channel.error.is_none(),
+                "discarded" => channel.candidate_count == 0,
+                _ => false,
+            };
+            let status_allowed = match channel.channel {
+                RetrievalChannel::Bm25 => matches!(status, "ok" | "disabled"),
+                RetrievalChannel::Vector => {
+                    matches!(status, "ok" | "disabled" | "error" | "discarded")
+                        && (status != "discarded" || error_nonempty)
+                }
+                RetrievalChannel::Entity | RetrievalChannel::State => {
+                    matches!(
+                        status,
+                        "ok" | "empty" | "disabled" | "skipped" | "discarded" | "error"
+                    ) && (status != "discarded" || channel.error.is_none())
+                }
+                RetrievalChannel::Episode => {
+                    matches!(
+                        status,
+                        "ok" | "empty" | "disabled" | "skipped" | "discarded"
+                    ) && (status != "discarded" || channel.error.is_none())
+                }
+                RetrievalChannel::Graph => {
+                    matches!(status, "ok" | "empty" | "disabled" | "skipped" | "error")
+                }
+            };
+            let derived = derived_counts[index];
+            let artifacts_match = match channel.channel {
+                RetrievalChannel::Bm25 => match status {
+                    "ok" => channel.candidate_count == derived,
+                    "disabled" => derived == 0,
+                    _ => false,
+                },
+                RetrievalChannel::Vector => {
+                    if status == "ok" {
+                        channel.candidate_count == derived
+                    } else {
+                        derived == 0
+                    }
+                }
+                RetrievalChannel::Entity
+                | RetrievalChannel::State
+                | RetrievalChannel::Episode
+                | RetrievalChannel::Graph => match status {
+                    "ok" => derived > 0 && channel.candidate_count == derived,
+                    "empty" => derived == 0 && channel.candidate_count == 0,
+                    _ => derived == 0,
+                },
+            };
+            if !common_valid || !status_allowed || !artifacts_match {
+                return Err(RetrievalError::CorruptIndex(
+                    "retrieval trace channel status/count/artifact 绑定不一致".into(),
+                ));
+            }
+        }
+        if matches!(trace.channels[4].status.as_str(), "skipped" | "discarded")
+            && trace
+                .fusion_candidates
+                .iter()
+                .any(|candidate| candidate != &FusionCandidateTrace::default())
+        {
+            return Err(RetrievalError::CorruptIndex(
+                "skipped/discarded Episode channel 包含 fusion artifacts".into(),
+            ));
+        }
+        Ok(matches!(trace.channels[4].status.as_str(), "ok" | "empty"))
+    }
+
     fn retrieval_trace_is_active(
         &self,
         connection: &Connection,
@@ -8196,6 +8382,7 @@ impl RetrievalStore {
         trace: &RetrievalTrace,
     ) -> RetrievalResult<bool> {
         let mut active = true;
+        let episode_enabled = self.validate_retrieval_channel_contract(connection, trace)?;
         if !trace.current_query_event_id.is_empty() {
             if control.event_is_excluded(&trace.current_query_event_id) {
                 active = false;
@@ -8228,36 +8415,6 @@ impl RetrievalStore {
                 self.ranked_candidate_document_is_active(connection, control, candidate)?;
             active &= span_active && document_active;
         }
-        let episode_enabled = if trace.channels.is_empty() {
-            true
-        } else {
-            const CHANNELS: [RetrievalChannel; 6] = [
-                RetrievalChannel::Bm25,
-                RetrievalChannel::Vector,
-                RetrievalChannel::Entity,
-                RetrievalChannel::State,
-                RetrievalChannel::Episode,
-                RetrievalChannel::Graph,
-            ];
-            const STATUSES: [&str; 6] =
-                ["ok", "empty", "disabled", "skipped", "discarded", "error"];
-            if trace.channels.len() != CHANNELS.len()
-                || trace
-                    .channels
-                    .iter()
-                    .zip(CHANNELS)
-                    .any(|(actual, expected)| {
-                        actual.channel != expected
-                            || actual.status.is_empty()
-                            || !STATUSES.contains(&actual.status.as_str())
-                    })
-            {
-                return Err(RetrievalError::CorruptIndex(
-                    "retrieval trace channels 不符合 canonical producer".into(),
-                ));
-            }
-            trace.channels[4].status != "disabled"
-        };
         for candidate in &trace.fusion_candidates {
             if candidate == &FusionCandidateTrace::default() {
                 continue;
