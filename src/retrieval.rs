@@ -8423,6 +8423,11 @@ impl RetrievalStore {
                 ));
             }
         }
+        if trace.channels[1].status != "ok" && !trace.fusion_candidates.is_empty() {
+            return Err(RetrievalError::CorruptIndex(
+                "非 ok Vector channel 包含 fusion artifacts".into(),
+            ));
+        }
         if matches!(trace.channels[4].status.as_str(), "skipped" | "discarded")
             && trace
                 .fusion_candidates
