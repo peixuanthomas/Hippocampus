@@ -3884,6 +3884,11 @@ impl RetrievalStore {
         retrieval_config: RetrievalConfig,
         memory_config: &MemoryConfig,
     ) -> RetrievalResult<RecallResult> {
+        let channels = if memory_config.enabled {
+            RecallChannels::all()
+        } else {
+            RecallChannels::bm25_only()
+        };
         self.hybrid_recall_with_options(
             backend,
             raw_query,
@@ -3892,7 +3897,10 @@ impl RetrievalStore {
             session_filter,
             retrieval_config,
             memory_config,
-            HybridRecallOptions::default(),
+            HybridRecallOptions {
+                channels,
+                query_origin: RecallQueryOrigin::IndexedEvent,
+            },
         )
         .await
     }
@@ -4640,6 +4648,7 @@ impl RetrievalStore {
         let mut sidecar = if options.channels.state {
             self.load_state_sidecar(
                 &transaction,
+                &control,
                 raw_query,
                 current_user_event_id,
                 recent_event_ids,
@@ -4654,7 +4663,13 @@ impl RetrievalStore {
         } else if options.channels.entity {
             let entity_started = Instant::now();
             let (entity_matches, _) = self
-                .load_entity_matches(&transaction, raw_query, session_filter, &visibility)
+                .load_entity_matches(
+                    &transaction,
+                    &control,
+                    raw_query,
+                    session_filter,
+                    &visibility,
+                )
                 .map_err(|error| HybridRecallFailure::new(HybridRecallStage::EntityState, error))?;
             StateSidecar {
                 entity_matches,
@@ -5416,6 +5431,7 @@ impl RetrievalStore {
     fn load_entity_matches(
         &self,
         connection: &Connection,
+        control: &ControlState,
         raw_query: &str,
         session_filter: Option<&str>,
         visibility: &RecallVisibility,
@@ -5433,15 +5449,11 @@ impl RetrievalStore {
         let mut statement = connection
             .prepare(
                 "SELECT e.entity_id,e.canonical_name,e.normalized_name
-                 FROM memory_entities e
-                 WHERE EXISTS (SELECT 1 FROM memory_entity_mentions m
-                     WHERE m.entity_id=e.entity_id AND m.entity_status='resolved'
-                       AND (?1 IS NULL OR m.session_id=?1))
-                 ORDER BY e.entity_id",
+                 FROM memory_entities e ORDER BY e.entity_id",
             )
             .map_err(|error| self.database_error(error))?;
         let rows = statement
-            .query_map([session_filter], |row| {
+            .query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
@@ -5451,7 +5463,7 @@ impl RetrievalStore {
             .map_err(|error| self.database_error(error))?;
         for row in rows {
             let (id, text, normalized) = row.map_err(|error| self.database_error(error))?;
-            if !self.entity_is_visible(connection, &id, visibility)? {
+            if !self.entity_is_visible(connection, control, &id, session_filter, visibility)? {
                 continue;
             }
             let occurrences =
@@ -5466,12 +5478,10 @@ impl RetrievalStore {
         drop(statement);
         let mut statement = connection
             .prepare(
-                "SELECT a.entity_id,a.alias_text,a.normalized_alias,a.alias_kind
+                "SELECT a.entity_id,a.alias_text,a.normalized_alias,a.alias_kind,a.session_id,
+                        a.event_id,a.proof_event_id,a.identity_event_id
                  FROM memory_entity_aliases a JOIN memory_entities e ON e.entity_id=a.entity_id
                  WHERE (?1 IS NULL OR a.session_id=?1)
-                   AND EXISTS (SELECT 1 FROM memory_entity_mentions m
-                       WHERE m.entity_id=a.entity_id AND m.entity_status='resolved'
-                         AND m.session_id=a.session_id)
                  ORDER BY a.alias_id",
             )
             .map_err(|error| self.database_error(error))?;
@@ -5482,12 +5492,42 @@ impl RetrievalStore {
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
                 ))
             })
             .map_err(|error| self.database_error(error))?;
         for row in rows {
-            let (id, text, normalized, basis) = row.map_err(|error| self.database_error(error))?;
-            if !self.entity_is_visible(connection, &id, visibility)? {
+            let (
+                id,
+                text,
+                normalized,
+                basis,
+                alias_session,
+                event_id,
+                proof_event_id,
+                identity_event_id,
+            ) = row.map_err(|error| self.database_error(error))?;
+            if !self.alias_provenance_is_visible(
+                connection,
+                control,
+                &alias_session,
+                [
+                    event_id.as_deref(),
+                    proof_event_id.as_deref(),
+                    identity_event_id.as_deref(),
+                ],
+                session_filter,
+                visibility,
+            )? || !self.entity_is_visible(
+                connection,
+                control,
+                &id,
+                session_filter,
+                visibility,
+            )? {
                 continue;
             }
             let occurrences =
@@ -5503,13 +5543,20 @@ impl RetrievalStore {
         drop(statement);
         let self_eligible = connection
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM memory_entity_mentions WHERE entity_id='ent_self'
-                 AND entity_status='resolved' AND (?1 IS NULL OR session_id=?1))",
-                [session_filter],
+                "SELECT EXISTS(SELECT 1 FROM memory_entities WHERE entity_id='ent_self')",
+                [],
                 |row| row.get::<_, bool>(0),
             )
             .map_err(|error| self.database_error(error))?;
-        if self_eligible && self.entity_is_visible(connection, "ent_self", visibility)? {
+        if self_eligible
+            && self.entity_is_visible(
+                connection,
+                control,
+                "ent_self",
+                session_filter,
+                visibility,
+            )?
+        {
             for pronoun in ["我", "本人", "i", "me", "my"] {
                 let occurrences =
                     identity_match_ranges(&normalized_query, pronoun, &identity_tokens);
@@ -5586,7 +5633,9 @@ impl RetrievalStore {
     fn entity_is_visible(
         &self,
         connection: &Connection,
+        control: &ControlState,
         entity_id: &str,
+        session_filter: Option<&str>,
         visibility: &RecallVisibility,
     ) -> RetrievalResult<bool> {
         let created_event_id = connection
@@ -5598,14 +5647,104 @@ impl RetrievalStore {
             .optional()
             .map_err(|error| self.database_error(error))?
             .ok_or_else(|| RetrievalError::CorruptIndex(format!("实体 {entity_id} 缺失")))?;
-        let event = self.get_event_from_connection(connection, &created_event_id)?;
-        visibility.event_created_at_is_visible(&event.created_at)
+        let event = self.authoritative_indexed_event(connection, &created_event_id)?;
+        if !control.allows_session(&event.session_id)
+            || !control.allows_event(&event.session_id, &event.id)
+        {
+            return Ok(false);
+        }
+        Ok(visibility.event_created_at_is_visible(&event.created_at)?
+            && self.entity_has_visible_resolved_mention(
+                connection,
+                control,
+                entity_id,
+                session_filter,
+                visibility,
+            )?)
+    }
+
+    fn entity_has_visible_resolved_mention(
+        &self,
+        connection: &Connection,
+        control: &ControlState,
+        entity_id: &str,
+        session_filter: Option<&str>,
+        visibility: &RecallVisibility,
+    ) -> RetrievalResult<bool> {
+        let mut statement = connection
+            .prepare(
+                "SELECT event_id,session_id FROM memory_entity_mentions
+                 WHERE entity_id=?1 AND entity_status='resolved'
+                   AND (?2 IS NULL OR session_id=?2)
+                 ORDER BY mention_id",
+            )
+            .map_err(|error| self.database_error(error))?;
+        let rows = statement
+            .query_map(params![entity_id, session_filter], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| self.database_error(error))?;
+        let mut visible = false;
+        for row in rows {
+            let (event_id, mention_session) = row.map_err(|error| self.database_error(error))?;
+            let event = self.authoritative_indexed_event(connection, &event_id)?;
+            if event.session_id != mention_session {
+                return Err(RetrievalError::CorruptIndex(format!(
+                    "实体 {entity_id} mention 会话绑定损坏"
+                )));
+            }
+            if session_filter.is_some_and(|scope| scope != event.session_id) {
+                return Err(RetrievalError::CorruptIndex(format!(
+                    "实体 {entity_id} mention 超出会话范围"
+                )));
+            }
+            if !control.allows_session(&event.session_id)
+                || !control.allows_event(&event.session_id, &event.id)
+            {
+                continue;
+            }
+            visible |= visibility.event_created_at_is_visible(&event.created_at)?;
+        }
+        Ok(visible)
+    }
+
+    fn alias_provenance_is_visible(
+        &self,
+        connection: &Connection,
+        control: &ControlState,
+        alias_session: &str,
+        event_ids: [Option<&str>; 3],
+        session_filter: Option<&str>,
+        visibility: &RecallVisibility,
+    ) -> RetrievalResult<bool> {
+        let mut visible = true;
+        for event_id in event_ids.into_iter().flatten() {
+            let event = self.authoritative_indexed_event(connection, event_id)?;
+            if event.session_id != alias_session {
+                return Err(RetrievalError::CorruptIndex(
+                    "entity alias provenance 会话绑定损坏".into(),
+                ));
+            }
+            if session_filter.is_some_and(|scope| scope != event.session_id) {
+                return Err(RetrievalError::CorruptIndex(
+                    "entity alias provenance 超出会话范围".into(),
+                ));
+            }
+            if !control.allows_session(&event.session_id)
+                || !control.allows_event(&event.session_id, &event.id)
+            {
+                return Ok(false);
+            }
+            visible &= visibility.event_created_at_is_visible(&event.created_at)?;
+        }
+        Ok(visible)
     }
 
     #[allow(clippy::too_many_arguments)]
     fn load_state_sidecar(
         &self,
         connection: &Connection,
+        control: &ControlState,
         raw_query: &str,
         current_user_event_id: &str,
         recent_event_ids: &[String],
@@ -5621,7 +5760,7 @@ impl RetrievalStore {
         let original_valid_to = original_claim_valid_to_by_id(connection)?;
         let normalized_query = normalize_match(raw_query);
         let (entity_matches, selected_entities) =
-            self.load_entity_matches(connection, raw_query, session_filter, visibility)?;
+            self.load_entity_matches(connection, control, raw_query, session_filter, visibility)?;
         let entity_ms = elapsed_ms(entity_started);
         let state_started = Instant::now();
         let moment = match query_origin {
@@ -5899,7 +6038,9 @@ impl RetrievalStore {
             let object_resolved = if object_kind == "entity" {
                 object
                     .as_deref()
-                    .map(|id| entity_is_resolved(connection, id))
+                    .map(|id| {
+                        self.entity_is_visible(connection, control, id, session_filter, visibility)
+                    })
                     .transpose()?
                     .unwrap_or(false)
             } else {
@@ -7358,6 +7499,7 @@ impl RetrievalStore {
     fn validate_entity_trace_provenance(
         &self,
         connection: &Connection,
+        control: &ControlState,
         trace: &RetrievalTrace,
         current: &StoredEvent,
     ) -> RetrievalResult<()> {
@@ -7386,10 +7528,16 @@ impl RetrievalStore {
             cutoff: None,
             allow_aggregate_documents: true,
         };
-        let (global_matches, _) =
-            self.load_entity_matches(connection, &current.content, None, &indexed_visibility)?;
+        let (global_matches, _) = self.load_entity_matches(
+            connection,
+            control,
+            &current.content,
+            None,
+            &indexed_visibility,
+        )?;
         let (session_matches, _) = self.load_entity_matches(
             connection,
+            control,
             &current.content,
             Some(&current.session_id),
             &indexed_visibility,
@@ -7421,17 +7569,21 @@ impl RetrievalStore {
             }
             let resolved_entity = connection
                 .query_row(
-                    "SELECT EXISTS(
-                         SELECT 1 FROM memory_entities e
-                         WHERE e.entity_id=?1 AND e.disambiguation='resolved'
-                           AND EXISTS (SELECT 1 FROM memory_entity_mentions m
-                               WHERE m.entity_id=e.entity_id AND m.entity_status='resolved')
-                     )",
+                    "SELECT EXISTS(SELECT 1 FROM memory_entities
+                         WHERE entity_id=?1 AND disambiguation='resolved')",
                     [entity_id],
                     |row| row.get::<_, bool>(0),
                 )
                 .map_err(|error| self.database_error(error))?;
-            if !resolved_entity {
+            if !resolved_entity
+                || !self.entity_has_visible_resolved_mention(
+                    connection,
+                    control,
+                    entity_id,
+                    None,
+                    &indexed_visibility,
+                )?
+            {
                 return Err(RetrievalError::CorruptIndex(
                     "selected entity trace 不属于 resolved projection".into(),
                 ));
@@ -7987,7 +8139,7 @@ impl RetrievalStore {
                     "entity trace current query 不是 user event".into(),
                 ));
             }
-            self.validate_entity_trace_provenance(connection, trace, &current)?;
+            self.validate_entity_trace_provenance(connection, control, trace, &current)?;
             active &= control.allows_event(&current.session_id, &current.id);
         }
         if has_state_selections {
@@ -13170,16 +13322,6 @@ fn claim_overlap(terms: &BTreeSet<String>, predicate: &str, relation: &str, obje
                 .any(|field| query_contains_match(field, term) || query_contains_match(term, field))
         })
         .count()
-}
-
-fn entity_is_resolved(connection: &Connection, entity_id: &str) -> RetrievalResult<bool> {
-    connection
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM memory_entity_mentions WHERE entity_id=?1 AND entity_status='resolved')",
-            [entity_id],
-            |row| row.get(0),
-        )
-        .map_err(|error| RetrievalError::CorruptIndex(format!("实体状态查询失败：{error}")))
 }
 
 fn state_priority(state: &str) -> u8 {
