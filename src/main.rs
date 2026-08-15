@@ -3,19 +3,24 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use hippocampus::config::AppConfig;
 use hippocampus::engine::PreparationStatus;
 use hippocampus::model::{
-    BudgetConfig, ChatEventKind, ChatMessage, Session, TokenUsage, Turn, identity_instruction,
+    BudgetConfig, ChatEventKind, ChatMessage, RetrievalConfig, Session, TokenUsage, Turn,
+    identity_instruction, utc_now,
 };
 use hippocampus::ollama::{ChatBackend, ChatRequest};
 use hippocampus::{
     ChatEngine, ConsolidationRunReport, ConsolidationRunStatus, ConsolidationTrigger,
-    KnowledgeSyncReport, LimitAction, OllamaClient, SessionStore,
+    ControlRecord, ControlTarget, ControlTargetKind, EmbeddingRefreshReport,
+    GraphMaterializationReport, HybridRecallOptions, KnowledgeSyncReport, LimitAction,
+    MemoryStatus, OllamaClient, RebuildOptions, RebuildReport, RecallChannels, RecallQueryOrigin,
+    RecallResult, SessionStore,
 };
 use serde::Serialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Parser)]
@@ -77,6 +82,53 @@ enum MemoryCommand {
         #[arg(long)]
         json: bool,
     },
+    /// 查看派生记忆健康状态
+    Status {
+        session: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 检索派生记忆，不生成回答
+    Search {
+        query: String,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long, value_enum, value_delimiter = ',')]
+        channels: Vec<MemoryChannel>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 从原始会话重建派生记忆
+    Rebuild {
+        #[arg(long)]
+        reembed: bool,
+    },
+    /// 排除会话或事件
+    Exclude {
+        #[command(subcommand)]
+        target: MemoryTarget,
+    },
+    /// 恢复会话或事件
+    Restore {
+        #[command(subcommand)]
+        target: MemoryTarget,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum MemoryChannel {
+    Bm25,
+    Vector,
+    Entity,
+    State,
+    Episode,
+    Graph,
+}
+
+#[derive(Debug, Subcommand)]
+enum MemoryTarget {
+    Session { id: String },
+    Event { id: String },
 }
 
 #[derive(Debug, Args)]
@@ -223,6 +275,9 @@ impl AskArgs {
 #[tokio::main]
 async fn main() {
     if let Err(error) = run().await {
+        if error.is::<SilentCliExit>() {
+            std::process::exit(1);
+        }
         eprintln!("错误：{error:#}");
         std::process::exit(1);
     }
@@ -241,7 +296,7 @@ async fn run() -> Result<()> {
         Some(Command::Ask(args)) => run_ask(store, &cli.host, args, &config).await,
         Some(Command::Serve(args)) => run_serve(store, &cli.host, args, &config).await,
         Some(Command::Knowledge(args)) => run_knowledge(store, &cli.host, args, &config).await,
-        Some(Command::Memory(args)) => run_memory(store, args, &config).await,
+        Some(Command::Memory(args)) => run_memory(store, &cli.host, args, &config).await,
     }
 }
 
@@ -488,11 +543,464 @@ async fn run_knowledge(
     Ok(())
 }
 
-async fn run_memory(store: SessionStore, args: MemoryArgs, config: &AppConfig) -> Result<()> {
+#[derive(Debug)]
+struct SilentCliExit;
+
+impl std::fmt::Display for SilentCliExit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("command failed after printing its report")
+    }
+}
+
+impl std::error::Error for SilentCliExit {}
+
+#[derive(Serialize)]
+struct MemorySearchOutput<'a> {
+    query: &'a str,
+    session_id: Option<&'a str>,
+    reference_time: &'a str,
+    channels: &'a [&'static str],
+    recall: &'a RecallResult,
+}
+
+struct MemoryMaintenanceReport {
+    rebuild: RebuildReport,
+    embedding: Option<EmbeddingRefreshReport>,
+    graph: Option<GraphMaterializationReport>,
+}
+
+async fn run_memory(
+    store: SessionStore,
+    host: &str,
+    args: MemoryArgs,
+    config: &AppConfig,
+) -> Result<()> {
     match args.command {
         MemoryCommand::Consolidate { session, all, json } => {
             run_memory_consolidate(store, session, all, json, config).await
         }
+        MemoryCommand::Status { session, json } => {
+            run_memory_status(&store, session.as_deref(), json, config)
+        }
+        MemoryCommand::Search {
+            query,
+            session,
+            channels,
+            json,
+        } => {
+            run_memory_search(
+                &store,
+                host,
+                &query,
+                session.as_deref(),
+                &channels,
+                json,
+                config,
+            )
+            .await
+        }
+        MemoryCommand::Rebuild { reembed } => {
+            if reembed && !config.memory.enabled {
+                bail!("memory rebuild --reembed requires memory.enabled=true");
+            }
+            let rebuild = rebuild_projection(&store, !reembed).await?;
+            let report = refresh_after_rebuild(&store, host, config, rebuild)
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "raw data is unchanged and the rebuild commit succeeded, but derived refresh is incomplete: {error:#}"
+                    )
+                })?;
+            print_memory_maintenance(&report);
+            Ok(())
+        }
+        MemoryCommand::Exclude { target } => {
+            run_memory_control(&store, host, target, true, config).await
+        }
+        MemoryCommand::Restore { target } => {
+            run_memory_control(&store, host, target, false, config).await
+        }
+    }
+}
+
+fn run_memory_status(
+    store: &SessionStore,
+    session: Option<&str>,
+    json_output: bool,
+    config: &AppConfig,
+) -> Result<()> {
+    let status = store.retrieval().memory_status(&config.memory, session)?;
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&status)?);
+    } else {
+        print_memory_status(&status);
+    }
+    if status.healthy {
+        Ok(())
+    } else {
+        Err(SilentCliExit.into())
+    }
+}
+
+fn print_memory_status(status: &MemoryStatus) {
+    println!(
+        "session_id: {}",
+        status.session_id.as_deref().unwrap_or("all")
+    );
+    println!("healthy: {}", status.healthy);
+    println!("memory_enabled: {}", status.memory_enabled);
+    println!("projection_current: {}", status.projection_current);
+    println!(
+        "expected_control_generation_sha256: {}",
+        status.expected_control_generation_sha256
+    );
+    println!(
+        "indexed_control_generation_sha256: {}",
+        status
+            .indexed_control_generation_sha256
+            .as_deref()
+            .unwrap_or("none")
+    );
+    println!(
+        "validation_error: {}",
+        status.validation_error.as_deref().unwrap_or("none")
+    );
+    if let Some(metrics) = &status.metrics {
+        println!("active_sessions: {}", metrics.active_sessions);
+        println!("active_events: {}", metrics.active_events);
+        println!("embedding_total: {}", metrics.embedding_total);
+        println!("embedding_compatible: {}", metrics.embedding_compatible);
+        println!("embedding_stale: {}", metrics.embedding_stale);
+        println!(
+            "pending_consolidation_events: {}",
+            metrics.pending_consolidation_events
+        );
+        println!("entity_count: {}", metrics.entity_count);
+        println!("episode_count: {}", metrics.episode_count);
+        println!("graph_current: {}", metrics.graph_current);
+        println!(
+            "graph_node_count: {}",
+            display_optional(metrics.graph_node_count)
+        );
+        println!(
+            "graph_edge_count: {}",
+            display_optional(metrics.graph_edge_count)
+        );
+        println!(
+            "consolidation_attempts: applied={} rejected={} model_error={} cancelled={} failed={}",
+            metrics.consolidation_attempts.applied,
+            metrics.consolidation_attempts.rejected,
+            metrics.consolidation_attempts.model_error,
+            metrics.consolidation_attempts.cancelled,
+            metrics.consolidation_attempts.failed
+        );
+        println!(
+            "consolidation_latency_ms: samples={} p50={} p95={}",
+            metrics.consolidation_latency_ms.samples,
+            display_optional(metrics.consolidation_latency_ms.p50_ms),
+            display_optional(metrics.consolidation_latency_ms.p95_ms)
+        );
+        println!("retrieval_runs: {}", metrics.retrieval_runs);
+        println!("retrieval_failures: {}", metrics.retrieval_failures);
+        println!(
+            "retrieval_latency_ms: samples={} p50={} p95={}",
+            metrics.retrieval_latency_ms.samples,
+            display_optional(metrics.retrieval_latency_ms.p50_ms),
+            display_optional(metrics.retrieval_latency_ms.p95_ms)
+        );
+    }
+}
+
+fn display_optional<T: std::fmt::Display>(value: Option<T>) -> String {
+    value.map_or_else(|| "none".into(), |value| value.to_string())
+}
+
+async fn run_memory_search(
+    store: &SessionStore,
+    host: &str,
+    query: &str,
+    session: Option<&str>,
+    requested_channels: &[MemoryChannel],
+    json_output: bool,
+    config: &AppConfig,
+) -> Result<()> {
+    let (session_id, retrieval_config) = if let Some(identifier) = session {
+        let session = store.load(identifier)?;
+        (Some(session.id), session.retrieval)
+    } else {
+        (None, RetrievalConfig::default())
+    };
+    let channels = recall_channels(requested_channels, config.memory.enabled)?;
+    let channel_names = enabled_channel_names(channels);
+    let reference_time = utc_now();
+    let sentinel = memory_search_sentinel(query, session_id.as_deref(), &channel_names);
+    let client = OllamaClient::new(host)?;
+    let recall = store
+        .retrieval()
+        .hybrid_recall_with_options(
+            &client,
+            query,
+            &sentinel,
+            &[],
+            session_id.as_deref(),
+            retrieval_config,
+            &config.memory,
+            HybridRecallOptions {
+                channels,
+                query_origin: RecallQueryOrigin::Synthetic {
+                    reference_time: reference_time.clone(),
+                },
+            },
+        )
+        .await?;
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&MemorySearchOutput {
+                query,
+                session_id: session_id.as_deref(),
+                reference_time: &reference_time,
+                channels: &channel_names,
+                recall: &recall,
+            })?
+        );
+    } else {
+        for channel in &recall.trace.channels {
+            println!(
+                "{:?}: status={} count={} error={}",
+                channel.channel,
+                channel.status,
+                channel.candidate_count,
+                channel.error.as_deref().unwrap_or("none")
+            );
+        }
+        for warning in &recall.trace.warnings {
+            println!("warning: {warning}");
+        }
+        for (index, evidence) in recall.evidence.iter().enumerate() {
+            println!(
+                "[{}] {}:{}..{} role={:?} kind={:?} reason={}\n{}",
+                index + 1,
+                evidence.selected.span.event_id,
+                evidence.selected.span.start_char,
+                evidence.selected.span.end_char,
+                evidence.selected.role,
+                evidence.selected.kind,
+                evidence.selected.reason,
+                evidence.content
+            );
+        }
+    }
+    Ok(())
+}
+
+fn recall_channels(requested: &[MemoryChannel], memory_enabled: bool) -> Result<RecallChannels> {
+    let mut channels = if requested.is_empty() {
+        if memory_enabled {
+            RecallChannels::all()
+        } else {
+            RecallChannels::bm25_only()
+        }
+    } else {
+        RecallChannels {
+            bm25: false,
+            vector: false,
+            entity: false,
+            state: false,
+            episode: false,
+            graph: false,
+        }
+    };
+    for channel in requested {
+        match channel {
+            MemoryChannel::Bm25 => channels.bm25 = true,
+            MemoryChannel::Vector => channels.vector = true,
+            MemoryChannel::Entity => channels.entity = true,
+            MemoryChannel::State => channels.state = true,
+            MemoryChannel::Episode => channels.episode = true,
+            MemoryChannel::Graph => channels.graph = true,
+        }
+    }
+    channels.validate().map_err(anyhow::Error::msg)?;
+    if !memory_enabled && channels != RecallChannels::bm25_only() {
+        bail!("memory.enabled=false only supports BM25-only recall");
+    }
+    Ok(channels)
+}
+
+fn enabled_channel_names(channels: RecallChannels) -> Vec<&'static str> {
+    [
+        (channels.bm25, "bm25"),
+        (channels.vector, "vector"),
+        (channels.entity, "entity"),
+        (channels.state, "state"),
+        (channels.episode, "episode"),
+        (channels.graph, "graph"),
+    ]
+    .into_iter()
+    .filter_map(|(enabled, name)| enabled.then_some(name))
+    .collect()
+}
+
+fn memory_search_sentinel(query: &str, session_id: Option<&str>, channels: &[&str]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"hippocampus-memory-search-sentinel-v1\0");
+    hasher.update(query.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(session_id.unwrap_or("<all-sessions>").as_bytes());
+    for channel in channels {
+        hasher.update(b"\0");
+        hasher.update(channel.as_bytes());
+    }
+    format!("synthetic-memory-search-{:x}", hasher.finalize())
+}
+
+async fn rebuild_and_refresh(
+    store: &SessionStore,
+    host: &str,
+    config: &AppConfig,
+    reuse_compatible_embeddings: bool,
+) -> Result<MemoryMaintenanceReport> {
+    let rebuild = rebuild_projection(store, reuse_compatible_embeddings).await?;
+    refresh_after_rebuild(store, host, config, rebuild).await
+}
+
+async fn rebuild_projection(
+    store: &SessionStore,
+    reuse_compatible_embeddings: bool,
+) -> Result<RebuildReport> {
+    let retrieval = store.retrieval().clone();
+    tokio::task::spawn_blocking(move || {
+        retrieval.rebuild_with_options(RebuildOptions {
+            reuse_compatible_embeddings,
+        })
+    })
+    .await
+    .context("rebuild task failed")?
+    .map_err(Into::into)
+}
+
+async fn refresh_after_rebuild(
+    store: &SessionStore,
+    host: &str,
+    config: &AppConfig,
+    rebuild: RebuildReport,
+) -> Result<MemoryMaintenanceReport> {
+    if !config.memory.enabled {
+        return Ok(MemoryMaintenanceReport {
+            rebuild,
+            embedding: None,
+            graph: None,
+        });
+    }
+    let client = OllamaClient::new(host)?;
+    let engine = ChatEngine::with_config(store.clone(), client, config.clone());
+    let embedding = engine
+        .refresh_embeddings(cancellation_on_ctrl_c())
+        .await
+        .context("embedding and episode refresh failed")?;
+    let retrieval = store.retrieval().clone();
+    let memory = config.memory.clone();
+    let graph = tokio::task::spawn_blocking(move || retrieval.refresh_graph(&memory))
+        .await
+        .context("graph refresh task failed")??;
+    Ok(MemoryMaintenanceReport {
+        rebuild,
+        embedding: Some(embedding),
+        graph: Some(graph),
+    })
+}
+
+async fn run_memory_control(
+    store: &SessionStore,
+    host: &str,
+    target: MemoryTarget,
+    exclude: bool,
+    config: &AppConfig,
+) -> Result<()> {
+    let target = match target {
+        MemoryTarget::Session { id } => ControlTarget {
+            kind: ControlTargetKind::Session,
+            id,
+        },
+        MemoryTarget::Event { id } => ControlTarget {
+            kind: ControlTargetKind::Event,
+            id,
+        },
+    };
+    let record = if exclude {
+        store.exclude(target)?
+    } else {
+        store.restore(target)?
+    };
+    let report = rebuild_and_refresh(store, host, config, true)
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "control record sequence {} is committed, but projection/refresh is incomplete: {error:#}",
+                record.sequence
+            )
+        })?;
+    print_control_record(&record);
+    print_memory_maintenance(&report);
+    Ok(())
+}
+
+fn print_control_record(record: &ControlRecord) {
+    let action = match record.action {
+        hippocampus::ControlAction::Exclude => "exclude",
+        hippocampus::ControlAction::Restore => "restore",
+    };
+    let target_kind = match record.target_kind {
+        ControlTargetKind::Session => "session",
+        ControlTargetKind::Event => "event",
+    };
+    println!(
+        "control: action={} target={}:{} sequence={} hash={}",
+        action, target_kind, record.target_id, record.sequence, record.record_sha256
+    );
+}
+
+fn print_memory_maintenance(report: &MemoryMaintenanceReport) {
+    println!(
+        "rebuild: sessions={} events={} spans={} answer_contexts={} documents={} control_generation={} ledger_preserved={} attempts_replayed={} skipped_inactive={} skipped_dependency={} embeddings_reused={}",
+        report.rebuild.sync.sessions,
+        report.rebuild.sync.events,
+        report.rebuild.sync.spans,
+        report.rebuild.sync.answer_contexts,
+        report.rebuild.sync.documents,
+        report.rebuild.control_generation_sha256,
+        report.rebuild.ledger_attempts_preserved,
+        report.rebuild.consolidation_attempts_replayed,
+        report.rebuild.consolidation_attempts_skipped_inactive,
+        report.rebuild.consolidation_attempts_skipped_dependency,
+        report.rebuild.embeddings_reused
+    );
+    if let Some(embedding) = report.embedding {
+        println!(
+            "embedding: leaf_documents={} leaf_reused={} leaf_embedded_inputs={} backend_batches={} aggregate_documents={} leaf_committed={}",
+            embedding.leaf_documents,
+            embedding.leaf_reused,
+            embedding.leaf_embedded_inputs,
+            embedding.backend_batches,
+            embedding.aggregate_documents,
+            embedding.leaf_committed
+        );
+    } else {
+        println!("embedding: disabled");
+    }
+    if let Some(graph) = &report.graph {
+        println!(
+            "graph: changed={} nodes={} edges={} source_sha256={} catalog_sha256={} vector_index_fingerprint={}",
+            graph.changed,
+            graph.node_count,
+            graph.edge_count,
+            graph.source_sha256,
+            graph.catalog_sha256,
+            graph.vector_index_fingerprint
+        );
+    } else {
+        println!("graph: disabled");
     }
 }
 
