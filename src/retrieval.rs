@@ -3094,7 +3094,7 @@ impl RetrievalStore {
         )
     }
 
-    fn compatible_embeddings_from_connection_filtered(
+    pub(crate) fn compatible_embeddings_from_connection_filtered(
         &self,
         connection: &Connection,
         spec: &VectorIndexSpec,

@@ -202,6 +202,7 @@ pub(crate) fn graph_status_from_connection(
         &event_rows,
         &embeddings,
         &runs,
+        true,
     )?;
     let config_sha256 = config_hash(config, &fingerprint);
     let source_sha256 = source_hash(
@@ -593,6 +594,7 @@ pub(crate) fn refresh_graph(
         &event_rows,
         &embeddings,
         &runs,
+        true,
     )?;
     let config_sha256 = config_hash(config, &fingerprint);
     let source_sha256 = source_hash(
@@ -686,26 +688,51 @@ pub(crate) fn recall_graph_from_connection(
     let fingerprint = spec
         .fingerprint()
         .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
-    let leaf_snapshot = load_leaf_embedding_snapshot(store, connection, &spec)?;
-    let aggregate_snapshot = load_aggregate_embedding_snapshot(store, connection, &spec)?;
-    if leaf_snapshot.control_generation_sha256 != aggregate_snapshot.control_generation_sha256 {
-        return Err(RetrievalError::ControlStateChanged);
-    }
+    let control = store.replay_control_state_under_guard()?;
+    let leaf_snapshot =
+        load_leaf_embedding_snapshot_with_control(store, connection, &spec, &control)?;
+    let aggregate_snapshot = if filter.allow_aggregate_documents {
+        let aggregate =
+            load_aggregate_embedding_snapshot_with_control(store, connection, &spec, &control)?;
+        if leaf_snapshot.control_generation_sha256 != aggregate.control_generation_sha256 {
+            return Err(RetrievalError::ControlStateChanged);
+        }
+        aggregate
+    } else {
+        crate::retrieval::AggregateEmbeddingSnapshot {
+            catalog_sha256: String::new(),
+            control_generation_sha256: leaf_snapshot.control_generation_sha256.clone(),
+            documents: Vec::new(),
+        }
+    };
     validate_full_derived_integrity(connection)?;
-    let embeddings =
-        store.compatible_embeddings_from_connection(connection, &spec, &fingerprint, None)?;
+    let embeddings = store.compatible_embeddings_from_connection_filtered(
+        connection,
+        &spec,
+        &fingerprint,
+        None,
+        &control,
+        filter.allow_aggregate_documents,
+    )?;
     validate_graph_embeddings(&embeddings)?;
+    let granularity_clause = if filter.allow_aggregate_documents {
+        ""
+    } else {
+        " WHERE granularity IN ('message','fragment')"
+    };
     let document_count: i64 = connection
-        .query_row("SELECT count(*) FROM memory_documents", [], |row| {
-            row.get(0)
-        })
+        .query_row(
+            &format!("SELECT count(*) FROM memory_documents{granularity_clause}"),
+            [],
+            |row| row.get(0),
+        )
         .map_err(|error| store.database_error(error))?;
     if usize::try_from(document_count).ok() != Some(embeddings.len()) {
         return Err(RetrievalError::CorruptIndex(
             "memory_documents 未被 compatible embeddings 完整覆盖".into(),
         ));
     }
-    let runs = store.validated_retrieval_runs_from_connection(connection)?;
+    let runs = store.validated_retrieval_runs_from_connection_with_control(connection, &control)?;
     let (expected_nodes, leaves, event_rows) =
         build_nodes(store, connection, &leaf_snapshot, &aggregate_snapshot)?;
     let expected_edges = build_edges(
@@ -717,38 +744,44 @@ pub(crate) fn recall_graph_from_connection(
         &event_rows,
         &embeddings,
         &runs,
+        filter.allow_aggregate_documents,
     )?;
-    let config_sha256 = config_hash(config, &fingerprint);
-    let source_sha256 = source_hash(
-        store,
-        connection,
-        &leaf_snapshot.control_generation_sha256,
-        &leaf_snapshot.catalog_sha256,
-        &aggregate_snapshot.catalog_sha256,
-        &fingerprint,
-        &embeddings,
-        &runs,
-    )?;
-    let catalog_sha256 = catalog_hash(&expected_nodes, &expected_edges);
-    if exact_existing_catalog(
-        store,
-        connection,
-        &expected_nodes,
-        &expected_edges,
-        &fingerprint,
-        &config_sha256,
-        &source_sha256,
-        &catalog_sha256,
-    )?
-    .is_none()
-    {
-        return Err(RetrievalError::CorruptIndex(
-            "图 materialization 缺失或已过期".into(),
-        ));
-    }
-
-    let nodes = read_nodes(store, connection)?;
-    let edges = read_edges(store, connection)?;
+    let (nodes, edges) = if filter.cutoff.is_none() && filter.allow_aggregate_documents {
+        let config_sha256 = config_hash(config, &fingerprint);
+        let source_sha256 = source_hash(
+            store,
+            connection,
+            &leaf_snapshot.control_generation_sha256,
+            &leaf_snapshot.catalog_sha256,
+            &aggregate_snapshot.catalog_sha256,
+            &fingerprint,
+            &embeddings,
+            &runs,
+        )?;
+        let catalog_sha256 = catalog_hash(&expected_nodes, &expected_edges);
+        if exact_existing_catalog(
+            store,
+            connection,
+            &expected_nodes,
+            &expected_edges,
+            &fingerprint,
+            &config_sha256,
+            &source_sha256,
+            &catalog_sha256,
+        )?
+        .is_none()
+        {
+            return Err(RetrievalError::CorruptIndex(
+                "图 materialization 缺失或已过期".into(),
+            ));
+        }
+        (
+            read_nodes(store, connection)?,
+            read_edges(store, connection)?,
+        )
+    } else {
+        (expected_nodes, expected_edges)
+    };
     if seeds.is_empty() {
         return Ok(GraphRecallResult::default());
     }
@@ -1520,6 +1553,7 @@ fn build_edges(
     events: &EventRows,
     embeddings: &[StoredEmbedding],
     runs: &[(String, crate::model::RetrievalTrace)],
+    allow_aggregate_documents: bool,
 ) -> RetrievalResult<Vec<Edge>> {
     let node_by_source = nodes
         .iter()
@@ -1611,13 +1645,15 @@ fn build_edges(
             )?;
         }
     }
-    add_episode_edges(
-        store,
-        connection,
-        &node_by_source,
-        &message_by_event,
-        &mut acc,
-    )?;
+    if allow_aggregate_documents {
+        add_episode_edges(
+            store,
+            connection,
+            &node_by_source,
+            &message_by_event,
+            &mut acc,
+        )?;
+    }
     let chosen_mentions =
         add_entity_edges(store, connection, config, &node_by_source, leaves, &mut acc)?;
     add_shared_edges(config, &chosen_mentions, &mut acc)?;
