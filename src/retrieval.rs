@@ -3612,6 +3612,7 @@ impl RetrievalStore {
             config,
             &state,
             &visibility,
+            query_origin,
         )?;
         let recent = recent_event_ids.iter().map(String::as_str).collect();
         let mut used_events = result
@@ -3655,8 +3656,19 @@ impl RetrievalStore {
         config: RetrievalConfig,
         control: &ControlState,
         visibility: &RecallVisibility,
+        query_origin: &RecallQueryOrigin,
     ) -> RetrievalResult<RecallResult> {
-        self.validate_recall_input_id(connection, control, current_user_event_id, session_filter)?;
+        match query_origin {
+            RecallQueryOrigin::IndexedEvent => self.validate_recall_input_id(
+                connection,
+                control,
+                current_user_event_id,
+                session_filter,
+            )?,
+            RecallQueryOrigin::Synthetic { .. } => {
+                self.validate_synthetic_sentinel(connection, current_user_event_id)?;
+            }
+        }
         for event_id in recent_event_ids {
             self.validate_recall_input_id(connection, control, event_id, session_filter)?;
         }
@@ -4321,6 +4333,7 @@ impl RetrievalStore {
                 retrieval_config.clone(),
                 &control,
                 &visibility,
+                &options.query_origin,
             )?
         } else {
             empty_recall_base(raw_query, current_user_event_id, retrieval_config.clone())
