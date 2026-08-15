@@ -4,6 +4,7 @@ pub mod context;
 pub mod control;
 pub mod engine;
 pub mod episode;
+pub mod eval;
 pub mod graph;
 pub mod knowledge;
 pub mod model;
@@ -46,6 +47,13 @@ pub use episode::{
     EPISODE_ALGORITHM_VERSION, EpisodeBoundaryDecision, EpisodeDocument, EpisodeGapState,
     EpisodeMaterializationReport, EpisodeMember, EpisodeSignal, EpisodeSignalState,
     SOFT_BOUNDARY_VOTE_THRESHOLD,
+};
+pub use eval::{
+    EVAL_SCHEMA_VERSION, EvalAggregate, EvalBenchmark, EvalCase, EvalCorpus, EvalEvidenceRef,
+    EvalFingerprintInput, EvalJsonl, EvalMessage, EvalQuestionClass, EvalRecord, EvalRecordMetrics,
+    EvalSession, EvalSummary, eval_mrr, eval_recall_at_k, eval_run_fingerprint, eval_token_f1,
+    load_eval_corpus, normalize_eval_answer, score_eval_case, summarize_eval_records,
+    validate_eval_paths, write_eval_summary,
 };
 pub use graph::{
     GRAPH_ALGORITHM_VERSION, GRAPH_SCHEMA_VERSION, GraphEdgeType, GraphMaterializationReport,
