@@ -4662,6 +4662,8 @@ impl RetrievalStore {
             .map_err(|error| HybridRecallFailure::new(HybridRecallStage::EntityState, error))?
         } else if options.channels.entity {
             let entity_started = Instant::now();
+            validate_full_derived_integrity(&transaction)
+                .map_err(|error| HybridRecallFailure::new(HybridRecallStage::EntityState, error))?;
             let (entity_matches, _) = self
                 .load_entity_matches(
                     &transaction,
