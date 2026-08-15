@@ -3716,7 +3716,6 @@ impl RetrievalStore {
         expression: &str,
         session_filter: Option<&str>,
     ) -> RetrievalResult<Vec<KeywordRecallRow>> {
-        load_canonical_leaf_catalog(self, connection, control)?;
         let document_count = connection
             .query_row("SELECT count(*) FROM retrieval_documents", [], |row| {
                 row.get::<_, i64>(0)
@@ -3892,6 +3891,7 @@ impl RetrievalStore {
         for event_id in recent_event_ids {
             self.validate_recall_input_id(connection, control, event_id, session_filter)?;
         }
+        load_canonical_leaf_catalog(self, connection, control)?;
         config
             .validate()
             .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
@@ -4396,6 +4396,7 @@ impl RetrievalStore {
         spec.validate()
             .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
         let control = self.replay_control_state_under_guard()?;
+        load_canonical_leaf_catalog(self, connection, &control)?;
         let total = self.active_memory_document_count(connection, &control, session_filter)?;
         let fingerprint = spec
             .fingerprint()
@@ -4556,9 +4557,6 @@ impl RetrievalStore {
             session_filter,
             &visibility,
         )?;
-        if index.is_empty() {
-            return Err(RetrievalError::CorruptIndex("没有兼容的向量索引".into()));
-        }
         let hits = index
             .search(&query_vector, memory_config.vector_candidate_limit)
             .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
@@ -7861,8 +7859,9 @@ impl RetrievalStore {
         selection: &StateSelectionTrace,
         snapshots: &BTreeMap<String, ClaimSnapshot>,
         conflicts: &BTreeMap<String, BTreeSet<String>>,
+        visibility_upper: DateTime<Utc>,
     ) -> RetrievalResult<bool> {
-        if selection.claim_id.is_empty() || selection.rank == 0 || selection.reason.is_empty() {
+        if selection.claim_id.is_empty() || selection.reason.is_empty() {
             return Err(RetrievalError::CorruptIndex(
                 "state trace 缺少 canonical claim selection".into(),
             ));
@@ -7888,6 +7887,35 @@ impl RetrievalStore {
             .optional()
             .map_err(|error| self.database_error(error))?
             .ok_or_else(|| RetrievalError::CorruptIndex("state trace claim 不存在".into()))?;
+        let asserted_at = parse_retrieval_time(&claim.3, "claim.asserted_at")?;
+        let event_time = claim
+            .4
+            .as_deref()
+            .map(|value| parse_retrieval_time(value, "claim.event_time"))
+            .transpose()?;
+        let valid_from = parse_retrieval_time(&claim.5, "claim.valid_from")?;
+        let reference_time = parse_retrieval_time(&claim.6, "claim.reference_time")?;
+        let time_visible = asserted_at <= visibility_upper
+            && reference_time <= visibility_upper
+            && valid_from <= visibility_upper
+            && event_time.is_none_or(|value| value <= visibility_upper);
+        if selection.rank == 0 {
+            if time_visible
+                || selection.reason != "not_yet_visible"
+                || selection.selected
+                || selection.evidence_id.is_some()
+                || selection.evidence_span.is_some()
+                || selection.evidence_role.is_some()
+            {
+                return Err(RetrievalError::CorruptIndex(
+                    "state trace rank-0 exclusion 不规范".into(),
+                ));
+            }
+        } else if !time_visible || selection.reason == "not_yet_visible" {
+            return Err(RetrievalError::CorruptIndex(
+                "state trace visible rank 与时间可见性不一致".into(),
+            ));
+        }
         let snapshot = snapshots.get(&selection.claim_id).ok_or_else(|| {
             RetrievalError::CorruptIndex("state trace claim 在查询时间不可见".into())
         })?;
@@ -8401,14 +8429,19 @@ impl RetrievalStore {
                 if selections_by_claim
                     .insert(&selection.claim_id, selection)
                     .is_some()
-                    || !selection_ranks.insert(selection.rank)
+                    || selection.rank > 0 && !selection_ranks.insert(selection.rank)
                 {
                     return Err(RetrievalError::CorruptIndex(
                         "state trace 包含重复 claim 或 rank".into(),
                     ));
                 }
                 active &= self.state_selection_is_active(
-                    connection, control, selection, &snapshots, &conflicts,
+                    connection,
+                    control,
+                    selection,
+                    &snapshots,
+                    &conflicts,
+                    visibility_upper,
                 )?;
             }
             for selection in selections_by_claim.values() {
