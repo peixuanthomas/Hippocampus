@@ -286,6 +286,16 @@ async fn main() {
 async fn run() -> Result<()> {
     let cli = Cli::parse();
     let config = AppConfig::load(cli.config.as_deref())?.config;
+    if !config.memory.enabled
+        && matches!(
+            &cli.command,
+            Some(Command::Memory(MemoryArgs {
+                command: MemoryCommand::Rebuild { reembed: true }
+            }))
+        )
+    {
+        bail!("memory rebuild --reembed requires memory.enabled=true");
+    }
     let store = SessionStore::new(&cli.sessions_dir)?;
     match cli.command {
         None => run_new_tui(store, &cli.host, NewArgs::default(), &config).await,
