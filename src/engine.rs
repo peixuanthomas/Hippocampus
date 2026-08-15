@@ -525,7 +525,7 @@ impl<B: ChatBackend> ChatEngine<B> {
             let request = EmbeddingRequest {
                 model: spec.model.clone(),
                 input: chunk.iter().map(|(_, content)| content.clone()).collect(),
-                dimensions: None,
+                dimensions: Some(spec.dimensions),
                 truncate: false,
             };
             let retrieval = self.store.retrieval().clone();

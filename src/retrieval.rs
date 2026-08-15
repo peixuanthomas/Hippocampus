@@ -4415,7 +4415,7 @@ impl RetrievalStore {
             backend.embed(EmbeddingRequest {
                 model: spec.model.clone(),
                 input: vec![raw_query.to_owned()],
-                dimensions: None,
+                dimensions: Some(spec.dimensions),
                 truncate: false,
             }),
         )
