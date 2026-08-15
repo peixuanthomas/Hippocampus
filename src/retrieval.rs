@@ -912,6 +912,7 @@ struct ValidatedFtsDocument {
     active: bool,
 }
 
+#[derive(Clone)]
 struct CanonicalLeafDocument {
     document_id: String,
     session_id: String,
@@ -923,6 +924,14 @@ struct CanonicalLeafDocument {
     end: usize,
     message_document_id: String,
     sequence: i64,
+    role: EventRole,
+    created_at: String,
+    active: bool,
+}
+
+struct CanonicalLeafCatalog {
+    active: Vec<CanonicalLeafDocument>,
+    by_id: BTreeMap<String, CanonicalLeafDocument>,
 }
 
 struct RecallTransition {
@@ -1616,8 +1625,46 @@ impl RetrievalStore {
             .optional()
             .map_err(|error| self.database_error(error))?
             .ok_or_else(|| RetrievalError::CorruptIndex("派生来源事件缺少权威会话绑定".into()))?;
-        self.verify_fresh(&indexed_session)?;
-        let source = self.read_source(&self.root.join(&indexed_session.source_file))?;
+        if !is_safe_source_file(&indexed_session.source_file) {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "会话 {} 的源文件名不安全",
+                indexed_session.id
+            )));
+        }
+        let path = self.root.join(&indexed_session.source_file);
+        let bytes = fs::read(&path).map_err(|_| RetrievalError::StaleIndex {
+            session_id: indexed_session.id.clone(),
+        })?;
+        if bytes_sha256(&bytes) != indexed_session.source_sha256 {
+            return Err(RetrievalError::StaleIndex {
+                session_id: indexed_session.id.clone(),
+            });
+        }
+        let mut session: Session =
+            serde_json::from_slice(&bytes).map_err(|error| RetrievalError::InvalidSource {
+                path: path.clone(),
+                message: error.to_string(),
+            })?;
+        session.normalize_legacy_provenance();
+        session
+            .validate()
+            .map_err(|error| RetrievalError::InvalidSource {
+                path: path.clone(),
+                message: error.to_string(),
+            })?;
+        if path.file_stem().and_then(|value| value.to_str()) != Some(session.id.as_str()) {
+            return Err(RetrievalError::InvalidSource {
+                path,
+                message: "文件名必须与会话 ID 一致".into(),
+            });
+        }
+        session.refresh_cumulative_usage();
+        let source = SessionSource {
+            legacy: session.schema_version == crate::model::LEGACY_SCHEMA_VERSION,
+            session,
+            path: self.root.join(&indexed_session.source_file),
+            sha256: bytes_sha256(&bytes),
+        };
         if source.sha256 != indexed_session.source_sha256
             || source.session.id != indexed_session.id
             || source.session.title != indexed_session.title
@@ -3720,7 +3767,7 @@ impl RetrievalStore {
     fn validate_fts_catalog(
         &self,
         connection: &Connection,
-        control: &ControlState,
+        canonical: &CanonicalLeafCatalog,
     ) -> RetrievalResult<Vec<ValidatedFtsDocument>> {
         let document_count = connection
             .query_row("SELECT count(*) FROM retrieval_documents", [], |row| {
@@ -3741,7 +3788,8 @@ impl RetrievalStore {
         let mut statement = connection
             .prepare(
                 "SELECT d.rowid,d.document_id,d.lexical_content,d.ngram_content,d.exact_content,
-                        f.lexical_content,f.ngram_content,e.session_id,e.created_at
+                        f.lexical_content,f.ngram_content,d.event_id,d.start_char,d.end_char,
+                        d.granularity,d.content_sha256,e.role,e.session_id,e.created_at
                  FROM retrieval_documents d
                  LEFT JOIN retrieval_documents_fts f ON f.rowid=d.rowid
                  LEFT JOIN events e ON e.event_id=d.event_id
@@ -3758,8 +3806,14 @@ impl RetrievalStore {
                     row.get::<_, String>(4)?,
                     row.get::<_, Option<String>>(5)?,
                     row.get::<_, Option<String>>(6)?,
-                    row.get::<_, Option<String>>(7)?,
-                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, String>(7)?,
+                    i64_to_usize(row.get(8)?)?,
+                    i64_to_usize(row.get(9)?)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, String>(11)?,
+                    row.get::<_, Option<String>>(12)?,
+                    row.get::<_, Option<String>>(13)?,
+                    row.get::<_, Option<String>>(14)?,
                 ))
             })
             .map_err(|error| self.database_error(error))?;
@@ -3773,6 +3827,12 @@ impl RetrievalStore {
                 exact,
                 fts_lexical,
                 fts_ngram,
+                event_id,
+                start,
+                end,
+                granularity,
+                source_sha256,
+                role,
                 session_id,
                 created_at,
             ) = row.map_err(|error| self.database_error(error))?;
@@ -3791,8 +3851,30 @@ impl RetrievalStore {
             let created_at = created_at.ok_or_else(|| {
                 RetrievalError::CorruptIndex(format!("检索文档 {document_id} 缺少 event"))
             })?;
+            let role = role.ok_or_else(|| {
+                RetrievalError::CorruptIndex(format!("检索文档 {document_id} 缺少 event"))
+            })?;
+            let canonical = canonical.by_id.get(&document_id).ok_or_else(|| {
+                RetrievalError::CorruptIndex(format!(
+                    "检索文档 {document_id} 缺少 canonical raw leaf"
+                ))
+            })?;
+            if event_id != canonical.event_id
+                || start != canonical.start
+                || end != canonical.end
+                || parse_granularity(&granularity)? != canonical.granularity
+                || source_sha256 != canonical.source_sha256
+                || exact != canonical.content
+                || role != canonical.role.as_str()
+                || session_id != canonical.session_id
+                || created_at != canonical.created_at
+            {
+                return Err(RetrievalError::CorruptIndex(format!(
+                    "检索文档 {document_id} 与 canonical raw leaf 不一致"
+                )));
+            }
             catalog.push(ValidatedFtsDocument {
-                active: self.document_reference_is_active(connection, control, &document_id)?,
+                active: canonical.active,
                 document_id,
                 lexical_content: stored_lexical,
                 ngram_content: stored_ngram,
@@ -3927,8 +4009,8 @@ impl RetrievalStore {
         for event_id in recent_event_ids {
             self.validate_recall_input_id(connection, control, event_id, session_filter)?;
         }
-        load_canonical_leaf_catalog(self, connection, control)?;
-        let fts_catalog = self.validate_fts_catalog(connection, control)?;
+        let canonical = load_canonical_leaf_catalog(self, connection, control)?;
+        let fts_catalog = self.validate_fts_catalog(connection, &canonical)?;
         config
             .validate()
             .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
@@ -10554,7 +10636,7 @@ fn load_canonical_leaf_catalog(
     store: &RetrievalStore,
     connection: &Connection,
     control: &ControlState,
-) -> RetrievalResult<Vec<CanonicalLeafDocument>> {
+) -> RetrievalResult<CanonicalLeafCatalog> {
     let session_ids = connection
         .prepare("SELECT session_id FROM indexed_sessions ORDER BY session_id")
         .and_then(|mut statement| {
@@ -10563,123 +10645,125 @@ fn load_canonical_leaf_catalog(
                 .collect::<rusqlite::Result<Vec<_>>>()
         })
         .map_err(|error| store.database_error(error))?;
-    for session_id in session_ids
-        .into_iter()
-        .filter(|id| control.allows_session(id))
-    {
-        store.verify_indexed_session_source_projection_with_control(
-            connection,
-            &session_id,
-            control,
-        )?;
-    }
-
-    let mut expected = Vec::new();
-    let mut events = connection.prepare("SELECT event_id,session_id,sequence,role,content,content_sha256 FROM events ORDER BY session_id,sequence,event_id")
-        .map_err(|error| store.database_error(error))?;
-    let rows = events
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-            ))
-        })
-        .map_err(|error| store.database_error(error))?;
-    for row in rows {
-        let (event_id, session_id, sequence, role, content, event_hash) =
-            row.map_err(|error| store.database_error(error))?;
-        if !control.allows_event(&session_id, &event_id) {
-            continue;
-        }
-        if role == "system" || content.trim().is_empty() {
-            continue;
-        }
-        if content_sha256(&content) != event_hash {
+    let mut all = Vec::new();
+    for session_id in session_ids {
+        let indexed = store.get_session_from_connection(connection, &session_id)?;
+        if indexed.source_file != format!("{session_id}.json")
+            || indexed.source_sha256.len() != 64
+            || !indexed
+                .source_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
             return Err(RetrievalError::CorruptIndex(format!(
-                "事件 {event_id} 内容哈希损坏"
+                "会话 {session_id} 的源文件绑定不精确"
             )));
         }
-        let event = StoredEvent {
-            id: event_id.clone(),
-            session_id: session_id.clone(),
-            turn_id: None,
-            sequence: i64_to_usize(sequence)
-                .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?,
-            role: EventRole::User,
-            created_at: String::new(),
-            content: content.clone(),
-            content_sha256: event_hash,
-            reply_to_event_id: None,
-            token_count: None,
-            turn_status: None,
-            done_reason: None,
-            error: None,
-        };
-        let message_document_id = format!("{}:0:{}", event_id, content.chars().count());
-        for (granularity, span) in document_spans(&event) {
-            let part = slice_chars(&content, &span)?;
-            expected.push(CanonicalLeafDocument {
-                document_id: format!("{}:{}:{}", event_id, span.start_char, span.end_char),
+        let source = store.authoritative_indexed_session_source(connection, &session_id)?;
+        let authoritative_events = derive_events(&source.session);
+        let indexed_events = connection
+            .prepare(
+                "SELECT event_id, session_id, turn_id, sequence, role, created_at, content,
+                        content_sha256, reply_to_event_id, token_count, turn_status, done_reason, error
+                 FROM events WHERE session_id=?1 ORDER BY sequence",
+            )
+            .and_then(|mut statement| {
+                statement
+                    .query_map([session_id.as_str()], map_event)?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .map_err(|error| store.database_error(error))?;
+        for event in &indexed_events {
+            verify_event_hash(event)?;
+        }
+        let indexed_active = indexed_events
+            .into_iter()
+            .filter(|event| control.allows_event(&event.session_id, &event.id))
+            .collect::<Vec<_>>();
+        let authoritative_active = authoritative_events
+            .iter()
+            .filter(|event| control.allows_event(&event.session_id, &event.id))
+            .cloned()
+            .collect::<Vec<_>>();
+        if indexed_active != authoritative_active {
+            return Err(RetrievalError::StaleIndex {
                 session_id: session_id.clone(),
-                granularity,
-                source_sha256: content_sha256(&part),
-                content: part,
-                event_id: event_id.clone(),
-                start: span.start_char,
-                end: span.end_char,
-                message_document_id: message_document_id.clone(),
-                sequence,
             });
         }
+        for event in authoritative_events {
+            verify_event_hash(&event)?;
+            if event.role == EventRole::System || event.content.trim().is_empty() {
+                continue;
+            }
+            let active = control.allows_event(&event.session_id, &event.id);
+            let sequence = i64::try_from(event.sequence)
+                .map_err(|_| RetrievalError::CorruptIndex("event sequence 溢出".into()))?;
+            let message_document_id = format!("{}:0:{}", event.id, event.content.chars().count());
+            for (granularity, span) in document_spans(&event) {
+                let part = slice_chars(&event.content, &span)?;
+                all.push(CanonicalLeafDocument {
+                    document_id: format!("{}:{}:{}", event.id, span.start_char, span.end_char),
+                    session_id: event.session_id.clone(),
+                    granularity,
+                    source_sha256: content_sha256(&part),
+                    content: part,
+                    event_id: event.id.clone(),
+                    start: span.start_char,
+                    end: span.end_char,
+                    message_document_id: message_document_id.clone(),
+                    sequence,
+                    role: event.role,
+                    created_at: event.created_at.clone(),
+                    active,
+                });
+            }
+        }
     }
-    expected.sort_by(|left, right| left.document_id.cmp(&right.document_id));
+    all.sort_by(|left, right| left.document_id.cmp(&right.document_id));
+    let mut by_id = BTreeMap::new();
+    for document in &all {
+        if by_id
+            .insert(document.document_id.clone(), document.clone())
+            .is_some()
+        {
+            return Err(RetrievalError::CorruptIndex(
+                "canonical raw leaf document ID 不唯一".into(),
+            ));
+        }
+    }
+    let expected = all
+        .iter()
+        .filter(|document| document.active)
+        .cloned()
+        .collect::<Vec<_>>();
 
     let all_retrieval = connection
         .prepare(
-            "SELECT r.document_id,e.session_id,r.event_id
-             FROM retrieval_documents r LEFT JOIN events e ON e.event_id=r.event_id
+            "SELECT r.document_id
+             FROM retrieval_documents r
              WHERE r.granularity IN ('message','fragment') ORDER BY r.document_id",
         )
         .and_then(|mut statement| {
             statement
-                .query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, Option<String>>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                })?
+                .query_map([], |row| row.get::<_, String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()
         })
         .map_err(|error| store.database_error(error))?;
-    let mut retrieval_ids = Vec::new();
-    for (id, session_id, event_id) in all_retrieval {
-        if control.event_is_excluded(&event_id)
-            || session_id
-                .as_deref()
-                .is_some_and(|session| !control.allows_session(session))
-        {
-            continue;
-        }
-        let session_id = session_id.ok_or_else(|| {
-            RetrievalError::CorruptIndex(format!("retrieval leaf {id} 缺少权威事件"))
-        })?;
-        if !control.allows_event(&session_id, &event_id) {
-            continue;
-        }
-        if store.memory_document_is_active(connection, control, &id)? {
-            retrieval_ids.push(id);
+    for id in &all_retrieval {
+        if !by_id.contains_key(id) {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "retrieval leaf {id} 缺少 canonical raw leaf"
+            )));
         }
     }
     let expected_ids = expected
         .iter()
         .map(|document| document.document_id.clone())
         .collect::<Vec<_>>();
-    if retrieval_ids != expected_ids {
+    if expected_ids
+        .iter()
+        .any(|id| all_retrieval.binary_search(id).is_err())
+    {
         return Err(RetrievalError::CorruptIndex(
             "retrieval leaf catalog 集合不规范".into(),
         ));
@@ -10688,19 +10772,26 @@ fn load_canonical_leaf_catalog(
     let all_memory = connection.prepare("SELECT document_id FROM memory_documents WHERE granularity IN ('message','fragment') ORDER BY document_id")
         .and_then(|mut statement| statement.query_map([], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>())
         .map_err(|error| store.database_error(error))?;
-    let mut memory_ids = Vec::new();
-    for id in all_memory {
-        if store.memory_document_is_active(connection, control, &id)? {
-            memory_ids.push(id);
+    for id in &all_memory {
+        if !by_id.contains_key(id) {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "memory leaf {id} 缺少 canonical raw leaf"
+            )));
         }
     }
-    if memory_ids != retrieval_ids {
+    if all_memory != all_retrieval {
         return Err(RetrievalError::CorruptIndex(
-            "memory leaf catalog 集合不规范".into(),
+            "persisted retrieval/memory leaf catalog 集合不一致".into(),
         ));
     }
 
-    for document in &expected {
+    for id in &all_retrieval {
+        let document = &by_id[id];
+        if store.memory_document_is_active(connection, control, id)? != document.active {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "leaf document {id} active projection 不一致"
+            )));
+        }
         let granularity = match document.granularity {
             RetrievalDocumentGranularity::Message => "message",
             RetrievalDocumentGranularity::Fragment => "fragment",
@@ -10714,7 +10805,10 @@ fn load_canonical_leaf_catalog(
             )));
         }
     }
-    Ok(expected)
+    Ok(CanonicalLeafCatalog {
+        active: expected,
+        by_id,
+    })
 }
 
 pub(crate) fn load_leaf_embedding_snapshot_with_control(
@@ -10738,8 +10832,8 @@ pub(crate) fn load_leaf_embedding_snapshot_with_control(
         .filter(|id| control.allows_session(id))
         .collect::<Vec<_>>();
     let expected = load_canonical_leaf_catalog(store, connection, control)?;
-    let mut documents = Vec::with_capacity(expected.len());
-    for document in expected {
+    let mut documents = Vec::with_capacity(expected.active.len());
+    for document in expected.active {
         let granularity_str = match document.granularity {
             RetrievalDocumentGranularity::Message => "message",
             RetrievalDocumentGranularity::Fragment => "fragment",
