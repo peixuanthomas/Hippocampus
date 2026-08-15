@@ -1181,13 +1181,15 @@ fn graph_node_is_visible(
         GraphNodeKind::Claim => {
             let row = connection
                 .query_row(
-                    "SELECT asserted_at,reference_time,valid_from FROM memory_claims WHERE claim_id=?1",
+                    "SELECT asserted_at,reference_time,valid_from,event_time
+                     FROM memory_claims WHERE claim_id=?1",
                     [&node.source_id],
                     |row| {
                         Ok((
                             row.get::<_, String>(0)?,
                             row.get::<_, String>(1)?,
                             row.get::<_, String>(2)?,
+                            row.get::<_, Option<String>>(3)?,
                         ))
                     },
                 )
@@ -1210,6 +1212,11 @@ fn graph_node_is_visible(
                 if !graph_time_is_visible(value, filter.cutoff)? {
                     return Ok(false);
                 }
+            }
+            if let Some(event_time) = row.3
+                && !graph_time_is_visible(&event_time, filter.cutoff)?
+            {
+                return Ok(false);
             }
             Ok(true)
         }
