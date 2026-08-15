@@ -232,7 +232,7 @@ pub fn eval_token_f1(a: &str, b: &str) -> f64 {
     let a = tokens(a);
     let b = tokens(b);
     if a.is_empty() || b.is_empty() {
-        return (a == b) as u8 as f64;
+        return 0.0;
     }
     let mut ac = HashMap::new();
     let mut bc = HashMap::new();
@@ -734,8 +734,6 @@ fn locomo(bytes: &[u8]) -> Result<Vec<EvalCase>> {
                 "%I:%M %p on %d %B, %Y",
             )?;
             latest = Some(occurred.clone());
-            let mut first = None;
-            let mut second = None;
             let mut previous: Option<String> = None;
             let mut messages = Vec::new();
             for u in x.conversation[&key].as_array().unwrap() {
@@ -747,15 +745,6 @@ fn locomo(bytes: &[u8]) -> Result<Vec<EvalCase>> {
                 ensure!(
                     speaker == speaker_a || speaker == speaker_b,
                     "utterance speaker must equal speaker_a or speaker_b"
-                );
-                if first.is_none() {
-                    first = Some(speaker.to_owned())
-                } else if first.as_deref() != Some(speaker) && second.is_none() {
-                    second = Some(speaker.to_owned())
-                }
-                ensure!(
-                    first.as_deref() == Some(speaker) || second.as_deref() == Some(speaker),
-                    "third speaker unsupported"
                 );
                 ensure!(
                     previous.as_deref() != Some(speaker),
@@ -782,7 +771,7 @@ fn locomo(bytes: &[u8]) -> Result<Vec<EvalCase>> {
                     "dia_id must be nonempty and unique"
                 );
                 messages.push(EvalMessage {
-                    role: if first.as_deref() == Some(speaker) {
+                    role: if speaker == speaker_a {
                         EventRole::User
                     } else {
                         EventRole::Assistant
