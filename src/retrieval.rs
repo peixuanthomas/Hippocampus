@@ -8194,6 +8194,89 @@ impl RetrievalStore {
         connection: &Connection,
         trace: &RetrievalTrace,
     ) -> RetrievalResult<bool> {
+        if trace
+            .fusion_candidates
+            .iter()
+            .any(|candidate| candidate == &FusionCandidateTrace::default())
+            || trace
+                .entity_matches
+                .iter()
+                .any(|matched| matched == &EntityMatchTrace::default())
+            || trace
+                .state_selections
+                .iter()
+                .any(|selection| selection == &StateSelectionTrace::default())
+            || trace
+                .graph_paths
+                .iter()
+                .any(|path| path == &crate::model::GraphPathTrace::default())
+        {
+            return Err(RetrievalError::CorruptIndex(
+                "retrieval trace artifact array 包含 default placeholder".into(),
+            ));
+        }
+
+        let mut next_positive_rank = 1usize;
+        let mut rank_zero_started = false;
+        let mut positive_spans = HashSet::new();
+        let mut provenance_keys = HashSet::new();
+        let mut previous_rank_zero_key = None;
+        for candidate in &trace.fusion_candidates {
+            if !provenance_keys.insert((
+                candidate.document_id.clone(),
+                candidate.span.clone(),
+                candidate.source_document_ids.clone(),
+            )) {
+                return Err(RetrievalError::CorruptIndex(
+                    "fusion trace 包含重复 provenance key".into(),
+                ));
+            }
+            if candidate.fused_rank > 0 {
+                if rank_zero_started
+                    || candidate.fused_rank != next_positive_rank
+                    || !positive_spans.insert(candidate.span.clone())
+                {
+                    return Err(RetrievalError::CorruptIndex(
+                        "fusion positive ranks/span 不符合 canonical producer".into(),
+                    ));
+                }
+                next_positive_rank += 1;
+            } else {
+                rank_zero_started = true;
+                let key = (
+                    candidate.vector_rank,
+                    candidate.document_id.as_str(),
+                    candidate.span.event_id.as_str(),
+                    candidate.span.start_char,
+                    candidate.span.end_char,
+                    candidate.reason.as_str(),
+                );
+                if previous_rank_zero_key
+                    .as_ref()
+                    .is_some_and(|previous| previous >= &key)
+                {
+                    return Err(RetrievalError::CorruptIndex(
+                        "fusion rank-zero suffix 顺序不符合 canonical producer".into(),
+                    ));
+                }
+                previous_rank_zero_key = Some(key);
+            }
+        }
+
+        let mut graph_target_ids = HashSet::new();
+        let mut previous_graph_rank = 0usize;
+        for path in &trace.graph_paths {
+            if path.target_rank == 0
+                || path.target_rank <= previous_graph_rank
+                || !graph_target_ids.insert(path.target_document_id.as_str())
+            {
+                return Err(RetrievalError::CorruptIndex(
+                    "graph trace target/rank 不符合 canonical producer".into(),
+                ));
+            }
+            previous_graph_rank = path.target_rank;
+        }
+
         if trace.channels.is_empty() {
             return Ok(true);
         }
@@ -8221,25 +8304,11 @@ impl RetrievalStore {
         let vector_count = trace
             .fusion_candidates
             .iter()
-            .filter(|candidate| {
-                *candidate != &FusionCandidateTrace::default() && candidate.vector_rank.is_some()
-            })
+            .filter(|candidate| candidate.vector_rank.is_some())
             .count();
-        let entity_count = trace
-            .entity_matches
-            .iter()
-            .filter(|matched| *matched != &EntityMatchTrace::default())
-            .count();
-        let state_count = trace
-            .state_selections
-            .iter()
-            .filter(|selection| *selection != &StateSelectionTrace::default())
-            .count();
-        let graph_count = trace
-            .graph_paths
-            .iter()
-            .filter(|path| *path != &crate::model::GraphPathTrace::default())
-            .count();
+        let entity_count = trace.entity_matches.len();
+        let state_count = trace.state_selections.len();
+        let graph_count = trace.graph_paths.len();
         let mut aggregate_document_ids = BTreeSet::new();
         let mut include_aggregate = |document_id: &str| -> RetrievalResult<()> {
             if document_id.is_empty() {
@@ -8268,20 +8337,12 @@ impl RetrievalStore {
             }
             Ok(())
         };
-        for candidate in trace
-            .fusion_candidates
-            .iter()
-            .filter(|candidate| *candidate != &FusionCandidateTrace::default())
-        {
+        for candidate in &trace.fusion_candidates {
             for document_id in &candidate.source_document_ids {
                 include_aggregate(document_id)?;
             }
         }
-        for path in trace
-            .graph_paths
-            .iter()
-            .filter(|path| *path != &crate::model::GraphPathTrace::default())
-        {
+        for path in &trace.graph_paths {
             include_aggregate(&path.target_document_id)?;
         }
         let derived_counts = [
