@@ -7,55 +7,88 @@
     <link rel="stylesheet" href="/app.css">
   </head>
   <body>
-    <div class="shell">
+    <div class="app">
       <header class="topbar">
-        <div class="brand">
-          <span class="brand-mark">H</span>
-          <div>
-            <strong id="brand-name">LLM</strong>
-            <small>local memory · raw truth</small>
+        <div class="topbar-row">
+          <div class="brand">
+            <span class="brand-mark" aria-hidden="true">H</span>
+            <div class="brand-text">
+              <strong id="brand-name">Hippocampus</strong>
+              <small>本地记忆 · 原文即本体</small>
+            </div>
+          </div>
+          <div class="topbar-actions" aria-label="会话控制">
+            <span class="chip mono" id="model-chip">model —</span>
+            <span class="chip mono" id="context-chip">ctx —</span>
+            <button class="think-switch" id="think-button" type="button" role="switch" aria-checked="false" aria-label="切换 thinking" disabled>
+              <span class="think-track" aria-hidden="true"><span class="think-thumb"></span></span>
+              <span>think</span>
+            </button>
+            <button class="ghost-button" id="save-button" type="button" title="原子保存当前会话" disabled>
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2Z"/><path d="M17 21v-8H7v8"/><path d="M7 3v5h8"/></svg>
+              <span>保存</span>
+            </button>
+            <span class="status-badge mono" id="session-status" data-tone="muted">connecting</span>
           </div>
         </div>
-        <div class="chips" aria-label="会话状态">
-          <span class="chip" id="model-chip">model</span>
-          <button class="chip button-chip" id="think-button" type="button">think:on</button>
-          <span class="chip" id="context-chip">ctx:—</span>
-          <span class="chip status-chip" id="session-status">active</span>
+        <div class="budget" id="budget" aria-label="上下文预算">
+          <div class="budget-head">
+            <span class="budget-label">上下文占用</span>
+            <span class="budget-value mono" id="budget-value">—</span>
+          </div>
+          <div class="budget-track">
+            <div class="budget-fill" id="budget-fill" data-stage="ok"></div>
+            <span class="budget-tick warning" id="tick-warning" title="warning 阈值"></span>
+            <span class="budget-tick probe" id="tick-probe" title="probe 阈值"></span>
+          </div>
+          <div class="budget-foot">
+            <span id="budget-note">发送第一条消息后开始统计</span>
+            <span class="mono" id="cumulative-usage"></span>
+          </div>
         </div>
       </header>
 
       <main id="conversation" class="conversation" aria-live="polite">
-        <div class="empty-state" id="empty-state">
-          <div class="empty-mark">◇</div>
-          <h1 id="empty-name">LLM</h1>
-          <p>原始对话是记忆本体。Markdown 回复会在这里渲染为富文本。</p>
-        </div>
+        <section class="empty" id="empty-state">
+          <div class="empty-mark" aria-hidden="true">◈</div>
+          <h1 id="empty-name">Hippocampus</h1>
+          <p class="empty-tag">原始对话是记忆本体——每一次检索都可回溯到原文 span。</p>
+          <div class="empty-cards">
+            <div class="empty-card"><strong>追加式记忆</strong><span>会话逐轮原子落盘，历史永不覆盖。</span></div>
+            <div class="empty-card"><strong>程序化溯源</strong><span>知识与实时来源附 trace，不经模型转述。</span></div>
+            <div class="empty-card"><strong>预算透明</strong><span>占用、裁剪、探针阈值全程可见。</span></div>
+          </div>
+        </section>
       </main>
 
-      <footer class="composer-wrap">
-        <div class="runtime-status">
-          <span class="pulse" id="pulse"></span>
-          <span id="runtime-message">正在连接…</span>
-          <span class="token-status" id="token-status"></span>
+      <button id="scroll-bottom" class="scroll-bottom hidden" type="button">↓ 回到最新</button>
+
+      <footer class="dock">
+        <div class="phase-line" role="status">
+          <span class="pulse" id="pulse" aria-hidden="true"></span>
+          <span id="phase-text">正在连接…</span>
+          <span class="phase-stats mono" id="phase-stats"></span>
         </div>
         <form id="composer" class="composer">
-          <textarea id="message" rows="1" maxlength="1048576" placeholder="Ask anything…" aria-label="消息"></textarea>
-          <div class="composer-actions">
-            <button class="ghost-button" id="save-button" type="button">Save</button>
-            <button class="ghost-button danger hidden" id="cancel-button" type="button">Stop</button>
-            <button class="send-button" id="send-button" type="submit" aria-label="发送">↑</button>
-          </div>
+          <textarea id="message" rows="1" maxlength="1048576" placeholder="发消息…" aria-label="消息输入" disabled></textarea>
+          <button class="send-button" id="send-button" type="submit" aria-label="发送" disabled>
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5"/><path d="m5 12 7-7 7 7"/></svg>
+          </button>
+          <button class="send-button stop hidden" id="stop-button" type="button" aria-label="停止生成" title="停止并保留已生成内容">
+            <svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor" aria-hidden="true"><rect x="5" y="5" width="14" height="14" rx="2.5"/></svg>
+          </button>
         </form>
-        <div class="footer-line">
-          <span id="session-label">session —</span>
-          <span>Enter 发送 · Shift+Enter 换行</span>
+        <div class="dock-foot">
+          <span id="session-label" class="mono">session —</span>
+          <span class="dock-hint">Enter 发送 · Shift+Enter 换行</span>
+          <span id="char-count" class="mono"></span>
         </div>
       </footer>
     </div>
 
     <dialog id="limit-dialog" class="limit-dialog">
       <form method="dialog">
-        <div class="warning-mark">!</div>
+        <div class="limit-icon" aria-hidden="true">!</div>
         <h2>上下文接近上限</h2>
         <p id="limit-message">继续会丢弃最旧的完整轮次，原始会话记录仍会保留。</p>
         <div class="dialog-actions">
@@ -65,18 +98,23 @@
       </form>
     </dialog>
 
+    <div id="toast-root" class="toast-root" aria-live="polite"></div>
+
     <template id="message-template">
-      <article class="message-row">
-        <div class="role-icon"></div>
-        <div class="message-body">
-          <div class="role-label"></div>
+      <article class="msg">
+        <div class="msg-avatar" aria-hidden="true"></div>
+        <div class="msg-main">
+          <div class="msg-head">
+            <span class="msg-role"></span>
+            <span class="msg-badge mono hidden"></span>
+            <span class="msg-meta mono"></span>
+          </div>
           <details class="thinking hidden">
-            <summary>Thinking</summary>
-            <pre></pre>
+            <summary><span class="thinking-caret" aria-hidden="true"></span><span class="thinking-title">思考过程</span><span class="thinking-count mono"></span></summary>
+            <pre class="thinking-body"></pre>
           </details>
-          <div class="markdown"></div>
+          <div class="msg-content markdown"></div>
           <div class="provenance hidden"></div>
-          <div class="message-meta"></div>
         </div>
       </article>
     </template>
