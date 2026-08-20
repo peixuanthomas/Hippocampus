@@ -95,6 +95,7 @@ struct TurnView {
 #[derive(Debug, Deserialize)]
 struct ChatInput {
     message: String,
+    session_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -256,11 +257,14 @@ async fn get_session(State(state): State<WebState>) -> Json<SessionView> {
 async fn chat(
     State(state): State<WebState>,
     Json(input): Json<ChatInput>,
-) -> std::result::Result<impl IntoResponse, ApiError> {
+) -> std::result::Result<Response, ApiError> {
     if input.message.trim().is_empty() {
         return Err(ApiError::bad_request("消息不能为空"));
     }
+    let session_id = state.session.lock().await.id.clone();
+    validate_session_id(input.session_id.as_deref(), &session_id)?;
     let (event_tx, event_rx) = mpsc::unbounded_channel::<Event>();
+    send_event(&event_tx, "session", json!({ "session_id": session_id }));
     let (decision_tx, decision_rx) = mpsc::unbounded_channel();
     let cancellation = CancellationToken::new();
     {
@@ -281,17 +285,41 @@ async fn chat(
         cancellation,
     ));
 
+    Ok(sse_response(event_rx, &session_id))
+}
+
+fn validate_session_id(supplied: Option<&str>, active: &str) -> std::result::Result<(), ApiError> {
+    if supplied.is_some_and(|session_id| session_id != active) {
+        return Err(ApiError::conflict("session_id 与服务当前活动会话不匹配"));
+    }
+    Ok(())
+}
+
+fn sse_response(event_rx: mpsc::UnboundedReceiver<Event>, session_id: &str) -> Response {
     let stream = stream::unfold(event_rx, |mut receiver| async move {
         receiver
             .recv()
             .await
             .map(|event| (Ok::<Event, Infallible>(event), receiver))
     });
-    Ok(Sse::new(stream).keep_alive(
-        KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .text("keepalive"),
-    ))
+    let mut response = Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("keepalive"),
+        )
+        .into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache, no-store, no-transform"),
+    );
+    headers.insert("x-accel-buffering", HeaderValue::from_static("no"));
+    headers.insert(
+        "x-hippocampus-session-id",
+        HeaderValue::from_str(session_id).expect("session id is a valid header value"),
+    );
+    response
 }
 
 async fn run_generation(
@@ -372,6 +400,7 @@ async fn generate(
         event_tx,
         "done",
         json!({
+            "session_id": session.id,
             "turn_id": turn.id,
             "status": turn.status.as_str(),
             "markdown": turn.assistant_content,
@@ -584,6 +613,31 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
+    fn test_state() -> WebState {
+        let root = tempfile::tempdir().unwrap().keep();
+        let store = crate::store::SessionStore::new(&root).unwrap();
+        let session = store
+            .create(
+                "model",
+                "http://127.0.0.1:11434",
+                None,
+                Default::default(),
+                false,
+            )
+            .unwrap();
+        let client = OllamaClient::new("http://127.0.0.1:11434").unwrap();
+        WebState {
+            engine: ChatEngine::new(store, client),
+            session: Arc::new(Mutex::new(session)),
+            model_info: ModelInfo {
+                version: "test".into(),
+                name: "model".into(),
+                context_length: 32_768,
+            },
+            runtime: Arc::new(Mutex::new(RuntimeState::default())),
+        }
+    }
+
     #[test]
     fn markdown_is_rich_and_sanitized() {
         let rendered = render_markdown(
@@ -613,29 +667,7 @@ mod tests {
 
     #[tokio::test]
     async fn health_route_is_json() {
-        let root = tempfile::tempdir().unwrap();
-        let store = crate::store::SessionStore::new(root.path()).unwrap();
-        let session = store
-            .create(
-                "model",
-                "http://127.0.0.1:11434",
-                None,
-                Default::default(),
-                false,
-            )
-            .unwrap();
-        let client = OllamaClient::new("http://127.0.0.1:11434").unwrap();
-        let state = WebState {
-            engine: ChatEngine::new(store, client),
-            session: Arc::new(Mutex::new(session)),
-            model_info: ModelInfo {
-                version: "test".into(),
-                name: "model".into(),
-                context_length: 32_768,
-            },
-            runtime: Arc::new(Mutex::new(RuntimeState::default())),
-        };
-        let response = router(state)
+        let response = router(test_state())
             .oneshot(
                 http::Request::builder()
                     .uri("/api/health")
@@ -649,5 +681,41 @@ mod tests {
             response.headers().get(header::CONTENT_TYPE).unwrap(),
             "application/json"
         );
+    }
+
+    #[tokio::test]
+    async fn chat_rejects_mismatched_session_without_starting_generation() {
+        let state = test_state();
+        let response = router(state.clone())
+            .oneshot(
+                http::Request::builder()
+                    .method("POST")
+                    .uri("/api/chat")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"message":"hello","session_id":"wrong"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(state.runtime.lock().await.generation.is_none());
+    }
+
+    #[tokio::test]
+    async fn chat_stream_has_session_event_and_no_buffering_headers() {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        send_event(&sender, "session", json!({"session_id": "session-1"}));
+        drop(sender);
+        let response = sse_response(receiver, "session-1");
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "no-cache, no-store, no-transform"
+        );
+        assert_eq!(response.headers()["x-accel-buffering"], "no");
+        assert_eq!(response.headers()["x-hippocampus-session-id"], "session-1");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.starts_with("event: session\n"));
+        assert!(text.contains(r#"data: {"session_id":"session-1"}"#));
     }
 }

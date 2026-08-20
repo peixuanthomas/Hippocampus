@@ -8,8 +8,8 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use hippocampus::config::AppConfig;
 use hippocampus::engine::PreparationStatus;
 use hippocampus::model::{
-    BudgetConfig, ChatEventKind, ChatMessage, RetrievalConfig, Session, TokenUsage, Turn,
-    identity_instruction, utc_now,
+    BudgetConfig, ChatEvent, ChatEventKind, ChatMessage, RetrievalConfig, Session, TokenUsage,
+    Turn, identity_instruction, utc_now,
 };
 use hippocampus::ollama::{ChatBackend, ChatRequest};
 use hippocampus::{
@@ -21,7 +21,7 @@ use hippocampus::{
     run_evaluation, validate_eval_paths,
 };
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
@@ -57,7 +57,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// 单次调用；带 --session 使用会话上下文，否则只发送 system prompt + 当前问题
+    /// 单次调用；--json 输出逐行刷新的 JSONL 事件
     Ask(AskArgs),
     /// 启动本地 Web UI 并保持服务运行
     Serve(ServeArgs),
@@ -277,7 +277,7 @@ struct AskArgs {
     /// 将 thinking 流输出到 stderr
     #[arg(long)]
     show_thinking: bool,
-    /// 输出单个 JSON 对象，不实时打印正文
+    /// 输出逐行刷新、包含增量和最终元数据的 JSONL 事件
     #[arg(long)]
     json: bool,
 }
@@ -799,10 +799,12 @@ async fn run_contextual_ask(
     let json_output = args.json;
     engine
         .stream_turn(&mut session, &prepared, cancellation, move |event| {
-            if !json_output && event.kind == ChatEventKind::Content {
+            if json_output {
+                print_json_stream_event(&event);
+            } else if event.kind == ChatEventKind::Content {
                 print!("{}", event.text);
                 let _ = io::stdout().flush();
-            } else if !json_output && show_thinking && event.kind == ChatEventKind::Thinking {
+            } else if show_thinking && event.kind == ChatEventKind::Thinking {
                 eprint!("{}", event.text);
                 let _ = io::stderr().flush();
             }
@@ -816,7 +818,9 @@ async fn run_contextual_ask(
         println!(
             "{}",
             serde_json::to_string(&json!({
+                "event": "done",
                 "session_id": session.id,
+                "stateless": false,
                 "turn_id": turn.id,
                 "status": turn.status,
                 "thinking": turn.thinking,
@@ -1636,20 +1640,33 @@ async fn run_stateless_ask(host: &str, args: AskArgs, config: &AppConfig) -> Res
             &mut |event| match event.kind {
                 ChatEventKind::Thinking => {
                     thinking.push_str(&event.text);
-                    if !json_output && show_thinking {
+                    if json_output {
+                        print_json_stream_event(&event);
+                    } else if show_thinking {
                         eprint!("{}", event.text);
                         let _ = io::stderr().flush();
                     }
                 }
                 ChatEventKind::Content => {
                     content.push_str(&event.text);
-                    if !json_output {
+                    if json_output {
+                        print_json_stream_event(&event);
+                    } else {
                         print!("{}", event.text);
                         let _ = io::stdout().flush();
                     }
                 }
-                ChatEventKind::Completed => usage = event.usage,
-                ChatEventKind::Usage => {}
+                ChatEventKind::Completed => {
+                    usage = event.usage;
+                    if json_output {
+                        print_json_stream_event(&event);
+                    }
+                }
+                ChatEventKind::Usage => {
+                    if json_output {
+                        print_json_stream_event(&event);
+                    }
+                }
             },
         )
         .await?;
@@ -1657,6 +1674,7 @@ async fn run_stateless_ask(host: &str, args: AskArgs, config: &AppConfig) -> Res
         println!(
             "{}",
             serde_json::to_string(&json!({
+                "event": "done",
                 "session_id": null,
                 "stateless": true,
                 "thinking": thinking,
@@ -1670,6 +1688,38 @@ async fn run_stateless_ask(host: &str, args: AskArgs, config: &AppConfig) -> Res
         print_usage(usage);
     }
     Ok(())
+}
+
+fn json_stream_event(event: &ChatEvent) -> Value {
+    match event.kind {
+        ChatEventKind::Thinking => json!({
+            "event": "thinking",
+            "delta": event.text,
+            "live_output_tokens": event.live_output_tokens,
+        }),
+        ChatEventKind::Content => json!({
+            "event": "content",
+            "delta": event.text,
+            "live_output_tokens": event.live_output_tokens,
+        }),
+        ChatEventKind::Usage => json!({
+            "event": "usage",
+            "live_output_tokens": event.live_output_tokens,
+        }),
+        ChatEventKind::Completed => json!({
+            "event": "completed",
+            "live_output_tokens": event.live_output_tokens,
+            "usage": event.usage,
+            "done_reason": event.done_reason,
+        }),
+    }
+}
+
+fn print_json_stream_event(event: &ChatEvent) {
+    if let Ok(line) = serde_json::to_string(&json_stream_event(event)) {
+        println!("{line}");
+        let _ = io::stdout().flush();
+    }
 }
 
 fn cancellation_on_ctrl_c() -> CancellationToken {
@@ -1828,6 +1878,25 @@ fn print_turn_sources(turn: &Turn) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_stream_events_use_exact_deltas_and_stable_event_names() {
+        let thinking = ChatEvent::text(ChatEventKind::Thinking, "think".into(), 1);
+        let content = ChatEvent::text(ChatEventKind::Content, "delta".into(), 2);
+        let completed = ChatEvent {
+            kind: ChatEventKind::Completed,
+            text: String::new(),
+            live_output_tokens: Some(2),
+            usage: Some(TokenUsage::new(Some(3), Some(2))),
+            done_reason: Some("stop".into()),
+        };
+        assert_eq!(json_stream_event(&thinking)["event"], "thinking");
+        assert_eq!(json_stream_event(&thinking)["delta"], "think");
+        assert_eq!(json_stream_event(&content)["event"], "content");
+        assert_eq!(json_stream_event(&content)["delta"], "delta");
+        assert_eq!(json_stream_event(&completed)["event"], "completed");
+        assert_eq!(json_stream_event(&completed)["usage"]["input_tokens"], 3);
+    }
 
     #[test]
     fn ask_session_is_optional_and_thinking_defaults_off() {

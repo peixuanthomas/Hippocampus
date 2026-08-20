@@ -244,10 +244,8 @@ impl OllamaClient {
     ) -> Result<StructuredChatResponse, OllamaError> {
         validate_structured_chat_request(&request)?;
         let payload = structured_chat_payload(&request);
-        let response = self
-            .request_json(reqwest::Method::POST, "/api/chat", Some(payload))
-            .await?;
-        parse_structured_chat_response(&response)
+        let events = self.request_chat_events(payload).await?;
+        parse_structured_chat_events(&events)
     }
 
     pub async fn web_search(
@@ -362,6 +360,43 @@ impl OllamaClient {
         Ok(payload)
     }
 
+    async fn request_chat_events(&self, payload: Value) -> Result<Vec<Value>, OllamaError> {
+        let response = self
+            .client
+            .post(format!("{}/api/chat", self.host))
+            .header("Accept", "application/json")
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|error| self.connection(error))?;
+        let status = response.status();
+        if !status.is_success() {
+            let bytes = response
+                .bytes()
+                .await
+                .map_err(|error| self.connection(error))?;
+            let payload = serde_json::from_slice(&bytes)
+                .unwrap_or_else(|_| json!({"error": String::from_utf8_lossy(&bytes)}));
+            return Err(api_error(&payload, Some(status)));
+        }
+        let mut stream = response.bytes_stream();
+        let mut buffer = Vec::new();
+        let mut events = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            buffer.extend_from_slice(&chunk.map_err(|error| self.connection(error))?);
+            while let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
+                let line = buffer.drain(..=newline).collect::<Vec<_>>();
+                if let Some(event) = parse_chat_event_line(&line[..line.len() - 1])? {
+                    events.push(event);
+                }
+            }
+        }
+        if let Some(event) = parse_chat_event_line(&buffer)? {
+            events.push(event);
+        }
+        Ok(events)
+    }
+
     fn connection(&self, error: reqwest::Error) -> OllamaError {
         OllamaError::Connection {
             host: self.host.clone(),
@@ -375,12 +410,11 @@ impl OllamaClient {
         think: bool,
         num_ctx: u64,
         num_predict: u64,
-        stream: bool,
     ) -> Value {
         json!({
             "model": model,
             "messages": messages,
-            "stream": stream,
+            "stream": true,
             "think": think,
             "truncate": false,
             "shift": false,
@@ -392,12 +426,12 @@ impl OllamaClient {
         })
     }
 
-    fn agent_chat_payload(request: &AgentChatRequest, stream: bool) -> Value {
+    fn agent_chat_payload(request: &AgentChatRequest) -> Value {
         json!({
             "model": request.model,
             "messages": request.messages,
             "tools": request.tools,
-            "stream": stream,
+            "stream": true,
             "think": request.think,
             "truncate": false,
             "shift": false,
@@ -532,7 +566,7 @@ fn structured_chat_payload(request: &StructuredChatRequest) -> Value {
     json!({
         "model": request.model,
         "messages": messages,
-        "stream": false,
+        "stream": true,
         "think": false,
         "format": request.schema,
         "truncate": false,
@@ -578,6 +612,56 @@ fn parse_structured_chat_response(payload: &Value) -> Result<StructuredChatRespo
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
     })
+}
+
+#[cfg(test)]
+fn parse_chat_event_bytes(bytes: &[u8]) -> Result<Vec<Value>, OllamaError> {
+    let mut events = Vec::new();
+    for line in bytes.split(|byte| *byte == b'\n') {
+        if let Some(event) = parse_chat_event_line(line)? {
+            events.push(event);
+        }
+    }
+    Ok(events)
+}
+
+fn parse_chat_event_line(line: &[u8]) -> Result<Option<Value>, OllamaError> {
+    if line.iter().all(u8::is_ascii_whitespace) {
+        return Ok(None);
+    }
+    let event: Value = serde_json::from_slice(line)
+        .map_err(|error| OllamaError::Protocol(format!("Ollama 返回了无效流式 JSON: {error}")))?;
+    if !event.is_object() {
+        return Err(OllamaError::Protocol(
+            "Ollama 流式响应事件不是 JSON 对象".into(),
+        ));
+    }
+    if event.get("error").is_some() {
+        return Err(api_error(&event, None));
+    }
+    Ok(Some(event))
+}
+
+fn parse_structured_chat_events(events: &[Value]) -> Result<StructuredChatResponse, OllamaError> {
+    let final_event = events
+        .last()
+        .ok_or_else(|| OllamaError::Protocol("Ollama 结构化响应为空".into()))?;
+    let mut content = String::new();
+    for event in events {
+        if let Some(fragment) = event
+            .get("message")
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_str)
+        {
+            content.push_str(fragment);
+        }
+    }
+    let mut aggregate = final_event.clone();
+    aggregate
+        .as_object_mut()
+        .expect("validated event object")
+        .insert("message".into(), json!({"content": content}));
+    parse_structured_chat_response(&aggregate)
 }
 
 pub fn validate_public_http_url(raw: &str) -> Result<Url, OllamaError> {
@@ -747,19 +831,19 @@ impl ChatBackend for OllamaClient {
         think: bool,
         num_ctx: u64,
     ) -> Result<Option<String>, OllamaError> {
-        let mut payload = Self::chat_payload(model, messages, think, num_ctx, 1, false);
+        let mut payload = Self::chat_payload(model, messages, think, num_ctx, 1);
         payload
             .as_object_mut()
             .expect("chat payload is an object")
             .insert("_debug_render_only".into(), Value::Bool(true));
-        let response = self
-            .request_json(reqwest::Method::POST, "/api/chat", Some(payload))
-            .await?;
-        Ok(response
-            .get("_debug_info")
-            .and_then(|value| value.get("rendered_template"))
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned))
+        let events = self.request_chat_events(payload).await?;
+        Ok(events.iter().rev().find_map(|response| {
+            response
+                .get("_debug_info")
+                .and_then(|value| value.get("rendered_template"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        }))
     }
 
     async fn probe(
@@ -769,16 +853,17 @@ impl ChatBackend for OllamaClient {
         think: bool,
         num_ctx: u64,
     ) -> Result<TokenUsage, OllamaError> {
-        let mut payload = Self::chat_payload(model, messages, think, num_ctx, 1, false);
+        let mut payload = Self::chat_payload(model, messages, think, num_ctx, 1);
         let options = payload
             .get_mut("options")
             .and_then(Value::as_object_mut)
             .expect("chat options are an object");
         options.insert("temperature".into(), Value::from(0));
         options.insert("seed".into(), Value::from(0));
-        let response = self
-            .request_json(reqwest::Method::POST, "/api/chat", Some(payload))
-            .await?;
+        let events = self.request_chat_events(payload).await?;
+        let response = events
+            .last()
+            .ok_or_else(|| OllamaError::Protocol("精确探测响应为空".into()))?;
         let input = response.get("prompt_eval_count").and_then(Value::as_u64);
         let output = response.get("eval_count").and_then(Value::as_u64);
         match (input, output) {
@@ -801,7 +886,6 @@ impl ChatBackend for OllamaClient {
             request.think,
             request.num_ctx,
             request.num_predict,
-            true,
         );
         let object = payload.as_object_mut().expect("chat payload is an object");
         object.insert("logprobs".into(), Value::Bool(true));
@@ -884,7 +968,7 @@ impl ChatBackend for OllamaClient {
     }
 
     async fn probe_agent(&self, request: &AgentChatRequest) -> Result<TokenUsage, OllamaError> {
-        let mut payload = Self::agent_chat_payload(request, false);
+        let mut payload = Self::agent_chat_payload(request);
         let options = payload
             .get_mut("options")
             .and_then(Value::as_object_mut)
@@ -892,9 +976,10 @@ impl ChatBackend for OllamaClient {
         options.insert("num_predict".into(), Value::from(1));
         options.insert("temperature".into(), Value::from(0));
         options.insert("seed".into(), Value::from(0));
-        let response = self
-            .request_json(reqwest::Method::POST, "/api/chat", Some(payload))
-            .await?;
+        let events = self.request_chat_events(payload).await?;
+        let response = events
+            .last()
+            .ok_or_else(|| OllamaError::Protocol("工具请求精确探测响应为空".into()))?;
         let input = response.get("prompt_eval_count").and_then(Value::as_u64);
         let output = response.get("eval_count").and_then(Value::as_u64);
         match (input, output) {
@@ -911,7 +996,7 @@ impl ChatBackend for OllamaClient {
         cancellation: CancellationToken,
         emit: &mut (dyn FnMut(ChatEvent) + Send),
     ) -> Result<AgentRoundResult, OllamaError> {
-        let mut payload = Self::agent_chat_payload(&request, true);
+        let mut payload = Self::agent_chat_payload(&request);
         let object = payload.as_object_mut().expect("agent payload is an object");
         object.insert("logprobs".into(), Value::Bool(true));
         object.insert("top_logprobs".into(), Value::from(0));
@@ -1417,7 +1502,7 @@ mod tests {
         let request = structured_request();
         let payload = structured_chat_payload(&request);
         assert_eq!(payload["format"], request.schema);
-        assert_eq!(payload["stream"], false);
+        assert_eq!(payload["stream"], true);
         assert_eq!(payload["think"], false);
         assert_eq!(payload["truncate"], false);
         assert_eq!(payload["shift"], false);
@@ -1435,6 +1520,41 @@ mod tests {
             "done_reason": "stop"
         }))
         .unwrap();
+        assert_eq!(response.content, "{\"name\":\"Ada\"}");
+        assert_eq!(response.usage, TokenUsage::new(Some(12), Some(5)));
+        assert_eq!(response.done_reason.as_deref(), Some("stop"));
+    }
+
+    #[test]
+    fn all_chat_payload_builders_force_streaming() {
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+        }];
+        let payload = OllamaClient::chat_payload("model", &messages, false, 4096, 32);
+        assert_eq!(payload["stream"], true);
+
+        let agent = AgentChatRequest {
+            model: "model".into(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            think: false,
+            num_ctx: 4096,
+            num_predict: 32,
+        };
+        assert_eq!(OllamaClient::agent_chat_payload(&agent)["stream"], true);
+        assert_eq!(
+            structured_chat_payload(&structured_request())["stream"],
+            true
+        );
+    }
+
+    #[test]
+    fn streamed_structured_chat_concatenates_chunks_and_accepts_final_without_newline() {
+        let bytes = br#"{"message":{"content":"{\"name\":"},"done":false}
+{"message":{"content":"\"Ada\"}"},"done":true,"prompt_eval_count":12,"eval_count":5,"done_reason":"stop"}"#;
+        let events = parse_chat_event_bytes(bytes).unwrap();
+        let response = parse_structured_chat_events(&events).unwrap();
         assert_eq!(response.content, "{\"name\":\"Ada\"}");
         assert_eq!(response.usage, TokenUsage::new(Some(12), Some(5)));
         assert_eq!(response.done_reason.as_deref(), Some("stop"));

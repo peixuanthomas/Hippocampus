@@ -114,6 +114,19 @@ API key 不会写入配置、日志或会话。每轮最多执行配置的工具
 
 网页端同样保留上下文临界决策：达到 90% 后会弹出“裁剪并继续”或“暂停会话”。所有静态资源都编译进可执行文件，不依赖 CDN 或外部前端服务。
 
+所有模型聊天调用都使用 Ollama 流式响应。外部客户端也可以通过现有的 SSE 接口连续对话：
+
+```bash
+curl -i -N -H 'Content-Type: application/json' \
+  -d '{"message":"你好"}' http://127.0.0.1:31415/api/chat
+
+curl -N -H 'Content-Type: application/json' \
+  -d '{"message":"继续","session_id":"20260811-abcdef12"}' \
+  http://127.0.0.1:31415/api/chat
+```
+
+首个响应会在 `X-Hippocampus-Session-Id` 响应头和第一个 `session` SSE 事件中给出活动会话 ID；后续请求可在 JSON body 中传回 `session_id`，不匹配时返回 409。`done` 事件也包含该 ID。一个 `serve` 进程只拥有一个活动会话，不提供认证或多租户隔离；进程重启后需要用 `serve --session <id>` 继续原会话。
+
 如需保持在 shell 后台运行，可以使用操作系统自己的进程管理方式，例如：
 
 ```bash
@@ -131,6 +144,8 @@ API key 不会写入配置、日志或会话。每轮最多执行配置的工具
 ./build/hippocampus ask --think --system-prompt "简洁回答" "你好"
 ./build/hippocampus ask --json "你好"
 ```
+
+`ask --json` 输出逐行刷新的 JSONL 事件，而不是单个缓冲 JSON 对象。`thinking` 和 `content` 事件携带本次增量，随后可能有 `usage`/`completed`，最后一行固定为 `event:"done"` 并包含完整内容、thinking、最终 usage、会话 ID 和上下文来源元数据。JSON 模式总是输出 thinking 事件，不受 `--show-thinking` 影响。
 
 无状态 `ask` 默认使用 `qwen3.8:27b-mlx` 且 thinking 关闭；显式传入 `--think` 才会开启，兼容参数 `--no-think` 仍可使用。带 `--session` 时则沿用会话已保存的模型和 thinking 设置。
 
