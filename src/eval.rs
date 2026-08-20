@@ -247,7 +247,14 @@ pub fn eval_run_fingerprint(i: &EvalFingerprintInput) -> Result<String> {
     )?))
 }
 pub fn validate_eval_paths(dataset: Option<&Path>, output: &Path, workspace: &Path) -> Result<()> {
-    let summary = resolve_eval_path(&eval_summary_path(output)?)?;
+    reject_parent_components(output, "evaluation output")?;
+    reject_parent_components(workspace, "evaluation workspace")?;
+    if let Some(dataset) = dataset {
+        reject_parent_components(dataset, "evaluation dataset")?;
+    }
+    let summary_path = eval_summary_path(output)?;
+    reject_parent_components(&summary_path, "evaluation summary")?;
+    let summary = resolve_eval_path(&summary_path)?;
     let output = resolve_eval_path(output)?;
     let workspace = resolve_eval_path(workspace)?;
     ensure!(
@@ -489,7 +496,7 @@ impl EvalJsonl {
                     "empty evaluation JSONL line {}",
                     i + 1
                 );
-                let r: EvalRecord = serde_json::from_str(&line)
+                let mut r: EvalRecord = serde_json::from_str(&line)
                     .with_context(|| format!("malformed JSONL line {}", i + 1))?;
                 ensure!(
                     r.schema_version == 1
@@ -500,6 +507,7 @@ impl EvalJsonl {
                     "mixed JSONL line {}",
                     i + 1
                 );
+                r.usage.refresh();
                 ensure!(ids.insert(r.question_id.clone()), "duplicate question ID");
                 records.push(r)
             }
@@ -822,6 +830,11 @@ fn validate_runtime(
     corpus: &EvalCorpus,
     options: &EvalRunOptions,
 ) -> Result<()> {
+    validate_eval_paths(
+        options.dataset_path.as_deref(),
+        &options.output,
+        &options.workspace,
+    )?;
     config.validate()?;
     options.channels.validate().map_err(anyhow::Error::msg)?;
     ensure!(
@@ -866,11 +879,18 @@ fn validate_runtime(
             "disabled memory only supports BM25-only channels"
         );
     }
-    validate_eval_paths(
-        options.dataset_path.as_deref(),
-        &options.output,
-        &options.workspace,
-    )?;
+    let canonical = match corpus.benchmark {
+        EvalBenchmark::Synthetic => load_eval_corpus(EvalBenchmark::Synthetic, None, None)?,
+        benchmark => load_eval_corpus(
+            benchmark,
+            options.dataset_path.as_deref(),
+            Some(corpus.cases.len()),
+        )?,
+    };
+    ensure!(
+        canonical == *corpus,
+        "evaluation corpus does not exactly match its canonical source"
+    );
     let mut ids = HashSet::new();
     for case in &corpus.cases {
         ensure!(
@@ -1512,15 +1532,7 @@ fn locomo(bytes: &[u8]) -> Result<Vec<EvalCase>> {
             let cat = scalar(&q.category, "category")?.parse::<u8>()?;
             ensure!((1..=5).contains(&cat), "invalid category");
             let (mut gold, unresolved) = resolve(&q.evidence, &known);
-            let answer = q
-                .answer
-                .as_ref()
-                .map(|value| {
-                    let answer = scalar(value, "answer")?;
-                    ensure!(!answer.trim().is_empty(), "answer empty");
-                    Ok(answer)
-                })
-                .transpose()?;
+            let answer = locomo_answer(q.answer.as_ref(), q.adversarial_answer.as_ref())?;
             ensure!(
                 cat == 5 || answer.is_some(),
                 "categories 1-4 require an answer"
@@ -1620,10 +1632,34 @@ fn resolve_eval_path(path: &Path) -> Result<PathBuf> {
     }
     Ok(resolved)
 }
+fn reject_parent_components(path: &Path, label: &str) -> Result<()> {
+    ensure!(
+        !path
+            .components()
+            .any(|component| component == Component::ParentDir),
+        "{label} must not contain parent-directory components"
+    );
+    Ok(())
+}
 fn eval_summary_path(output: &Path) -> Result<PathBuf> {
     let mut filename = OsString::from(output.file_name().context("output filename missing")?);
     filename.push(".summary.json");
     Ok(output.with_file_name(filename))
+}
+fn locomo_answer(answer: Option<&Value>, adversarial: Option<&Value>) -> Result<Option<String>> {
+    if let Some(value) = answer {
+        let answer = scalar(value, "answer")?;
+        if !answer.trim().is_empty() {
+            return Ok(Some(answer));
+        }
+    }
+    if let Some(value) = adversarial {
+        let answer = scalar(value, "adversarial_answer")?;
+        ensure!(!answer.trim().is_empty(), "adversarial_answer empty");
+        return Ok(Some(answer));
+    }
+    ensure!(answer.is_none(), "blank answer has no adversarial fallback");
+    Ok(None)
 }
 fn aggregate<I: Iterator<Item = Option<f64>>>(i: I) -> EvalAggregate {
     let mut v = i.flatten().filter(|x| x.is_finite()).collect::<Vec<_>>();
