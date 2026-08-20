@@ -12,7 +12,7 @@ Hippocampus 是一个完全使用 Rust 实现的本地 Ollama 会话客户端。
 
 ```bash
 ollama serve
-ollama pull qwen3.5:9b
+ollama pull qwen3.8:27b-mlx
 ollama pull qwen3-embedding:8b
 cargo build --release
 ```
@@ -79,10 +79,12 @@ API key 不会写入配置、日志或会话。每轮最多执行配置的工具
 
 ```bash
 ./build/hippocampus
-./build/hippocampus new --model qwen3.5:9b --no-think
+./build/hippocampus new --model qwen3.8:27b-mlx
 ./build/hippocampus resume 20260811-abcdef12
 ./build/hippocampus --sessions-dir ./sessions resume 20260811-abcdef12
 ```
+
+新会话默认使用 `qwen3.8:27b-mlx` 且 thinking 关闭；显式传入 `--think` 才会开启，`--no-think` 作为兼容参数保留。恢复旧会话始终沿用其中已保存的模型和 thinking 设置，不会迁移到新默认值。
 
 界面顶部显示模型、thinking、上下文与会话状态；中间是对话；底部是可编辑的多行输入框。
 
@@ -105,10 +107,10 @@ API key 不会写入配置、日志或会话。每轮最多执行配置的工具
 ```bash
 ./build/hippocampus serve
 ./build/hippocampus serve --session 20260811-abcdef12
-./build/hippocampus serve --port 8080 --no-think
+./build/hippocampus serve --port 8080 --think
 ```
 
-不传 `--session` 时会创建新会话；传入后会继续指定会话。页面包含与 TUI 相近的顶部状态栏、对话区、多行输入框、thinking 开关、原子保存和停止生成按钮。流式正文实时出现，完成后 Markdown 会渲染成标题、列表、表格、引用、代码块和链接等富文本；原始 HTML 与危险内容会在 Rust 服务端清洗。
+不传 `--session` 时会创建默认关闭 thinking 的新会话；传入后会继续指定会话并保留其中已保存的模型和 thinking 设置。页面包含与 TUI 相近的顶部状态栏、对话区、多行输入框、thinking 开关、原子保存和停止生成按钮。流式正文实时出现，完成后 Markdown 会渲染成标题、列表、表格、引用、代码块和链接等富文本；原始 HTML 与危险内容会在 Rust 服务端清洗。
 
 网页端同样保留上下文临界决策：达到 90% 后会弹出“裁剪并继续”或“暂停会话”。所有静态资源都编译进可执行文件，不依赖 CDN 或外部前端服务。
 
@@ -126,9 +128,11 @@ API key 不会写入配置、日志或会话。每轮最多执行配置的工具
 
 ```bash
 ./build/hippocampus ask "只回答一个词：天空是什么颜色？"
-./build/hippocampus ask --no-think --system-prompt "简洁回答" "你好"
+./build/hippocampus ask --think --system-prompt "简洁回答" "你好"
 ./build/hippocampus ask --json "你好"
 ```
+
+无状态 `ask` 默认使用 `qwen3.8:27b-mlx` 且 thinking 关闭；显式传入 `--think` 才会开启，兼容参数 `--no-think` 仍可使用。带 `--session` 时则沿用会话已保存的模型和 thinking 设置。
 
 传入 `--session` 时才会加载该会话上下文，并把新一轮原子保存回同一个会话：
 
@@ -178,7 +182,7 @@ location = "https://example.com/docs.txt"
 
 ## 派生记忆运维
 
-启用仓库配置后，巩固使用该会话写入时冻结的聊天模型（默认命令模型为 `qwen3.5:9b`）提取可追溯结构，并使用 `[memory].embedding_model`（当前为 `qwen3-embedding:8b`）生成向量。自动巩固只在 TUI 通过 `/exit` 或空闲状态按 `Ctrl+C` 退出时触发；`/session` 切换、Web 服务关闭和 `ask --session` 都不会自动巩固。手动命令如下：
+启用仓库配置后，巩固使用该会话写入时冻结的聊天模型（新会话默认模型为 `qwen3.8:27b-mlx`，旧会话仍使用各自保存的模型）提取可追溯结构，并使用 `[memory].embedding_model`（当前为 `qwen3-embedding:8b`）生成向量。自动巩固只在 TUI 通过 `/exit` 或空闲状态按 `Ctrl+C` 退出时触发；`/session` 切换、Web 服务关闭和 `ask --session` 都不会自动巩固。手动命令如下：
 
 ```bash
 ./build/hippocampus memory consolidate 20260811-abcdef12
@@ -213,7 +217,7 @@ location = "https://example.com/docs.txt"
 
 ## 记忆评测
 
-评测命令固定使用真实回答模型 `qwen3.5:9b`，embedding 模型和参数来自当前配置；它不会报告仓库预先跑出的分数。三个入口为：
+评测命令固定使用真实回答模型 `qwen3.8:27b-mlx`，embedding 模型和参数来自当前配置；结构化调用仍关闭 thinking。它不会报告仓库预先跑出的分数。三个入口为：
 
 ```bash
 ./build/hippocampus eval synthetic

@@ -189,7 +189,7 @@ enum KnowledgeCommand {
 
 #[derive(Debug, Clone, Args)]
 struct NewArgs {
-    #[arg(long, default_value = "qwen3.5:9b")]
+    #[arg(long, default_value = "qwen3.8:27b-mlx")]
     model: String,
     #[arg(long, default_value_t = 32_768)]
     context_window: u64,
@@ -210,11 +210,11 @@ struct NewArgs {
 impl Default for NewArgs {
     fn default() -> Self {
         Self {
-            model: "qwen3.5:9b".into(),
+            model: "qwen3.8:27b-mlx".into(),
             context_window: 32_768,
             max_output_tokens: 4_096,
             safety_margin_tokens: 512,
-            think: true,
+            think: false,
             no_think: false,
             system_prompt: None,
             system_prompt_file: None,
@@ -244,7 +244,7 @@ impl NewArgs {
     }
 
     fn thinking_enabled(&self) -> bool {
-        self.think || !self.no_think
+        self.think && !self.no_think
     }
 }
 
@@ -255,7 +255,7 @@ struct AskArgs {
     /// 使用该会话的历史上下文；不传则无历史且不创建会话
     #[arg(long)]
     session: Option<String>,
-    #[arg(long, default_value = "qwen3.5:9b")]
+    #[arg(long, default_value = "qwen3.8:27b-mlx")]
     model: String,
     #[arg(long, default_value_t = 32_768)]
     context_window: u64,
@@ -299,7 +299,7 @@ struct ServeArgs {
 
 impl AskArgs {
     fn thinking_enabled(&self) -> bool {
-        self.think || !self.no_think
+        self.think && !self.no_think
     }
 }
 
@@ -544,7 +544,7 @@ async fn run_single_evaluation_inner(
         dataset_path: dataset,
         output: output.clone(),
         workspace,
-        answer_model: "qwen3.5:9b".into(),
+        answer_model: "qwen3.8:27b-mlx".into(),
         ollama_host: ollama_host.to_owned(),
         channels,
         num_ctx: 32_768,
@@ -1830,13 +1830,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ask_session_is_optional_and_no_think_is_supported() {
+    fn ask_session_is_optional_and_thinking_defaults_off() {
         let stateless = Cli::try_parse_from(["hippocampus", "ask", "hello"]).unwrap();
         let Some(Command::Ask(args)) = stateless.command else {
             panic!("expected ask command");
         };
         assert!(args.session.is_none());
-        assert!(args.thinking_enabled());
+        assert!(!args.thinking_enabled());
 
         let contextual = Cli::try_parse_from([
             "hippocampus",
