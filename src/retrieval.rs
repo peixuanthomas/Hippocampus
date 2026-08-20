@@ -4697,38 +4697,54 @@ impl RetrievalStore {
         for event_id in recent_event_ids {
             self.validate_recall_input_id(&transaction, &control, event_id, session_filter)?;
         }
-        let bm25_started = Instant::now();
-        let mut bm25 = if options.channels.bm25 {
-            self.keyword_recall_core_from_connection(
-                &transaction,
-                raw_query,
-                current_user_event_id,
-                recent_event_ids,
-                session_filter,
-                retrieval_config.clone(),
-                &control,
-                &visibility,
-                &options.query_origin,
-            )?
-        } else {
-            empty_recall_base(raw_query, current_user_event_id, retrieval_config.clone())
-        };
-        let bm25_ms = if options.channels.bm25 {
-            elapsed_ms(bm25_started)
-        } else {
-            0
-        };
         self.require_current_control_projection(&transaction, &control)?;
-        bm25.trace.budget_allocation = memory_budget_trace(&memory_config, bm25.trace.query_kind);
         let (index, pending_vector_cache) = self.load_vector_index_from_connection(
             &transaction,
             spec,
             session_filter,
             &visibility,
         )?;
-        let hits = index
-            .search(&query_vector, memory_config.vector_candidate_limit)
-            .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+        let (mut bm25, bm25_ms, hits) = if options.channels.bm25 {
+            std::thread::scope(|scope| -> RetrievalResult<_> {
+                let vector_worker = scope.spawn(|| {
+                    index
+                        .search(&query_vector, memory_config.vector_candidate_limit)
+                        .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))
+                });
+                let bm25_started = Instant::now();
+                let bm25 = self.keyword_recall_core_from_connection(
+                    &transaction,
+                    raw_query,
+                    current_user_event_id,
+                    recent_event_ids,
+                    session_filter,
+                    retrieval_config.clone(),
+                    &control,
+                    &visibility,
+                    &options.query_origin,
+                );
+                let bm25_ms = elapsed_ms(bm25_started);
+                let vector = vector_worker.join().map_err(|_| {
+                    RetrievalError::HybridRecall(HybridRecallFailure::new(
+                        HybridRecallStage::Vector,
+                        "向量召回工作线程异常终止",
+                    ))
+                });
+                let bm25 = bm25?;
+                let hits = vector??;
+                Ok((bm25, bm25_ms, hits))
+            })?
+        } else {
+            let hits = index
+                .search(&query_vector, memory_config.vector_candidate_limit)
+                .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+            (
+                empty_recall_base(raw_query, current_user_event_id, retrieval_config.clone()),
+                0,
+                hits,
+            )
+        };
+        bm25.trace.budget_allocation = memory_budget_trace(&memory_config, bm25.trace.query_kind);
         let vector_aggregate_sources = hits
             .iter()
             .filter(|hit| {
