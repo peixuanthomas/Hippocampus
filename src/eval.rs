@@ -269,6 +269,10 @@ pub fn validate_eval_paths(dataset: Option<&Path>, output: &Path, workspace: &Pa
     let output = resolve_eval_path(output)?;
     let workspace = resolve_eval_path(workspace)?;
     ensure!(
+        output != summary,
+        "evaluation output and summary must be distinct"
+    );
+    ensure!(
         !output.starts_with(&workspace) && !summary.starts_with(&workspace),
         "evaluation output must not be inside workspace"
     );
