@@ -230,9 +230,20 @@ pub fn load_eval_corpus(
                 lme(&bytes)?
             };
             cases.truncate(n.min(cases.len()));
+            let source_sha256 = hash(&bytes);
+            let selected_case_ids = cases
+                .iter()
+                .map(|case| case.id.as_str())
+                .collect::<Vec<_>>();
+            let dataset_sha256 = hash(&serde_json::to_vec(&json!({
+                "domain": "hippocampus-eval-dataset-selection-v1",
+                "benchmark": benchmark,
+                "source_sha256": source_sha256,
+                "selected_case_ids": selected_case_ids,
+            }))?);
             Ok(EvalCorpus {
                 benchmark,
-                dataset_sha256: hash(&bytes),
+                dataset_sha256,
                 cases,
             })
         }

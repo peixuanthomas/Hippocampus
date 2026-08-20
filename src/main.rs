@@ -1,6 +1,7 @@
+use std::ffi::OsString;
 use std::io::{self, Write};
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -13,10 +14,11 @@ use hippocampus::model::{
 use hippocampus::ollama::{ChatBackend, ChatRequest};
 use hippocampus::{
     ChatEngine, ConsolidationRunReport, ConsolidationRunStatus, ConsolidationTrigger,
-    ControlRecord, ControlTarget, ControlTargetKind, EmbeddingRefreshReport,
-    GraphMaterializationReport, HybridRecallOptions, KnowledgeSyncReport, LimitAction,
-    MemoryStatus, OllamaClient, RebuildOptions, RebuildReport, RecallChannels, RecallQueryOrigin,
-    RecallResult, SessionStore,
+    ControlRecord, ControlTarget, ControlTargetKind, EmbeddingRefreshReport, EvalBenchmark,
+    EvalRunOptions, EvalRunReport, GraphMaterializationReport, HybridRecallOptions,
+    KnowledgeSyncReport, LimitAction, MemoryStatus, OllamaClient, RebuildOptions, RebuildReport,
+    RecallChannels, RecallQueryOrigin, RecallResult, SessionStore, load_eval_corpus,
+    run_evaluation, validate_eval_paths,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -63,6 +65,35 @@ enum Command {
     Knowledge(KnowledgeArgs),
     /// 管理派生记忆
     Memory(MemoryArgs),
+    /// 运行可恢复的记忆评测
+    Eval(EvalArgs),
+}
+
+#[derive(Debug, Args)]
+struct EvalArgs {
+    #[command(subcommand)]
+    command: EvalCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum EvalCommand {
+    Synthetic,
+    Longmemeval {
+        #[arg(long)]
+        dataset: PathBuf,
+        #[arg(long)]
+        limit: usize,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    Locomo {
+        #[arg(long)]
+        dataset: PathBuf,
+        #[arg(long)]
+        limit: usize,
+        #[arg(long)]
+        output: PathBuf,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -285,7 +316,18 @@ async fn main() {
 
 async fn run() -> Result<()> {
     let cli = Cli::parse();
-    let config = AppConfig::load(cli.config.as_deref())?.config;
+    let loaded = AppConfig::load(cli.config.as_deref())?;
+    if let Some(Command::Eval(args)) = cli.command {
+        return run_eval(
+            args,
+            &cli.host,
+            &cli.sessions_dir,
+            loaded.path.as_deref(),
+            loaded.config,
+        )
+        .await;
+    }
+    let config = loaded.config;
     if !config.memory.enabled
         && matches!(
             &cli.command,
@@ -307,7 +349,298 @@ async fn run() -> Result<()> {
         Some(Command::Serve(args)) => run_serve(store, &cli.host, args, &config).await,
         Some(Command::Knowledge(args)) => run_knowledge(store, &cli.host, args, &config).await,
         Some(Command::Memory(args)) => run_memory(store, &cli.host, args, &config).await,
+        Some(Command::Eval(_)) => unreachable!("evaluation returned before opening session store"),
     }
+}
+
+async fn run_eval(
+    args: EvalArgs,
+    host: &str,
+    sessions_dir: &Path,
+    config_path: Option<&Path>,
+    config: AppConfig,
+) -> Result<()> {
+    let matrices = if config.memory.enabled {
+        vec![
+            ("bm25-only", RecallChannels::bm25_only()),
+            (
+                "vector-only",
+                RecallChannels {
+                    bm25: false,
+                    vector: true,
+                    entity: false,
+                    state: false,
+                    episode: false,
+                    graph: false,
+                },
+            ),
+            (
+                "vector-graph",
+                RecallChannels {
+                    bm25: false,
+                    vector: true,
+                    entity: false,
+                    state: false,
+                    episode: false,
+                    graph: true,
+                },
+            ),
+            ("full", RecallChannels::all()),
+        ]
+    } else {
+        vec![("bm25-only", RecallChannels::bm25_only())]
+    };
+    let client = OllamaClient::new(host)?;
+    let ollama_host = host.trim_end_matches('/').to_owned();
+    match args.command {
+        EvalCommand::Synthetic => {
+            println!(
+                "evaluation matrix: {}",
+                matrices
+                    .iter()
+                    .map(|(name, _)| *name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            let total = matrices.len();
+            for (matrix, channels) in matrices {
+                let output = PathBuf::from(format!("eval-results/synthetic.{matrix}.jsonl"));
+                run_single_evaluation(
+                    client.clone(),
+                    config.clone(),
+                    EvalBenchmark::Synthetic,
+                    matrix,
+                    None,
+                    None,
+                    output,
+                    channels,
+                    sessions_dir,
+                    config_path,
+                    &ollama_host,
+                )
+                .await?;
+            }
+            println!("completed matrices: {total}/{total}");
+        }
+        EvalCommand::Longmemeval {
+            dataset,
+            limit,
+            output,
+        } => {
+            let (matrix, channels) = if config.memory.enabled {
+                ("full", RecallChannels::all())
+            } else {
+                ("bm25-only", RecallChannels::bm25_only())
+            };
+            println!("evaluation matrix: {matrix}");
+            run_single_evaluation(
+                client,
+                config,
+                EvalBenchmark::LongMemEval,
+                matrix,
+                Some(dataset),
+                Some(limit),
+                output,
+                channels,
+                sessions_dir,
+                config_path,
+                &ollama_host,
+            )
+            .await?;
+        }
+        EvalCommand::Locomo {
+            dataset,
+            limit,
+            output,
+        } => {
+            let (matrix, channels) = if config.memory.enabled {
+                ("full", RecallChannels::all())
+            } else {
+                ("bm25-only", RecallChannels::bm25_only())
+            };
+            println!("evaluation matrix: {matrix}");
+            run_single_evaluation(
+                client,
+                config,
+                EvalBenchmark::Locomo,
+                matrix,
+                Some(dataset),
+                Some(limit),
+                output,
+                channels,
+                sessions_dir,
+                config_path,
+                &ollama_host,
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_single_evaluation(
+    client: OllamaClient,
+    config: AppConfig,
+    benchmark: EvalBenchmark,
+    matrix: &str,
+    dataset: Option<PathBuf>,
+    limit: Option<usize>,
+    output: PathBuf,
+    channels: RecallChannels,
+    sessions_dir: &Path,
+    config_path: Option<&Path>,
+    ollama_host: &str,
+) -> Result<()> {
+    let context = format!(
+        "evaluation failed: benchmark={benchmark:?}, matrix={matrix}, output={}; 已持久化记录保留，可用相同命令恢复",
+        output.display()
+    );
+    run_single_evaluation_inner(
+        client,
+        config,
+        benchmark,
+        matrix,
+        dataset,
+        limit,
+        output,
+        channels,
+        sessions_dir,
+        config_path,
+        ollama_host,
+    )
+    .await
+    .with_context(|| context)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_single_evaluation_inner(
+    client: OllamaClient,
+    config: AppConfig,
+    benchmark: EvalBenchmark,
+    matrix: &str,
+    dataset: Option<PathBuf>,
+    limit: Option<usize>,
+    output: PathBuf,
+    channels: RecallChannels,
+    sessions_dir: &Path,
+    config_path: Option<&Path>,
+    ollama_host: &str,
+) -> Result<()> {
+    let corpus = load_eval_corpus(benchmark, dataset.as_deref(), limit)?;
+    if config.memory.candidate_limit < 10 {
+        bail!("evaluation requires memory.candidate_limit >= 10");
+    }
+    let filename = output
+        .file_name()
+        .context("evaluation output filename missing")?;
+    let mut workspace_name = OsString::from(".");
+    workspace_name.push(filename);
+    workspace_name.push(".workspace");
+    let workspace = output.with_file_name(workspace_name);
+    validate_eval_paths(dataset.as_deref(), &output, &workspace)?;
+    validate_eval_store_isolation(&workspace, sessions_dir, config_path)?;
+    let options = EvalRunOptions {
+        dataset_path: dataset,
+        output: output.clone(),
+        workspace,
+        answer_model: "qwen3.5:9b".into(),
+        ollama_host: ollama_host.to_owned(),
+        channels,
+        num_ctx: 32_768,
+        num_predict: 4_096,
+        selected_evidence_limit: 10,
+    };
+    let report = run_evaluation(client, config, corpus, options).await?;
+    print_eval_report(benchmark, matrix, &report);
+    Ok(())
+}
+
+fn print_eval_report(benchmark: EvalBenchmark, matrix: &str, report: &EvalRunReport) {
+    println!("benchmark: {benchmark:?}");
+    println!("matrix: {matrix}");
+    println!("output: {}", report.output.display());
+    println!("summary_path: {}", report.summary_path.display());
+    println!("resumed_records: {}", report.resumed_records);
+    println!("appended_records: {}", report.appended_records);
+    println!(
+        "completed/requested: {}/{}",
+        report.summary.completed_questions, report.summary.requested_questions
+    );
+    println!("run_fingerprint: {}", report.summary.run_fingerprint);
+}
+
+fn validate_eval_store_isolation(
+    workspace: &Path,
+    sessions_dir: &Path,
+    config_path: Option<&Path>,
+) -> Result<()> {
+    reject_parent_path(workspace, "evaluation workspace")?;
+    reject_parent_path(sessions_dir, "sessions directory")?;
+    let workspace = resolve_path_components(workspace)?;
+    let sessions = resolve_path_components(sessions_dir)?;
+    ensure_disjoint(
+        &workspace,
+        &sessions,
+        "evaluation workspace",
+        "sessions directory",
+    )?;
+    if let Some(config_path) = config_path {
+        reject_parent_path(config_path, "config path")?;
+        let config = resolve_path_components(config_path)?;
+        ensure_disjoint(&workspace, &config, "evaluation workspace", "config path")?;
+    }
+    Ok(())
+}
+
+fn reject_parent_path(path: &Path, label: &str) -> Result<()> {
+    if path
+        .components()
+        .any(|component| component == Component::ParentDir)
+    {
+        bail!("{label} must not contain parent-directory components");
+    }
+    Ok(())
+}
+
+fn resolve_path_components(path: &Path) -> Result<PathBuf> {
+    let mut resolved = if path.is_absolute() {
+        PathBuf::new()
+    } else {
+        std::fs::canonicalize(std::env::current_dir()?)?
+    };
+    for component in path.components() {
+        match component {
+            Component::RootDir => resolved.push(Path::new("/")),
+            Component::Prefix(prefix) => resolved.push(prefix.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => unreachable!("parent components rejected before resolution"),
+            Component::Normal(part) => {
+                let candidate = resolved.join(part);
+                match std::fs::symlink_metadata(&candidate) {
+                    Ok(_) => {
+                        resolved = std::fs::canonicalize(&candidate).with_context(|| {
+                            format!("cannot resolve path {}", candidate.display())
+                        })?;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => resolved.push(part),
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("cannot inspect path {}", candidate.display())
+                        });
+                    }
+                }
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+fn ensure_disjoint(a: &Path, b: &Path, a_label: &str, b_label: &str) -> Result<()> {
+    if a == b || a.starts_with(b) || b.starts_with(a) {
+        bail!("{a_label} and {b_label} must be disjoint");
+    }
+    Ok(())
 }
 
 async fn run_serve(
