@@ -16,13 +16,13 @@ use pulldown_cmark::{Options, Parser, html};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, Notify, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::engine::{ChatEngine, LimitAction, PreparationStatus};
 use crate::knowledge::KnowledgeEvidence;
 use crate::model::{ChatEvent, ChatEventKind, Session, TokenUsage, Turn, WebSourceTrace};
-use crate::ollama::{ModelInfo, OllamaClient};
+use crate::ollama::{ChatBackend, ModelInfo, OllamaClient};
 
 const INDEX_HTML: &str = include_str!("web/index.html");
 const APP_CSS: &str = include_str!("web/app.css");
@@ -30,11 +30,12 @@ const APP_JS: &str = include_str!("web/app.js");
 const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone)]
-struct WebState {
-    engine: ChatEngine<OllamaClient>,
+struct WebState<B: ChatBackend> {
+    engine: ChatEngine<B>,
     session: Arc<Mutex<Session>>,
     model_info: ModelInfo,
     runtime: Arc<Mutex<RuntimeState>>,
+    generation_finished: Arc<Notify>,
 }
 
 #[derive(Default)]
@@ -160,8 +161,9 @@ pub async fn serve(
         session: Arc::new(Mutex::new(session)),
         model_info,
         runtime: Arc::new(Mutex::new(RuntimeState::default())),
+        generation_finished: Arc::new(Notify::new()),
     };
-    let app = router(state);
+    let app = router(state.clone());
     let listener = TcpListener::bind(address)
         .await
         .with_context(|| format!("无法监听 {address}"))?;
@@ -178,16 +180,17 @@ pub async fn serve(
     if !actual.ip().is_loopback() {
         eprintln!("警告：服务正在非回环地址监听，当前版本没有用户认证，请勿暴露到不可信网络。");
     }
-    axum::serve(listener, app)
+    let serve_result = axum::serve(listener, app)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
         })
-        .await
-        .context("Web 服务异常退出")?;
+        .await;
+    wait_for_idle(&state).await;
+    serve_result.context("Web 服务异常退出")?;
     Ok(())
 }
 
-fn router(state: WebState) -> Router {
+fn router<B: ChatBackend>(state: WebState<B>) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/app.css", get(styles))
@@ -240,7 +243,7 @@ fn secured_static(body: impl IntoResponse, content_type: &'static str) -> Respon
     response
 }
 
-async fn health(State(state): State<WebState>) -> Json<Value> {
+async fn health<B: ChatBackend>(State(state): State<WebState<B>>) -> Json<Value> {
     Json(json!({
         "ok": true,
         "version": env!("CARGO_PKG_VERSION"),
@@ -248,14 +251,14 @@ async fn health(State(state): State<WebState>) -> Json<Value> {
     }))
 }
 
-async fn get_session(State(state): State<WebState>) -> Json<SessionView> {
+async fn get_session<B: ChatBackend>(State(state): State<WebState<B>>) -> Json<SessionView> {
     let session = state.session.lock().await;
     let busy = state.runtime.lock().await.generation.is_some();
     Json(session_view(&session, &state.model_info, busy))
 }
 
-async fn chat(
-    State(state): State<WebState>,
+async fn chat<B: ChatBackend>(
+    State(state): State<WebState<B>>,
     Json(input): Json<ChatInput>,
 ) -> std::result::Result<Response, ApiError> {
     if input.message.trim().is_empty() {
@@ -322,8 +325,8 @@ fn sse_response(event_rx: mpsc::UnboundedReceiver<Event>, session_id: &str) -> R
     response
 }
 
-async fn run_generation(
-    state: WebState,
+async fn run_generation<B: ChatBackend>(
+    state: WebState<B>,
     message: String,
     event_tx: mpsc::UnboundedSender<Event>,
     mut decision_rx: mpsc::UnboundedReceiver<LimitAction>,
@@ -338,10 +341,11 @@ async fn run_generation(
         );
     }
     state.runtime.lock().await.generation = None;
+    state.generation_finished.notify_waiters();
 }
 
-async fn generate(
-    state: &WebState,
+async fn generate<B: ChatBackend>(
+    state: &WebState<B>,
     message: String,
     event_tx: &mpsc::UnboundedSender<Event>,
     decision_rx: &mut mpsc::UnboundedReceiver<LimitAction>,
@@ -453,8 +457,8 @@ fn send_event(sender: &mpsc::UnboundedSender<Event>, name: &'static str, data: V
     }
 }
 
-async fn decide(
-    State(state): State<WebState>,
+async fn decide<B: ChatBackend>(
+    State(state): State<WebState<B>>,
     Json(input): Json<DecisionInput>,
 ) -> std::result::Result<Json<ApiMessage>, ApiError> {
     let action = match input.action.as_str() {
@@ -477,7 +481,9 @@ async fn decide(
     }))
 }
 
-async fn cancel(State(state): State<WebState>) -> std::result::Result<Json<ApiMessage>, ApiError> {
+async fn cancel<B: ChatBackend>(
+    State(state): State<WebState<B>>,
+) -> std::result::Result<Json<ApiMessage>, ApiError> {
     let runtime = state.runtime.lock().await;
     let control = runtime
         .generation
@@ -490,8 +496,8 @@ async fn cancel(State(state): State<WebState>) -> std::result::Result<Json<ApiMe
     }))
 }
 
-async fn set_think(
-    State(state): State<WebState>,
+async fn set_think<B: ChatBackend>(
+    State(state): State<WebState<B>>,
     Json(input): Json<ThinkInput>,
 ) -> std::result::Result<Json<ApiMessage>, ApiError> {
     ensure_idle(&state).await?;
@@ -511,7 +517,9 @@ async fn set_think(
     }))
 }
 
-async fn save(State(state): State<WebState>) -> std::result::Result<Json<ApiMessage>, ApiError> {
+async fn save<B: ChatBackend>(
+    State(state): State<WebState<B>>,
+) -> std::result::Result<Json<ApiMessage>, ApiError> {
     ensure_idle(&state).await?;
     let mut session = state.session.lock().await;
     let path = state
@@ -525,11 +533,21 @@ async fn save(State(state): State<WebState>) -> std::result::Result<Json<ApiMess
     }))
 }
 
-async fn ensure_idle(state: &WebState) -> std::result::Result<(), ApiError> {
+async fn ensure_idle<B: ChatBackend>(state: &WebState<B>) -> std::result::Result<(), ApiError> {
     if state.runtime.lock().await.generation.is_some() {
         Err(ApiError::conflict("生成期间不能修改会话设置"))
     } else {
         Ok(())
+    }
+}
+
+async fn wait_for_idle<B: ChatBackend>(state: &WebState<B>) {
+    loop {
+        let finished = state.generation_finished.notified();
+        if state.runtime.lock().await.generation.is_none() {
+            return;
+        }
+        finished.await;
     }
 }
 
@@ -608,12 +626,16 @@ pub fn render_markdown(markdown: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use axum::body::Body;
     use axum::http;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
-    fn test_state() -> WebState {
+    use crate::model::ChatEvent;
+    use crate::ollama::{ChatRequest, OllamaError};
+
+    fn test_state() -> WebState<OllamaClient> {
         let root = tempfile::tempdir().unwrap().keep();
         let store = crate::store::SessionStore::new(&root).unwrap();
         let session = store
@@ -635,6 +657,83 @@ mod tests {
                 context_length: 32_768,
             },
             runtime: Arc::new(Mutex::new(RuntimeState::default())),
+            generation_finished: Arc::new(Notify::new()),
+        }
+    }
+
+    #[derive(Clone)]
+    struct ThreeRoundClient;
+
+    #[async_trait]
+    impl ChatBackend for ThreeRoundClient {
+        async fn check_model(&self, model: &str, _: u64) -> Result<ModelInfo, OllamaError> {
+            Ok(ModelInfo {
+                version: "test".into(),
+                name: model.into(),
+                context_length: 32_768,
+            })
+        }
+
+        async fn render_prompt(
+            &self,
+            _: &str,
+            _: &[crate::model::ChatMessage],
+            _: bool,
+            _: u64,
+        ) -> Result<Option<String>, OllamaError> {
+            Ok(None)
+        }
+
+        async fn probe(
+            &self,
+            _: &str,
+            _: &[crate::model::ChatMessage],
+            _: bool,
+            _: u64,
+        ) -> Result<TokenUsage, OllamaError> {
+            Ok(TokenUsage::new(Some(100), Some(1)))
+        }
+
+        async fn stream_chat(
+            &self,
+            _: ChatRequest,
+            _: CancellationToken,
+            emit: &mut (dyn FnMut(ChatEvent) + Send),
+        ) -> Result<(), OllamaError> {
+            emit(ChatEvent::text(ChatEventKind::Content, "answer".into(), 1));
+            emit(ChatEvent {
+                kind: ChatEventKind::Completed,
+                text: String::new(),
+                live_output_tokens: Some(1),
+                usage: Some(TokenUsage::new(Some(100), Some(1))),
+                done_reason: Some("stop".into()),
+            });
+            Ok(())
+        }
+    }
+
+    fn three_round_state() -> WebState<ThreeRoundClient> {
+        let root = tempfile::tempdir().unwrap().keep();
+        let store = crate::store::SessionStore::new(&root).unwrap();
+        let session = store
+            .create(
+                "model",
+                "http://127.0.0.1:11434",
+                None,
+                Default::default(),
+                false,
+            )
+            .unwrap();
+        WebState {
+            engine: ChatEngine::new(store, ThreeRoundClient),
+            session: Arc::new(Mutex::new(session)),
+            model_info: ModelInfo {
+                version: "test".into(),
+                name: "model".into(),
+                context_length: 32_768,
+            },
+            runtime: Arc::new(Mutex::new(RuntimeState::default())),
+            generation_finished: Arc::new(Notify::new()),
         }
     }
 
@@ -717,5 +816,78 @@ mod tests {
         let text = String::from_utf8(body.to_vec()).unwrap();
         assert!(text.starts_with("event: session\n"));
         assert!(text.contains(r#"data: {"session_id":"session-1"}"#));
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_waits_for_active_generation() {
+        let state = test_state();
+        let (decision_tx, _decision_rx) = mpsc::unbounded_channel();
+        state.runtime.lock().await.generation = Some(GenerationControl {
+            cancellation: CancellationToken::new(),
+            decision_tx,
+        });
+        let wait_state = state.clone();
+        let mut waiter = tokio::spawn(async move { wait_for_idle(&wait_state).await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut waiter)
+                .await
+                .is_err()
+        );
+
+        state.runtime.lock().await.generation = None;
+        state.generation_finished.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn three_consecutive_api_rounds_keep_terminal_context_traces_frozen() {
+        let state = three_round_state();
+        let session_id = state.session.lock().await.id.clone();
+        for round in 1..=3 {
+            let response = router(state.clone())
+                .oneshot(
+                    http::Request::builder()
+                        .method("POST")
+                        .uri("/api/chat")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(format!(
+                            r#"{{"message":"round {round}","session_id":"{session_id}"}}"#
+                        )))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let stream = String::from_utf8(body.to_vec()).unwrap();
+            assert!(!stream.contains("event: error\n"), "{stream}");
+            assert!(stream.contains("event: done\n"), "{stream}");
+        }
+
+        wait_for_idle(&state).await;
+        let in_memory = state.session.lock().await.clone();
+        let persisted = state.engine.store().load(&session_id).unwrap();
+        assert_eq!(in_memory.turns.len(), 3);
+        assert!(
+            in_memory
+                .turns
+                .iter()
+                .all(|turn| turn.status == crate::model::TurnStatus::Complete)
+        );
+        assert_eq!(
+            in_memory
+                .turns
+                .iter()
+                .map(|turn| &turn.context_trace)
+                .collect::<Vec<_>>(),
+            persisted
+                .turns
+                .iter()
+                .map(|turn| &turn.context_trace)
+                .collect::<Vec<_>>()
+        );
     }
 }

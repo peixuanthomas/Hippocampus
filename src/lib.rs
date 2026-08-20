@@ -39,8 +39,8 @@ pub use control::{
     ControlState, ControlTarget, ControlTargetKind,
 };
 pub use engine::{
-    ChatEngine, EmbeddingRefreshError, EmbeddingRefreshReport, EmbeddingRefreshStage, LimitAction,
-    PreparedTurn,
+    ChatEngine, ConsolidationProgress, EmbeddingRefreshError, EmbeddingRefreshReport,
+    EmbeddingRefreshStage, LimitAction, PreparedTurn,
 };
 pub use episode::{
     EMBEDDING_COSINE_SIMILARITY_THRESHOLD, ENTITY_JACCARD_DISTANCE_THRESHOLD,

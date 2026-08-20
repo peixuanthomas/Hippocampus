@@ -61,6 +61,27 @@ pub struct EmbeddingRefreshReport {
     pub leaf_committed: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConsolidationProgress {
+    AttemptStarted {
+        session_id: String,
+        attempt: usize,
+        events: usize,
+        from_sequence: usize,
+        through_sequence: usize,
+    },
+    ValidationRetry {
+        session_id: String,
+        next_attempt: usize,
+        max_attempts: usize,
+    },
+    BatchApplied {
+        session_id: String,
+        batches_applied: usize,
+        watermark_after: usize,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EmbeddingRefreshStage {
     LeafSnapshot,
@@ -259,6 +280,22 @@ fn consolidation_elapsed_ms(started: Instant) -> u64 {
 
 fn consolidation_failure_json(kind: &str, message: impl AsRef<str>) -> String {
     json!({"kind": kind, "message": message.as_ref(), "valid": false}).to_string()
+}
+
+const CONSOLIDATION_VALIDATION_ATTEMPTS: usize = 3;
+
+fn consolidation_audit_response(raw: &str) -> String {
+    if serde_json::from_str::<Value>(raw).is_ok() {
+        raw.to_owned()
+    } else {
+        json!({
+            "kind": "invalid_model_output",
+            "raw_output": raw,
+            "raw_sha256": content_sha256(raw),
+            "valid": false,
+        })
+        .to_string()
+    }
 }
 
 struct ToolExecution {
@@ -723,6 +760,20 @@ impl<B: ChatBackend> ChatEngine<B> {
         trigger: ConsolidationTrigger,
         cancellation: CancellationToken,
     ) -> ConsolidationRunReport {
+        self.consolidate_session_with_progress(session, trigger, cancellation, |_| {})
+            .await
+    }
+
+    pub async fn consolidate_session_with_progress<F>(
+        &self,
+        session: &Session,
+        trigger: ConsolidationTrigger,
+        cancellation: CancellationToken,
+        mut progress: F,
+    ) -> ConsolidationRunReport
+    where
+        F: FnMut(ConsolidationProgress),
+    {
         let mut report = consolidation_report(session, trigger);
         match self.store.control_state() {
             Ok(controls) if controls.allows_session(&session.id) => {}
@@ -839,10 +890,20 @@ impl<B: ChatBackend> ChatEngine<B> {
 
             report.batches_attempted += 1;
             report.events_attempted += batch.events.len();
-            let started_at = utc_now();
-            let started = Instant::now();
-            let call = self.client.structured_chat(request.clone());
-            let result = tokio::select! {
+            let mut validation_attempt = 0_usize;
+            loop {
+                validation_attempt += 1;
+                progress(ConsolidationProgress::AttemptStarted {
+                    session_id: persisted.id.clone(),
+                    attempt: validation_attempt,
+                    events: batch.events.len(),
+                    from_sequence: batch.from_sequence,
+                    through_sequence: batch.through_sequence,
+                });
+                let started_at = utc_now();
+                let started = Instant::now();
+                let call = self.client.structured_chat(request.clone());
+                let result = tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => Err(("cancellation", "caller cancelled consolidation".to_owned(), ConsolidationAttemptStatus::Cancelled)),
                 timed = tokio::time::timeout(Duration::from_secs(self.config.memory.consolidation_timeout_secs), call) => match timed {
@@ -850,161 +911,187 @@ impl<B: ChatBackend> ChatEngine<B> {
                     Ok(Err(error)) => Err(("backend", error.to_string(), ConsolidationAttemptStatus::ModelError)),
                     Err(_) => Err(("timeout", "structured consolidation model call timed out".to_owned(), ConsolidationAttemptStatus::ModelError)),
                 },
-            };
-            let completed_at = utc_now();
-            let latency_ms = consolidation_elapsed_ms(started);
-            let base_attempt = |status,
-                                response_json,
-                                response_sha256,
-                                input_tokens,
-                                output_tokens,
-                                validation_json,
-                                error_json| {
-                ConsolidationAttemptRecord {
-                    attempt_id: Uuid::new_v4().to_string(),
-                    batch_key: batch.batch_key.clone(),
-                    session_id: persisted.id.clone(),
-                    from_sequence: batch.from_sequence,
-                    through_sequence: batch.through_sequence,
-                    trigger: trigger.as_str().into(),
-                    model: persisted.model.clone(),
-                    request_json: request_json.clone(),
-                    request_sha256: content_sha256(&request_json),
-                    input_event_ids: batch
-                        .events
-                        .iter()
-                        .map(|event| event.event_id.clone())
-                        .collect(),
-                    input_event_hashes: batch
-                        .events
-                        .iter()
-                        .map(|event| event.content_sha256.clone())
-                        .collect(),
-                    response_json,
-                    response_sha256,
-                    status,
-                    input_tokens,
-                    output_tokens,
-                    latency_ms,
-                    started_at: started_at.clone(),
-                    completed_at: completed_at.clone(),
-                    validation_json,
-                    error_json,
-                }
-            };
-
-            let response = match result {
-                Ok(response) => response,
-                Err((kind, message, status)) => {
-                    let primary = format!("{kind}: {message}");
-                    let attempt = base_attempt(
+                };
+                let completed_at = utc_now();
+                let latency_ms = consolidation_elapsed_ms(started);
+                let base_attempt = |status,
+                                    response_json,
+                                    response_sha256,
+                                    input_tokens,
+                                    output_tokens,
+                                    validation_json,
+                                    error_json| {
+                    ConsolidationAttemptRecord {
+                        attempt_id: Uuid::new_v4().to_string(),
+                        batch_key: batch.batch_key.clone(),
+                        session_id: persisted.id.clone(),
+                        from_sequence: batch.from_sequence,
+                        through_sequence: batch.through_sequence,
+                        trigger: trigger.as_str().into(),
+                        model: persisted.model.clone(),
+                        request_json: request_json.clone(),
+                        request_sha256: content_sha256(&request_json),
+                        input_event_ids: batch
+                            .events
+                            .iter()
+                            .map(|event| event.event_id.clone())
+                            .collect(),
+                        input_event_hashes: batch
+                            .events
+                            .iter()
+                            .map(|event| event.content_sha256.clone())
+                            .collect(),
+                        response_json,
+                        response_sha256,
                         status,
+                        input_tokens,
+                        output_tokens,
+                        latency_ms,
+                        started_at: started_at.clone(),
+                        completed_at: completed_at.clone(),
+                        validation_json,
+                        error_json,
+                    }
+                };
+
+                let response = match result {
+                    Ok(response) => response,
+                    Err((kind, message, status)) => {
+                        let primary = format!("{kind}: {message}");
+                        let attempt = base_attempt(
+                            status,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            Some(consolidation_failure_json(kind, &message)),
+                        );
+                        if let Err(audit_error) = retrieval.record_consolidation_failure(&attempt) {
+                            report.warnings.push(format!(
+                                "巩固失败 ({primary}); 失败审计无法写入: {audit_error}"
+                            ));
+                        } else {
+                            report.warnings.push(format!("巩固失败: {primary}"));
+                        }
+                        report.status = if status == ConsolidationAttemptStatus::Cancelled {
+                            ConsolidationRunStatus::Cancelled
+                        } else {
+                            consolidation_failure_status(&report)
+                        };
+                        return report;
+                    }
+                };
+
+                let response_json = response.content;
+                let response_sha256 = content_sha256(&response_json);
+                let response_input_tokens = response.usage.input_tokens;
+                let response_output_tokens = response.usage.output_tokens;
+                let decoded = serde_json::from_str::<StructuredConsolidationOutput>(&response_json);
+                if let Ok(output) = &decoded {
+                    report.entities_attempted += output.entities.len();
+                    report.claims_attempted += output.claims.len();
+                    report.boundaries_attempted += output.boundaries.len();
+                }
+                if cancellation.is_cancelled() {
+                    let message = "caller cancelled consolidation";
+                    let attempt = base_attempt(
+                        ConsolidationAttemptStatus::Cancelled,
+                        Some(response_json),
+                        Some(response_sha256),
+                        response_input_tokens,
+                        response_output_tokens,
                         None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        Some(consolidation_failure_json(kind, &message)),
+                        Some(consolidation_failure_json("cancellation", message)),
                     );
                     if let Err(audit_error) = retrieval.record_consolidation_failure(&attempt) {
                         report.warnings.push(format!(
-                            "巩固失败 ({primary}); 失败审计无法写入: {audit_error}"
+                            "巩固取消 ({message}); 失败审计无法写入: {audit_error}"
                         ));
-                    } else {
-                        report.warnings.push(format!("巩固失败: {primary}"));
                     }
-                    report.status = if status == ConsolidationAttemptStatus::Cancelled {
-                        ConsolidationRunStatus::Cancelled
-                    } else {
-                        consolidation_failure_status(&report)
-                    };
+                    report.status = ConsolidationRunStatus::Cancelled;
                     return report;
                 }
-            };
-
-            let response_json = response.content;
-            let response_sha256 = content_sha256(&response_json);
-            let response_input_tokens = response.usage.input_tokens;
-            let response_output_tokens = response.usage.output_tokens;
-            let decoded = serde_json::from_str::<StructuredConsolidationOutput>(&response_json);
-            if let Ok(output) = &decoded {
-                report.entities_attempted += output.entities.len();
-                report.claims_attempted += output.claims.len();
-                report.boundaries_attempted += output.boundaries.len();
-            }
-            if cancellation.is_cancelled() {
-                let message = "caller cancelled consolidation";
                 let attempt = base_attempt(
-                    ConsolidationAttemptStatus::Cancelled,
-                    Some(response_json),
+                    ConsolidationAttemptStatus::Applied,
+                    Some(response_json.clone()),
                     Some(response_sha256),
                     response_input_tokens,
                     response_output_tokens,
+                    Some(json!({"valid": true, "batch_key": batch.batch_key, "watermark_after": batch.through_sequence}).to_string()),
                     None,
-                    Some(consolidation_failure_json("cancellation", message)),
                 );
-                if let Err(audit_error) = retrieval.record_consolidation_failure(&attempt) {
-                    report.warnings.push(format!(
-                        "巩固取消 ({message}); 失败审计无法写入: {audit_error}"
-                    ));
-                }
-                report.status = ConsolidationRunStatus::Cancelled;
-                return report;
-            }
-            let attempt = base_attempt(
-                ConsolidationAttemptStatus::Applied,
-                Some(response_json.clone()),
-                Some(response_sha256),
-                response_input_tokens,
-                response_output_tokens,
-                Some(json!({"valid": true, "batch_key": batch.batch_key, "watermark_after": batch.through_sequence}).to_string()),
-                None,
-            );
-            match retrieval.apply_consolidation_attempt(&batch, &candidates, &attempt) {
-                Ok(applied) => {
-                    report.batches_applied += 1;
-                    report.events_applied += batch.events.len();
-                    if let Ok(output) = decoded {
-                        report.entities_applied += output.entities.len();
-                        report.claims_applied += output.claims.len();
-                        report.boundaries_applied += output.boundaries.len();
-                    }
-                    report.watermark_after = applied.watermark_after;
-                }
-                Err(error) => {
-                    let (validation_json, message) = match error {
-                        ConsolidationApplyError::Rejected {
-                            validation_json,
-                            message,
-                        } => (validation_json, message),
-                        ConsolidationApplyError::Stale { message } => {
-                            (consolidation_failure_json("stale", &message), message)
+                match retrieval.apply_consolidation_attempt(&batch, &candidates, &attempt) {
+                    Ok(applied) => {
+                        report.batches_applied += 1;
+                        report.events_applied += batch.events.len();
+                        if let Ok(output) = decoded {
+                            report.entities_applied += output.entities.len();
+                            report.claims_applied += output.claims.len();
+                            report.boundaries_applied += output.boundaries.len();
                         }
-                        ConsolidationApplyError::Retrieval(error) => {
-                            let message = error.to_string();
-                            (consolidation_failure_json("retrieval", &message), message)
-                        }
-                    };
-                    let rejected = base_attempt(
-                        ConsolidationAttemptStatus::Rejected,
-                        Some(response_json),
-                        Some(content_sha256(
-                            &attempt.response_json.clone().unwrap_or_default(),
-                        )),
-                        attempt.input_tokens,
-                        attempt.output_tokens,
-                        Some(validation_json),
-                        Some(consolidation_failure_json("apply", &message)),
-                    );
-                    if let Err(audit_error) = retrieval.record_consolidation_failure(&rejected) {
-                        report.warnings.push(format!(
-                            "巩固应用被拒绝 ({message}); 失败审计无法写入: {audit_error}"
-                        ));
-                    } else {
-                        report.warnings.push(format!("巩固应用被拒绝: {message}"));
+                        report.watermark_after = applied.watermark_after;
+                        progress(ConsolidationProgress::BatchApplied {
+                            session_id: persisted.id.clone(),
+                            batches_applied: report.batches_applied,
+                            watermark_after: report.watermark_after,
+                        });
+                        break;
                     }
-                    report.status = consolidation_failure_status(&report);
-                    return report;
+                    Err(error) => {
+                        let (validation_json, message, retryable) = match error {
+                            ConsolidationApplyError::Rejected {
+                                validation_json,
+                                message,
+                            } => (validation_json, message, true),
+                            ConsolidationApplyError::Stale { message } => (
+                                consolidation_failure_json("stale", &message),
+                                message,
+                                false,
+                            ),
+                            ConsolidationApplyError::Retrieval(error) => {
+                                let message = error.to_string();
+                                (
+                                    consolidation_failure_json("retrieval", &message),
+                                    message,
+                                    false,
+                                )
+                            }
+                        };
+                        let audited_response = consolidation_audit_response(&response_json);
+                        let rejected = base_attempt(
+                            ConsolidationAttemptStatus::Rejected,
+                            Some(audited_response.clone()),
+                            Some(content_sha256(&audited_response)),
+                            attempt.input_tokens,
+                            attempt.output_tokens,
+                            Some(validation_json),
+                            Some(consolidation_failure_json("apply", &message)),
+                        );
+                        if let Err(audit_error) = retrieval.record_consolidation_failure(&rejected)
+                        {
+                            report.warnings.push(format!(
+                                "巩固应用被拒绝 ({message}); 失败审计无法写入: {audit_error}"
+                            ));
+                        } else {
+                            report.warnings.push(format!("巩固应用被拒绝: {message}"));
+                        }
+                        if retryable && validation_attempt < CONSOLIDATION_VALIDATION_ATTEMPTS {
+                            report.warnings.push(format!(
+                                "巩固输出校验失败，正在进行第 {}/{} 次重试",
+                                validation_attempt + 1,
+                                CONSOLIDATION_VALIDATION_ATTEMPTS
+                            ));
+                            progress(ConsolidationProgress::ValidationRetry {
+                                session_id: persisted.id.clone(),
+                                next_attempt: validation_attempt + 1,
+                                max_attempts: CONSOLIDATION_VALIDATION_ATTEMPTS,
+                            });
+                            continue;
+                        }
+                        report.status = consolidation_failure_status(&report);
+                        return report;
+                    }
                 }
             }
         }
@@ -4319,56 +4406,67 @@ mod tests {
         let mut config = AppConfig::default();
         config.memory.enabled = true;
         let engine = ChatEngine::with_config(store.clone(), client.clone(), config);
-        client.structured_responses.lock().unwrap().push_back(Ok(
-            crate::ollama::StructuredChatResponse {
+        *client.structured_responses.lock().unwrap() = VecDeque::from([
+            Ok(crate::ollama::StructuredChatResponse {
                 content: "malformed raw output".into(),
                 usage: TokenUsage::new(Some(8), Some(4)),
                 done_reason: None,
-            },
-        ));
-        let report = engine
-            .consolidate_session(
-                &session,
-                ConsolidationTrigger::Manual,
-                CancellationToken::new(),
-            )
-            .await;
-        assert_eq!(report.status, ConsolidationRunStatus::Failed);
-        assert_eq!(report.watermark_after, 0);
-        let attempts = store
-            .retrieval()
-            .consolidation_attempts(&session.id)
-            .unwrap();
-        assert_eq!(attempts.len(), 1);
-        assert_eq!(attempts[0].status, ConsolidationAttemptStatus::Rejected);
-        assert_eq!(
-            attempts[0].response_json.as_deref(),
-            Some("malformed raw output")
-        );
-        assert_eq!(
-            attempts[0].response_sha256.as_deref(),
-            Some(content_sha256("malformed raw output").as_str())
-        );
-        assert!(
-            serde_json::from_str::<Value>(attempts[0].validation_json.as_deref().unwrap()).is_ok()
-        );
-
-        client.structured_responses.lock().unwrap().push_back(Ok(
-            crate::ollama::StructuredChatResponse {
+            }),
+            Ok(crate::ollama::StructuredChatResponse {
                 content: "{\"entities\":[],\"claims\":[],\"boundaries\":[]}".into(),
                 usage: TokenUsage::new(Some(8), Some(4)),
                 done_reason: None,
-            },
-        ));
+            }),
+        ]);
+        let progress = Arc::new(Mutex::new(Vec::new()));
+        let observed_progress = progress.clone();
         let report = engine
-            .consolidate_session(
+            .consolidate_session_with_progress(
                 &session,
-                ConsolidationTrigger::TuiExit,
+                ConsolidationTrigger::Manual,
                 CancellationToken::new(),
+                move |event| observed_progress.lock().unwrap().push(event),
             )
             .await;
         assert_eq!(report.status, ConsolidationRunStatus::Completed);
         assert!(report.watermark_after > 0);
+        let attempts = store
+            .retrieval()
+            .consolidation_attempts(&session.id)
+            .unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].status, ConsolidationAttemptStatus::Rejected);
+        assert_eq!(attempts[1].status, ConsolidationAttemptStatus::Applied);
+        let wrapped: Value =
+            serde_json::from_str(attempts[0].response_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            wrapped["raw_output"],
+            Value::String("malformed raw output".into())
+        );
+        assert_eq!(
+            wrapped["raw_sha256"],
+            Value::String(content_sha256("malformed raw output"))
+        );
+        assert_eq!(
+            attempts[0].response_sha256.as_deref(),
+            Some(content_sha256(attempts[0].response_json.as_deref().unwrap()).as_str())
+        );
+        assert!(
+            serde_json::from_str::<Value>(attempts[0].validation_json.as_deref().unwrap()).is_ok()
+        );
+        assert!(matches!(
+            progress.lock().unwrap().as_slice(),
+            [
+                ConsolidationProgress::AttemptStarted { attempt: 1, .. },
+                ConsolidationProgress::ValidationRetry {
+                    next_attempt: 2,
+                    max_attempts: CONSOLIDATION_VALIDATION_ATTEMPTS,
+                    ..
+                },
+                ConsolidationProgress::AttemptStarted { attempt: 2, .. },
+                ConsolidationProgress::BatchApplied { .. },
+            ]
+        ));
 
         let mut second = store
             .create("model", "http://localhost", None, budget(), true)
@@ -4398,6 +4496,44 @@ mod tests {
         assert_eq!(failure[0].status, ConsolidationAttemptStatus::ModelError);
         assert!(failure[0].response_json.is_none());
         assert_eq!(report.watermark_after, 0);
+
+        let mut exhausted = store
+            .create("model", "http://localhost", None, budget(), true)
+            .unwrap();
+        let mut turn = Turn::pending("fact".into());
+        turn.status = TurnStatus::Complete;
+        turn.assistant_content = "answer".into();
+        exhausted.turns.push(turn);
+        store.save(&mut exhausted).unwrap();
+        *client.structured_responses.lock().unwrap() = (0..CONSOLIDATION_VALIDATION_ATTEMPTS)
+            .map(|attempt| {
+                Ok(crate::ollama::StructuredChatResponse {
+                    content: format!("malformed {attempt}"),
+                    usage: TokenUsage::new(Some(8), Some(4)),
+                    done_reason: None,
+                })
+            })
+            .collect();
+        let report = engine
+            .consolidate_session(
+                &exhausted,
+                ConsolidationTrigger::Manual,
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(report.status, ConsolidationRunStatus::Failed);
+        assert_eq!(report.batches_attempted, 1);
+        assert_eq!(report.watermark_after, 0);
+        let failures = store
+            .retrieval()
+            .consolidation_attempts(&exhausted.id)
+            .unwrap();
+        assert_eq!(failures.len(), CONSOLIDATION_VALIDATION_ATTEMPTS);
+        assert!(
+            failures
+                .iter()
+                .all(|attempt| attempt.status == ConsolidationAttemptStatus::Rejected)
+        );
     }
 
     #[tokio::test]
@@ -4524,14 +4660,15 @@ mod tests {
             .unwrap()
             .unwrap();
         let client = FakeClient::new(100);
-        *client.structured_responses.lock().unwrap() = VecDeque::from([
-            Ok(valid_response()),
+        let mut responses = VecDeque::from([Ok(valid_response())]);
+        responses.extend((0..CONSOLIDATION_VALIDATION_ATTEMPTS).map(|attempt| {
             Ok(crate::ollama::StructuredChatResponse {
-                content: "malformed".into(),
+                content: format!("malformed {attempt}"),
                 usage: TokenUsage::new(Some(9), Some(5)),
                 done_reason: None,
-            }),
-        ]);
+            })
+        }));
+        *client.structured_responses.lock().unwrap() = responses;
         let report = engine(store.clone(), client.clone())
             .consolidate_session(
                 &session,
@@ -4556,11 +4693,17 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 ConsolidationAttemptStatus::Applied,
+                ConsolidationAttemptStatus::Rejected,
+                ConsolidationAttemptStatus::Rejected,
                 ConsolidationAttemptStatus::Rejected
             ]
         );
         assert_eq!(attempts[0].through_sequence, first.through_sequence);
-        assert!(attempts[1].through_sequence > first.through_sequence);
+        assert!(
+            attempts[1..]
+                .iter()
+                .all(|attempt| attempt.through_sequence > first.through_sequence)
+        );
 
         // E: cancellation after the second call starts keeps exactly the first batch.
         let root = tempfile::tempdir().unwrap();

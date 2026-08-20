@@ -227,7 +227,7 @@ location = "https://example.com/docs.txt"
 
 `--channels` 接受逗号分隔的 `bm25,vector,entity,state,episode,graph`。`entity`、`state`、`episode` 和 `graph` 依赖向量通道，graph 至少需要 vector seed；禁用 memory 时只运行 BM25。`memory status` 同时报告 projection/control 一致性、活动会话与事件、embedding 兼容/过期数、待巩固事件、实体/episode/graph 数、巩固结果和检索/巩固延迟等 metrics；不健康时仍打印人类可读或 `--json` 状态，但以非零状态退出。
 
-`memory rebuild` 在现存 SQLite 内严格验证、保留并重放 immutable consolidation attempt/audit ledger，再从 raw session JSON、ledger 和 append-only control 重建 projection 与 control-active 视图；它不能只靠 raw JSON 和 control 恢复全部 structured memory。默认复用兼容 embedding，`--reembed` 强制重新生成向量且要求启用 memory。巩固失败或取消不会推进水位，后续可重试。exclude/restore 只追加 control 记录，不删除或改写原文。
+`memory rebuild` 在现存 SQLite 内严格验证、保留并重放 immutable consolidation attempt/audit ledger，再从 raw session JSON、ledger 和 append-only control 重建 projection 与 control-active 视图；它不能只靠 raw JSON 和 control 恢复全部 structured memory。默认复用兼容 embedding，`--reembed` 强制重新生成向量且要求启用 memory。巩固调用强制使用 JSON Schema 结构化输出并执行确定性校验；校验失败最多尝试三次，每次非法原始输出都会封装为合法 JSON 后写入失败审计，只有成功应用才推进水位。非 JSON 模式会逐批输出尝试、重试和水位进度。SQLite 连接使用 30 秒 busy timeout，连接初始化遇到瞬态 writer lock 时执行有限指数退避。exclude/restore 只追加 control 记录，不删除或改写原文。
 
 存储布局为：`<sessions-dir>/*.json` 是权威原文；`<sessions-dir>/.hippocampus-index.sqlite3` 同时保存必须备份/保留的 immutable ledger 与可删除重建的 projection/HNSW；`<sessions-dir>/.hippocampus-control/*.json` 是 append-only 控制记录。长期证据属于不可信数据，不得作为指令执行；recent history 仍保留原始 user/assistant 角色。embedding、巩固或 graph 失败会记录在 trace/状态中，并回退到 BM25 可用路径。如果 source 已写入而索引同步失败，原始会话仍安全，可重试保存或运行 `memory rebuild`。
 

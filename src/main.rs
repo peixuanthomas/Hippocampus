@@ -13,9 +13,9 @@ use hippocampus::model::{
 };
 use hippocampus::ollama::{ChatBackend, ChatRequest};
 use hippocampus::{
-    ChatEngine, ConsolidationRunReport, ConsolidationRunStatus, ConsolidationTrigger,
-    ControlRecord, ControlTarget, ControlTargetKind, EmbeddingRefreshReport, EvalBenchmark,
-    EvalRunOptions, EvalRunReport, GraphMaterializationReport, HybridRecallOptions,
+    ChatEngine, ConsolidationProgress, ConsolidationRunReport, ConsolidationRunStatus,
+    ConsolidationTrigger, ControlRecord, ControlTarget, ControlTargetKind, EmbeddingRefreshReport,
+    EvalBenchmark, EvalRunOptions, EvalRunReport, GraphMaterializationReport, HybridRecallOptions,
     KnowledgeSyncReport, LimitAction, MemoryStatus, OllamaClient, RebuildOptions, RebuildReport,
     RecallChannels, RecallQueryOrigin, RecallResult, SessionStore, load_eval_corpus,
     run_evaluation, validate_eval_paths,
@@ -1407,6 +1407,7 @@ async fn run_memory_consolidate(
             config,
             ConsolidationTrigger::Manual,
             cancellation.clone(),
+            !json_output,
         )
         .await;
         let stop = report.status == ConsolidationRunStatus::Cancelled;
@@ -1458,8 +1459,15 @@ async fn run_tui_exit_consolidation(
     if config.memory.enabled {
         eprintln!("巩固中：会话 {}（模型 {}）…", session.id, session.model);
     }
-    let report =
-        consolidate_for_session(store, session, config, trigger, cancellation_on_ctrl_c()).await;
+    let report = consolidate_for_session(
+        store,
+        session,
+        config,
+        trigger,
+        cancellation_on_ctrl_c(),
+        true,
+    )
+    .await;
     eprintln!("{}", format_consolidation_report(&report));
     for warning in &report.warnings {
         eprintln!("警告：{warning}");
@@ -1472,6 +1480,7 @@ async fn consolidate_for_session(
     config: &AppConfig,
     trigger: ConsolidationTrigger,
     cancellation: CancellationToken,
+    show_progress: bool,
 ) -> ConsolidationRunReport {
     if !config.memory.enabled {
         return synthetic_consolidation_report(
@@ -1500,9 +1509,46 @@ async fn consolidate_for_session(
             );
         }
     };
-    ChatEngine::with_config(store.clone(), client, config.clone())
-        .consolidate_session(session, trigger, cancellation)
-        .await
+    let engine = ChatEngine::with_config(store.clone(), client, config.clone());
+    if show_progress {
+        engine
+            .consolidate_session_with_progress(session, trigger, cancellation, |progress| {
+                eprintln!("{}", format_consolidation_progress(&progress));
+            })
+            .await
+    } else {
+        engine
+            .consolidate_session(session, trigger, cancellation)
+            .await
+    }
+}
+
+fn format_consolidation_progress(progress: &ConsolidationProgress) -> String {
+    match progress {
+        ConsolidationProgress::AttemptStarted {
+            session_id,
+            attempt,
+            events,
+            from_sequence,
+            through_sequence,
+        } => format!(
+            "巩固进度：会话 {session_id}｜校验尝试 {attempt}｜事件 {events}｜序列 {from_sequence}→{through_sequence}"
+        ),
+        ConsolidationProgress::ValidationRetry {
+            session_id,
+            next_attempt,
+            max_attempts,
+        } => format!(
+            "巩固进度：会话 {session_id}｜结构化输出无效，重试 {next_attempt}/{max_attempts}"
+        ),
+        ConsolidationProgress::BatchApplied {
+            session_id,
+            batches_applied,
+            watermark_after,
+        } => format!(
+            "巩固进度：会话 {session_id}｜已应用批次 {batches_applied}｜水位 {watermark_after}"
+        ),
+    }
 }
 
 fn synthetic_consolidation_report(

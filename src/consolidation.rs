@@ -11845,6 +11845,25 @@ mod tests {
     }
 
     #[test]
+    fn consolidation_failure_audit_waits_out_a_transient_sqlite_writer_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let store = RetrievalStore::new(root.path()).unwrap();
+        let blocker = Connection::open(store.index_path()).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE;").unwrap();
+
+        let worker_store = store.clone();
+        let record = failed_attempt("lock-retry", "cb_lock", "session");
+        let started = std::time::Instant::now();
+        let worker = std::thread::spawn(move || worker_store.record_consolidation_failure(&record));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        blocker.execute_batch("COMMIT;").unwrap();
+
+        worker.join().unwrap().unwrap();
+        assert!(started.elapsed() >= std::time::Duration::from_millis(100));
+        assert_eq!(store.consolidation_attempts("session").unwrap().len(), 1);
+    }
+
+    #[test]
     fn applied_status_is_reserved_but_failure_api_cannot_write_it() {
         assert_eq!(
             serde_json::to_string(&ConsolidationAttemptStatus::Applied).unwrap(),

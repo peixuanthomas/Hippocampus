@@ -44,9 +44,39 @@ use crate::vector::{
 };
 
 pub const INDEX_FILENAME: &str = ".hippocampus-index.sqlite3";
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
+const SQLITE_BUSY_RETRY_ATTEMPTS: usize = 8;
 const INDEX_SCHEMA_VERSION: i64 = 7;
 const MEMORY_STATE_SCHEMA_VERSION: i64 = 4;
 const DEFERRED_HARD_LIMIT: usize = usize::MAX;
+
+fn sqlite_is_busy(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(failure, _)
+            if matches!(
+                failure.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
+}
+
+fn with_sqlite_busy_backoff<T>(
+    mut operation: impl FnMut() -> rusqlite::Result<T>,
+) -> rusqlite::Result<T> {
+    let mut delay_ms = 25_u64;
+    for attempt in 1..=SQLITE_BUSY_RETRY_ATTEMPTS {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error) if sqlite_is_busy(&error) && attempt < SQLITE_BUSY_RETRY_ATTEMPTS => {
+                std::thread::sleep(Duration::from_millis(delay_ms));
+                delay_ms = delay_ms.saturating_mul(2).min(400);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("bounded SQLite retry loop always returns")
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
@@ -9395,7 +9425,7 @@ impl RetrievalStore {
             Connection::open_with_flags(&self.index_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
                 .map_err(|source| self.database_error(source))?;
         connection
-            .busy_timeout(Duration::from_secs(5))
+            .busy_timeout(SQLITE_BUSY_TIMEOUT)
             .map_err(|source| self.database_error(source))?;
 
         let application_id = connection
@@ -9531,7 +9561,7 @@ impl RetrievalStore {
         let mut connection =
             Connection::open(&self.index_path).map_err(|source| self.database_error(source))?;
         connection
-            .busy_timeout(Duration::from_secs(5))
+            .busy_timeout(SQLITE_BUSY_TIMEOUT)
             .map_err(|source| self.database_error(source))?;
         let version = connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
@@ -9553,13 +9583,14 @@ impl RetrievalStore {
                 existing_graph_version.expect("checked as some"),
             ));
         }
-        connection
-            .execute_batch(
+        with_sqlite_busy_backoff(|| {
+            connection.execute_batch(
                 "PRAGMA foreign_keys = ON;
                  PRAGMA journal_mode = WAL;
                  PRAGMA synchronous = FULL;",
             )
-            .map_err(|source| self.database_error(source))?;
+        })
+        .map_err(|source| self.database_error(source))?;
         if matches!(version, 1 | 2) {
             // v1 contains all immutable events, so a transactional rebuild of
             // only derived tables is deterministic and loses no source data.
@@ -17623,6 +17654,73 @@ CREATE INDEX memory_boundary_suggestions_session_event
         }
     }
 
+    #[derive(Clone)]
+    struct QueryEmbeddingBackend {
+        model: String,
+        dimensions: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl ChatBackend for QueryEmbeddingBackend {
+        async fn check_model(
+            &self,
+            model: &str,
+            _: u64,
+        ) -> Result<crate::ollama::ModelInfo, crate::ollama::OllamaError> {
+            Ok(crate::ollama::ModelInfo {
+                version: "test".into(),
+                name: model.into(),
+                context_length: 32_768,
+            })
+        }
+
+        async fn render_prompt(
+            &self,
+            _: &str,
+            _: &[ChatMessage],
+            _: bool,
+            _: u64,
+        ) -> Result<Option<String>, crate::ollama::OllamaError> {
+            Ok(None)
+        }
+
+        async fn probe(
+            &self,
+            _: &str,
+            _: &[ChatMessage],
+            _: bool,
+            _: u64,
+        ) -> Result<TokenUsage, crate::ollama::OllamaError> {
+            Ok(TokenUsage::new(Some(1), Some(1)))
+        }
+
+        async fn stream_chat(
+            &self,
+            _: crate::ollama::ChatRequest,
+            _: tokio_util::sync::CancellationToken,
+            _: &mut (dyn FnMut(crate::model::ChatEvent) + Send),
+        ) -> Result<(), crate::ollama::OllamaError> {
+            Err(crate::ollama::OllamaError::Other(
+                "query embedding backend does not chat".into(),
+            ))
+        }
+
+        async fn embed(
+            &self,
+            request: EmbeddingRequest,
+        ) -> Result<crate::ollama::EmbeddingResponse, crate::ollama::OllamaError> {
+            let mut vector = vec![0.0; self.dimensions];
+            vector[0] = 1.0;
+            Ok(crate::ollama::EmbeddingResponse {
+                model: self.model.clone(),
+                embeddings: request.input.iter().map(|_| vector.clone()).collect(),
+                prompt_eval_count: Some(1),
+                total_duration: None,
+                load_duration: None,
+            })
+        }
+    }
+
     fn canonical_message_writes(
         store: &SessionStore,
         session: &Session,
@@ -17756,6 +17854,171 @@ CREATE INDEX memory_boundary_suggestions_session_event
         turn.status = TurnStatus::Complete;
         turn.done_reason = Some("stop".into());
         event_id(&session.id, Some(&turn.id), EventRole::Assistant)
+    }
+
+    #[tokio::test]
+    async fn consolidated_memory_recalls_vector_state_and_graph_across_sessions() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let mut source = store
+            .create(
+                "fixture-model",
+                "http://localhost",
+                None,
+                Default::default(),
+                false,
+            )
+            .unwrap();
+        append_complete_turn(&mut source, "Alice aka Al likes tea.", "noted", "");
+        append_complete_turn(&mut source, "change topic now.", "changed", "");
+        store.save(&mut source).unwrap();
+        seed_episode_projection(&store, &source.id);
+        let source_user_event = event_id(&source.id, Some(&source.turns[0].id), EventRole::User);
+
+        let mut query_session = store
+            .create(
+                "fixture-model",
+                "http://localhost",
+                None,
+                Default::default(),
+                false,
+            )
+            .unwrap();
+        append_complete_turn(&mut query_session, "Alice likes which tea?", "checking", "");
+        let query_time = (DateTime::parse_from_rfc3339(&source.turns[0].created_at).unwrap()
+            + chrono::Duration::seconds(5))
+        .to_rfc3339();
+        query_session.turns[0].created_at = query_time.clone();
+        query_session.turns[0].updated_at = query_time;
+        store.save(&mut query_session).unwrap();
+        let query_event = event_id(
+            &query_session.id,
+            Some(&query_session.turns[0].id),
+            EventRole::User,
+        );
+
+        let config = aggregate_memory_config();
+        let spec = VectorIndexSpec::from_config(&config).unwrap();
+        let leaf = store.retrieval().leaf_embedding_snapshot(&spec).unwrap();
+        let mut unit = vec![0.0; spec.dimensions];
+        unit[0] = 1.0;
+        let leaf_writes = leaf
+            .documents
+            .iter()
+            .map(|document| EmbeddingWrite {
+                document_id: document.document_id.clone(),
+                expected_source_sha256: document.source_sha256.clone(),
+                vector: unit.clone(),
+            })
+            .collect::<Vec<_>>();
+        store
+            .retrieval()
+            .publish_leaf_embedding_catalog(&spec, &leaf, &leaf_writes)
+            .unwrap();
+        for session_id in [&source.id, &query_session.id] {
+            store
+                .retrieval()
+                .materialize_episode_documents(session_id, &config)
+                .unwrap();
+        }
+        let aggregate = store
+            .retrieval()
+            .aggregate_embedding_snapshot(&spec)
+            .unwrap();
+        let aggregate_blobs =
+            canonical_aggregate_blobs_from_snapshot(&aggregate, spec.dimensions).unwrap();
+        let aggregate_writes = aggregate
+            .documents
+            .iter()
+            .map(|document| EmbeddingWrite {
+                document_id: document.document_id.clone(),
+                expected_source_sha256: document.source_sha256.clone(),
+                vector: decode_f32_le(
+                    aggregate_blobs.get(&document.document_id).unwrap(),
+                    spec.dimensions,
+                )
+                .unwrap(),
+            })
+            .collect::<Vec<_>>();
+        store
+            .retrieval()
+            .publish_aggregate_embedding_catalog(&spec, &aggregate, &aggregate_writes)
+            .unwrap();
+        store.retrieval().refresh_graph(&config).unwrap();
+
+        let connection = store.retrieval().open_connection().unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM memory_claims", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            1
+        );
+        drop(connection);
+
+        let status = store.retrieval().memory_status(&config, None).unwrap();
+        let metrics = status.metrics.as_ref().unwrap();
+        assert!(status.healthy, "{status:?}");
+        assert!(metrics.entity_count > 0);
+        assert!(metrics.episode_count >= 2);
+        assert!(metrics.graph_current);
+
+        let backend = QueryEmbeddingBackend {
+            model: spec.model.clone(),
+            dimensions: spec.dimensions,
+        };
+        let recall = store
+            .retrieval()
+            .hybrid_recall(
+                &backend,
+                "Alice likes which tea?",
+                &query_event,
+                &[],
+                None,
+                RetrievalConfig::default(),
+                &config,
+            )
+            .await
+            .unwrap();
+        assert_eq!(recall.trace.status, "ok", "{:?}", recall.trace.warnings);
+        assert!(
+            recall
+                .trace
+                .selected_evidence
+                .iter()
+                .any(|evidence| evidence.span.event_id == source_user_event)
+        );
+        assert!(!recall.trace.entity_matches.is_empty());
+        assert!(
+            recall
+                .trace
+                .state_selections
+                .iter()
+                .any(|selection| selection.selected),
+            "{:?}",
+            recall.trace.state_selections
+        );
+        assert!(recall.trace.graph_paths.iter().any(|path| path.selected));
+        for channel in [
+            RetrievalChannel::Vector,
+            RetrievalChannel::Entity,
+            RetrievalChannel::State,
+            RetrievalChannel::Episode,
+            RetrievalChannel::Graph,
+        ] {
+            assert_eq!(
+                recall
+                    .trace
+                    .channels
+                    .iter()
+                    .find(|trace| trace.channel == channel)
+                    .map(|trace| trace.status.as_str()),
+                Some("ok"),
+                "channel {channel:?}: {:?}",
+                recall.trace.channels
+            );
+        }
     }
 
     #[test]

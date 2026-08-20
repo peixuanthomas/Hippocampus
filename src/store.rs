@@ -151,6 +151,10 @@ impl SessionStore {
     ) -> Result<PathBuf> {
         validate_identifier(&session.id)?;
         session.normalize_legacy_provenance();
+        // Normalize derived usage before the append-only comparison so a
+        // long-lived in-memory session and a freshly decoded snapshot have the
+        // same canonical representation.
+        session.refresh_cumulative_usage();
         session.validate()?;
         for turn in &session.turns {
             self.knowledge
@@ -166,7 +170,6 @@ impl SessionStore {
         }
         session.schema_version = SCHEMA_VERSION;
         session.touch();
-        session.refresh_cumulative_usage();
         let temporary = self
             .root
             .join(format!(".{}.{}.tmp", session.id, Uuid::new_v4().simple()));
@@ -187,15 +190,27 @@ impl SessionStore {
             let _ = fs::remove_file(&temporary);
         }
         result.with_context(|| format!("无法原子保存会话 {}", target.display()))?;
-        if !controls.allows_session(&session.id) || controls.session_has_excluded_event(session) {
-            return Ok(target);
+        let sync_result = if !controls.allows_session(&session.id)
+            || controls.session_has_excluded_event(session)
+        {
+            Ok(())
+        } else {
+            self.retrieval
+                .sync_session_under_root_write(session, &target)
+                .map_err(|source| IndexSyncAfterSourceCommit {
+                    source_path: target.clone(),
+                    source,
+                })
+                .map(|_| ())
+        };
+
+        // The serialized file is authoritative. Rehydrate it even if derived
+        // index synchronization failed after the source commit, freezing every
+        // terminal audit field to the exact persisted representation.
+        *session = load_session_snapshot(&target)?;
+        if let Err(error) = sync_result {
+            return Err(error.into());
         }
-        self.retrieval
-            .sync_session_under_root_write(session, &target)
-            .map_err(|source| IndexSyncAfterSourceCommit {
-                source_path: target.clone(),
-                source,
-            })?;
         Ok(target)
     }
 
