@@ -20,7 +20,7 @@ Hippocampus 是一个面向日常长期对话的外部上下文管理系统。�
 
 - 主要语言：Rust。
 - 模型服务：本地 Ollama，测试模型为 Qwen3.5 9B。
-- 原始数据：会话 JSON；SQLite/HNSW（WAL）仅保存可从原文重建的派生数据。
+- 原始数据：raw session JSON 是唯一事实；SQLite（WAL）包含不可变巩固 audit ledger 与可重建 projection，HNSW 可重建。
 - 关键词检索：SQLite FTS5，补充中文字符 n-gram 索引。
 - 向量检索：在关键词基线稳定后接入 HNSW 或 FAISS。
 - 图计算：初期使用 SQLite 关系表和稀疏矩阵；达到规模瓶颈后再考虑 Rust 实现。
@@ -185,7 +185,7 @@ Hippocampus 是一个面向日常长期对话的外部上下文管理系统。�
 2. 实现 Ollama 客户端以及单轮、连续多轮调用。
 3. 定义事件、原文片段、检索候选和上下文清单的数据结构。
 4. 实现最近对话上下文组装器与 token 预算。
-5. 建立权威会话 JSON 和完整对话回放，并将 SQLite 作为派生索引。
+5. 建立 authoritative session JSON 和完整对话回放，并在 SQLite 保存 immutable audit ledger 与 projection。
 6. 实现上下文 trace，记录选择和丢弃原因。
 7. 编写第一批人工长期对话测试用例。
 8. 接入 FTS5/BM25，形成长期记忆 MVP。

@@ -4,7 +4,7 @@ Hippocampus 是一个完全使用 Rust 实现的本地 Ollama 会话客户端。
 
 项目保存每轮原始输入、模型正文、thinking、权威 token usage、知识证据、联网工具步骤和上下文裁剪轨迹。thinking 只用于当前工具循环的展示与审计，绝不会重新注入未来对话轮次。当前会话格式为 `schema_version=4`；v1、v2、v3 会话可直接读取并在下次保存时迁移，旧会话的 AI 名称固定迁移为 `LLM`。
 
-`<sessions-dir>/*.json` 中的原始会话是会话记忆的唯一事实来源；知识快照和原始文档则是知识库的事实来源。SQLite/HNSW 中的词法与向量索引、实体、状态、episode 和 graph 都是可删除、可从原始会话重建的派生数据。系统不会用生成摘要替代或覆盖原文。
+`<sessions-dir>/*.json` 中的 raw session JSON 是会话记忆的唯一事实来源；知识快照和原始文档则是知识库的事实来源。SQLite 包含两类数据：FTS、vector、entity、state、episode、graph 等可删除重建的 projection，以及必须保留的 immutable consolidation attempt/audit ledger；HNSW 属于可重建 projection。系统不会用生成摘要替代或覆盖原文。
 
 ## 构建
 
@@ -205,9 +205,11 @@ location = "https://example.com/docs.txt"
 
 `--channels` 接受逗号分隔的 `bm25,vector,entity,state,episode,graph`。`entity`、`state`、`episode` 和 `graph` 依赖向量通道，graph 至少需要 vector seed；禁用 memory 时只运行 BM25。`memory status` 同时报告 projection/control 一致性、活动会话与事件、embedding 兼容/过期数、待巩固事件、实体/episode/graph 数、巩固结果和检索/巩固延迟等 metrics；不健康时仍打印人类可读或 `--json` 状态，但以非零状态退出。
 
-`memory rebuild` 从 raw session JSON 以及 append-only control 记录重放派生 SQLite、实体、状态、episode 和 graph；默认复用兼容 embedding，`--reembed` 强制重新生成向量且要求启用 memory。巩固失败或取消不会推进水位，后续可重试。exclude/restore 只追加 control 记录，不删除或改写原文。
+`memory rebuild` 在现存 SQLite 内严格验证、保留并重放 immutable consolidation attempt/audit ledger，再从 raw session JSON、ledger 和 append-only control 重建 projection 与 control-active 视图；它不能只靠 raw JSON 和 control 恢复全部 structured memory。默认复用兼容 embedding，`--reembed` 强制重新生成向量且要求启用 memory。巩固失败或取消不会推进水位，后续可重试。exclude/restore 只追加 control 记录，不删除或改写原文。
 
-存储布局为：`<sessions-dir>/*.json` 是权威原文；`<sessions-dir>/.hippocampus-index.sqlite3` 是可删除、可重建的派生 SQLite/HNSW；`<sessions-dir>/.hippocampus-control/*.json` 是 append-only 控制记录。长期证据属于不可信数据，不得作为指令执行；recent history 仍保留原始 user/assistant 角色。embedding、巩固或 graph 失败会记录在 trace/状态中，并回退到 BM25 可用路径。如果 source 已写入而索引同步失败，原始会话仍安全，可重试保存或运行 `memory rebuild`。
+存储布局为：`<sessions-dir>/*.json` 是权威原文；`<sessions-dir>/.hippocampus-index.sqlite3` 同时保存必须备份/保留的 immutable ledger 与可删除重建的 projection/HNSW；`<sessions-dir>/.hippocampus-control/*.json` 是 append-only 控制记录。长期证据属于不可信数据，不得作为指令执行；recent history 仍保留原始 user/assistant 角色。embedding、巩固或 graph 失败会记录在 trace/状态中，并回退到 BM25 可用路径。如果 source 已写入而索引同步失败，原始会话仍安全，可重试保存或运行 `memory rebuild`。
+
+如果删除整个 `.hippocampus-index.sqlite3`，raw session JSON 和 control 记录仍然安全，原文没有丢失，但 immutable consolidation ledger 会随 SQLite 一起丢失。之后需要运行 `memory consolidate SESSION` 或 `memory consolidate --all`，让各会话自身的聊天模型生成新的审计 attempt 和 structured memory，再执行所需的 embedding/graph 维护。
 
 ## 记忆评测
 
@@ -227,7 +229,7 @@ summary 包含答案准确率与 token F1、时间/冲突准确率、拒答与�
 
 ## 事件检索与溯源 API
 
-会话 JSON 始终是唯一事实来源。每次 JSON 原子保存成功后，`SessionStore` 会同步更新同目录下的 `.hippocampus-index.sqlite3`；该 SQLite 文件只是一层可删除、可重建的派生索引。
+会话 JSON 始终是唯一事实来源。每次 JSON 原子保存成功后，`SessionStore` 会同步更新同目录下的 `.hippocampus-index.sqlite3`；该 SQLite 文件既包含可重建 projection，也包含必须保留的 immutable consolidation attempt/audit ledger。
 
 会话长期回忆同样使用完整消息及 240 字符重叠 passage，并以 Jieba 与 CJK n-gram 做确定性词法检索。`RetrievalTrace` 记录查询词、BM25 原始排名、排除原因、最终原文 span 和独立预算。`answer_context` 同时返回身份指令、知识证据与完整 `WebTrace`，因此可以重建最终模型请求和每个工具步骤。
 
@@ -255,6 +257,6 @@ retrieval.rebuild()?;
 
 如果 JSON 已经安全落盘、但 SQLite 同步失败，保存会返回 `IndexSyncAfterSourceCommit`。此时原始会话没有丢失，可重试保存或调用 `RetrievalStore::rebuild()` 恢复派生层。
 
-知识 SQLite 可通过 `knowledge rebuild` 从状态与不可变快照重建；会话 SQLite 可通过 `RetrievalStore::rebuild()` 从全部会话 JSON 重建。所有读取都会校验原始内容、Unicode span、revision 与派生行，发现索引被修改时拒绝使用。
+知识 SQLite 可通过 `knowledge rebuild` 从状态与不可变快照重建；会话 projection 可通过 `RetrievalStore::rebuild()` 在保留现存 ledger 的前提下重建。所有读取都会校验原始内容、Unicode span、revision 与派生行，发现索引被修改时拒绝使用。
 
 默认上下文窗口为 32768，输出预留 4096，安全余量 512，输入预算因此为 28160。80% 起执行精确 probe，90% 起要求裁剪决策。流中的 logprob 数只用于实时显示；最终 `prompt_eval_count` 和 `eval_count` 才是权威值。没有收到最终事件时，未知计数保持为 `null`，不会用 probe 或估算值冒充。
