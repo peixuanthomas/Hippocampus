@@ -13,7 +13,7 @@ pub const LEGACY_SCHEMA_VERSION: u32 = 1;
 pub const PREVIOUS_SCHEMA_VERSION: u32 = 2;
 pub const PREVIOUS_SCHEMA_VERSION_V3: u32 = 3;
 pub const DEFAULT_SYSTEM_PROMPT: &str =
-    "你是一个乐于助人的AI助手，你的任务是解决用户的问题或者与用户对话。";
+    "你是一个AI助手，你的任务是用简练且切中要害的解决用户的问题或者与用户对话。";
 
 pub fn utc_now() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::AutoSi, false)
