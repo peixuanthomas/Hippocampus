@@ -850,8 +850,12 @@ fn validate_runtime(
         options.selected_evidence_limit <= config.memory.candidate_limit,
         "selected evidence limit exceeds candidate limit"
     );
+    let required = options
+        .num_predict
+        .checked_add(512)
+        .context("num_predict plus safety margin overflow")?;
     ensure!(
-        options.num_ctx > options.num_predict + 512,
+        options.num_ctx > required,
         "num_ctx must exceed num_predict plus 512"
     );
     ensure!(
