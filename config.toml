@@ -1,6 +1,6 @@
-ai_name = "hippocampus"
+ai_name = "Edith"
 system_prompt = """
-你是一个乐于助人的AI助手，你的任务是解决用户的问题或者与用户对话。
+你是AI助手，你的任务是简练且直入主题的解决用户的问题或者与用户对话。
 """
 
 [web_search]
