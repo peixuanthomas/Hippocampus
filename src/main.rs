@@ -57,6 +57,8 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// 清空全部会话历史及其派生记忆，保留知识库
+    Clear,
     /// 单次调用；--json 输出逐行刷新的 JSONL 事件
     Ask(AskArgs),
     /// 启动本地 Web UI 并保持服务运行
@@ -345,6 +347,7 @@ async fn run() -> Result<()> {
         Some(Command::Resume { identifier }) => run_resume_tui(store, &identifier, &config).await,
         Some(Command::List) => list_sessions(&store),
         Some(Command::Show { identifier, json }) => show_session(&store, &identifier, json),
+        Some(Command::Clear) => clear_history(&store),
         Some(Command::Ask(args)) => run_ask(store, &cli.host, args, &config).await,
         Some(Command::Serve(args)) => run_serve(store, &cli.host, args, &config).await,
         Some(Command::Knowledge(args)) => run_knowledge(store, &cli.host, args, &config).await,
@@ -1764,6 +1767,15 @@ fn list_sessions(store: &SessionStore) -> Result<()> {
     Ok(())
 }
 
+fn clear_history(store: &SessionStore) -> Result<()> {
+    let report = store.clear_history()?;
+    println!(
+        "已清空全部历史记录：{} 个会话，{} 个临时文件，{} 个记忆索引文件；知识库已保留。",
+        report.sessions_removed, report.temporary_files_removed, report.index_files_removed
+    );
+    Ok(())
+}
+
 fn show_session(store: &SessionStore, identifier: &str, json_output: bool) -> Result<()> {
     let session = store.load(identifier)?;
     if json_output {
@@ -2009,6 +2021,12 @@ mod tests {
         };
         assert_eq!(query, "海棠计划");
         assert!(json);
+    }
+
+    #[test]
+    fn clear_command_parses() {
+        let cli = Cli::try_parse_from(["hippocampus", "clear"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Clear)));
     }
 
     #[test]

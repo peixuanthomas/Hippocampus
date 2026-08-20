@@ -193,7 +193,10 @@ location = "https://example.com/docs.txt"
 ./build/hippocampus list
 ./build/hippocampus show 20260811-abcdef12
 ./build/hippocampus show 20260811-abcdef12 --json
+./build/hippocampus clear
 ```
+
+`clear` 会清空 sessions 目录中的全部会话原文、临时会话文件、派生记忆索引和 control 历史；独立的 `.knowledge` 知识快照与索引会保留。
 
 ## 派生记忆运维
 

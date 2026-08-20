@@ -3335,6 +3335,14 @@ impl RetrievalStore {
             })
     }
 
+    pub(crate) fn clear_vector_cache_under_root_write(&self) -> RetrievalResult<()> {
+        *self
+            .vector_cache
+            .lock()
+            .map_err(|_| RetrievalError::VectorCachePoisoned)? = None;
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn episode_entity_sets_for_test(
         &self,

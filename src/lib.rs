@@ -81,7 +81,7 @@ pub use retrieval::{
     RecallQueryOrigin, RecallResult, RecalledEvidence, ResolvedSpan, RetrievalError,
     RetrievalStore, StoredEvent, SyncReport, classify_query,
 };
-pub use store::{IndexSyncAfterSourceCommit, SessionStore};
+pub use store::{ClearHistoryReport, IndexSyncAfterSourceCommit, SessionStore};
 pub use vector::{
     EMBEDDING_PREPROCESSING_VERSION, EmbeddingCoverage, EmbeddingWrite, HnswVectorIndex,
     StoredEmbedding, VectorError, VectorIndexSpec, VectorSearchHit, decode_f32_le, encode_f32_le,

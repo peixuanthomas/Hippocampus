@@ -26,6 +26,14 @@ pub struct IndexSyncAfterSourceCommit {
     pub source: RetrievalError,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ClearHistoryReport {
+    pub sessions_removed: usize,
+    pub temporary_files_removed: usize,
+    pub index_files_removed: usize,
+    pub control_log_removed: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionStore {
     root: PathBuf,
@@ -329,6 +337,94 @@ impl SessionStore {
         Ok(sessions)
     }
 
+    pub fn clear_history(&self) -> Result<ClearHistoryReport> {
+        let _root_guard = self
+            .retrieval
+            .acquire_root_write()
+            .context("无法锁定会话目录以清空历史记录")?;
+        let mut report = ClearHistoryReport::default();
+        let index_paths = [
+            self.retrieval.index_path().to_path_buf(),
+            path_with_suffix(self.retrieval.index_path(), "-wal"),
+            path_with_suffix(self.retrieval.index_path(), "-shm"),
+        ];
+        for path in &index_paths {
+            match fs::symlink_metadata(path) {
+                Ok(metadata)
+                    if metadata.file_type().is_file() || metadata.file_type().is_symlink() => {}
+                Ok(_) => bail!("历史索引路径不是普通文件，拒绝清空: {}", path.display()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("无法检查历史索引 {}", path.display()));
+                }
+            }
+        }
+
+        let control_directory = self.control.directory();
+        let control_log_exists = match fs::symlink_metadata(control_directory) {
+            Ok(metadata) if metadata.file_type().is_dir() => true,
+            Ok(_) => bail!(
+                "控制历史路径不是普通目录，拒绝清空: {}",
+                control_directory.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("无法检查控制历史目录 {}", control_directory.display())
+                });
+            }
+        };
+
+        let mut history_files = Vec::new();
+        for entry in fs::read_dir(&self.root)
+            .with_context(|| format!("无法读取会话目录 {}", self.root.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            let Some(name) = entry.file_name().to_str().map(ToOwned::to_owned) else {
+                continue;
+            };
+            let is_session = Path::new(&name)
+                .extension()
+                .and_then(|value| value.to_str())
+                == Some("json");
+            let is_temporary = name.starts_with('.') && name.ends_with(".tmp");
+            if !is_session && !is_temporary {
+                continue;
+            }
+            let file_type = entry.file_type()?;
+            if !(file_type.is_file() || file_type.is_symlink()) {
+                bail!("历史记录路径不是普通文件，拒绝清空: {}", path.display());
+            }
+            history_files.push((path, is_session));
+        }
+
+        for path in index_paths {
+            if remove_file_if_present(&path)? {
+                report.index_files_removed += 1;
+            }
+        }
+        if control_log_exists {
+            fs::remove_dir_all(control_directory)
+                .with_context(|| format!("无法删除控制历史目录 {}", control_directory.display()))?;
+            report.control_log_removed = true;
+        }
+        for (path, is_session) in history_files {
+            fs::remove_file(&path)
+                .with_context(|| format!("无法删除历史记录 {}", path.display()))?;
+            if is_session {
+                report.sessions_removed += 1;
+            } else {
+                report.temporary_files_removed += 1;
+            }
+        }
+
+        self.retrieval.clear_vector_cache_under_root_write()?;
+        sync_directory(&self.root)?;
+        Ok(report)
+    }
+
     pub fn reopen(&self, session: &mut Session) -> Result<()> {
         let _root_guard = self
             .retrieval
@@ -415,6 +511,20 @@ fn same_authoritative_usage(
     right: crate::model::TokenUsage,
 ) -> bool {
     left.input_tokens == right.input_tokens && left.output_tokens == right.output_tokens
+}
+
+fn remove_file_if_present(path: &Path) -> Result<bool> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("无法删除历史索引 {}", path.display())),
+    }
+}
+
+fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
 }
 
 fn expand_tilde(path: &Path) -> PathBuf {
@@ -645,6 +755,70 @@ mod tests {
         fs::write(&path, "{broken").unwrap();
         assert!(store.load("broken").is_err());
         assert_eq!(fs::read_to_string(path).unwrap(), "{broken");
+    }
+
+    #[test]
+    fn clear_history_removes_sessions_and_memory_but_preserves_knowledge() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let session = store
+            .create(
+                "model",
+                "http://localhost",
+                None,
+                BudgetConfig::default(),
+                false,
+            )
+            .unwrap();
+        store
+            .exclude(ControlTarget {
+                kind: crate::control::ControlTargetKind::Session,
+                id: session.id.clone(),
+            })
+            .unwrap();
+        let knowledge = root.path().join(".knowledge");
+        fs::create_dir_all(&knowledge).unwrap();
+        fs::write(knowledge.join("sentinel"), "keep").unwrap();
+        fs::write(root.path().join(".stale.tmp"), "partial history").unwrap();
+        fs::write(
+            path_with_suffix(store.retrieval().index_path(), "-wal"),
+            "wal",
+        )
+        .unwrap();
+        fs::write(
+            path_with_suffix(store.retrieval().index_path(), "-shm"),
+            "shm",
+        )
+        .unwrap();
+
+        let report = store.clear_history().unwrap();
+
+        assert_eq!(report.sessions_removed, 1);
+        assert_eq!(report.temporary_files_removed, 1);
+        assert_eq!(report.index_files_removed, 3);
+        assert!(report.control_log_removed);
+        assert_eq!(
+            fs::read_to_string(knowledge.join("sentinel")).unwrap(),
+            "keep"
+        );
+        assert!(store.list_sessions().unwrap().is_empty());
+        assert!(!store.retrieval().index_path().exists());
+        assert!(!store.control_log().directory().exists());
+
+        assert_eq!(
+            store.clear_history().unwrap(),
+            ClearHistoryReport::default()
+        );
+        let fresh = store
+            .create(
+                "model",
+                "http://localhost",
+                None,
+                BudgetConfig::default(),
+                false,
+            )
+            .unwrap();
+        assert_eq!(store.list_sessions().unwrap()[0].id, fresh.id);
     }
 
     #[test]
