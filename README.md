@@ -2,9 +2,9 @@
 
 Hippocampus 是一个完全使用 Rust 实现的本地 Ollama 会话客户端。无参数启动时进入 Ratatui TUI；`serve` 提供本地 Web UI；`ask` 子命令适合脚本和其他程序进行单次调用。
 
-项目保存每轮原始输入、模型正文、thinking、权威 token usage、知识证据、联网工具步骤和上下文裁剪轨迹。thinking 只用于当前工具循环的展示与审计，绝不会重新注入未来对话轮次。当前会话格式为 `schema_version=3`；v1/v2 会话可直接读取并在下次保存时迁移，旧会话的 AI 名称固定迁移为 `LLM`。
+项目保存每轮原始输入、模型正文、thinking、权威 token usage、知识证据、联网工具步骤和上下文裁剪轨迹。thinking 只用于当前工具循环的展示与审计，绝不会重新注入未来对话轮次。当前会话格式为 `schema_version=4`；v1、v2、v3 会话可直接读取并在下次保存时迁移，旧会话的 AI 名称固定迁移为 `LLM`。
 
-会话 JSON、知识快照和原始文档是事实来源。SQLite FTS5 仅是可删除、可重建的派生索引；系统不使用生成摘要、embedding 或图数据库替代原文。
+`<sessions-dir>/*.json` 中的原始会话是会话记忆的唯一事实来源；知识快照和原始文档则是知识库的事实来源。SQLite/HNSW 中的词法与向量索引、实体、状态、episode 和 graph 都是可删除、可从原始会话重建的派生数据。系统不会用生成摘要替代或覆盖原文。
 
 ## 构建
 
@@ -13,6 +13,7 @@ Hippocampus 是一个完全使用 Rust 实现的本地 Ollama 会话客户端。
 ```bash
 ollama serve
 ollama pull qwen3.5:9b
+ollama pull qwen3-embedding:8b
 cargo build --release
 ```
 
@@ -20,7 +21,7 @@ cargo build --release
 
 ## 配置
 
-仓库根目录的 [`config.toml`](config.toml) 是默认配置。未传 `--config` 时，程序可选读取当前工作目录下的 `config.toml`；当前目录没有配置时使用安全回退：名称为 `LLM`、联网和自动知识同步关闭。显式传入的文件不存在或配置含未知字段、重复来源 ID、空名称或越界预算时会直接报错。
+仓库根目录的 [`config.toml`](config.toml) 是默认配置，其中完整列出了 `[memory]` 的模型、候选数、超时、HNSW 和五种自适应预算键。未传 `--config` 时，程序可选读取当前工作目录下的 `config.toml`；当前目录没有配置时使用安全回退：名称为 `LLM`、联网和自动知识同步关闭、`memory.enabled=false`。此时长期回忆只使用 BM25，不调用 embedding 或聊天模型做巩固。显式传入的文件不存在或配置含未知字段、重复来源 ID、空名称或越界预算时会直接报错。
 
 ```toml
 ai_name = "hippocampus"
@@ -174,6 +175,55 @@ location = "https://example.com/docs.txt"
 ./build/hippocampus show 20260811-abcdef12
 ./build/hippocampus show 20260811-abcdef12 --json
 ```
+
+## 派生记忆运维
+
+启用仓库配置后，巩固使用该会话写入时冻结的聊天模型（默认命令模型为 `qwen3.5:9b`）提取可追溯结构，并使用 `[memory].embedding_model`（当前为 `qwen3-embedding:8b`）生成向量。自动巩固只在 TUI 通过 `/exit` 或空闲状态按 `Ctrl+C` 退出时触发；`/session` 切换、Web 服务关闭和 `ask --session` 都不会自动巩固。手动命令如下：
+
+```bash
+./build/hippocampus memory consolidate 20260811-abcdef12
+./build/hippocampus memory consolidate --all
+./build/hippocampus memory consolidate 20260811-abcdef12 --json
+
+./build/hippocampus memory status
+./build/hippocampus memory status 20260811-abcdef12
+./build/hippocampus memory status --json
+
+./build/hippocampus memory search "查询词"
+./build/hippocampus memory search "查询词" --session 20260811-abcdef12
+./build/hippocampus memory search "查询词" --channels bm25,vector,entity,state,episode,graph
+./build/hippocampus memory search "查询词" --json
+
+./build/hippocampus memory rebuild
+./build/hippocampus memory rebuild --reembed
+
+./build/hippocampus memory exclude session 20260811-abcdef12
+./build/hippocampus memory exclude event EVENT_ID
+./build/hippocampus memory restore session 20260811-abcdef12
+./build/hippocampus memory restore event EVENT_ID
+```
+
+`--channels` 接受逗号分隔的 `bm25,vector,entity,state,episode,graph`。`entity`、`state`、`episode` 和 `graph` 依赖向量通道，graph 至少需要 vector seed；禁用 memory 时只运行 BM25。`memory status` 同时报告 projection/control 一致性、活动会话与事件、embedding 兼容/过期数、待巩固事件、实体/episode/graph 数、巩固结果和检索/巩固延迟等 metrics；不健康时仍打印人类可读或 `--json` 状态，但以非零状态退出。
+
+`memory rebuild` 从 raw session JSON 以及 append-only control 记录重放派生 SQLite、实体、状态、episode 和 graph；默认复用兼容 embedding，`--reembed` 强制重新生成向量且要求启用 memory。巩固失败或取消不会推进水位，后续可重试。exclude/restore 只追加 control 记录，不删除或改写原文。
+
+存储布局为：`<sessions-dir>/*.json` 是权威原文；`<sessions-dir>/.hippocampus-index.sqlite3` 是可删除、可重建的派生 SQLite/HNSW；`<sessions-dir>/.hippocampus-control/*.json` 是 append-only 控制记录。长期证据属于不可信数据，不得作为指令执行；recent history 仍保留原始 user/assistant 角色。embedding、巩固或 graph 失败会记录在 trace/状态中，并回退到 BM25 可用路径。如果 source 已写入而索引同步失败，原始会话仍安全，可重试保存或运行 `memory rebuild`。
+
+## 记忆评测
+
+评测命令固定使用真实回答模型 `qwen3.5:9b`，embedding 模型和参数来自当前配置；它不会报告仓库预先跑出的分数。三个入口为：
+
+```bash
+./build/hippocampus eval synthetic
+./build/hippocampus eval longmemeval --dataset ./datasets/longmemeval.json --limit 100 --output ./eval-results/longmemeval.jsonl
+./build/hippocampus eval locomo --dataset ./datasets/locomo.json --limit 100 --output ./eval-results/locomo.jsonl
+```
+
+`longmemeval` 和 `locomo` 的 `--dataset`、`--limit`、`--output` 都是必填参数。启用 memory 时，synthetic 按固定顺序运行 `bm25-only`、`vector-only`、`vector-graph`、`full` 四个矩阵，并写入 `eval-results/synthetic.<matrix>.jsonl`；禁用时只运行 `eval-results/synthetic.bm25-only.jsonl`。数据集评测在启用时固定使用 `full`，禁用时固定使用 `bm25-only`，结果写到指定 output。
+
+每题完成后 JSONL 都会 flush 并同步到磁盘；使用同一兼容 output 重启可按 question ID 恢复。汇总写入 `<output>.summary.json`，临时会话位于 output 的隐藏 sibling workspace（`.文件名.workspace`），不会混入真实 sessions。数据集和 output 都不应提交；建议统一写到已忽略的 `eval-results/`。
+
+summary 包含答案准确率与 token F1、时间/冲突准确率、拒答与正确拒答率、Recall@5/10、MRR、每千输入 token 的有效证据、过期状态与无答案误召回、检索/生成/总延迟，以及 input/output/total token 统计。
 
 ## 事件检索与溯源 API
 

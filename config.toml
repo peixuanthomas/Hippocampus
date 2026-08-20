@@ -17,7 +17,52 @@ max_selected = 4
 evidence_char_budget = 3200
 
 [memory]
+config_version = 1
 enabled = true
+embedding_model = "qwen3-embedding:8b"
+embedding_dimensions = 1024
+embedding_batch_size = 16
+candidate_limit = 64
+vector_candidate_limit = 64
+graph_candidate_limit = 32
+max_graph_depth = 2
+rrf_k = 60
+consolidation_timeout_secs = 600
+embedding_timeout_secs = 600
+episode_gap_minutes = 30
+hnsw_m = 16
+hnsw_ef_construction = 200
+hnsw_ef_search = 64
+
+[memory.budgets.exact_fact]
+recent_history = 45
+exact_or_state = 40
+episode = 5
+graph = 10
+
+[memory.budgets.general_semantic]
+recent_history = 45
+exact_or_state = 30
+episode = 15
+graph = 10
+
+[memory.budgets.event_recap]
+recent_history = 35
+exact_or_state = 20
+episode = 35
+graph = 10
+
+[memory.budgets.temporal_state]
+recent_history = 35
+exact_or_state = 35
+episode = 15
+graph = 15
+
+[memory.budgets.multi_hop]
+recent_history = 30
+exact_or_state = 25
+episode = 15
+graph = 30
 
 # [[knowledge.sources]]
 # id = "local-notes"
