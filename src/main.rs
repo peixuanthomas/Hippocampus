@@ -539,7 +539,7 @@ async fn run_single_evaluation_inner(
     workspace_name.push(".workspace");
     let workspace = output.with_file_name(workspace_name);
     validate_eval_paths(dataset.as_deref(), &output, &workspace)?;
-    validate_eval_store_isolation(&workspace, sessions_dir, config_path)?;
+    validate_eval_store_isolation(&output, &workspace, sessions_dir, config_path)?;
     let options = EvalRunOptions {
         dataset_path: dataset,
         output: output.clone(),
@@ -571,12 +571,24 @@ fn print_eval_report(benchmark: EvalBenchmark, matrix: &str, report: &EvalRunRep
 }
 
 fn validate_eval_store_isolation(
+    output: &Path,
     workspace: &Path,
     sessions_dir: &Path,
     config_path: Option<&Path>,
 ) -> Result<()> {
+    let mut summary_name = OsString::from(
+        output
+            .file_name()
+            .context("evaluation output filename missing")?,
+    );
+    summary_name.push(".summary.json");
+    let summary = output.with_file_name(summary_name);
+    reject_parent_path(output, "evaluation output")?;
+    reject_parent_path(&summary, "evaluation summary")?;
     reject_parent_path(workspace, "evaluation workspace")?;
     reject_parent_path(sessions_dir, "sessions directory")?;
+    let output = resolve_path_components(output)?;
+    let summary = resolve_path_components(&summary)?;
     let workspace = resolve_path_components(workspace)?;
     let sessions = resolve_path_components(sessions_dir)?;
     ensure_disjoint(
@@ -588,6 +600,12 @@ fn validate_eval_store_isolation(
     if let Some(config_path) = config_path {
         reject_parent_path(config_path, "config path")?;
         let config = resolve_path_components(config_path)?;
+        if output == config {
+            bail!("evaluation output and config path must be distinct");
+        }
+        if summary == config {
+            bail!("evaluation summary and config path must be distinct");
+        }
         ensure_disjoint(&workspace, &config, "evaluation workspace", "config path")?;
     }
     Ok(())
