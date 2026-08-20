@@ -528,9 +528,10 @@ fn validate_structured_chat_request(request: &StructuredChatRequest) -> Result<(
 }
 
 fn structured_chat_payload(request: &StructuredChatRequest) -> Value {
+    let messages = structured_chat_messages(request);
     json!({
         "model": request.model,
-        "messages": request.messages,
+        "messages": messages,
         "stream": false,
         "think": false,
         "format": request.schema,
@@ -544,6 +545,20 @@ fn structured_chat_payload(request: &StructuredChatRequest) -> Value {
             "seed": 0,
         }
     })
+}
+
+fn structured_chat_messages(request: &StructuredChatRequest) -> Vec<ChatMessage> {
+    let schema = serde_json::to_string(&request.schema)
+        .expect("serde_json::Value serialization is infallible");
+    let mut messages = Vec::with_capacity(request.messages.len() + 1);
+    messages.push(ChatMessage {
+        role: "system".into(),
+        content: format!(
+            "Respond with exactly one JSON value matching the following JSON Schema. Do not include Markdown, code fences, or any extra text.\nJSON Schema:\n{schema}"
+        ),
+    });
+    messages.extend(request.messages.iter().cloned());
+    messages
 }
 
 fn parse_structured_chat_response(payload: &Value) -> Result<StructuredChatResponse, OllamaError> {
