@@ -14329,8 +14329,7 @@ pub(crate) fn embedding_queries(raw_query: &str) -> Vec<String> {
     }
     let separated = raw_query
         .replace("以及", "、")
-        .replace('和', "、")
-        .replace('与', "、")
+        .replace(['和', '与'], "、")
         .replace(" and ", "、")
         .replace(" AND ", "、");
     let segments = separated

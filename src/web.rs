@@ -875,7 +875,7 @@ mod tests {
             let stream = String::from_utf8(body.to_vec()).unwrap();
             assert!(!stream.contains("event: error\n"), "{stream}");
             assert!(stream.contains("event: prepared\n"), "{stream}");
-            assert!(stream.contains("\"search_deadline_ms\":1000"), "{stream}");
+            assert!(stream.contains("\"search_deadline_ms\":15000"), "{stream}");
             assert!(stream.contains("\"search_timed_out\":false"), "{stream}");
             assert!(stream.contains("event: done\n"), "{stream}");
         }
