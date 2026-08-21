@@ -838,6 +838,19 @@ struct PendingVectorIndexCache {
     observed_identity: Option<(String, String)>,
 }
 
+pub(crate) struct PreparedQueryVectorRecall {
+    query_vector: Vec<f32>,
+    spec: VectorIndexSpec,
+    semantic: PreparedSemanticRecall,
+}
+
+struct PreparedSemanticRecall {
+    projected: Vec<ProjectedVectorCandidate>,
+    vector_aggregate_sources: BTreeSet<String>,
+    sidecar: StateSidecar,
+    graph_sidecar: GraphSidecar,
+}
+
 #[derive(Clone)]
 struct ProjectedVectorCandidate {
     document_id: String,
@@ -3948,7 +3961,7 @@ impl RetrievalStore {
                 }
             },
         )?;
-        let mut connection = self.open_connection()?;
+        let mut connection = self.open_search_connection()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Deferred)
             .map_err(|error| self.database_error(error))?;
@@ -4713,6 +4726,7 @@ impl RetrievalStore {
                     vector_elapsed,
                     fusion_options,
                     None,
+                    None,
                 )
                 .map_err(|error| match error {
                     RetrievalError::HybridRecall(_) => error,
@@ -4790,7 +4804,7 @@ impl RetrievalStore {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn hybrid_recall_from_query_vector(
+    pub(crate) async fn prepare_query_vector_recall(
         &self,
         raw_query: &str,
         current_user_event_id: &str,
@@ -4799,10 +4813,7 @@ impl RetrievalStore {
         retrieval_config: RetrievalConfig,
         memory_config: &MemoryConfig,
         query_vector: Vec<f32>,
-        vector_elapsed_ms: u64,
-        fast_bm25: RecallResult,
-        bm25_elapsed_ms: u64,
-    ) -> RetrievalResult<RecallResult> {
+    ) -> RetrievalResult<PreparedQueryVectorRecall> {
         retrieval_config
             .validate()
             .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
@@ -4821,6 +4832,55 @@ impl RetrievalStore {
             )));
         }
 
+        let preparation_store = self.clone();
+        let preparation_query = raw_query.to_owned();
+        let preparation_scope = session_filter.map(str::to_owned);
+        let preparation_current = current_user_event_id.to_owned();
+        let preparation_recent = recent_event_ids.to_vec();
+        let preparation_memory = memory_config.clone();
+        let preparation_spec = spec.clone();
+        join_blocking(tokio::task::spawn_blocking(move || {
+            preparation_store.prepare_query_vector_recall_sync(
+                &preparation_query,
+                query_vector,
+                preparation_spec,
+                &preparation_current,
+                &preparation_recent,
+                preparation_scope.as_deref(),
+                preparation_memory,
+            )
+        }))
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn hybrid_recall_from_prepared_query_vector(
+        &self,
+        raw_query: &str,
+        current_user_event_id: &str,
+        recent_event_ids: &[String],
+        session_filter: Option<&str>,
+        retrieval_config: RetrievalConfig,
+        memory_config: &MemoryConfig,
+        prepared: PreparedQueryVectorRecall,
+        vector_elapsed_ms: u64,
+        fast_bm25: RecallResult,
+        bm25_elapsed_ms: u64,
+    ) -> RetrievalResult<RecallResult> {
+        retrieval_config
+            .validate()
+            .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+        memory_config
+            .validate()
+            .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+        let expected_spec = VectorIndexSpec::from_config(memory_config)
+            .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+        if prepared.spec != expected_spec {
+            return Err(RetrievalError::CorruptIndex(
+                "预取向量索引规格与当前 memory 配置不一致".into(),
+            ));
+        }
+
         let started = Instant::now();
         let options = HybridRecallOptions::default();
         let fallback = fast_bm25.clone();
@@ -4831,7 +4891,9 @@ impl RetrievalStore {
         let fusion_recent = recent_event_ids.to_vec();
         let retrieval = retrieval_config.clone();
         let memory = memory_config.clone();
-        let fusion_spec = spec.clone();
+        let fusion_spec = prepared.spec;
+        let query_vector = prepared.query_vector;
+        let semantic = prepared.semantic;
         let fused_task = tokio::task::spawn_blocking(move || {
             fusion_store.fuse_vector_recall(
                 &fusion_query,
@@ -4845,6 +4907,7 @@ impl RetrievalStore {
                 vector_elapsed_ms,
                 options,
                 Some((fast_bm25, bm25_elapsed_ms)),
+                Some(semantic),
             )
         });
         let mut result = match join_blocking(fused_task).await {
@@ -4871,6 +4934,175 @@ impl RetrievalStore {
         }
         result.trace.elapsed_ms = elapsed_ms(started).saturating_add(vector_elapsed_ms);
         Ok(result)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_query_vector_recall_sync(
+        &self,
+        raw_query: &str,
+        query_vector: Vec<f32>,
+        spec: VectorIndexSpec,
+        current_user_event_id: &str,
+        recent_event_ids: &[String],
+        session_filter: Option<&str>,
+        memory_config: MemoryConfig,
+    ) -> RetrievalResult<PreparedQueryVectorRecall> {
+        let options = HybridRecallOptions::default();
+        let visibility = RecallVisibility::from_options(&options)?;
+        let _guard = self.acquire_root_read()?;
+        let control = self.replay_control_state_under_guard()?;
+        let mut connection = self.open_search_connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(|error| self.database_error(error))?;
+        self.validate_recall_input_id(
+            &transaction,
+            &control,
+            current_user_event_id,
+            session_filter,
+        )?;
+        for event_id in recent_event_ids {
+            self.validate_recall_input_id(&transaction, &control, event_id, session_filter)?;
+        }
+        self.require_current_control_projection(&transaction, &control)?;
+        let (index, pending_vector_cache, _) = self.load_vector_index_from_connection(
+            &transaction,
+            &spec,
+            session_filter,
+            &visibility,
+        )?;
+        let hits = index
+            .search(&query_vector, memory_config.vector_candidate_limit)
+            .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+        let vector_aggregate_sources = hits
+            .iter()
+            .filter(|hit| {
+                matches!(
+                    hit.granularity,
+                    RetrievalDocumentGranularity::Episode | RetrievalDocumentGranularity::Session
+                )
+            })
+            .map(|hit| hit.document_id.clone())
+            .collect::<BTreeSet<_>>();
+        let recent_set = recent_event_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        let mut projected = Vec::new();
+        let mut vector_seed_rows = Vec::new();
+        let mut vector_seed_documents = BTreeSet::new();
+        for (rank_index, hit) in hits.iter().enumerate() {
+            if hit.document_id.is_empty() || !vector_seed_documents.insert(hit.document_id.clone())
+            {
+                return Err(RetrievalError::CorruptIndex(
+                    "Vector graph seed 文档 ID 为空或重复".into(),
+                ));
+            }
+            let mut hit_projection = self.project_vector_hit(
+                &transaction,
+                &index,
+                &query_vector,
+                hit,
+                rank_index + 1,
+                usize::MAX,
+            )?;
+            let blocked = hit_projection.iter().any(|raw| {
+                raw.span.event_id == current_user_event_id
+                    || recent_set.contains(raw.span.event_id.as_str())
+                    || raw.role == EventRole::System
+                    || session_filter.is_some_and(|scope| raw.session_id != scope)
+            });
+            if !blocked {
+                vector_seed_rows.push(hit);
+            }
+            hit_projection.truncate(memory_config.candidate_limit);
+            projected.extend(hit_projection);
+        }
+        let mut graph_seeds = vector_seed_rows
+            .into_iter()
+            .enumerate()
+            .map(|(index, hit)| GraphRecallSeed {
+                channel: RetrievalChannel::Vector,
+                source_id: hit.document_id.clone(),
+                document_id: Some(hit.document_id.clone()),
+                rank: index + 1,
+                score: f64::from(hit.cosine_similarity),
+            })
+            .collect::<Vec<_>>();
+        let sidecar = self
+            .load_state_sidecar(
+                &transaction,
+                &control,
+                raw_query,
+                current_user_event_id,
+                recent_event_ids,
+                session_filter,
+                classify_query(raw_query),
+                memory_config.candidate_limit,
+                &options.query_origin,
+                true,
+                &visibility,
+            )
+            .map_err(|error| HybridRecallFailure::new(HybridRecallStage::EntityState, error))?;
+        graph_seeds.extend(entity_graph_seeds(&sidecar.entity_matches));
+        let graph_started = Instant::now();
+        let graph_seed_documents = graph_seeds
+            .iter()
+            .filter_map(|seed| seed.document_id.clone())
+            .collect::<BTreeSet<_>>();
+        let graph_result = crate::graph::recall_graph_from_connection(
+            self,
+            &transaction,
+            &memory_config,
+            &graph_seeds,
+            session_filter,
+            crate::graph::GraphRecallFilter {
+                cutoff: visibility.cutoff(),
+                allow_aggregate_documents: visibility.allows_aggregate_documents(),
+            },
+        );
+        let graph_sidecar = match graph_result.and_then(|graph| {
+            let graph_ms = elapsed_ms(graph_started);
+            self.prepare_graph_candidates(
+                &transaction,
+                &index,
+                &query_vector,
+                current_user_event_id,
+                recent_event_ids,
+                session_filter,
+                &graph_seed_documents,
+                &vector_aggregate_sources,
+                graph,
+                graph_ms,
+                true,
+            )
+        }) {
+            Ok(sidecar) => sidecar,
+            Err(error) => {
+                let mut sidecar = empty_graph_sidecar();
+                sidecar.elapsed_ms = elapsed_ms(graph_started);
+                sidecar.warning = Some(format!("关系图使用上次整理结果失败：{error}"));
+                sidecar.status = "error".into();
+                sidecar
+            }
+        };
+        self.require_unchanged_control_state(&control)?;
+        transaction
+            .commit()
+            .map_err(|error| self.database_error(error))?;
+        if let Some(pending) = pending_vector_cache {
+            self.publish_vector_index_cache(pending)?;
+        }
+        Ok(PreparedQueryVectorRecall {
+            query_vector,
+            spec,
+            semantic: PreparedSemanticRecall {
+                projected,
+                vector_aggregate_sources,
+                sidecar,
+                graph_sidecar,
+            },
+        })
     }
 
     fn load_vector_index_from_connection(
@@ -4992,11 +5224,12 @@ impl RetrievalStore {
         vector_ms: u64,
         options: HybridRecallOptions,
         precomputed_bm25: Option<(RecallResult, u64)>,
+        precomputed_semantic: Option<PreparedSemanticRecall>,
     ) -> RetrievalResult<RecallResult> {
         let visibility = RecallVisibility::from_options(&options)?;
         let _guard = self.acquire_root_read()?;
         let control = self.replay_control_state_under_guard()?;
-        let mut connection = self.open_connection()?;
+        let mut connection = self.open_search_connection()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Deferred)
             .map_err(|error| self.database_error(error))?;
@@ -5023,9 +5256,13 @@ impl RetrievalStore {
             .load_vector_index_from_connection(&transaction, spec, session_filter, &visibility)?;
         let (mut bm25, bm25_ms, hits) = if let Some((bm25, bm25_ms)) = precomputed_bm25 {
             self.validate_recall_evidence_active(&transaction, &control, &bm25, &visibility)?;
-            let hits = index
-                .search(&query_vector, memory_config.vector_candidate_limit)
-                .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+            let hits = if precomputed_semantic.is_some() {
+                Vec::new()
+            } else {
+                index
+                    .search(&query_vector, memory_config.vector_candidate_limit)
+                    .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?
+            };
             (bm25, bm25_ms, hits)
         } else if options.channels.bm25 {
             std::thread::scope(|scope| -> RetrievalResult<_> {
@@ -5068,16 +5305,6 @@ impl RetrievalStore {
             )
         };
         bm25.trace.budget_allocation = memory_budget_trace(&memory_config, bm25.trace.query_kind);
-        let vector_aggregate_sources = hits
-            .iter()
-            .filter(|hit| {
-                matches!(
-                    hit.granularity,
-                    RetrievalDocumentGranularity::Episode | RetrievalDocumentGranularity::Session
-                )
-            })
-            .map(|hit| hit.document_id.clone())
-            .collect::<BTreeSet<_>>();
         let mut bm25_document_ids = BTreeSet::new();
         for candidate in &bm25.trace.candidates {
             if candidate.document_id.is_empty()
@@ -5117,57 +5344,83 @@ impl RetrievalStore {
                 score: candidate.bm25_score,
             })
             .collect::<Vec<_>>();
-        let recent_set = recent_event_ids
-            .iter()
-            .map(String::as_str)
-            .collect::<HashSet<_>>();
-        let mut projected = Vec::new();
-        let mut vector_seed_rows = Vec::new();
-        let mut vector_seed_documents = BTreeSet::new();
-        for (rank_index, hit) in hits.iter().enumerate() {
-            if hit.document_id.is_empty() || !vector_seed_documents.insert(hit.document_id.clone())
-            {
-                return Err(RetrievalError::CorruptIndex(
-                    "Vector graph seed 文档 ID 为空或重复".into(),
-                ));
-            }
-            let mut hit_projection = self.project_vector_hit(
-                &transaction,
-                &index,
-                &query_vector,
-                hit,
-                rank_index + 1,
-                usize::MAX,
-            )?;
-            if !options.channels.episode {
-                for projection in &mut hit_projection {
-                    projection.episode_id = None;
+        let (vector_aggregate_sources, projected, mut prepared_sidecar, prepared_graph_sidecar) =
+            if let Some(prepared) = precomputed_semantic {
+                // The live path prepares all semantic sidecars without lexical seeds.
+                // BM25 joins only for final RRF fusion, so a slow lexical worker cannot
+                // postpone vector/entity/state/episode/graph work until the deadline tail.
+                (
+                    prepared.vector_aggregate_sources,
+                    prepared.projected,
+                    Some(prepared.sidecar),
+                    Some(prepared.graph_sidecar),
+                )
+            } else {
+                let vector_aggregate_sources = hits
+                    .iter()
+                    .filter(|hit| {
+                        matches!(
+                            hit.granularity,
+                            RetrievalDocumentGranularity::Episode
+                                | RetrievalDocumentGranularity::Session
+                        )
+                    })
+                    .map(|hit| hit.document_id.clone())
+                    .collect::<BTreeSet<_>>();
+                let recent_set = recent_event_ids
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<HashSet<_>>();
+                let mut projected = Vec::new();
+                let mut vector_seed_rows = Vec::new();
+                let mut vector_seed_documents = BTreeSet::new();
+                for (rank_index, hit) in hits.iter().enumerate() {
+                    if hit.document_id.is_empty()
+                        || !vector_seed_documents.insert(hit.document_id.clone())
+                    {
+                        return Err(RetrievalError::CorruptIndex(
+                            "Vector graph seed 文档 ID 为空或重复".into(),
+                        ));
+                    }
+                    let mut hit_projection = self.project_vector_hit(
+                        &transaction,
+                        &index,
+                        &query_vector,
+                        hit,
+                        rank_index + 1,
+                        usize::MAX,
+                    )?;
+                    if !options.channels.episode {
+                        for projection in &mut hit_projection {
+                            projection.episode_id = None;
+                        }
+                    }
+                    let blocked = hit_projection.iter().any(|raw| {
+                        raw.span.event_id == current_user_event_id
+                            || recent_set.contains(raw.span.event_id.as_str())
+                            || raw.role == EventRole::System
+                            || session_filter.is_some_and(|scope| raw.session_id != scope)
+                    });
+                    if !blocked {
+                        vector_seed_rows.push(hit);
+                    }
+                    hit_projection.truncate(memory_config.candidate_limit);
+                    projected.extend(hit_projection);
                 }
-            }
-            let blocked = hit_projection.iter().any(|raw| {
-                raw.span.event_id == current_user_event_id
-                    || recent_set.contains(raw.span.event_id.as_str())
-                    || raw.role == EventRole::System
-                    || session_filter.is_some_and(|scope| raw.session_id != scope)
-            });
-            if !blocked {
-                vector_seed_rows.push(hit);
-            }
-            hit_projection.truncate(memory_config.candidate_limit);
-            projected.extend(hit_projection);
-        }
-        graph_seeds.extend(
-            vector_seed_rows
-                .into_iter()
-                .enumerate()
-                .map(|(index, hit)| GraphRecallSeed {
-                    channel: RetrievalChannel::Vector,
-                    source_id: hit.document_id.clone(),
-                    document_id: Some(hit.document_id.clone()),
-                    rank: index + 1,
-                    score: f64::from(hit.cosine_similarity),
-                }),
-        );
+                graph_seeds.extend(
+                    vector_seed_rows
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, hit)| GraphRecallSeed {
+                            channel: RetrievalChannel::Vector,
+                            source_id: hit.document_id.clone(),
+                            document_id: Some(hit.document_id.clone()),
+                            rank: index + 1,
+                            score: f64::from(hit.cosine_similarity),
+                        }),
+                );
+                (vector_aggregate_sources, projected, None, None)
+            };
         let mut fused = HashMap::<(String, usize, usize), FusedRawCandidate>::new();
         let mut excluded_vectors = Vec::new();
         let eligible = ["selected_core", "evidence_budget", "selection_limit"];
@@ -5369,7 +5622,9 @@ impl RetrievalStore {
                 .then_with(|| left.span.end_char.cmp(&right.span.end_char))
                 .then_with(|| left.reason.cmp(&right.reason))
         });
-        let mut sidecar = if options.channels.state {
+        let mut sidecar = if let Some(sidecar) = prepared_sidecar.take() {
+            sidecar
+        } else if options.channels.state {
             self.load_state_sidecar(
                 &transaction,
                 &control,
@@ -5416,7 +5671,9 @@ impl RetrievalStore {
             }
         }
         if options.channels.entity {
-            graph_seeds.extend(entity_graph_seeds(&sidecar.entity_matches));
+            if prepared_graph_sidecar.is_none() {
+                graph_seeds.extend(entity_graph_seeds(&sidecar.entity_matches));
+            }
         } else {
             sidecar.entity_matches.clear();
             sidecar.entity_ms = 0;
@@ -5426,7 +5683,9 @@ impl RetrievalStore {
             .iter()
             .filter_map(|seed| seed.document_id.clone())
             .collect::<BTreeSet<_>>();
-        let mut graph_sidecar = if options.channels.graph {
+        let mut graph_sidecar = if let Some(sidecar) = prepared_graph_sidecar {
+            sidecar
+        } else if options.channels.graph {
             let graph_result = crate::graph::recall_graph_from_connection(
                 self,
                 &transaction,
@@ -9965,6 +10224,46 @@ impl RetrievalStore {
             connection
                 .prepare(query)
                 .map_err(|source| self.database_error(source))?;
+        }
+        Ok(connection)
+    }
+
+    fn open_search_connection(&self) -> RetrievalResult<Connection> {
+        let connection = Connection::open_with_flags(
+            &self.index_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|source| self.database_error(source))?;
+        connection
+            .busy_timeout(SQLITE_BUSY_TIMEOUT)
+            .map_err(|source| self.database_error(source))?;
+        let version = connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .map_err(|source| self.database_error(source))?;
+        if version != INDEX_SCHEMA_VERSION {
+            return Err(RetrievalError::UnsupportedIndexVersion(version));
+        }
+        match read_existing_memory_state_version(&connection)
+            .map_err(|source| self.database_error(source))?
+        {
+            Some(MEMORY_STATE_SCHEMA_VERSION) => {}
+            Some(version) => return Err(RetrievalError::UnsupportedMemoryStateVersion(version)),
+            None => {
+                return Err(RetrievalError::CorruptIndex(
+                    "派生索引缺少 memory state schema version".into(),
+                ));
+            }
+        }
+        match read_existing_graph_schema_version(&connection)
+            .map_err(|source| self.database_error(source))?
+        {
+            Some(crate::graph::GRAPH_SCHEMA_VERSION) => {}
+            Some(version) => return Err(RetrievalError::UnsupportedGraphSchemaVersion(version)),
+            None => {
+                return Err(RetrievalError::CorruptIndex(
+                    "派生索引缺少 graph schema version".into(),
+                ));
+            }
         }
         Ok(connection)
     }

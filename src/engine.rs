@@ -33,8 +33,8 @@ use crate::ollama::{
     validate_public_http_url,
 };
 use crate::retrieval::{
-    AggregateEmbeddingSnapshot, LeafEmbeddingSnapshot, RecallResult, RecalledEvidence,
-    RetrievalError,
+    AggregateEmbeddingSnapshot, LeafEmbeddingSnapshot, PreparedQueryVectorRecall, RecallResult,
+    RecalledEvidence, RetrievalError,
 };
 use crate::store::SessionStore;
 use crate::vector::{
@@ -189,6 +189,10 @@ pub struct ChatEngine<B: ChatBackend> {
     background_embedding_cancellation: Arc<Mutex<CancellationToken>>,
     #[cfg(test)]
     live_search_barrier: Arc<Mutex<Option<Arc<tokio::sync::Barrier>>>>,
+    #[cfg(test)]
+    live_search_fast_gate: Arc<Mutex<Option<Arc<Notify>>>>,
+    #[cfg(test)]
+    live_search_semantic_prepared: Arc<Mutex<Option<Arc<Notify>>>>,
 }
 
 struct StreamSnapshot<'a> {
@@ -230,6 +234,7 @@ enum LiveSearchEvent {
         result: std::result::Result<Vec<f32>, String>,
         elapsed_ms: u64,
     },
+    SemanticPrepared(std::result::Result<PreparedQueryVectorRecall, String>),
     Semantic(std::result::Result<RecallResult, String>),
 }
 
@@ -517,6 +522,10 @@ impl<B: ChatBackend> ChatEngine<B> {
             background_embedding_cancellation: Arc::new(Mutex::new(CancellationToken::new())),
             #[cfg(test)]
             live_search_barrier: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            live_search_fast_gate: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            live_search_semantic_prepared: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1181,10 +1190,20 @@ impl<B: ChatBackend> ChatEngine<B> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
+        #[cfg(test)]
+        let fast_gate = self
+            .live_search_fast_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         tasks.push(tokio::spawn(async move {
             #[cfg(test)]
             if let Some(barrier) = fast_barrier {
                 barrier.wait().await;
+            }
+            #[cfg(test)]
+            if let Some(gate) = fast_gate {
+                gate.notified().await;
             }
             let task_started = Instant::now();
             let result = tokio::task::spawn_blocking(move || {
@@ -1301,17 +1320,15 @@ impl<B: ChatBackend> ChatEngine<B> {
         let mut embedding_error = None;
         let mut embedding_elapsed_ms = 0;
         let mut semantic: Option<RecallResult> = None;
+        let mut semantic_prepared: Option<PreparedQueryVectorRecall> = None;
         let mut semantic_finished = !memory_config.enabled;
         let mut semantic_error = None;
-        let mut semantic_started = false;
+        let mut semantic_preparation_started = false;
+        let mut semantic_fusion_started = false;
         let mut deadline_exceeded = false;
 
         loop {
-            if fast_finished
-                && knowledge_finished
-                && (semantic_finished
-                    || (embedding_finished && (embedding_error.is_some() || fast.is_none())))
-            {
+            if fast_finished && knowledge_finished && semantic_finished {
                 break;
             }
             tokio::select! {
@@ -1345,6 +1362,26 @@ impl<B: ChatBackend> ChatEngine<B> {
                                 Err(error) => embedding_error = Some(error),
                             }
                         }
+                        LiveSearchEvent::SemanticPrepared(result) => {
+                            #[cfg(test)]
+                            if let Some(notify) = self
+                                .live_search_semantic_prepared
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .clone()
+                            {
+                                notify.notify_one();
+                            }
+                            match result {
+                                Ok(prepared) => {
+                                    semantic_prepared = Some(prepared);
+                                }
+                                Err(error) => {
+                                    semantic_error = Some(error);
+                                    semantic_finished = true;
+                                }
+                            }
+                        }
                         LiveSearchEvent::Semantic(result) => {
                             semantic_finished = true;
                             match result {
@@ -1356,22 +1393,19 @@ impl<B: ChatBackend> ChatEngine<B> {
                 }
             }
 
-            if !semantic_started
-                && let (Some(fast_result), Some(vector)) = (&fast, &query_embedding)
-            {
-                semantic_started = true;
+            if !semantic_preparation_started && let Some(vector) = query_embedding.as_ref() {
+                semantic_preparation_started = true;
                 let semantic_store = self.store.retrieval().clone();
                 let semantic_query = user_content.to_owned();
                 let semantic_current = current_event_id.to_owned();
                 let semantic_recent = recent_event_ids.to_vec();
                 let semantic_retrieval = retrieval_config.clone();
                 let semantic_memory = memory_config.clone();
-                let semantic_fast = fast_result.clone();
                 let semantic_vector = vector.clone();
                 let semantic_sender = sender.clone();
                 tasks.push(tokio::spawn(async move {
                     let result = semantic_store
-                        .hybrid_recall_from_query_vector(
+                        .prepare_query_vector_recall(
                             &semantic_query,
                             &semantic_current,
                             &semantic_recent,
@@ -1379,6 +1413,36 @@ impl<B: ChatBackend> ChatEngine<B> {
                             semantic_retrieval,
                             &semantic_memory,
                             semantic_vector,
+                        )
+                        .await
+                        .map_err(|error| error.to_string());
+                    let _ = semantic_sender.send(LiveSearchEvent::SemanticPrepared(result));
+                }));
+            }
+
+            if !semantic_fusion_started
+                && let Some(semantic_fast) = fast.as_ref()
+                && let Some(prepared) = semantic_prepared.take()
+            {
+                semantic_fusion_started = true;
+                let semantic_store = self.store.retrieval().clone();
+                let semantic_query = user_content.to_owned();
+                let semantic_current = current_event_id.to_owned();
+                let semantic_recent = recent_event_ids.to_vec();
+                let semantic_retrieval = retrieval_config.clone();
+                let semantic_memory = memory_config.clone();
+                let semantic_fast = semantic_fast.clone();
+                let semantic_sender = sender.clone();
+                tasks.push(tokio::spawn(async move {
+                    let result = semantic_store
+                        .hybrid_recall_from_prepared_query_vector(
+                            &semantic_query,
+                            &semantic_current,
+                            &semantic_recent,
+                            None,
+                            semantic_retrieval,
+                            &semantic_memory,
+                            prepared,
                             embedding_elapsed_ms,
                             semantic_fast,
                             fast_elapsed_ms,
@@ -1387,6 +1451,14 @@ impl<B: ChatBackend> ChatEngine<B> {
                         .map_err(|error| error.to_string());
                     let _ = semantic_sender.send(LiveSearchEvent::Semantic(result));
                 }));
+            }
+
+            if memory_config.enabled
+                && !semantic_finished
+                && ((embedding_finished && embedding_error.is_some())
+                    || (fast_finished && fast.is_none()))
+            {
+                semantic_finished = true;
             }
         }
 
@@ -5368,13 +5440,66 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
             Some(Arc::new(tokio::sync::Barrier::new(3)));
         let prepared = tokio::time::timeout(
-            Duration::from_millis(500),
+            Duration::from_millis(1_500),
             engine.prepare_turn(&mut session, "parallel query".into()),
         )
         .await
         .expect("all three search workers must reach the shared barrier")
         .unwrap();
         assert!(!prepared.plan.retrieval_trace.deadline_exceeded);
+    }
+
+    #[tokio::test]
+    async fn semantic_channels_prepare_before_delayed_bm25_finishes() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let mut session = store
+            .create("model", "http://localhost", None, roomy_budget(), false)
+            .unwrap();
+        let engine =
+            ChatEngine::with_config(store, FakeClient::new(100), enabled_memory_config(1_000));
+        let fast_gate = Arc::new(Notify::new());
+        let semantic_prepared = Arc::new(Notify::new());
+        *engine
+            .live_search_fast_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&fast_gate));
+        *engine
+            .live_search_semantic_prepared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(Arc::clone(&semantic_prepared));
+
+        let task_engine = engine.clone();
+        let preparation = tokio::spawn(async move {
+            task_engine
+                .prepare_turn(&mut session, "delayed bm25 query".into())
+                .await
+        });
+        tokio::time::timeout(Duration::from_millis(1_500), semantic_prepared.notified())
+            .await
+            .expect("semantic preparation must finish while BM25 is still blocked");
+        fast_gate.notify_one();
+        let prepared = tokio::time::timeout(Duration::from_millis(1_500), preparation)
+            .await
+            .expect("live search should finish within its shared deadline")
+            .unwrap()
+            .unwrap();
+        assert!(!prepared.plan.retrieval_trace.deadline_exceeded);
+        assert!(
+            prepared
+                .plan
+                .retrieval_trace
+                .channels
+                .iter()
+                .any(|channel| {
+                    channel.channel == RetrievalChannel::Vector
+                        && matches!(channel.status.as_str(), "ok" | "stale")
+                }),
+            "semantic channels: {:#?}; warnings: {:#?}",
+            prepared.plan.retrieval_trace.channels,
+            prepared.plan.retrieval_trace.warnings
+        );
     }
 
     #[tokio::test]
@@ -5413,7 +5538,7 @@ mod tests {
             .unwrap();
         let client = FakeClient::new(100);
         let requests = client.embed_requests.clone();
-        let config = enabled_memory_config(1_000);
+        let config = enabled_memory_config(5_000);
         let engine = ChatEngine::with_config(store.clone(), client, config.clone());
         let user = "short cache query".to_owned();
         let prepared = engine
@@ -5440,7 +5565,9 @@ mod tests {
                 (RetrievalChannel::State, "stale", false),
                 (RetrievalChannel::Episode, "stale", false),
                 (RetrievalChannel::Graph, "error", true),
-            ]
+            ],
+            "warnings: {:#?}",
+            prepared.plan.retrieval_trace.warnings
         );
         let before_answer = Connection::open(store.retrieval().index_path()).unwrap();
         let cached_before: i64 = before_answer
@@ -5499,7 +5626,11 @@ mod tests {
             .iter()
             .find(|channel| channel.channel == RetrievalChannel::Vector)
             .expect("live search records vector status");
-        assert_eq!(vector_channel.status, "stale");
+        assert_eq!(
+            vector_channel.status, "stale",
+            "warnings: {:#?}",
+            second.plan.retrieval_trace.warnings
+        );
         assert!(!second.plan.retrieval_trace.fusion_candidates.is_empty());
         assert_eq!(
             requests
@@ -5522,7 +5653,7 @@ mod tests {
             .unwrap();
         let client = FakeClient::new(100);
         let requests = client.embed_requests.clone();
-        let config = enabled_memory_config(1_000);
+        let config = enabled_memory_config(5_000);
         let engine = ChatEngine::with_config(store.clone(), client, config.clone());
         let user = "长消息".repeat(100);
         assert!(user.chars().count() > 240);
@@ -5587,7 +5718,7 @@ mod tests {
         let mut session = store
             .create("model", "http://localhost", None, roomy_budget(), false)
             .unwrap();
-        let config = enabled_memory_config(1_000);
+        let config = enabled_memory_config(5_000);
         let engine = ChatEngine::with_config(store.clone(), FakeClient::new(100), config.clone());
         let first = engine
             .prepare_turn(&mut session, "first organized fact".into())
