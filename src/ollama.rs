@@ -1626,39 +1626,153 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unload_tracked_models_posts_zero_keep_alive_once_per_model() {
+    async fn unload_tracked_models_covers_successful_request_paths_and_hosts() {
         use axum::extract::State;
+        use axum::http::StatusCode;
+        use axum::response::{IntoResponse, Response};
         use axum::routing::post;
         use axum::{Json, Router};
-        use tokio::sync::mpsc;
+        use std::sync::{Arc, Mutex};
 
-        async fn capture(
-            State(sender): State<mpsc::UnboundedSender<Value>>,
-            Json(payload): Json<Value>,
-        ) -> Json<Value> {
-            sender.send(payload).unwrap();
+        #[derive(Clone, Default)]
+        struct MockState {
+            chats: Arc<Mutex<Vec<Value>>>,
+            embeds: Arc<Mutex<Vec<Value>>>,
+            unloads: Arc<Mutex<Vec<Value>>>,
+        }
+
+        async fn chat(State(state): State<MockState>, Json(payload): Json<Value>) -> Response {
+            state.chats.lock().unwrap().push(payload.clone());
+            if payload["model"] == "failed-model" {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "model request failed"})),
+                )
+                    .into_response();
+            }
+            let response = json!({
+                "message": {"content": "{\"name\":\"Ada\"}"},
+                "done": true,
+                "done_reason": "stop",
+                "prompt_eval_count": 12,
+                "eval_count": 5
+            });
+            (StatusCode::OK, format!("{response}\n")).into_response()
+        }
+
+        async fn embed(State(state): State<MockState>, Json(payload): Json<Value>) -> Json<Value> {
+            state.embeds.lock().unwrap().push(payload.clone());
+            Json(json!({
+                "model": payload["model"],
+                "embeddings": [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]
+            }))
+        }
+
+        async fn unload(State(state): State<MockState>, Json(payload): Json<Value>) -> Json<Value> {
+            state.unloads.lock().unwrap().push(payload);
             Json(json!({"done": true, "done_reason": "unload"}))
         }
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let host = format!("http://{}", listener.local_addr().unwrap());
-        let (sender, mut receiver) = mpsc::unbounded_channel();
-        let app = Router::new()
-            .route("/api/generate", post(capture))
-            .with_state(sender);
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        async fn spawn_mock() -> (String, MockState, tokio::task::JoinHandle<()>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let host = format!("http://{}", listener.local_addr().unwrap());
+            let state = MockState::default();
+            let app = Router::new()
+                .route("/api/chat", post(chat))
+                .route("/api/embed", post(embed))
+                .route("/api/generate", post(unload))
+                .with_state(state.clone());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            (host, state, server)
+        }
 
-        let client = OllamaClient::new(&host).unwrap();
-        client.record_model_use("chat-model");
-        client.record_model_use("chat-model");
+        let (first_host, first_state, first_server) = spawn_mock().await;
+        let (second_host, second_state, second_server) = spawn_mock().await;
+        let first = OllamaClient::new(&first_host).unwrap();
+        let second = OllamaClient::new(&second_host).unwrap();
+
+        let mut shared = structured_request();
+        shared.model = "shared-model".into();
+        first.structured_chat(shared.clone()).await.unwrap();
+
+        let chat_request = ChatRequest {
+            model: "shared-model".into(),
+            messages: shared.messages.clone(),
+            think: false,
+            num_ctx: 4_096,
+            num_predict: 32,
+        };
+        ChatBackend::stream_chat(&first, chat_request, CancellationToken::new(), &mut |_| {})
+            .await
+            .unwrap();
+
+        let agent_request = AgentChatRequest {
+            model: "agent-model".into(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            think: false,
+            num_ctx: 4_096,
+            num_predict: 32,
+        };
+        ChatBackend::stream_agent_round(
+            &first,
+            agent_request,
+            CancellationToken::new(),
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
+
+        let mut failed = structured_request();
+        failed.model = "failed-model".into();
+        assert!(first.structured_chat(failed).await.is_err());
+
+        second.embed(embedding_request()).await.unwrap();
         OllamaClient::unload_tracked_models().await.unwrap();
 
+        let first_chats = first_state.chats.lock().unwrap().clone();
+        assert_eq!(first_chats.len(), 4);
         assert_eq!(
-            receiver.recv().await.unwrap(),
-            json!({"model": "chat-model", "keep_alive": 0})
+            first_chats
+                .iter()
+                .filter(|payload| payload["model"] == "shared-model")
+                .count(),
+            2
         );
-        assert!(receiver.try_recv().is_err());
-        server.abort();
+        assert!(
+            first_chats
+                .iter()
+                .any(|payload| payload["model"] == "agent-model")
+        );
+        assert!(
+            first_chats
+                .iter()
+                .any(|payload| payload["model"] == "failed-model")
+        );
+        assert_eq!(second_state.embeds.lock().unwrap().len(), 1);
+
+        assert_eq!(
+            *first_state.unloads.lock().unwrap(),
+            vec![
+                json!({"model": "agent-model", "keep_alive": 0}),
+                json!({"model": "shared-model", "keep_alive": 0}),
+            ]
+        );
+        assert_eq!(
+            *second_state.unloads.lock().unwrap(),
+            vec![json!({"model": "qwen3-embedding:8b", "keep_alive": 0})]
+        );
+        assert!(
+            first_state
+                .unloads
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|payload| payload["model"] != "failed-model")
+        );
+
+        first_server.abort();
+        second_server.abort();
     }
 
     #[test]
