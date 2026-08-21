@@ -9,6 +9,7 @@ use crate::model::DEFAULT_SYSTEM_PROMPT;
 
 pub const DEFAULT_CONFIG_FILENAME: &str = "config.toml";
 pub const DEFAULT_AI_NAME: &str = "LLM";
+pub const CONSOLIDATION_MODEL: &str = "qwen3.5:9b";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
@@ -129,7 +130,7 @@ impl Default for MemoryConfig {
             graph_candidate_limit: 32,
             max_graph_depth: 2,
             rrf_k: 60,
-            consolidation_model: "qwen3.5:9b".into(),
+            consolidation_model: CONSOLIDATION_MODEL.into(),
             consolidation_context_window: 16_384,
             consolidation_input_target_tokens: 4_096,
             consolidation_max_output_tokens: 4_096,
@@ -177,8 +178,8 @@ impl MemoryConfig {
         if !(1..=1_000).contains(&self.rrf_k) {
             bail!("memory.rrf_k 必须在 1..=1000 之间");
         }
-        if self.consolidation_model.trim().is_empty() {
-            bail!("memory.consolidation_model 不能为空");
+        if self.consolidation_model != CONSOLIDATION_MODEL {
+            bail!("memory.consolidation_model 是固定巩固契约，必须精确为 {CONSOLIDATION_MODEL}");
         }
         if !(4_096..=262_144).contains(&self.consolidation_context_window) {
             bail!("memory.consolidation_context_window 必须在 4096..=262144 之间");
@@ -491,7 +492,7 @@ location = "https://example.com/docs"
         assert_eq!(memory.graph_candidate_limit, 32);
         assert_eq!(memory.max_graph_depth, 2);
         assert_eq!(memory.rrf_k, 60);
-        assert_eq!(memory.consolidation_model, "qwen3.5:9b");
+        assert_eq!(memory.consolidation_model, CONSOLIDATION_MODEL);
         assert_eq!(memory.consolidation_context_window, 16_384);
         assert_eq!(memory.consolidation_input_target_tokens, 4_096);
         assert_eq!(memory.consolidation_max_output_tokens, 4_096);
@@ -544,6 +545,13 @@ location = "https://example.com/docs"
             ..MemoryConfig::default()
         };
         assert!(blank_model.validate().is_err());
+
+        let wrong_consolidation_model = MemoryConfig {
+            consolidation_model: "qwen3.5:27b".into(),
+            ..MemoryConfig::default()
+        };
+        let error = wrong_consolidation_model.validate().unwrap_err();
+        assert!(error.to_string().contains(CONSOLIDATION_MODEL));
 
         let construction_too_small = MemoryConfig {
             hnsw_ef_construction: 15,
