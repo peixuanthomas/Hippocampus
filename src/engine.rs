@@ -1676,7 +1676,7 @@ impl<B: ChatBackend> ChatEngine<B> {
             embedding_elapsed_ms,
         );
         if recall.trace.fast_fallback_used {
-            log::warn!(
+            log::debug!(
                 target: "hippocampus::retrieval",
                 "live search fell back to bm25 event_id={} reason={} total_ms={} bm25_ms={} embedding_ms={} semantic_prepare_ms={} semantic_fusion_ms={} knowledge_ms={}",
                 current_event_id,
