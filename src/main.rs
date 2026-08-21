@@ -25,6 +25,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
+const DEFAULT_OLLAMA_MODEL: &str = "qwen3.8:27b-mlx";
+
 #[derive(Debug, Parser)]
 #[command(
     name = "hippocampus",
@@ -39,6 +41,9 @@ struct Cli {
     sessions_dir: PathBuf,
     #[arg(long, global = true, default_value = "http://127.0.0.1:11434")]
     host: String,
+    /// 新会话和无状态 ask 使用的 Ollama 模型；恢复会话时忽略
+    #[arg(long, global = true, default_value = DEFAULT_OLLAMA_MODEL)]
+    model: String,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -191,8 +196,6 @@ enum KnowledgeCommand {
 
 #[derive(Debug, Clone, Args)]
 struct NewArgs {
-    #[arg(long, default_value = "qwen3.8:27b-mlx")]
-    model: String,
     #[arg(long, default_value_t = 32_768)]
     context_window: u64,
     #[arg(long, default_value_t = 4_096)]
@@ -212,7 +215,6 @@ struct NewArgs {
 impl Default for NewArgs {
     fn default() -> Self {
         Self {
-            model: "qwen3.8:27b-mlx".into(),
             context_window: 32_768,
             max_output_tokens: 4_096,
             safety_margin_tokens: 512,
@@ -257,8 +259,6 @@ struct AskArgs {
     /// 使用该会话的历史上下文；不传则无历史且不创建会话
     #[arg(long)]
     session: Option<String>,
-    #[arg(long, default_value = "qwen3.8:27b-mlx")]
-    model: String,
     #[arg(long, default_value_t = 32_768)]
     context_window: u64,
     #[arg(long, default_value_t = 4_096)]
@@ -342,14 +342,14 @@ async fn run() -> Result<()> {
     }
     let store = SessionStore::new(&cli.sessions_dir)?;
     match cli.command {
-        None => run_new_tui(store, &cli.host, NewArgs::default(), &config).await,
-        Some(Command::New(args)) => run_new_tui(store, &cli.host, args, &config).await,
+        None => run_new_tui(store, &cli.host, &cli.model, NewArgs::default(), &config).await,
+        Some(Command::New(args)) => run_new_tui(store, &cli.host, &cli.model, args, &config).await,
         Some(Command::Resume { identifier }) => run_resume_tui(store, &identifier, &config).await,
         Some(Command::List) => list_sessions(&store),
         Some(Command::Show { identifier, json }) => show_session(&store, &identifier, json),
         Some(Command::Clear) => clear_history(&store),
-        Some(Command::Ask(args)) => run_ask(store, &cli.host, args, &config).await,
-        Some(Command::Serve(args)) => run_serve(store, &cli.host, args, &config).await,
+        Some(Command::Ask(args)) => run_ask(store, &cli.host, &cli.model, args, &config).await,
+        Some(Command::Serve(args)) => run_serve(store, &cli.host, &cli.model, args, &config).await,
         Some(Command::Knowledge(args)) => run_knowledge(store, &cli.host, args, &config).await,
         Some(Command::Memory(args)) => run_memory(store, &cli.host, args, &config).await,
         Some(Command::Eval(_)) => unreachable!("evaluation returned before opening session store"),
@@ -667,6 +667,7 @@ fn ensure_disjoint(a: &Path, b: &Path, a_label: &str, b_label: &str) -> Result<(
 async fn run_serve(
     store: SessionStore,
     host: &str,
+    model: &str,
     args: ServeArgs,
     config: &AppConfig,
 ) -> Result<()> {
@@ -684,7 +685,7 @@ async fn run_serve(
     } else {
         let prompt = args.new.read_prompt(config)?;
         store.create_named(
-            &args.new.model,
+            model,
             host,
             config.ai_name(),
             Some(&prompt),
@@ -707,13 +708,14 @@ async fn run_serve(
 async fn run_new_tui(
     store: SessionStore,
     host: &str,
+    model: &str,
     args: NewArgs,
     config: &AppConfig,
 ) -> Result<()> {
     auto_sync_knowledge(&store, host, config).await?;
     let prompt = args.read_prompt(config)?;
     let session = store.create_named(
-        &args.model,
+        model,
         host,
         config.ai_name(),
         Some(&prompt),
@@ -760,11 +762,17 @@ async fn run_resume_tui(store: SessionStore, identifier: &str, config: &AppConfi
     Ok(())
 }
 
-async fn run_ask(store: SessionStore, host: &str, args: AskArgs, config: &AppConfig) -> Result<()> {
+async fn run_ask(
+    store: SessionStore,
+    host: &str,
+    model: &str,
+    args: AskArgs,
+    config: &AppConfig,
+) -> Result<()> {
     if let Some(identifier) = args.session.clone() {
         return run_contextual_ask(store, &identifier, args, config).await;
     }
-    run_stateless_ask(host, args, config).await
+    run_stateless_ask(host, model, args, config).await
 }
 
 async fn run_contextual_ask(
@@ -1641,7 +1649,12 @@ fn print_sync_report(report: &KnowledgeSyncReport) {
     }
 }
 
-async fn run_stateless_ask(host: &str, args: AskArgs, config: &AppConfig) -> Result<()> {
+async fn run_stateless_ask(
+    host: &str,
+    model: &str,
+    args: AskArgs,
+    config: &AppConfig,
+) -> Result<()> {
     let system_prompt = read_ask_prompt(&args, config)?;
     let budget = BudgetConfig {
         context_window: args.context_window,
@@ -1651,9 +1664,7 @@ async fn run_stateless_ask(host: &str, args: AskArgs, config: &AppConfig) -> Res
     };
     budget.validate()?;
     let client = OllamaClient::new(host)?;
-    client
-        .check_model(&args.model, budget.context_window)
-        .await?;
+    client.check_model(model, budget.context_window).await?;
     let think = args.thinking_enabled();
     let mut messages = Vec::new();
     if !system_prompt.is_empty() {
@@ -1671,7 +1682,7 @@ async fn run_stateless_ask(host: &str, args: AskArgs, config: &AppConfig) -> Res
         content: args.prompt,
     });
     let request = ChatRequest {
-        model: args.model,
+        model: model.to_owned(),
         messages,
         think,
         num_ctx: budget.context_window,
@@ -1959,6 +1970,7 @@ mod tests {
     #[test]
     fn ask_session_is_optional_and_thinking_defaults_off() {
         let stateless = Cli::try_parse_from(["hippocampus", "ask", "hello"]).unwrap();
+        assert_eq!(stateless.model, DEFAULT_OLLAMA_MODEL);
         let Some(Command::Ask(args)) = stateless.command else {
             panic!("expected ask command");
         };
@@ -2002,10 +2014,17 @@ mod tests {
         let Some(Command::New(args)) = cli.command else {
             panic!("expected new command");
         };
-        assert_eq!(args.model, "qwen");
+        assert_eq!(cli.model, "qwen");
         assert_eq!(args.context_window, 2048);
         assert!(!args.thinking_enabled());
         assert_eq!(args.system_prompt.as_deref(), Some("system"));
+    }
+
+    #[test]
+    fn model_is_a_global_startup_option_for_default_tui() {
+        let cli = Cli::try_parse_from(["hippocampus", "--model", "llama3.3:70b"]).unwrap();
+        assert!(cli.command.is_none());
+        assert_eq!(cli.model, "llama3.3:70b");
     }
 
     #[test]

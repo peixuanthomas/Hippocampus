@@ -79,12 +79,13 @@ API key 不会写入配置、日志或会话。每轮最多执行配置的工具
 
 ```bash
 ./build/hippocampus
+./build/hippocampus --model llama3.3:70b
 ./build/hippocampus new --model qwen3.8:27b-mlx
 ./build/hippocampus resume 20260811-abcdef12
 ./build/hippocampus --sessions-dir ./sessions resume 20260811-abcdef12
 ```
 
-新会话默认使用 `qwen3.8:27b-mlx` 且 thinking 关闭；显式传入 `--think` 才会开启，`--no-think` 作为兼容参数保留。恢复旧会话始终沿用其中已保存的模型和 thinking 设置，不会迁移到新默认值。
+`--model` 是全局启动参数，可放在子命令前后；无参数 TUI、`new`、新建 Web 会话和无状态 `ask` 都使用它。默认模型为 `qwen3.8:27b-mlx`，thinking 默认关闭；显式传入 `--think` 才会开启，`--no-think` 作为兼容参数保留。恢复旧会话始终沿用其中已保存的模型和 thinking 设置，不会迁移到新默认值。TUI 会在模型生成期间持续追加并重绘正文，不等待完整回答结束。
 
 界面顶部显示模型、thinking、上下文与会话状态；中间是对话；底部是可编辑的多行输入框。
 

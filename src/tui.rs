@@ -80,6 +80,9 @@ struct SwitchReady {
 
 type SwitchResult = std::result::Result<SwitchOutcome, String>;
 
+const MAX_BACKGROUND_EVENTS_PER_FRAME: usize = 64;
+const MAX_VISIBLE_STREAM_EVENTS_PER_FRAME: usize = 8;
+
 enum BackgroundEvent {
     Status(String),
     Debug(String),
@@ -259,7 +262,19 @@ impl App {
     }
 
     fn drain_background(&mut self) {
-        while let Ok(event) = self.rx.try_recv() {
+        let mut visible_stream_events = 0;
+        for _ in 0..MAX_BACKGROUND_EVENTS_PER_FRAME {
+            let Ok(event) = self.rx.try_recv() else {
+                break;
+            };
+            let visibly_updates_stream = matches!(
+                &event,
+                BackgroundEvent::Stream(ChatEvent {
+                    kind: ChatEventKind::Thinking | ChatEventKind::Content,
+                    text,
+                    ..
+                }) if !text.is_empty()
+            );
             match event {
                 BackgroundEvent::Debug(content) => self.messages.push(Message {
                     role: Role::Debug,
@@ -388,6 +403,12 @@ impl App {
                             self.push_error(self.status.clone());
                         }
                     }
+                }
+            }
+            if visibly_updates_stream {
+                visible_stream_events += 1;
+                if visible_stream_events == MAX_VISIBLE_STREAM_EVENTS_PER_FRAME {
+                    break;
                 }
             }
         }
@@ -1562,6 +1583,39 @@ mod tests {
         );
         assert!(thinking.is_empty());
         assert_eq!(answer, "final answer");
+    }
+
+    #[test]
+    fn background_stream_is_batched_across_render_frames() {
+        let mut app = test_app();
+        for index in 0..=MAX_VISIBLE_STREAM_EVENTS_PER_FRAME {
+            app.tx
+                .send(BackgroundEvent::Stream(ChatEvent::text(
+                    ChatEventKind::Content,
+                    index.to_string(),
+                    index as u64,
+                )))
+                .unwrap();
+        }
+        app.tx
+            .send(BackgroundEvent::Finished {
+                session: Box::new(app.session.clone()),
+                result: Ok(()),
+            })
+            .unwrap();
+
+        app.drain_background();
+        assert_eq!(app.live_answer, "01234567");
+        assert_eq!(app.activity, Activity::Generating);
+
+        app.drain_background();
+        assert!(app.live_answer.is_empty());
+        assert_eq!(app.activity, Activity::Idle);
+        assert!(
+            app.messages.iter().any(|message| {
+                message.role == Role::Assistant && message.content == "012345678"
+            })
+        );
     }
 
     #[test]
