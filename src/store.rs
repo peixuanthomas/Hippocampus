@@ -11,9 +11,7 @@ use crate::control::{
     ControlAction, ControlLog, ControlRecord, ControlResult, ControlState, ControlTarget,
 };
 use crate::knowledge::KnowledgeStore;
-use crate::model::{
-    BudgetConfig, DEFAULT_SYSTEM_PROMPT, SCHEMA_VERSION, Session, SessionStatus, TurnStatus,
-};
+use crate::model::{BudgetConfig, DEFAULT_SYSTEM_PROMPT, Session, SessionStatus, TurnStatus};
 use crate::retrieval::{RetrievalError, RetrievalStore};
 
 #[derive(Debug, Error)]
@@ -150,7 +148,6 @@ impl SessionStore {
         controls: &ControlState,
     ) -> Result<PathBuf> {
         validate_identifier(&session.id)?;
-        session.normalize_legacy_provenance();
         // Normalize derived usage before the append-only comparison so a
         // long-lived in-memory session and a freshly decoded snapshot have the
         // same canonical representation.
@@ -168,7 +165,6 @@ impl SessionStore {
             let previous = load_session_snapshot(&target)?;
             validate_append_only(&previous, session)?;
         }
-        session.schema_version = SCHEMA_VERSION;
         session.touch();
         let temporary = self
             .root
@@ -317,7 +313,6 @@ impl SessionStore {
         let raw = fs::read(path).with_context(|| format!("无法读取会话文件 {}", path.display()))?;
         let mut session: Session = serde_json::from_slice(&raw)
             .map_err(|error| anyhow!("会话文件损坏或格式不受支持: {}: {error}", path.display()))?;
-        session.normalize_legacy_provenance();
         session
             .validate()
             .map_err(|error| anyhow!("会话文件损坏或格式不受支持: {}: {error}", path.display()))?;
@@ -716,7 +711,7 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_legacy_schema_and_atomic_file() {
+    fn round_trip_current_schema_and_atomic_file() {
         let root = tempfile::tempdir().unwrap();
         let store = SessionStore::new(root.path()).unwrap();
         let mut session = store
@@ -740,7 +735,7 @@ mod tests {
             usage: TokenUsage::new(Some(12), Some(4)),
             probe_usage: TokenUsage::new(Some(12), Some(1)),
             context_trace: ContextTrace {
-                provenance_quality: ProvenanceQuality::LegacyInferred,
+                provenance_quality: ProvenanceQuality::Inferred,
                 ..ContextTrace::default()
             },
             request_started_at: Some(now.clone()),
@@ -770,6 +765,30 @@ mod tests {
         fs::write(&path, "{broken").unwrap();
         assert!(store.load("broken").is_err());
         assert_eq!(fs::read_to_string(path).unwrap(), "{broken");
+    }
+
+    #[test]
+    fn old_session_schema_is_rejected_without_rewrite() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let session = Session::new_named(
+            "old-session".into(),
+            "model".into(),
+            "http://localhost".into(),
+            "LLM".into(),
+            "system".into(),
+            BudgetConfig::default(),
+            false,
+        )
+        .unwrap();
+        let mut value = serde_json::to_value(session).unwrap();
+        value["schema_version"] = serde_json::json!(4);
+        let bytes = serde_json::to_vec_pretty(&value).unwrap();
+        let path = root.path().join("old-session.json");
+        fs::write(&path, &bytes).unwrap();
+
+        assert!(store.load("old-session").is_err());
+        assert_eq!(fs::read(path).unwrap(), bytes);
     }
 
     #[test]
@@ -837,102 +856,6 @@ mod tests {
     }
 
     #[test]
-    fn loads_schema_v1_json_written_by_python_version() {
-        let root = tempfile::tempdir().unwrap();
-        let store = SessionStore::new(root.path()).unwrap();
-        let legacy = r#"{
-  "schema_version": 1,
-  "id": "20260811-abcdef12",
-  "title": "旧会话",
-  "created_at": "2026-08-11T01:02:03.123456+00:00",
-  "updated_at": "2026-08-11T01:03:04.123456+00:00",
-  "status": "active",
-  "model": "qwen3.5:9b",
-  "ollama_host": "http://127.0.0.1:11434",
-  "system_prompt": "系统",
-  "think": true,
-  "budget": {
-    "context_window": 32768,
-    "max_output_tokens": 4096,
-    "safety_margin_tokens": 512,
-    "probe_ratio": 0.8,
-    "warning_ratio": 0.9,
-    "trim_target_ratio": 0.8
-  },
-  "active_context_start_index": 0,
-  "turns": [{
-    "id": "turn-1",
-    "created_at": "2026-08-11T01:02:03.123456+00:00",
-    "updated_at": "2026-08-11T01:02:04.123456+00:00",
-    "status": "complete",
-    "user_content": "你好",
-    "assistant_content": "世界",
-    "thinking": "不会回注",
-    "usage": {"input_tokens": 12, "output_tokens": 4, "total_tokens": 16},
-    "probe_usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
-    "context_trace": {
-      "included_turn_ids": [], "omitted_turn_ids": [],
-      "estimated_upper_tokens": 100, "exact_input_tokens": 12,
-      "input_budget": 28160, "decision": "ready",
-      "active_context_start_before": 0, "active_context_start_after": 0
-    },
-    "done_reason": "stop", "error": null
-  }],
-  "cumulative_usage": {"input_tokens": 12, "output_tokens": 4, "total_tokens": 16},
-  "cumulative_probe_usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
-}"#;
-        fs::write(root.path().join("20260811-abcdef12.json"), legacy).unwrap();
-        let mut session = store.load("20260811-abc").unwrap();
-        assert_eq!(session.title, "旧会话");
-        assert_eq!(session.ai_name, "LLM");
-        assert_eq!(session.turns[0].thinking, "不会回注");
-        assert_eq!(session.cumulative_usage.total_tokens, Some(16));
-        store.save(&mut session).unwrap();
-        let migrated = store.load(&session.id).unwrap();
-        assert_eq!(migrated.schema_version, SCHEMA_VERSION);
-        let answer_id = crate::model::event_id(
-            &session.id,
-            Some("turn-1"),
-            crate::model::EventRole::Assistant,
-        );
-        let trace = store.retrieval().answer_context(&answer_id).unwrap();
-        assert_eq!(trace.provenance_quality, ProvenanceQuality::LegacyInferred);
-    }
-
-    #[test]
-    fn loads_schema_v2_without_name_as_llm() {
-        let root = tempfile::tempdir().unwrap();
-        let store = SessionStore::new(root.path()).unwrap();
-        let session = Session::new_named(
-            "legacy-v2".into(),
-            "model".into(),
-            "http://localhost".into(),
-            "temporary".into(),
-            "original system".into(),
-            BudgetConfig::default(),
-            false,
-        )
-        .unwrap();
-        let mut value = serde_json::to_value(session).unwrap();
-        value["schema_version"] = serde_json::json!(2);
-        value.as_object_mut().unwrap().remove("ai_name");
-        fs::write(
-            root.path().join("legacy-v2.json"),
-            serde_json::to_vec_pretty(&value).unwrap(),
-        )
-        .unwrap();
-
-        let mut loaded = store.load("legacy-v2").unwrap();
-        assert_eq!(loaded.ai_name, "LLM");
-        assert_eq!(loaded.system_prompt, "original system");
-        store.save(&mut loaded).unwrap();
-        assert_eq!(
-            store.load("legacy-v2").unwrap().schema_version,
-            SCHEMA_VERSION
-        );
-    }
-
-    #[test]
     fn identifier_validation_blocks_path_traversal() {
         let root = tempfile::tempdir().unwrap();
         let store = SessionStore::new(root.path()).unwrap();
@@ -966,7 +889,7 @@ mod tests {
         assert!(store.save(&mut session).is_err());
 
         session = store.load(&session.id).unwrap();
-        session.turns[0].context_trace.provenance_quality = ProvenanceQuality::LegacyInferred;
+        session.turns[0].context_trace.provenance_quality = ProvenanceQuality::Inferred;
         session.turns[0].request_started_at = Some(utc_now());
         session.turns[0].assistant_content = "终态回复".into();
         session.turns[0].thinking = "审计 thinking".into();

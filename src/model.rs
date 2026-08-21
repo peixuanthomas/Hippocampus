@@ -8,10 +8,7 @@ use uuid::Uuid;
 
 use crate::knowledge::KnowledgeTrace;
 
-pub const SCHEMA_VERSION: u32 = 4;
-pub const LEGACY_SCHEMA_VERSION: u32 = 1;
-pub const PREVIOUS_SCHEMA_VERSION: u32 = 2;
-pub const PREVIOUS_SCHEMA_VERSION_V3: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 5;
 pub const DEFAULT_SYSTEM_PROMPT: &str =
     "你是一个AI助手，你的任务是用简练且切中要害的解决用户的问题或者与用户对话。";
 
@@ -692,11 +689,7 @@ impl TurnStatus {
 #[serde(rename_all = "snake_case")]
 pub enum ProvenanceQuality {
     Exact,
-    LegacyInferred,
-}
-
-fn legacy_inferred() -> ProvenanceQuality {
-    ProvenanceQuality::LegacyInferred
+    Inferred,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1186,7 +1179,6 @@ pub struct ContextTrace {
     pub identity_instruction: Option<String>,
     #[serde(default)]
     pub untrusted_history_wrapped: bool,
-    #[serde(default = "legacy_inferred")]
     pub provenance_quality: ProvenanceQuality,
     #[serde(default)]
     pub retrieval: RetrievalTrace,
@@ -1311,18 +1303,14 @@ pub struct Session {
     pub status: SessionStatus,
     pub model: String,
     pub ollama_host: String,
-    #[serde(default = "default_ai_name")]
     pub ai_name: String,
     pub system_prompt: String,
     pub think: bool,
     pub budget: BudgetConfig,
-    #[serde(default)]
     pub retrieval: RetrievalConfig,
     pub active_context_start_index: usize,
     pub turns: Vec<Turn>,
-    #[serde(default)]
     pub cumulative_usage: TokenUsage,
-    #[serde(default)]
     pub cumulative_probe_usage: TokenUsage,
 }
 
@@ -1382,13 +1370,7 @@ impl Session {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if !matches!(
-            self.schema_version,
-            LEGACY_SCHEMA_VERSION
-                | PREVIOUS_SCHEMA_VERSION
-                | PREVIOUS_SCHEMA_VERSION_V3
-                | SCHEMA_VERSION
-        ) {
+        if self.schema_version != SCHEMA_VERSION {
             bail!("不支持的会话 schema 版本：{}", self.schema_version);
         }
         if self.id.is_empty() {
@@ -1424,14 +1406,6 @@ impl Session {
 
     pub fn touch(&mut self) {
         self.updated_at = utc_now();
-    }
-
-    pub fn normalize_legacy_provenance(&mut self) {
-        if self.schema_version == LEGACY_SCHEMA_VERSION {
-            for turn in &mut self.turns {
-                turn.context_trace.provenance_quality = ProvenanceQuality::LegacyInferred;
-            }
-        }
     }
 
     pub fn eligible_turns(
@@ -1575,7 +1549,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_budget_matches_legacy_behavior() {
+    fn default_budget_matches_expected_limits() {
         let budget = BudgetConfig::default();
         assert_eq!(budget.input_budget(), 28_160);
         assert_eq!(budget.probe_threshold(), 22_528);
@@ -1603,64 +1577,9 @@ mod tests {
     }
 
     #[test]
-    fn version_three_retrieval_trace_gets_schema_four_defaults() {
-        let trace: RetrievalTrace = serde_json::from_value(serde_json::json!({
-            "status": "complete",
-            "current_query_event_id": "evt_previous",
-            "query_terms": ["memory"]
-        }))
-        .unwrap();
-        assert_eq!(trace.query_kind, QueryKind::GeneralSemantic);
-        assert_eq!(trace.channels, Vec::<ChannelTrace>::new());
-        assert_eq!(trace.graph_paths, Vec::<GraphPathTrace>::new());
-        assert_eq!(
-            trace.budget_allocation,
-            BudgetAllocationTrace {
-                query_kind: QueryKind::GeneralSemantic,
-                recent_history_percent: 45,
-                exact_or_state_percent: 30,
-                episode_percent: 15,
-                graph_percent: 10,
-                ..Default::default()
-            }
-        );
-        assert!(trace.warnings.is_empty());
-        assert_eq!(trace.elapsed_ms, 0);
-
-        let serialized = serde_json::to_value(trace).unwrap();
-        assert_eq!(serialized["query_kind"], "general_semantic");
-        assert_eq!(serialized["budget_allocation"]["graph_percent"], 10);
-    }
-
-    #[test]
-    fn version_three_session_round_trips_and_upgrades_to_version_four() {
-        let mut value = serde_json::to_value(
-            Session::new(
-                "session-v3".into(),
-                "model".into(),
-                "http://localhost:11434".into(),
-                DEFAULT_SYSTEM_PROMPT.into(),
-                BudgetConfig::default(),
-                false,
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        value["schema_version"] = serde_json::json!(PREVIOUS_SCHEMA_VERSION_V3);
-
-        let mut session: Session = serde_json::from_value(value).unwrap();
-        session.validate().unwrap();
-        assert_eq!(session.schema_version, PREVIOUS_SCHEMA_VERSION_V3);
-
-        session.schema_version = SCHEMA_VERSION;
-        let saved = serde_json::to_value(session).unwrap();
-        assert_eq!(saved["schema_version"], SCHEMA_VERSION);
-    }
-
-    #[test]
-    fn all_historical_session_schema_versions_remain_valid() {
+    fn only_current_session_schema_version_is_valid() {
         let mut session = Session::new(
-            "compatible".into(),
+            "current".into(),
             "model".into(),
             "http://localhost:11434".into(),
             DEFAULT_SYSTEM_PROMPT.into(),
@@ -1668,9 +1587,10 @@ mod tests {
             false,
         )
         .unwrap();
-        for version in 1..=SCHEMA_VERSION {
+        session.validate().unwrap();
+        for version in 1..SCHEMA_VERSION {
             session.schema_version = version;
-            session.validate().unwrap();
+            assert!(session.validate().is_err());
         }
         session.schema_version = SCHEMA_VERSION + 1;
         assert!(session.validate().is_err());

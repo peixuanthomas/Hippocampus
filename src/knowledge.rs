@@ -36,7 +36,6 @@ pub struct KnowledgeSnapshot {
     pub content: String,
     pub content_sha256: String,
     pub previous_revision: Option<String>,
-    #[serde(default)]
     pub links: Vec<String>,
 }
 
@@ -61,9 +60,7 @@ impl KnowledgeSnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct KnowledgeState {
-    #[serde(default = "knowledge_schema_version")]
     schema_version: u32,
-    #[serde(default)]
     sources: BTreeMap<String, KnowledgeSourceState>,
 }
 
@@ -76,16 +73,11 @@ impl Default for KnowledgeState {
     }
 }
 
-fn knowledge_schema_version() -> u32 {
-    KNOWLEDGE_SCHEMA_VERSION
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct KnowledgeSourceState {
     kind: KnowledgeSourceKind,
     location: String,
     enabled: bool,
-    #[serde(default)]
     active_revisions: Vec<String>,
     last_sync_at: String,
     last_success_at: Option<String>,
@@ -812,17 +804,27 @@ impl KnowledgeStore {
         fs::create_dir_all(&self.root)?;
         let connection = Connection::open(&self.index_path)?;
         connection.busy_timeout(Duration::from_secs(5))?;
-        connection.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             PRAGMA synchronous=FULL;",
-        )?;
         let version =
             connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
         if !matches!(version, 0 | INDEX_SCHEMA_VERSION) {
             bail!("不支持的知识索引版本 {version}");
         }
-        connection.execute_batch(KNOWLEDGE_SCHEMA_SQL)?;
         if version == 0 {
+            let existing_objects = connection.query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?;
+            if existing_objects != 0 {
+                bail!("不支持的知识索引版本 {version}");
+            }
+        }
+        connection.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=FULL;",
+        )?;
+        if version == 0 {
+            connection.execute_batch(KNOWLEDGE_SCHEMA_SQL)?;
             connection.pragma_update(None, "user_version", INDEX_SCHEMA_VERSION)?;
         }
         Ok(connection)
@@ -1248,5 +1250,54 @@ mod tests {
         let recall = store.recall("紫藤罗盘", &config).unwrap();
         assert_eq!(recall.trace.selected_evidence.len(), 1);
         assert_eq!(recall.trace.selected_evidence[0].title, "facts.md");
+    }
+
+    #[test]
+    fn knowledge_state_requires_current_schema_fields() {
+        let root = tempfile::tempdir().unwrap();
+        let store = KnowledgeStore::new(root.path().join("sessions")).unwrap();
+        fs::create_dir_all(store.root()).unwrap();
+        fs::write(&store.state_path, b"{}").unwrap();
+
+        assert!(store.load_state().is_err());
+        assert_eq!(fs::read(&store.state_path).unwrap(), b"{}");
+    }
+
+    #[test]
+    fn unversioned_nonempty_knowledge_index_is_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let store = KnowledgeStore::new(root.path().join("sessions")).unwrap();
+        fs::create_dir_all(store.root()).unwrap();
+        let connection = Connection::open(store.index_path()).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE old_sentinel(value TEXT);
+                 INSERT INTO old_sentinel VALUES ('keep');",
+            )
+            .unwrap();
+        drop(connection);
+        let original_bytes = fs::read(store.index_path()).unwrap();
+
+        assert!(store.open_connection().is_err());
+        assert_eq!(fs::read(store.index_path()).unwrap(), original_bytes);
+        let connection = Connection::open(store.index_path()).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT value FROM old_sentinel", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            "keep"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE name='knowledge_documents'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
     }
 }

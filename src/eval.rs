@@ -1059,7 +1059,7 @@ fn canonical_sessions(
                 usage: TokenUsage::zero(),
                 probe_usage: TokenUsage::zero(),
                 context_trace: ContextTrace {
-                    provenance_quality: ProvenanceQuality::LegacyInferred,
+                    provenance_quality: ProvenanceQuality::Inferred,
                     ..ContextTrace::default()
                 },
                 request_started_at: None,

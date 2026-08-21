@@ -444,8 +444,7 @@ impl ControlLog {
                 "session {id} is not a regular source file"
             )));
         }
-        let mut session = read_session(&path)?;
-        session.normalize_legacy_provenance();
+        let session = read_session(&path)?;
         session
             .validate()
             .map_err(|error| ControlError::CorruptSource {

@@ -17,7 +17,6 @@ use crate::config::{MemoryBudgetConfig, MemoryConfig};
 use crate::consolidation::{
     consolidation_ledger_snapshot, normalize_match, original_claim_valid_to_by_id,
     prepare_consolidation_replay, replay_prepared_consolidation,
-    restore_compatible_legacy_watermarks, snapshot_compatible_legacy_watermarks,
     validate_consolidation_ledger_semantics, validate_full_derived_integrity,
 };
 use crate::context::{WrappedHistoryCursor, wrapped_history_identity};
@@ -34,8 +33,8 @@ use crate::model::{
     BudgetAllocationTrace, ChannelTrace, ChatMessage, ContextItemTrace, EntityMatchTrace,
     EventRole, EvidenceKind, FusionCandidateTrace, ModelRequestTrace, ProvenanceQuality, QueryKind,
     RankedCandidate, RetrievalChannel, RetrievalConfig, RetrievalDocumentGranularity,
-    RetrievalTrace, SCHEMA_VERSION, SelectedEvidence, Session, SourceSpan, StateSelectionTrace,
-    Turn, TurnStatus, WebTrace, content_sha256, context_sha256, event_id,
+    RetrievalTrace, SelectedEvidence, Session, SourceSpan, StateSelectionTrace, Turn, TurnStatus,
+    WebTrace, content_sha256, context_sha256, event_id,
 };
 use crate::ollama::{ChatBackend, EmbeddingRequest};
 use crate::vector::{
@@ -46,7 +45,7 @@ use crate::vector::{
 pub const INDEX_FILENAME: &str = ".hippocampus-index.sqlite3";
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 const SQLITE_BUSY_RETRY_ATTEMPTS: usize = 8;
-const INDEX_SCHEMA_VERSION: i64 = 8;
+const INDEX_SCHEMA_VERSION: i64 = 9;
 const MEMORY_STATE_SCHEMA_VERSION: i64 = 4;
 const DEFERRED_HARD_LIMIT: usize = usize::MAX;
 
@@ -1689,7 +1688,6 @@ impl RetrievalStore {
                 path: path.clone(),
                 message: error.to_string(),
             })?;
-        session.normalize_legacy_provenance();
         session
             .validate()
             .map_err(|error| RetrievalError::InvalidSource {
@@ -1704,7 +1702,6 @@ impl RetrievalStore {
         }
         session.refresh_cumulative_usage();
         let source = SessionSource {
-            legacy: session.schema_version == crate::model::LEGACY_SCHEMA_VERSION,
             session,
             path: self.root.join(&indexed_session.source_file),
             sha256: bytes_sha256(&bytes),
@@ -2429,8 +2426,6 @@ impl RetrievalStore {
         let ledger_before = consolidation_ledger_snapshot(&transaction)?;
         validate_consolidation_ledger_semantics(&transaction)?;
         let replay = prepare_consolidation_replay(&transaction, &state, &all_events)?;
-        let legacy_watermarks =
-            snapshot_compatible_legacy_watermarks(&transaction, &state, &all_events)?;
         let reusable_embeddings = if options.reuse_compatible_embeddings {
             self.snapshot_reusable_leaf_embeddings(&transaction, &state)?
         } else {
@@ -2479,7 +2474,6 @@ impl RetrievalStore {
             total.answer_contexts += report.answer_contexts;
         }
         let replay_report = replay_prepared_consolidation(&transaction, &state, replay)?;
-        restore_compatible_legacy_watermarks(&transaction, &legacy_watermarks)?;
         let embeddings_reused =
             self.restore_reusable_leaf_embeddings(&transaction, &state, &reusable_embeddings)?;
         transaction
@@ -8192,14 +8186,9 @@ impl RetrievalStore {
                 "回答事件索引与来源会话不匹配".into(),
             ));
         }
-        let authoritative = derive_context(
-            &source.session,
-            turn,
-            &source_event_by_id,
-            source.legacy,
-            &source.path,
-        )
-        .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+        let authoritative =
+            derive_context(&source.session, turn, &source_event_by_id, &source.path)
+                .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
         if answer.turn_id != turn.id
             || answer.context_sha256 != authoritative.context_sha256
             || answer.estimated_upper_tokens != turn.context_trace.estimated_upper_tokens
@@ -9841,13 +9830,7 @@ impl RetrievalStore {
             if !answer_active {
                 continue;
             }
-            let derived = derive_context(
-                &source.session,
-                turn,
-                &all_event_by_id,
-                source.legacy,
-                &source.path,
-            )?;
+            let derived = derive_context(&source.session, turn, &all_event_by_id, &source.path)?;
             if derived.untrusted_history_wrapped {
                 let expected_identity = wrapped_history_identity(
                     &source.session.ai_name,
@@ -10041,7 +10024,6 @@ impl RetrievalStore {
                 path: path.to_path_buf(),
                 message: error.to_string(),
             })?;
-        session.normalize_legacy_provenance();
         session
             .validate()
             .map_err(|error| RetrievalError::InvalidSource {
@@ -10056,7 +10038,6 @@ impl RetrievalStore {
         }
         session.refresh_cumulative_usage();
         Ok(SessionSource {
-            legacy: session.schema_version == crate::model::LEGACY_SCHEMA_VERSION,
             session,
             path: path.to_path_buf(),
             sha256: bytes_sha256(&bytes),
@@ -10281,25 +10262,48 @@ impl RetrievalStore {
         let version = connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .map_err(|source| self.database_error(source))?;
-        if !matches!(
-            version,
-            0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | INDEX_SCHEMA_VERSION
-        ) {
+        if !matches!(version, 0 | INDEX_SCHEMA_VERSION) {
             return Err(RetrievalError::UnsupportedIndexVersion(version));
         }
-        let existing_memory_version = read_existing_memory_state_version(&connection)
-            .map_err(|source| self.database_error(source))?;
-        if existing_memory_version.is_some_and(|value| !matches!(value, 1..=4)) {
-            return Err(RetrievalError::UnsupportedMemoryStateVersion(
-                existing_memory_version.expect("checked as some"),
-            ));
+        if version == 0 {
+            let existing_objects = connection
+                .query_row(
+                    "SELECT count(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|source| self.database_error(source))?;
+            if existing_objects != 0 {
+                return Err(RetrievalError::UnsupportedIndexVersion(version));
+            }
         }
-        let existing_graph_version = read_existing_graph_schema_version(&connection)
-            .map_err(|source| self.database_error(source))?;
-        if existing_graph_version.is_some_and(|value| value != crate::graph::GRAPH_SCHEMA_VERSION) {
-            return Err(RetrievalError::UnsupportedGraphSchemaVersion(
-                existing_graph_version.expect("checked as some"),
-            ));
+        if version == INDEX_SCHEMA_VERSION {
+            match read_existing_memory_state_version(&connection)
+                .map_err(|source| self.database_error(source))?
+            {
+                Some(MEMORY_STATE_SCHEMA_VERSION) => {}
+                Some(version) => {
+                    return Err(RetrievalError::UnsupportedMemoryStateVersion(version));
+                }
+                None => {
+                    return Err(RetrievalError::CorruptIndex(
+                        "派生索引缺少 memory state schema version".into(),
+                    ));
+                }
+            }
+            match read_existing_graph_schema_version(&connection)
+                .map_err(|source| self.database_error(source))?
+            {
+                Some(crate::graph::GRAPH_SCHEMA_VERSION) => {}
+                Some(version) => {
+                    return Err(RetrievalError::UnsupportedGraphSchemaVersion(version));
+                }
+                None => {
+                    return Err(RetrievalError::CorruptIndex(
+                        "派生索引缺少 graph schema version".into(),
+                    ));
+                }
+            }
         }
         with_sqlite_busy_backoff(|| {
             connection.execute_batch(
@@ -10309,131 +10313,29 @@ impl RetrievalStore {
             )
         })
         .map_err(|source| self.database_error(source))?;
-        if matches!(version, 1 | 2) {
-            // v1 contains all immutable events, so a transactional rebuild of
-            // only derived tables is deterministic and loses no source data.
-            let transaction = connection
-                .transaction()
-                .map_err(|e| self.database_error(e))?;
-            transaction
-                .execute_batch(SCHEMA_SQL)
-                .map_err(|e| self.database_error(e))?;
-            prepare_memory_state_schema(&transaction, existing_memory_version)
-                .map_err(|e| self.database_error(e))?;
-            prepare_graph_schema(&transaction, existing_graph_version)
-                .map_err(|e| self.database_error(e))?;
-            if !table_has_column(&transaction, "answer_contexts", "identity_instruction")
-                .map_err(|e| self.database_error(e))?
-            {
-                transaction
-                    .execute_batch(
-                        "ALTER TABLE answer_contexts ADD COLUMN identity_instruction TEXT;",
-                    )
-                    .map_err(|e| self.database_error(e))?;
-            }
-            if version == 1 {
-                transaction
-                    .execute_batch(
-                        "DELETE FROM memory_documents;
-                         DELETE FROM retrieval_documents_fts; DELETE FROM retrieval_documents;",
-                    )
-                    .map_err(|e| self.database_error(e))?;
-                let mut statement = transaction.prepare("SELECT event_id, session_id, turn_id, sequence, role, created_at, content, content_sha256, reply_to_event_id, token_count, turn_status, done_reason, error FROM events").map_err(|e| self.database_error(e))?;
-                let rows = statement
-                    .query_map([], map_event)
-                    .map_err(|e| self.database_error(e))?;
-                let events: Vec<_> = rows
-                    .collect::<Result<_, _>>()
-                    .map_err(|e| self.database_error(e))?;
-                drop(statement);
-                for event in &events {
-                    if event.role != EventRole::System && !event.content.trim().is_empty() {
-                        for (granularity, span) in document_spans(event) {
-                            let text = slice_chars(&event.content, &span)?;
-                            insert_span(&transaction, &span, &text)
-                                .map_err(|e| self.database_error(e))?;
-                            insert_document(&transaction, event, &span, granularity, &text)
-                                .map_err(|e| self.database_error(e))?;
-                            insert_memory_document(&transaction, event, &span, granularity, &text)
-                                .map_err(|e| self.database_error(e))?;
-                        }
-                    }
-                }
-            }
-            if version == 2 {
-                backfill_memory_documents(&transaction).map_err(|e| self.database_error(e))?;
-            }
-            transaction
-                .pragma_update(None, "user_version", INDEX_SCHEMA_VERSION)
-                .map_err(|e| self.database_error(e))?;
-            transaction.commit().map_err(|e| self.database_error(e))?;
-        } else if matches!(version, 0 | 3 | 4 | 5) {
-            let transaction = connection
-                .transaction()
-                .map_err(|e| self.database_error(e))?;
-            if version == 5 {
-                transaction
-                    .execute_batch(
-                        "DROP TRIGGER IF EXISTS memory_documents_before_source_span_delete;",
-                    )
-                    .map_err(|e| self.database_error(e))?;
-            }
-            transaction
-                .execute_batch(SCHEMA_SQL)
-                .map_err(|e| self.database_error(e))?;
-            prepare_memory_state_schema(&transaction, existing_memory_version)
-                .map_err(|e| self.database_error(e))?;
-            prepare_graph_schema(&transaction, existing_graph_version)
-                .map_err(|e| self.database_error(e))?;
-            if matches!(version, 3 | 4) {
-                backfill_memory_documents(&transaction).map_err(|e| self.database_error(e))?;
-            }
-            transaction
-                .pragma_update(None, "user_version", INDEX_SCHEMA_VERSION)
-                .map_err(|e| self.database_error(e))?;
-            transaction.commit().map_err(|e| self.database_error(e))?;
-        } else {
+        if version == 0 {
             let transaction = connection
                 .transaction()
                 .map_err(|e| self.database_error(e))?;
             transaction
                 .execute_batch(SCHEMA_SQL)
                 .map_err(|source| self.database_error(source))?;
-            prepare_memory_state_schema(&transaction, existing_memory_version)
-                .map_err(|e| self.database_error(e))?;
-            prepare_graph_schema(&transaction, existing_graph_version)
-                .map_err(|e| self.database_error(e))?;
+            transaction
+                .execute(
+                    "INSERT INTO memory_schema_meta(key,value) VALUES('state_schema_version',?1)",
+                    [MEMORY_STATE_SCHEMA_VERSION],
+                )
+                .map_err(|source| self.database_error(source))?;
+            transaction
+                .execute(
+                    "INSERT INTO memory_schema_meta(key,value) VALUES('graph_schema_version',?1)",
+                    [crate::graph::GRAPH_SCHEMA_VERSION],
+                )
+                .map_err(|source| self.database_error(source))?;
             transaction
                 .pragma_update(None, "user_version", INDEX_SCHEMA_VERSION)
                 .map_err(|e| self.database_error(e))?;
             transaction.commit().map_err(|e| self.database_error(e))?;
-        }
-        if version == 7 {
-            let materializations: i64 = connection
-                .query_row(
-                    "SELECT count(*) FROM memory_graph_materializations WHERE singleton=1",
-                    [],
-                    |row| row.get(0),
-                )
-                .map_err(|error| self.database_error(error))?;
-            let watermarks: i64 = connection
-                .query_row("SELECT count(*) FROM memory_graph_watermarks", [], |row| {
-                    row.get(0)
-                })
-                .map_err(|error| self.database_error(error))?;
-            if materializations == 1 && watermarks == 0 {
-                let generation = self.replay_control_state_under_guard()?.generation_sha256();
-                connection
-                    .execute(
-                        "INSERT INTO memory_graph_watermarks
-                         (session_id,through_sequence,control_generation_sha256,updated_at)
-                         SELECT s.session_id,COALESCE(MAX(e.sequence),0),?1,?2
-                         FROM indexed_sessions s LEFT JOIN events e ON e.session_id=s.session_id
-                         GROUP BY s.session_id",
-                        params![generation, Utc::now().to_rfc3339()],
-                    )
-                    .map_err(|error| self.database_error(error))?;
-            }
         }
         Ok(connection)
     }
@@ -10533,12 +10435,11 @@ impl RetrievalStore {
                 session_id: session_id.to_owned(),
             });
         }
-        let mut source: Session =
+        let source: Session =
             serde_json::from_slice(&bytes).map_err(|error| RetrievalError::InvalidSource {
                 path: self.root.join(&indexed.source_file),
                 message: error.to_string(),
             })?;
-        source.normalize_legacy_provenance();
         source
             .validate()
             .map_err(|error| RetrievalError::InvalidSource {
@@ -10615,7 +10516,7 @@ impl RetrievalStore {
                 control,
             )?;
             for turn in &source.session.turns {
-                if !has_assistant_event(&source.session, turn) {
+                if !has_assistant_event(turn) {
                     continue;
                 }
                 let answer_event_id =
@@ -11131,36 +11032,6 @@ fn verify_aggregate_document(
         ));
     }
     Ok(())
-}
-
-fn backfill_memory_documents(transaction: &Transaction<'_>) -> rusqlite::Result<()> {
-    transaction.execute_batch(
-        "INSERT INTO memory_documents
-         (document_id, session_id, granularity, source_sha256, start_sequence, end_sequence, member_count)
-         SELECT d.document_id, e.session_id, d.granularity, d.content_sha256,
-                e.sequence, e.sequence, 1
-         FROM retrieval_documents d JOIN events e ON e.event_id=d.event_id
-         WHERE d.granularity IN ('message', 'fragment')
-         ORDER BY d.document_id
-         ON CONFLICT(document_id) DO UPDATE SET
-         session_id=excluded.session_id, granularity=excluded.granularity,
-         source_sha256=excluded.source_sha256, start_sequence=excluded.start_sequence,
-         end_sequence=excluded.end_sequence, member_count=excluded.member_count;
-         DELETE FROM memory_document_members
-         WHERE document_id IN (
-             SELECT document_id FROM retrieval_documents
-             WHERE granularity IN ('message', 'fragment')
-         );
-         INSERT INTO memory_document_members
-         (document_id, ordinal, event_id, start_char, end_char, content_sha256)
-         SELECT d.document_id, 0, d.event_id, d.start_char, d.end_char, d.content_sha256
-         FROM retrieval_documents d
-         WHERE d.granularity IN ('message', 'fragment')
-         ORDER BY d.document_id
-         ON CONFLICT(document_id, ordinal) DO UPDATE SET
-         event_id=excluded.event_id, start_char=excluded.start_char,
-         end_char=excluded.end_char, content_sha256=excluded.content_sha256;",
-    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12446,7 +12317,6 @@ fn validate_aggregate_raw_source(
             "会话 {expected_session} 的规范原文件 JSON 损坏：{error}"
         ))
     })?;
-    session.normalize_legacy_provenance();
     session.validate().map_err(|error| {
         aggregate_corruption(format!(
             "会话 {expected_session} 的规范原文件语义损坏：{error}"
@@ -13111,7 +12981,6 @@ struct SessionSource {
     session: Session,
     path: PathBuf,
     sha256: String,
-    legacy: bool,
 }
 
 #[derive(Debug)]
@@ -13162,7 +13031,7 @@ pub(crate) fn derive_events(session: &Session) -> Vec<StoredEvent> {
             done_reason: None,
             error: turn.error.clone(),
         });
-        if has_assistant_event(session, turn) {
+        if has_assistant_event(turn) {
             let assistant_id = event_id(&session.id, Some(&turn.id), EventRole::Assistant);
             let token_count = if turn.usage.input_tokens.is_some() {
                 turn.usage.output_tokens
@@ -13193,10 +13062,9 @@ pub(crate) fn derive_events(session: &Session) -> Vec<StoredEvent> {
     events
 }
 
-fn has_assistant_event(session: &Session, turn: &Turn) -> bool {
+fn has_assistant_event(turn: &Turn) -> bool {
     turn.request_started_at.is_some()
-        || ((session.schema_version < SCHEMA_VERSION
-            || turn.context_trace.provenance_quality == ProvenanceQuality::LegacyInferred)
+        || (turn.context_trace.provenance_quality == ProvenanceQuality::Inferred
             && (!turn.assistant_content.is_empty()
                 || !turn.thinking.is_empty()
                 || turn.usage.input_tokens.is_some()
@@ -13259,7 +13127,7 @@ fn canonical_exact_context_items(
         previous_index = Some(index);
         let included_turn = &session.turns[index];
         items.push(full_turn_item(session, included_turn, EventRole::User));
-        if has_assistant_event(session, included_turn) {
+        if has_assistant_event(included_turn) {
             items.push(full_turn_item(session, included_turn, EventRole::Assistant));
         }
     }
@@ -13288,20 +13156,19 @@ fn derive_context(
     session: &Session,
     turn: &Turn,
     events: &HashMap<String, &StoredEvent>,
-    legacy: bool,
     source_path: &Path,
 ) -> RetrievalResult<DerivedContext> {
-    if !legacy && turn.context_trace.provenance_quality == ProvenanceQuality::Exact {
+    if turn.context_trace.provenance_quality == ProvenanceQuality::Exact {
         if turn.context_trace.context_items.is_empty() {
             return Err(RetrievalError::InvalidSource {
                 path: source_path.to_path_buf(),
-                message: format!("回答 {} 缺少 v2 精确上下文溯源", turn.id),
+                message: format!("回答 {} 缺少精确上下文溯源", turn.id),
             });
         }
         let context_hash = turn.context_trace.context_sha256.clone().ok_or_else(|| {
             RetrievalError::InvalidSource {
                 path: source_path.to_path_buf(),
-                message: format!("回答 {} 缺少 v2 上下文哈希", turn.id),
+                message: format!("回答 {} 缺少上下文哈希", turn.id),
             }
         })?;
         let request =
@@ -13310,7 +13177,7 @@ fn derive_context(
                 .clone()
                 .ok_or_else(|| RetrievalError::InvalidSource {
                     path: source_path.to_path_buf(),
-                    message: format!("回答 {} 缺少 v2 请求元数据", turn.id),
+                    message: format!("回答 {} 缺少请求元数据", turn.id),
                 })?;
         let canonical_items = canonical_exact_context_items(session, turn).map_err(|message| {
             RetrievalError::InvalidSource {
@@ -13368,7 +13235,7 @@ fn derive_context(
     Ok(DerivedContext {
         items,
         context_sha256: context_sha256(&messages),
-        provenance_quality: ProvenanceQuality::LegacyInferred,
+        provenance_quality: ProvenanceQuality::Inferred,
         request: None,
         identity_instruction: None,
         untrusted_history_wrapped: false,
@@ -13484,7 +13351,7 @@ fn insert_answer_context(
             turn.context_trace.decision,
             match derived.provenance_quality {
                 ProvenanceQuality::Exact => "exact",
-                ProvenanceQuality::LegacyInferred => "legacy_inferred",
+                ProvenanceQuality::Inferred => "inferred",
             },
             request.map(|value| value.model.as_str()),
             request.map(|value| value.think),
@@ -13534,7 +13401,7 @@ fn map_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredEvent> {
 fn map_answer_context(row: &rusqlite::Row<'_>) -> rusqlite::Result<AnswerContext> {
     let quality = match row.get::<_, String>(7)?.as_str() {
         "exact" => ProvenanceQuality::Exact,
-        "legacy_inferred" => ProvenanceQuality::LegacyInferred,
+        "inferred" => ProvenanceQuality::Inferred,
         value => {
             return Err(conversion_error(format!(
                 "unknown provenance quality {value}"
@@ -13646,14 +13513,6 @@ fn u64_to_i64(value: u64) -> rusqlite::Result<i64> {
         .map_err(|_| conversion_error(format!("u64 exceeds SQLite INTEGER: {value}")))
 }
 
-fn table_has_column(connection: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
-    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
-    let names = statement
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(names.iter().any(|name| name == column))
-}
-
 fn read_existing_memory_state_version(connection: &Connection) -> rusqlite::Result<Option<i64>> {
     let exists = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master
@@ -13690,86 +13549,6 @@ fn read_existing_graph_schema_version(connection: &Connection) -> rusqlite::Resu
             |row| row.get::<_, i64>(0),
         )
         .optional()
-}
-
-fn prepare_graph_schema(
-    connection: &Connection,
-    existing_version: Option<i64>,
-) -> rusqlite::Result<()> {
-    if existing_version.is_none() {
-        connection.execute_batch(
-            "DELETE FROM memory_graph_edges;
-             DELETE FROM memory_graph_nodes;
-             DELETE FROM memory_graph_materializations;",
-        )?;
-    }
-    connection.execute(
-        "INSERT INTO memory_schema_meta(key,value) VALUES('graph_schema_version',1)
-         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        [],
-    )?;
-    Ok(())
-}
-
-fn prepare_memory_state_schema(
-    connection: &Connection,
-    existing_version: Option<i64>,
-) -> rusqlite::Result<()> {
-    if !table_has_column(
-        connection,
-        "consolidation_batches",
-        "projection_schema_version",
-    )? {
-        connection.execute_batch(
-            "ALTER TABLE consolidation_batches ADD COLUMN projection_schema_version INTEGER
-             CHECK(projection_schema_version IS NULL OR projection_schema_version = 4);",
-        )?;
-    }
-    if existing_version != Some(MEMORY_STATE_SCHEMA_VERSION) {
-        // Pre-v3 rows use different deterministic-ID, evidence, or transition-order contracts.
-        // They cannot be upgraded row by row without trusting the old derived state, so discard
-        // only the replayable projection and retain raw events plus the immutable attempt ledger.
-        connection.execute_batch(
-            "DELETE FROM memory_graph_edges;
-             DELETE FROM memory_graph_nodes;
-             DELETE FROM memory_graph_materializations;
-             DELETE FROM memory_schema_meta WHERE key='graph_schema_version';
-             DELETE FROM memory_embeddings
-               WHERE document_id IN (SELECT document_id FROM memory_documents
-                                     WHERE granularity IN ('episode','session'));
-             DELETE FROM memory_episode_materializations;
-             DELETE FROM memory_episode_boundaries;
-             DELETE FROM memory_document_members
-               WHERE document_id IN (SELECT document_id FROM memory_documents
-                                     WHERE granularity IN ('episode','session'));
-             DELETE FROM memory_documents WHERE granularity IN ('episode','session');
-             DELETE FROM memory_entity_mentions;
-             DELETE FROM memory_episode_boundaries;
-             DELETE FROM memory_episode_materializations;
-             DELETE FROM memory_claim_evidence;
-             DELETE FROM memory_claim_transitions;
-             DELETE FROM memory_boundary_suggestions;
-             DELETE FROM memory_claims;
-             DELETE FROM memory_entity_aliases;
-             DELETE FROM memory_entities;
-             DELETE FROM consolidation_watermarks;
-             DROP TABLE memory_claim_evidence;
-             DROP TABLE memory_claim_transitions;
-             DROP TABLE memory_boundary_suggestions;
-             DROP TABLE memory_claims;
-             DROP TABLE memory_entity_aliases;
-             DROP TABLE memory_entities;
-             DROP TABLE consolidation_watermarks;",
-        )?;
-        connection.execute_batch(SCHEMA_SQL)?;
-    }
-    connection.execute(
-        "INSERT INTO memory_schema_meta(key, value)
-         VALUES ('state_schema_version', ?1)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        [MEMORY_STATE_SCHEMA_VERSION],
-    )?;
-    Ok(())
 }
 
 fn slice_chars(content: &str, span: &SourceSpan) -> RetrievalResult<String> {
@@ -13897,7 +13676,7 @@ CREATE TABLE IF NOT EXISTS answer_contexts (
     exact_input_tokens INTEGER,
     input_budget INTEGER NOT NULL,
     decision TEXT NOT NULL,
-    provenance_quality TEXT NOT NULL CHECK(provenance_quality IN ('exact', 'legacy_inferred')),
+    provenance_quality TEXT NOT NULL CHECK(provenance_quality IN ('exact', 'inferred')),
     request_model TEXT,
     request_think INTEGER,
     request_context_window INTEGER,
@@ -15980,170 +15759,6 @@ mod tests {
         );
     }
 
-    const OLD_MEMORY_V1_SCHEMA: &str = r#"
-CREATE TABLE consolidation_watermarks (
-    session_id TEXT PRIMARY KEY,
-    through_sequence INTEGER NOT NULL CHECK(through_sequence >= 0),
-    through_event_id TEXT,
-    through_event_sha256 TEXT,
-    updated_at TEXT,
-    CHECK((through_event_id IS NULL AND through_event_sha256 IS NULL)
-       OR (through_event_id IS NOT NULL AND through_event_sha256 IS NOT NULL))
-);
-CREATE TABLE memory_entities (
-    entity_id TEXT PRIMARY KEY,
-    kind TEXT NOT NULL CHECK(kind IN ('person','organization','location','object','concept','unknown')),
-    canonical_name TEXT NOT NULL CHECK(length(canonical_name) > 0),
-    normalized_name TEXT NOT NULL CHECK(length(normalized_name) > 0),
-    disambiguation TEXT NOT NULL CHECK(disambiguation IN ('resolved','pending')),
-    created_session_id TEXT NOT NULL CHECK(length(created_session_id) > 0),
-    created_batch_key TEXT NOT NULL CHECK(length(created_batch_key) > 0),
-    created_event_id TEXT NOT NULL CHECK(length(created_event_id) > 0),
-    created_start INTEGER NOT NULL CHECK(created_start >= 0),
-    created_end INTEGER NOT NULL CHECK(created_end > created_start),
-    created_hash TEXT NOT NULL CHECK(length(created_hash) = 64),
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-CREATE INDEX memory_entities_normalized ON memory_entities(normalized_name, kind, entity_id);
-CREATE TABLE memory_entity_aliases (
-    alias_id TEXT PRIMARY KEY,
-    entity_id TEXT NOT NULL,
-    alias_text TEXT NOT NULL CHECK(length(alias_text) > 0),
-    normalized_alias TEXT NOT NULL CHECK(length(normalized_alias) > 0),
-    alias_kind TEXT NOT NULL CHECK(alias_kind IN ('explicit_alias','stable_identifier')),
-    stable_identifier_kind TEXT,
-    session_id TEXT NOT NULL CHECK(length(session_id) > 0),
-    batch_key TEXT NOT NULL CHECK(length(batch_key) > 0),
-    event_id TEXT NOT NULL CHECK(length(event_id) > 0),
-    start_char INTEGER NOT NULL CHECK(start_char >= 0),
-    end_char INTEGER NOT NULL CHECK(end_char > start_char),
-    content_sha256 TEXT NOT NULL CHECK(length(content_sha256) = 64),
-    created_at TEXT NOT NULL,
-    CHECK((alias_kind = 'explicit_alias' AND stable_identifier_kind IS NULL)
-       OR (alias_kind = 'stable_identifier' AND stable_identifier_kind IS NOT NULL
-           AND length(stable_identifier_kind) > 0))
-);
-CREATE INDEX memory_entity_aliases_entity ON memory_entity_aliases(entity_id, alias_id);
-CREATE INDEX memory_entity_aliases_normalized
-    ON memory_entity_aliases(alias_kind, stable_identifier_kind, normalized_alias, entity_id);
-CREATE TABLE memory_claims (
-    claim_id TEXT PRIMARY KEY,
-    session_id TEXT NOT NULL CHECK(length(session_id) > 0),
-    subject_entity_id TEXT NOT NULL CHECK(length(subject_entity_id) > 0),
-    predicate_key TEXT NOT NULL CHECK(length(predicate_key) > 0),
-    object_kind TEXT NOT NULL CHECK(object_kind IN ('text','entity')),
-    object_text TEXT,
-    object_entity_id TEXT,
-    normalized_object TEXT NOT NULL CHECK(length(normalized_object) > 0),
-    polarity TEXT NOT NULL CHECK(polarity IN ('assert','deny')),
-    cardinality TEXT NOT NULL CHECK(cardinality IN ('single','multi')),
-    certainty TEXT NOT NULL CHECK(certainty IN ('certain','uncertain')),
-    state TEXT NOT NULL CHECK(state IN ('active','superseded','conflicted','uncertain')),
-    asserted_at TEXT NOT NULL,
-    event_time TEXT,
-    valid_from TEXT NOT NULL,
-    valid_to TEXT,
-    reference_time TEXT NOT NULL,
-    created_batch_key TEXT NOT NULL CHECK(length(created_batch_key) > 0),
-    updated_batch_key TEXT NOT NULL CHECK(length(updated_batch_key) > 0),
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    CHECK((object_kind = 'text' AND object_text IS NOT NULL AND object_entity_id IS NULL)
-       OR (object_kind = 'entity' AND object_text IS NULL AND object_entity_id IS NOT NULL))
-);
-CREATE INDEX memory_claims_subject_predicate
-    ON memory_claims(subject_entity_id, predicate_key, state, claim_id);
-CREATE INDEX memory_claims_updated ON memory_claims(updated_at DESC, claim_id);
-CREATE TABLE memory_claim_evidence (
-    evidence_id TEXT PRIMARY KEY,
-    claim_id TEXT NOT NULL,
-    session_id TEXT NOT NULL CHECK(length(session_id) > 0),
-    batch_key TEXT NOT NULL CHECK(length(batch_key) > 0),
-    event_id TEXT NOT NULL CHECK(length(event_id) > 0),
-    sequence INTEGER NOT NULL CHECK(sequence >= 0),
-    role TEXT NOT NULL CHECK(role IN ('user','assistant')),
-    kind TEXT NOT NULL CHECK(kind IN ('assertion','user_confirmation','correction','temporal')),
-    start_char INTEGER NOT NULL CHECK(start_char >= 0),
-    end_char INTEGER NOT NULL CHECK(end_char > start_char),
-    content_sha256 TEXT NOT NULL CHECK(length(content_sha256) = 64),
-    created_at TEXT NOT NULL
-);
-CREATE INDEX memory_claim_evidence_claim
-    ON memory_claim_evidence(claim_id, event_id, start_char, end_char, evidence_id);
-CREATE INDEX memory_claim_evidence_event ON memory_claim_evidence(event_id, claim_id);
-CREATE TABLE memory_claim_transitions (
-    transition_id TEXT PRIMARY KEY,
-    claim_id TEXT NOT NULL,
-    from_state TEXT CHECK(from_state IS NULL OR from_state IN ('active','superseded','conflicted','uncertain')),
-    to_state TEXT NOT NULL CHECK(to_state IN ('active','superseded','conflicted','uncertain')),
-    reason TEXT NOT NULL CHECK(reason IN ('created','confirmed','certainty_upgraded','conflicted','corrected','replaced')),
-    related_claim_id TEXT,
-    session_id TEXT NOT NULL CHECK(length(session_id) > 0),
-    batch_key TEXT NOT NULL CHECK(length(batch_key) > 0),
-    created_at TEXT NOT NULL
-);
-CREATE INDEX memory_claim_transitions_claim
-    ON memory_claim_transitions(claim_id, created_at, transition_id);
-CREATE TABLE memory_boundary_suggestions (
-    boundary_id TEXT PRIMARY KEY,
-    session_id TEXT NOT NULL CHECK(length(session_id) > 0),
-    batch_key TEXT NOT NULL CHECK(length(batch_key) > 0),
-    before_event_id TEXT NOT NULL CHECK(length(before_event_id) > 0),
-    reason TEXT NOT NULL CHECK(reason IN ('explicit_topic_transition','model_topic_shift')),
-    evidence_json TEXT NOT NULL CHECK(length(evidence_json) > 0),
-    created_at TEXT NOT NULL
-);
-CREATE INDEX memory_boundary_suggestions_session_event
-    ON memory_boundary_suggestions(session_id, before_event_id, boundary_id);
-"#;
-
-    fn replace_with_old_memory_v1_schema(connection: &Connection) {
-        connection
-            .execute_batch(
-                "PRAGMA foreign_keys=OFF;
-                 DROP TABLE memory_schema_meta;
-                 DROP TABLE memory_claim_evidence;
-                 DROP TABLE memory_claim_transitions;
-                 DROP TABLE memory_boundary_suggestions;
-                 DROP TABLE memory_claims;
-                 DROP TABLE memory_entity_aliases;
-                 DROP TABLE memory_entities;
-                 DROP TABLE consolidation_watermarks;",
-            )
-            .unwrap();
-        connection.execute_batch(OLD_MEMORY_V1_SCHEMA).unwrap();
-    }
-
-    fn replace_transition_table_with_memory_v2_schema(connection: &Connection) {
-        connection
-            .execute_batch(
-                "PRAGMA foreign_keys=OFF;
-                 DROP INDEX memory_claim_transitions_claim;
-                 DROP TABLE memory_claim_transitions;
-                 CREATE TABLE memory_claim_transitions (
-                    transition_id TEXT PRIMARY KEY,
-                    claim_id TEXT NOT NULL,
-                    from_state TEXT CHECK(from_state IS NULL OR from_state IN
-                        ('active','superseded','conflicted','uncertain')),
-                    to_state TEXT NOT NULL CHECK(to_state IN
-                        ('active','superseded','conflicted','uncertain')),
-                    reason TEXT NOT NULL CHECK(reason IN
-                        ('created','confirmed','certainty_upgraded','conflicted','corrected','replaced')),
-                    related_claim_id TEXT,
-                    session_id TEXT NOT NULL CHECK(length(session_id) > 0),
-                    batch_key TEXT NOT NULL CHECK(length(batch_key) > 0),
-                    created_at TEXT NOT NULL,
-                    FOREIGN KEY(claim_id) REFERENCES memory_claims(claim_id),
-                    FOREIGN KEY(related_claim_id) REFERENCES memory_claims(claim_id)
-                 );
-                 CREATE INDEX memory_claim_transitions_claim
-                    ON memory_claim_transitions(claim_id, created_at, transition_id);
-                 UPDATE memory_schema_meta SET value=2 WHERE key='state_schema_version';",
-            )
-            .unwrap();
-    }
-
     #[test]
     fn episode_materialize_preserves_direct_messages_and_is_idempotent() {
         let root = tempfile::tempdir().unwrap();
@@ -16217,525 +15832,6 @@ CREATE INDEX memory_boundary_suggestions_session_event
                 .unwrap()
                 .iter()
                 .any(|value| value.document_id == doc.document_id)
-        );
-    }
-
-    #[test]
-    fn v5_to_v7_preserves_leaf_vectors_and_replaces_trigger() {
-        let root = tempfile::tempdir().unwrap();
-        let store = SessionStore::new(root.path()).unwrap();
-        let mut session = store
-            .create("model", "http://localhost", None, Default::default(), false)
-            .unwrap();
-        append_complete_turn(&mut session, "你好🙂", "回复", "");
-        let path = store.save(&mut session).unwrap();
-        let source_bytes = fs::read(&path).unwrap();
-        store.retrieval().sync_session(&session, &path).unwrap();
-        let replay_before = store.retrieval().replay_session(&session.id).unwrap();
-        let spec = VectorIndexSpec {
-            model: "fixture-embedding-model".into(),
-            dimensions: 32,
-            hnsw_m: 16,
-            hnsw_ef_construction: 200,
-            hnsw_ef_search: 64,
-        };
-        let connection = Connection::open(store.retrieval().index_path()).unwrap();
-        let (document_id, source_sha256): (String, String) = connection
-            .query_row(
-                "SELECT document_id, source_sha256 FROM memory_documents
-                 WHERE session_id=?1 AND granularity='message' ORDER BY document_id LIMIT 1",
-                [&session.id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        drop(connection);
-        store
-            .retrieval()
-            .upsert_embeddings(
-                &spec,
-                &[EmbeddingWrite {
-                    document_id: document_id.clone(),
-                    expected_source_sha256: source_sha256,
-                    vector: (0..spec.dimensions)
-                        .map(|index| index as f32 - 7.5)
-                        .collect(),
-                }],
-            )
-            .unwrap();
-        let embedding_before = store
-            .retrieval()
-            .compatible_embeddings(&spec)
-            .unwrap()
-            .into_iter()
-            .find(|embedding| embedding.document_id == document_id)
-            .unwrap();
-        assert_eq!(
-            embedding_before.granularity,
-            RetrievalDocumentGranularity::Message
-        );
-
-        let connection = Connection::open(store.retrieval().index_path()).unwrap();
-        connection
-            .execute_batch(
-                "DROP TRIGGER memory_documents_before_source_span_delete;
-                 DROP TABLE memory_episode_boundaries;
-                 DROP TABLE memory_episode_materializations;
-                 CREATE TRIGGER memory_documents_before_source_span_delete
-                 BEFORE DELETE ON source_spans
-                 BEGIN
-                     DELETE FROM memory_documents
-                     WHERE document_id IN (
-                         SELECT document_id FROM memory_document_members
-                         WHERE event_id = OLD.event_id
-                           AND start_char = OLD.start_char
-                           AND end_char = OLD.end_char
-                     );
-                 END;",
-            )
-            .unwrap();
-        connection
-            .pragma_update(None, "user_version", 5_i64)
-            .unwrap();
-        for table in [
-            "memory_episode_boundaries",
-            "memory_episode_materializations",
-        ] {
-            assert_eq!(
-                connection
-                    .query_row(
-                        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
-                        [table],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .unwrap(),
-                0
-            );
-        }
-        let historical_trigger: String = connection
-            .query_row(
-                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='memory_documents_before_source_span_delete'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(!historical_trigger.contains("memory_episode_materializations"));
-        drop(connection);
-        let reopened = RetrievalStore::new(root.path()).unwrap();
-        assert_eq!(reopened.replay_session(&session.id).unwrap(), replay_before);
-        let connection = Connection::open(reopened.index_path()).unwrap();
-        assert_eq!(
-            connection
-                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
-                .unwrap(),
-            INDEX_SCHEMA_VERSION
-        );
-        for table in [
-            "memory_episode_boundaries",
-            "memory_episode_materializations",
-        ] {
-            assert_eq!(
-                connection
-                    .query_row(
-                        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
-                        [table],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .unwrap(),
-                1
-            );
-        }
-        let trigger: String = connection.query_row("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='memory_documents_before_source_span_delete'", [], |row| row.get(0)).unwrap();
-        assert!(trigger.contains("memory_episode_materializations"));
-        drop(connection);
-        let embedding_after = reopened
-            .compatible_embeddings(&spec)
-            .unwrap()
-            .into_iter()
-            .find(|embedding| embedding.document_id == document_id)
-            .unwrap();
-        assert_eq!(embedding_after, embedding_before);
-        assert_eq!(fs::read(path).unwrap(), source_bytes);
-    }
-
-    #[test]
-    fn memory_state_v4_migration_clears_aggregates_retains_leaf_raw_legacy_ledger_and_replays() {
-        let root = tempfile::tempdir().unwrap();
-        let store = SessionStore::new(root.path()).unwrap();
-        let mut session = store
-            .create("model", "http://localhost", None, Default::default(), false)
-            .unwrap();
-        append_complete_turn(&mut session, &"字".repeat(241), "complete answer", "");
-        let source_path = store.save(&mut session).unwrap();
-        let source_before = fs::read(&source_path).unwrap();
-        let batch = store
-            .retrieval()
-            .next_consolidation_batch(&session.id)
-            .unwrap()
-            .unwrap();
-        let config = MemoryConfig {
-            enabled: true,
-            embedding_dimensions: 32,
-            ..MemoryConfig::default()
-        };
-        let spec = VectorIndexSpec::from_config(&config).unwrap();
-        let leaf_writes = {
-            let connection = Connection::open(store.retrieval().index_path()).unwrap();
-            connection
-                .prepare(
-                    "SELECT document_id,source_sha256 FROM memory_documents
-                     WHERE session_id=?1 AND granularity IN ('message','fragment')
-                     ORDER BY document_id",
-                )
-                .unwrap()
-                .query_map([&session.id], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })
-                .unwrap()
-                .enumerate()
-                .map(|(index, row)| {
-                    let (document_id, expected_source_sha256) = row.unwrap();
-                    EmbeddingWrite {
-                        document_id,
-                        expected_source_sha256,
-                        vector: vec![index as f32 + 1.0; spec.dimensions],
-                    }
-                })
-                .collect::<Vec<_>>()
-        };
-        assert!(leaf_writes.iter().any(|write| {
-            write.document_id.contains(":0:240") || write.document_id.contains(":200:241")
-        }));
-        store
-            .retrieval()
-            .upsert_embeddings(&spec, &leaf_writes)
-            .unwrap();
-        let plan = store
-            .retrieval()
-            .materialize_episode_documents(&session.id, &config)
-            .unwrap();
-        let aggregate_writes = aggregate_writes(&store, &plan, &spec, 10.0);
-        assert!(aggregate_writes.len() >= 2);
-        store
-            .retrieval()
-            .upsert_embeddings(&spec, &aggregate_writes)
-            .unwrap();
-
-        let connection = Connection::open(store.retrieval().index_path()).unwrap();
-        let boundary_event_id: String = connection
-            .query_row(
-                "SELECT event_id FROM events WHERE session_id=?1 AND role='user'",
-                [&session.id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        connection
-            .execute(
-                "INSERT OR REPLACE INTO memory_episode_boundaries(session_id,before_event_id,decision_json,input_sha256)
-                 VALUES(?1,?2,'{\"fixture\":true}',?3)",
-                params![session.id, boundary_event_id, "a".repeat(64)],
-            )
-            .unwrap();
-        let aggregate_before = episode_materialization_sql_state(&connection, &session.id);
-        assert!(!aggregate_before.catalog.is_empty());
-        assert!(!aggregate_before.members.is_empty());
-        assert!(!aggregate_before.boundaries.is_empty());
-        assert!(!aggregate_before.materialization.is_empty());
-        assert!(!aggregate_before.embeddings.is_empty());
-        let leaf_before = (
-            episode_sql_rows(
-                &connection,
-                "SELECT d.document_id,d.granularity,d.source_sha256,d.start_sequence,d.end_sequence,
-                        d.member_count,m.ordinal,m.event_id,m.start_char,m.end_char,m.content_sha256
-                 FROM memory_documents d JOIN memory_document_members m ON m.document_id=d.document_id
-                 WHERE d.session_id=?1 AND d.granularity IN ('message','fragment')
-                 ORDER BY d.document_id,m.ordinal",
-                &session.id,
-            ),
-            episode_sql_rows(
-                &connection,
-                "SELECT r.document_id,r.event_id,r.start_char,r.end_char,r.granularity,r.content_sha256,
-                        r.exact_content,r.lexical_content,r.ngram_content
-                 FROM retrieval_documents r JOIN events e ON e.event_id=r.event_id
-                 WHERE e.session_id=?1 ORDER BY r.document_id",
-                &session.id,
-            ),
-            episode_sql_rows(
-                &connection,
-                "SELECT s.event_id,s.start_char,s.end_char,s.content_sha256
-                 FROM source_spans s JOIN events e ON e.event_id=s.event_id
-                 WHERE e.session_id=?1 ORDER BY s.event_id,s.start_char,s.end_char",
-                &session.id,
-            ),
-            episode_sql_rows(
-                &connection,
-                "SELECT e.document_id,e.model,e.dimensions,e.source_sha256,e.index_fingerprint,
-                        e.vector_blob,e.embedded_at
-                 FROM memory_embeddings e JOIN memory_documents d ON d.document_id=e.document_id
-                 WHERE d.session_id=?1 AND d.granularity IN ('message','fragment')
-                 ORDER BY e.document_id",
-                &session.id,
-            ),
-        );
-        assert!(!leaf_before.0.is_empty());
-        assert!(!leaf_before.1.is_empty());
-        assert!(!leaf_before.2.is_empty());
-        assert_eq!(leaf_before.3.len(), leaf_writes.len());
-        let raw_events_before = episode_sql_rows(
-            &connection,
-            "SELECT event_id,session_id,turn_id,sequence,role,created_at,content,content_sha256,
-                    reply_to_event_id,token_count,turn_status,done_reason,error
-             FROM events WHERE session_id=?1 ORDER BY sequence,event_id",
-            &session.id,
-        );
-        let event_ids = serde_json::to_string(
-            &batch
-                .events
-                .iter()
-                .map(|event| event.event_id.clone())
-                .collect::<Vec<_>>(),
-        )
-        .unwrap();
-        let event_hashes = serde_json::to_string(
-            &batch
-                .events
-                .iter()
-                .map(|event| event.content_sha256.clone())
-                .collect::<Vec<_>>(),
-        )
-        .unwrap();
-        let legacy_request_json = "{\"legacy\":true}";
-        let legacy_response_json = "{\"legacy_response\":true}";
-        connection
-            .execute_batch(
-                "DROP TRIGGER consolidation_batches_immutable_update;
-                 DROP TRIGGER consolidation_batches_immutable_delete;
-                 ALTER TABLE consolidation_batches DROP COLUMN projection_schema_version;",
-            )
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO consolidation_batches
-                 (attempt_id,batch_key,session_id,from_sequence,through_sequence,trigger,model,
-                  request_json,request_sha256,input_event_ids,input_event_hashes,response_json,
-                  response_sha256,status,input_tokens,output_tokens,latency_ms,started_at,
-                  completed_at,validation_json,error_json)
-                 VALUES('legacy-v3-applied',?1,?2,?3,?4,'legacy','legacy-model',?5,?6,?7,?8,
-                        ?9,?10,'applied',7,3,1,?11,?12,'{\"legacy\":true}',NULL)",
-                params![
-                    batch.batch_key,
-                    batch.session_id,
-                    batch.from_sequence as i64,
-                    batch.through_sequence as i64,
-                    legacy_request_json,
-                    content_sha256(legacy_request_json),
-                    event_ids,
-                    event_hashes,
-                    legacy_response_json,
-                    content_sha256(legacy_response_json),
-                    batch.events.last().unwrap().created_at,
-                    (DateTime::parse_from_rfc3339(&batch.events.last().unwrap().created_at)
-                        .unwrap()
-                        + chrono::Duration::seconds(1))
-                    .to_rfc3339(),
-                ],
-            )
-            .unwrap();
-        let legacy_before = episode_sql_rows(
-            &connection,
-            "SELECT attempt_id,batch_key,session_id,from_sequence,through_sequence,trigger,model,
-                    request_json,request_sha256,input_event_ids,input_event_hashes,response_json,
-                    response_sha256,status,input_tokens,output_tokens,latency_ms,started_at,
-                    completed_at,validation_json,error_json
-             FROM consolidation_batches WHERE session_id=?1 ORDER BY attempt_id",
-            &session.id,
-        );
-        assert_eq!(legacy_before.len(), 1);
-        connection
-            .execute(
-                "UPDATE memory_schema_meta SET value=3 WHERE key='state_schema_version'",
-                [],
-            )
-            .unwrap();
-        connection
-            .pragma_update(None, "user_version", 6_i64)
-            .unwrap();
-        drop(connection);
-
-        let reopened = RetrievalStore::new(root.path()).unwrap();
-        reopened.open_connection().unwrap();
-        let connection = Connection::open(reopened.index_path()).unwrap();
-        assert_eq!(
-            connection
-                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
-                .unwrap(),
-            INDEX_SCHEMA_VERSION
-        );
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT value FROM memory_schema_meta WHERE key='state_schema_version'",
-                    [],
-                    |row| row.get::<_, i64>(0),
-                )
-                .unwrap(),
-            4
-        );
-        let aggregate_after = episode_materialization_sql_state(&connection, &session.id);
-        assert!(aggregate_after.catalog.is_empty());
-        assert!(aggregate_after.members.is_empty());
-        assert!(aggregate_after.boundaries.is_empty());
-        assert!(aggregate_after.materialization.is_empty());
-        assert!(aggregate_after.embeddings.is_empty());
-        let leaf_after = (
-            episode_sql_rows(
-                &connection,
-                "SELECT d.document_id,d.granularity,d.source_sha256,d.start_sequence,d.end_sequence,
-                        d.member_count,m.ordinal,m.event_id,m.start_char,m.end_char,m.content_sha256
-                 FROM memory_documents d JOIN memory_document_members m ON m.document_id=d.document_id
-                 WHERE d.session_id=?1 AND d.granularity IN ('message','fragment')
-                 ORDER BY d.document_id,m.ordinal",
-                &session.id,
-            ),
-            episode_sql_rows(
-                &connection,
-                "SELECT r.document_id,r.event_id,r.start_char,r.end_char,r.granularity,r.content_sha256,
-                        r.exact_content,r.lexical_content,r.ngram_content
-                 FROM retrieval_documents r JOIN events e ON e.event_id=r.event_id
-                 WHERE e.session_id=?1 ORDER BY r.document_id",
-                &session.id,
-            ),
-            episode_sql_rows(
-                &connection,
-                "SELECT s.event_id,s.start_char,s.end_char,s.content_sha256
-                 FROM source_spans s JOIN events e ON e.event_id=s.event_id
-                 WHERE e.session_id=?1 ORDER BY s.event_id,s.start_char,s.end_char",
-                &session.id,
-            ),
-            episode_sql_rows(
-                &connection,
-                "SELECT e.document_id,e.model,e.dimensions,e.source_sha256,e.index_fingerprint,
-                        e.vector_blob,e.embedded_at
-                 FROM memory_embeddings e JOIN memory_documents d ON d.document_id=e.document_id
-                 WHERE d.session_id=?1 AND d.granularity IN ('message','fragment')
-                 ORDER BY e.document_id",
-                &session.id,
-            ),
-        );
-        assert_eq!(leaf_after, leaf_before);
-        assert_eq!(
-            episode_sql_rows(
-                &connection,
-                "SELECT event_id,session_id,turn_id,sequence,role,created_at,content,content_sha256,
-                        reply_to_event_id,token_count,turn_status,done_reason,error
-                 FROM events WHERE session_id=?1 ORDER BY sequence,event_id",
-                &session.id,
-            ),
-            raw_events_before
-        );
-        let legacy_after = episode_sql_rows(
-            &connection,
-            "SELECT attempt_id,batch_key,session_id,from_sequence,through_sequence,trigger,model,
-                    request_json,request_sha256,input_event_ids,input_event_hashes,response_json,
-                    response_sha256,status,input_tokens,output_tokens,latency_ms,started_at,
-                    completed_at,validation_json,error_json
-             FROM consolidation_batches WHERE session_id=?1 AND attempt_id='legacy-v3-applied'",
-            &session.id,
-        );
-        assert_eq!(legacy_after, legacy_before);
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT count(*) FROM consolidation_batches
-                     WHERE attempt_id='legacy-v3-applied' AND projection_schema_version IS NULL",
-                    [],
-                    |row| row.get::<_, i64>(0),
-                )
-                .unwrap(),
-            1
-        );
-        drop(connection);
-        assert_eq!(fs::read(&source_path).unwrap(), source_before);
-        assert_eq!(
-            reopened.next_consolidation_batch(&session.id).unwrap(),
-            Some(batch.clone())
-        );
-
-        let candidates = reopened.consolidation_candidates(16, 16).unwrap();
-        let output = StructuredConsolidationOutput {
-            entities: vec![],
-            claims: vec![],
-            boundaries: vec![],
-        };
-        let request_json = serde_json::to_string(
-            &canonical_consolidation_request(
-                "current-model".into(),
-                &batch,
-                &candidates,
-                4096,
-                1024,
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        let response_json = serde_json::to_string(&output).unwrap();
-        let started_at = batch.events.last().unwrap().created_at.clone();
-        let attempt = ConsolidationAttemptRecord {
-            attempt_id: "current-v4-replay".into(),
-            batch_key: batch.batch_key.clone(),
-            session_id: batch.session_id.clone(),
-            from_sequence: batch.from_sequence,
-            through_sequence: batch.through_sequence,
-            trigger: "test".into(),
-            model: "current-model".into(),
-            request_sha256: content_sha256(&request_json),
-            request_json,
-            input_event_ids: batch
-                .events
-                .iter()
-                .map(|event| event.event_id.clone())
-                .collect(),
-            input_event_hashes: batch
-                .events
-                .iter()
-                .map(|event| event.content_sha256.clone())
-                .collect(),
-            response_sha256: Some(content_sha256(&response_json)),
-            response_json: Some(response_json),
-            status: ConsolidationAttemptStatus::Applied,
-            input_tokens: Some(1),
-            output_tokens: Some(1),
-            latency_ms: 1,
-            started_at: started_at.clone(),
-            completed_at: (DateTime::parse_from_rfc3339(&started_at).unwrap()
-                + chrono::Duration::seconds(1))
-            .to_rfc3339(),
-            validation_json: Some("{\"valid\":true}".into()),
-            error_json: None,
-        };
-        let report = reopened
-            .apply_consolidation_attempt(&batch, &candidates, &attempt)
-            .unwrap();
-        assert_eq!(report.mentions_created, 0);
-        let connection = Connection::open(reopened.index_path()).unwrap();
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT count(*) FROM consolidation_batches WHERE batch_key=?1 AND status='applied' AND projection_schema_version=4",
-                    [&batch.batch_key],
-                    |row| row.get::<_, i64>(0),
-                )
-                .unwrap(),
-            1
-        );
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT count(*) FROM consolidation_batches WHERE attempt_id='legacy-v3-applied' AND projection_schema_version IS NULL",
-                    [],
-                    |row| row.get::<_, i64>(0),
-                )
-                .unwrap(),
-            1
         );
     }
 
@@ -19083,91 +18179,18 @@ CREATE INDEX memory_boundary_suggestions_session_event
     }
 
     #[test]
-    fn migrates_real_v1_index_transactionally_with_wal() {
-        let root = tempfile::tempdir().unwrap();
-        let store = SessionStore::new(root.path()).unwrap();
-        let mut session = store
-            .create(
-                "model",
-                "http://localhost",
-                Some("system"),
-                Default::default(),
-                false,
-            )
-            .unwrap();
-        let answer_id = append_complete_turn(
-            &mut session,
-            &format!("{}杭州唐波", "甲".repeat(241)),
-            "原始回复",
-            "",
-        );
-        store.save(&mut session).unwrap();
-        let expected = store.retrieval().answer_context(&answer_id).unwrap();
-        {
-            let connection = Connection::open(store.retrieval().index_path()).unwrap();
-            connection.execute_batch("DROP TABLE retrieval_documents_fts; DROP TABLE retrieval_documents; DROP TABLE retrieval_runs; PRAGMA user_version=1;").unwrap();
-        }
-        let migrated = RetrievalStore::new(root.path()).unwrap();
-        let replay = migrated.replay_session(&session.id).unwrap();
-        assert!(!replay.is_empty());
-        let connection = Connection::open(migrated.index_path()).unwrap();
-        assert_eq!(
-            connection
-                .query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0))
-                .unwrap(),
-            "wal"
-        );
-        assert_eq!(
-            connection
-                .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
-                .unwrap(),
-            INDEX_SCHEMA_VERSION
-        );
-        assert!(
-            connection
-                .query_row("SELECT count(*) FROM retrieval_documents", [], |r| r
-                    .get::<_, i64>(0))
-                .unwrap()
-                >= 3
-        );
-        let recall = migrated
-            .keyword_recall("唐波", "current", &[], RetrievalConfig::default())
-            .unwrap();
-        assert!(
-            recall
-                .evidence
-                .iter()
-                .any(|item| item.content.contains("杭州唐波"))
-        );
-        let restored = migrated.answer_context(&answer_id).unwrap();
-        assert_eq!(restored.context_sha256, expected.context_sha256);
-        assert_eq!(
-            restored
-                .items
-                .iter()
-                .map(|item| &item.resolved.content)
-                .collect::<Vec<_>>(),
-            expected
-                .items
-                .iter()
-                .map(|item| &item.resolved.content)
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn unknown_index_version_errors_before_v2_ddl() {
+    fn old_index_version_errors_without_mutation() {
         let root = tempfile::tempdir().unwrap();
         let index = root.path().join(INDEX_FILENAME);
         let connection = Connection::open(&index).unwrap();
         connection
-            .pragma_update(None, "user_version", 99_i64)
+            .pragma_update(None, "user_version", 7_i64)
             .unwrap();
         drop(connection);
         let store = RetrievalStore::new(root.path()).unwrap();
         assert!(matches!(
             store.replay_session("none"),
-            Err(RetrievalError::UnsupportedIndexVersion(99))
+            Err(RetrievalError::UnsupportedIndexVersion(7))
         ));
         let connection = Connection::open(index).unwrap();
         assert_eq!(
@@ -19176,6 +18199,47 @@ CREATE INDEX memory_boundary_suggestions_session_event
                     "SELECT count(*) FROM sqlite_master WHERE name='retrieval_documents'",
                     [],
                     |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn unversioned_nonempty_index_is_not_initialized_as_current() {
+        let root = tempfile::tempdir().unwrap();
+        let index = root.path().join(INDEX_FILENAME);
+        let connection = Connection::open(&index).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE old_sentinel(value TEXT);
+                 INSERT INTO old_sentinel VALUES ('keep');",
+            )
+            .unwrap();
+        drop(connection);
+        let original_bytes = fs::read(&index).unwrap();
+
+        let store = RetrievalStore::new(root.path()).unwrap();
+        assert!(matches!(
+            store.open_connection(),
+            Err(RetrievalError::UnsupportedIndexVersion(0))
+        ));
+        assert_eq!(fs::read(&index).unwrap(), original_bytes);
+        let connection = Connection::open(index).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT value FROM old_sentinel", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            "keep"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE name='indexed_sessions'",
+                    [],
+                    |row| row.get::<_, i64>(0),
                 )
                 .unwrap(),
             0
@@ -19212,7 +18276,7 @@ CREATE INDEX memory_boundary_suggestions_session_event
                  );
                  INSERT INTO consolidation_batches VALUES
                      ('future-attempt', 'future-applied', '{\"future\":true}');
-                 PRAGMA user_version=9;",
+                 PRAGMA user_version=10;",
             )
             .unwrap();
         drop(connection);
@@ -19221,7 +18285,7 @@ CREATE INDEX memory_boundary_suggestions_session_event
         let store = RetrievalStore::new(root.path()).unwrap();
         assert!(matches!(
             store.rebuild(),
-            Err(RetrievalError::UnsupportedIndexVersion(9))
+            Err(RetrievalError::UnsupportedIndexVersion(10))
         ));
         assert!(index.is_file());
         assert_eq!(fs::read(&index).unwrap(), original_bytes);
@@ -19231,7 +18295,7 @@ CREATE INDEX memory_boundary_suggestions_session_event
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            9
+            10
         );
         assert_eq!(
             connection
@@ -19291,213 +18355,6 @@ CREATE INDEX memory_boundary_suggestions_session_event
                 "{\"future\":true}".to_owned(),
             )
         );
-    }
-
-    #[test]
-    fn migrates_real_v4_vector_storage_transactionally() {
-        let root = tempfile::tempdir().unwrap();
-        let store = SessionStore::new(root.path()).unwrap();
-        let mut session = store
-            .create(
-                "model",
-                "http://localhost",
-                Some("system"),
-                Default::default(),
-                false,
-            )
-            .unwrap();
-        let answer_id = append_complete_turn(
-            &mut session,
-            &format!("{}杭州唐波", "甲".repeat(241)),
-            "原始回复",
-            "",
-        );
-        store.save(&mut session).unwrap();
-        let expected_context = store.retrieval().answer_context(&answer_id).unwrap();
-        {
-            let connection = Connection::open(store.retrieval().index_path()).unwrap();
-            connection
-                .execute(
-                    "INSERT INTO consolidation_watermarks
-                     (session_id, through_sequence, through_event_id, through_event_sha256, updated_at)
-                     VALUES (?1, 1, 'event', 'hash', '2026-01-01T00:00:00Z')",
-                    [&session.id],
-                )
-                .unwrap();
-            connection
-                .execute_batch(
-                    "DROP TABLE memory_embeddings;
-                     DROP TABLE memory_document_members;
-                     DROP TABLE memory_documents;
-                     PRAGMA user_version=4;",
-                )
-                .unwrap();
-        }
-
-        let migrated = RetrievalStore::new(root.path()).unwrap();
-        let connection = migrated.open_connection().unwrap();
-        assert_eq!(
-            connection
-                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
-                .unwrap(),
-            INDEX_SCHEMA_VERSION
-        );
-        assert_eq!(
-            connection
-                .query_row("SELECT count(*) FROM memory_documents", [], |row| row
-                    .get::<_, i64>(0))
-                .unwrap(),
-            connection
-                .query_row("SELECT count(*) FROM retrieval_documents", [], |row| row
-                    .get::<_, i64>(0))
-                .unwrap()
-        );
-        assert_eq!(
-            connection
-                .query_row("SELECT count(*) FROM memory_document_members", [], |row| {
-                    row.get::<_, i64>(0)
-                })
-                .unwrap(),
-            connection
-                .query_row("SELECT count(*) FROM retrieval_documents", [], |row| row
-                    .get::<_, i64>(0))
-                .unwrap()
-        );
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT member_count, start_sequence=end_sequence, source_sha256=content_sha256
-                     FROM memory_documents m
-                     JOIN retrieval_documents d ON d.document_id=m.document_id
-                     ORDER BY m.document_id LIMIT 1",
-                    [],
-                    |row| Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, i64>(2)?
-                    )),
-                )
-                .unwrap(),
-            (1, 1, 1)
-        );
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT mm.ordinal, mm.event_id=d.event_id,
-                            mm.start_char=d.start_char, mm.end_char=d.end_char,
-                            mm.content_sha256=d.content_sha256
-                     FROM memory_document_members mm
-                     JOIN retrieval_documents d ON d.document_id=mm.document_id
-                     ORDER BY mm.document_id LIMIT 1",
-                    [],
-                    |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, i64>(1)?,
-                            row.get::<_, i64>(2)?,
-                            row.get::<_, i64>(3)?,
-                            row.get::<_, i64>(4)?,
-                        ))
-                    },
-                )
-                .unwrap(),
-            (0, 1, 1, 1, 1)
-        );
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT through_sequence FROM consolidation_watermarks WHERE session_id=?1",
-                    [&session.id],
-                    |row| row.get::<_, i64>(0),
-                )
-                .unwrap(),
-            1
-        );
-        let recall = migrated
-            .keyword_recall("唐波", "current", &[], RetrievalConfig::default())
-            .unwrap();
-        assert!(
-            recall
-                .evidence
-                .iter()
-                .any(|item| item.content.contains("杭州唐波"))
-        );
-        assert_eq!(
-            migrated.answer_context(&answer_id).unwrap().context_sha256,
-            expected_context.context_sha256
-        );
-    }
-
-    #[test]
-    fn v4_vector_backfill_is_idempotent_and_preserves_compatible_embeddings() {
-        let root = tempfile::tempdir().unwrap();
-        let store = SessionStore::new(root.path()).unwrap();
-        let mut session = store
-            .create("model", "http://localhost", None, Default::default(), false)
-            .unwrap();
-        append_complete_turn(&mut session, "保留向量的原文", "回复", "");
-        store.save(&mut session).unwrap();
-        let spec = VectorIndexSpec {
-            model: "qwen3-embedding:8b".into(),
-            dimensions: 32,
-            hnsw_m: 16,
-            hnsw_ef_construction: 200,
-            hnsw_ef_search: 64,
-        };
-        let (document_id, source_sha256): (String, String) = store
-            .retrieval()
-            .open_connection()
-            .unwrap()
-            .query_row(
-                "SELECT document_id, source_sha256 FROM memory_documents ORDER BY document_id LIMIT 1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        let write = EmbeddingWrite {
-            document_id: document_id.clone(),
-            expected_source_sha256: source_sha256,
-            vector: vec![0.25; 32],
-        };
-        store
-            .retrieval()
-            .upsert_embeddings(&spec, std::slice::from_ref(&write))
-            .unwrap();
-
-        for _ in 0..2 {
-            let connection = Connection::open(store.retrieval().index_path()).unwrap();
-            connection
-                .pragma_update(None, "user_version", 4_i64)
-                .unwrap();
-            drop(connection);
-
-            let migrated = RetrievalStore::new(root.path()).unwrap();
-            assert_eq!(migrated.compatible_embeddings(&spec).unwrap().len(), 1);
-            let connection = migrated.open_connection().unwrap();
-            assert_eq!(
-                connection
-                    .query_row("SELECT count(*) FROM memory_documents", [], |row| row
-                        .get::<_, i64>(0))
-                    .unwrap(),
-                connection
-                    .query_row("SELECT count(*) FROM retrieval_documents", [], |row| row
-                        .get::<_, i64>(0))
-                    .unwrap()
-            );
-            assert_eq!(
-                connection
-                    .query_row(
-                        "SELECT count(*) FROM memory_documents d
-                         LEFT JOIN memory_document_members m ON m.document_id=d.document_id
-                         GROUP BY d.document_id HAVING count(m.ordinal) != d.member_count",
-                        [],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .optional()
-                    .unwrap(),
-                None
-            );
-        }
     }
 
     #[test]
@@ -19923,7 +18780,7 @@ CREATE INDEX memory_boundary_suggestions_session_event
             .unwrap();
         let mut turn = Turn::pending("问题".into());
         turn.request_started_at = Some(utc_now());
-        turn.context_trace.provenance_quality = ProvenanceQuality::LegacyInferred;
+        turn.context_trace.provenance_quality = ProvenanceQuality::Inferred;
         session.turns.push(turn);
         let path = store.save(&mut session).unwrap();
         let answer = event_id(
@@ -19933,7 +18790,7 @@ CREATE INDEX memory_boundary_suggestions_session_event
         );
         session.turns[0].assistant_content = "首次完成".into();
         session.turns[0].status = TurnStatus::Complete;
-        session.turns[0].context_trace.provenance_quality = ProvenanceQuality::LegacyInferred;
+        session.turns[0].context_trace.provenance_quality = ProvenanceQuality::Inferred;
         fs::write(&path, serde_json::to_vec(&session).unwrap()).unwrap();
         store.retrieval().sync_session(&session, &path).unwrap();
         assert_eq!(
@@ -20143,7 +19000,7 @@ CREATE INDEX memory_boundary_suggestions_session_event
     }
 
     #[test]
-    fn only_real_or_legacy_model_requests_create_assistant_events() {
+    fn only_requested_or_inferred_model_outputs_create_assistant_events() {
         let mut session = Session::new(
             "session".into(),
             "model".into(),
@@ -20168,7 +19025,7 @@ CREATE INDEX memory_boundary_suggestions_session_event
         ] {
             let mut requested = Turn::pending(format!("requested {}", status.as_str()));
             requested.request_started_at = Some(utc_now());
-            requested.context_trace.provenance_quality = ProvenanceQuality::LegacyInferred;
+            requested.context_trace.provenance_quality = ProvenanceQuality::Inferred;
             requested.status = status;
             session.turns.push(requested);
         }
@@ -20342,298 +19199,25 @@ CREATE INDEX memory_boundary_suggestions_session_event
     }
 
     #[test]
-    fn memory_state_v1_rows_reset_atomically_but_raw_events_and_ledger_survive() {
-        let root = tempfile::tempdir().unwrap();
-        let store = SessionStore::new(root.path()).unwrap();
-        let mut session = store
-            .create("model", "http://localhost", None, Default::default(), false)
-            .unwrap();
-        append_complete_turn(&mut session, "legacy fact", "answer", "");
-        store.save(&mut session).unwrap();
-        let raw_counts = {
-            let connection = Connection::open(store.retrieval().index_path()).unwrap();
-            (
-                connection
-                    .query_row("SELECT count(*) FROM events", [], |row| {
-                        row.get::<_, i64>(0)
-                    })
-                    .unwrap(),
-                connection
-                    .query_row("SELECT count(*) FROM source_spans", [], |row| {
-                        row.get::<_, i64>(0)
-                    })
-                    .unwrap(),
-                connection
-                    .query_row("SELECT count(*) FROM retrieval_documents", [], |row| {
-                        row.get::<_, i64>(0)
-                    })
-                    .unwrap(),
-            )
-        };
-        {
-            let connection = Connection::open(store.retrieval().index_path()).unwrap();
-            replace_with_old_memory_v1_schema(&connection);
-            connection
-                .execute_batch(
-                    "INSERT INTO consolidation_batches
-                     (attempt_id,batch_key,session_id,from_sequence,through_sequence,trigger,model,
-                      request_json,request_sha256,input_event_ids,input_event_hashes,response_json,
-                      response_sha256,status,input_tokens,output_tokens,latency_ms,started_at,
-                      completed_at,validation_json,error_json)
-                     VALUES ('old-attempt','old-batch','legacy-session',1,1,'test','model','{}',
-                      '0000000000000000000000000000000000000000000000000000000000000000',
-                      '[]','[]','{}',
-                      '0000000000000000000000000000000000000000000000000000000000000000',
-                      'applied',NULL,NULL,0,'2025-01-01T00:00:00Z','2025-01-01T00:00:01Z','{}',NULL);
-                     INSERT INTO memory_entities
-                     (entity_id,kind,canonical_name,normalized_name,disambiguation,
-                      created_session_id,created_batch_key,created_event_id,created_start,
-                      created_end,created_hash,created_at,updated_at)
-                     VALUES ('old-entity','person','old','old','resolved','legacy-session',
-                      'old-batch','old-event',0,3,
-                      '0000000000000000000000000000000000000000000000000000000000000000',
-                      '2025-01-01T00:00:01Z','2025-01-01T00:00:01Z');
-                     INSERT INTO consolidation_watermarks
-                     (session_id,through_sequence,through_event_id,through_event_sha256,updated_at)
-                     VALUES ('legacy-session',1,'old-event',
-                      '0000000000000000000000000000000000000000000000000000000000000000',
-                      '2025-01-01T00:00:01Z');",
-                )
-                .unwrap();
-        }
-
-        let reopened = RetrievalStore::new(root.path()).unwrap();
-        reopened.open_connection().unwrap();
-        let connection = Connection::open(reopened.index_path()).unwrap();
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT value FROM memory_schema_meta WHERE key='state_schema_version'",
-                    [],
-                    |row| row.get::<_, i64>(0),
-                )
-                .unwrap(),
-            4
-        );
-        assert_eq!(
-            (
-                connection
-                    .query_row("SELECT count(*) FROM events", [], |row| row
-                        .get::<_, i64>(0))
-                    .unwrap(),
-                connection
-                    .query_row("SELECT count(*) FROM source_spans", [], |row| {
-                        row.get::<_, i64>(0)
-                    })
-                    .unwrap(),
-                connection
-                    .query_row("SELECT count(*) FROM retrieval_documents", [], |row| {
-                        row.get::<_, i64>(0)
-                    })
-                    .unwrap(),
-            ),
-            raw_counts
-        );
-        assert_eq!(
-            connection
-                .query_row("SELECT count(*) FROM consolidation_batches", [], |row| {
-                    row.get::<_, i64>(0)
-                })
-                .unwrap(),
-            1
-        );
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT response_json FROM consolidation_batches WHERE attempt_id='old-attempt'",
-                    [],
-                    |row| row.get::<_, String>(0),
-                )
-                .unwrap(),
-            "{}"
-        );
-        for table in [
-            "memory_claim_evidence",
-            "memory_claim_transitions",
-            "memory_boundary_suggestions",
-            "memory_claims",
-            "memory_entity_aliases",
-            "memory_entities",
-            "consolidation_watermarks",
-        ] {
-            assert_eq!(
-                connection
-                    .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
-                        row.get::<_, i64>(0)
-                    })
-                    .unwrap(),
-                0,
-                "{table} was not reset"
-            );
-        }
-        let replay = reopened
-            .next_consolidation_batch(&session.id)
-            .unwrap()
-            .unwrap();
-        assert_eq!(replay.watermark_before, 0);
-        assert_ne!(replay.batch_key, "old-batch");
-    }
-
-    #[test]
-    fn empty_real_memory_v1_schema_upgrades_to_v3_without_rows() {
-        let root = tempfile::tempdir().unwrap();
-        let store = RetrievalStore::new(root.path()).unwrap();
-        store.open_connection().unwrap();
-        let connection = Connection::open(store.index_path()).unwrap();
-        replace_with_old_memory_v1_schema(&connection);
-        drop(connection);
-
-        store.open_connection().unwrap();
-        let connection = Connection::open(store.index_path()).unwrap();
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT value FROM memory_schema_meta WHERE key='state_schema_version'",
-                    [],
-                    |row| row.get::<_, i64>(0),
-                )
-                .unwrap(),
-            4
-        );
-        assert!(table_has_column(&connection, "memory_claims", "normalized_relation").unwrap());
-        assert!(
-            table_has_column(&connection, "memory_claim_evidence", "speech_act_sha256").unwrap()
-        );
-        assert!(table_has_column(&connection, "memory_claim_transitions", "ordinal").unwrap());
-    }
-
-    #[test]
-    fn memory_state_v2_upgrades_to_v3_and_preserves_raw_events_and_ledger() {
-        let root = tempfile::tempdir().unwrap();
-        let store = SessionStore::new(root.path()).unwrap();
-        let mut session = store
-            .create("model", "http://localhost", None, Default::default(), false)
-            .unwrap();
-        append_complete_turn(&mut session, "v2 fact", "answer", "");
-        store.save(&mut session).unwrap();
-        let index_path = store.retrieval().index_path().to_owned();
-        let (event_count, event_id, event_hash) = {
-            let connection = Connection::open(&index_path).unwrap();
-            let count = connection
-                .query_row("SELECT count(*) FROM events", [], |row| {
-                    row.get::<_, i64>(0)
-                })
-                .unwrap();
-            let source = connection
-                .query_row(
-                    "SELECT event_id, content_sha256 FROM events WHERE role='user' LIMIT 1",
-                    [],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-                )
-                .unwrap();
-            (count, source.0, source.1)
-        };
-        {
-            let connection = Connection::open(&index_path).unwrap();
-            replace_transition_table_with_memory_v2_schema(&connection);
-            connection
-                .execute_batch(&format!(
-                    "INSERT INTO consolidation_batches
-                     (attempt_id,batch_key,session_id,from_sequence,through_sequence,trigger,model,
-                      request_json,request_sha256,input_event_ids,input_event_hashes,response_json,
-                      response_sha256,status,input_tokens,output_tokens,latency_ms,started_at,
-                      completed_at,validation_json,error_json)
-                     VALUES ('v2-attempt','v2-batch','v2-session',1,1,'test','model','{{}}',
-                      '{zero}','[]','[]','{{}}','{zero}','applied',NULL,NULL,0,
-                      '2025-01-01T00:00:00Z','2025-01-01T00:00:01Z','{{}}',NULL);
-                     INSERT INTO memory_entities
-                     (entity_id,kind,canonical_name,normalized_name,disambiguation,
-                      created_session_id,created_batch_key,created_event_id,created_start,
-                      created_end,created_hash,created_at,updated_at)
-                     VALUES ('v2-entity','person','old','old','resolved','v2-session','v2-batch',
-                      '{event_id}',0,1,'{event_hash}',
-                      '2025-01-01T00:00:01Z','2025-01-01T00:00:01Z');
-                     INSERT INTO consolidation_watermarks
-                     (session_id,through_sequence,through_event_id,through_event_sha256,updated_at)
-                     VALUES ('v2-session',1,'{event_id}','{event_hash}',
-                      '2025-01-01T00:00:01Z');",
-                    zero = "0".repeat(64),
-                ))
-                .unwrap();
-        }
-
-        let reopened = RetrievalStore::new(root.path()).unwrap();
-        reopened.open_connection().unwrap();
-        let connection = Connection::open(reopened.index_path()).unwrap();
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT value FROM memory_schema_meta WHERE key='state_schema_version'",
-                    [],
-                    |row| row.get::<_, i64>(0),
-                )
-                .unwrap(),
-            4
-        );
-        assert!(table_has_column(&connection, "memory_claim_transitions", "ordinal").unwrap());
-        assert_eq!(
-            connection
-                .query_row("SELECT count(*) FROM events", [], |row| row
-                    .get::<_, i64>(0))
-                .unwrap(),
-            event_count
-        );
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT count(*) FROM consolidation_batches WHERE attempt_id='v2-attempt'",
-                    [],
-                    |row| row.get::<_, i64>(0),
-                )
-                .unwrap(),
-            1
-        );
-        for table in [
-            "memory_claim_evidence",
-            "memory_claim_transitions",
-            "memory_boundary_suggestions",
-            "memory_claims",
-            "memory_entity_aliases",
-            "memory_entities",
-            "consolidation_watermarks",
-        ] {
-            assert_eq!(
-                connection
-                    .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
-                        row.get::<_, i64>(0)
-                    })
-                    .unwrap(),
-                0,
-                "{table} was not reset"
-            );
-        }
-    }
-
-    #[test]
-    fn unknown_memory_state_version_fails_before_schema_mutation() {
+    fn old_memory_state_version_fails_before_schema_mutation() {
         let root = tempfile::tempdir().unwrap();
         let store = RetrievalStore::new(root.path()).unwrap();
         store.open_connection().unwrap();
         let connection = Connection::open(store.index_path()).unwrap();
         connection
             .execute(
-                "UPDATE memory_schema_meta SET value=99 WHERE key='state_schema_version'",
+                "UPDATE memory_schema_meta SET value=3 WHERE key='state_schema_version'",
                 [],
             )
             .unwrap();
         connection
-            .execute_batch("CREATE TABLE memory_unknown_sentinel(value TEXT); INSERT INTO memory_unknown_sentinel VALUES ('keep');")
+            .execute_batch("CREATE TABLE memory_old_sentinel(value TEXT); INSERT INTO memory_old_sentinel VALUES ('keep');")
             .unwrap();
         drop(connection);
 
         assert!(matches!(
             store.open_connection(),
-            Err(RetrievalError::UnsupportedMemoryStateVersion(99))
+            Err(RetrievalError::UnsupportedMemoryStateVersion(3))
         ));
         let connection = Connection::open(store.index_path()).unwrap();
         assert_eq!(
@@ -20642,11 +19226,11 @@ CREATE INDEX memory_boundary_suggestions_session_event
                     row.get::<_, i64>(0)
                 })
                 .unwrap(),
-            99
+            3
         );
         assert_eq!(
             connection
-                .query_row("SELECT value FROM memory_unknown_sentinel", [], |row| {
+                .query_row("SELECT value FROM memory_old_sentinel", [], |row| {
                     row.get::<_, String>(0)
                 })
                 .unwrap(),

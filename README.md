@@ -2,7 +2,7 @@
 
 Hippocampus 是一个完全使用 Rust 实现的本地 Ollama 会话客户端。无参数启动时进入 Ratatui TUI；`serve` 提供本地 Web UI；`ask` 子命令适合脚本和其他程序进行单次调用。
 
-项目保存每轮原始输入、模型正文、thinking、权威 token usage、知识证据、联网工具步骤和上下文裁剪轨迹。thinking 只用于当前工具循环的展示与审计，绝不会重新注入未来对话轮次。当前会话格式为 `schema_version=4`；v1、v2、v3 会话可直接读取并在下次保存时迁移。缺失 `ai_name` 的旧会话默认使用 `LLM`，v3 已持久化的自定义 `ai_name` 保持不变。
+项目保存每轮原始输入、模型正文、thinking、权威 token usage、知识证据、联网工具步骤和上下文裁剪轨迹。thinking 只用于当前工具循环的展示与审计，绝不会重新注入未来对话轮次。当前会话格式为 `schema_version=5`，其他版本不会读取或迁移。
 
 `<sessions-dir>/*.json` 中的 raw session JSON 是会话记忆的唯一事实来源；知识快照和原始文档则是知识库的事实来源。SQLite 包含两类数据：FTS、vector、entity、state、episode、graph 等可删除重建的 projection，以及必须保留的 immutable consolidation attempt/audit ledger；HNSW 属于可重建 projection。系统不会用生成摘要替代或覆盖原文。
 
