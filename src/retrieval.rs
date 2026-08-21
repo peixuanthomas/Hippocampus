@@ -48,6 +48,7 @@ const SQLITE_BUSY_RETRY_ATTEMPTS: usize = 8;
 const INDEX_SCHEMA_VERSION: i64 = 9;
 const MEMORY_STATE_SCHEMA_VERSION: i64 = 4;
 const DEFERRED_HARD_LIMIT: usize = usize::MAX;
+const MAX_QUERY_EMBEDDINGS: usize = 5;
 
 fn sqlite_is_busy(error: &rusqlite::Error) -> bool {
     matches!(
@@ -837,7 +838,7 @@ struct PendingVectorIndexCache {
 }
 
 pub(crate) struct PreparedQueryVectorRecall {
-    query_vector: Vec<f32>,
+    query_vectors: Vec<Vec<f32>>,
     spec: VectorIndexSpec,
     semantic: PreparedSemanticRecall,
 }
@@ -2297,6 +2298,114 @@ impl RetrievalStore {
         Ok(total)
     }
 
+    fn active_recall_eligible_memory_document_count_filtered(
+        &self,
+        connection: &Connection,
+        state: &ControlState,
+        session_filter: Option<&str>,
+        allow_aggregate_documents: bool,
+    ) -> RetrievalResult<usize> {
+        let granularity_clause = if allow_aggregate_documents {
+            ""
+        } else {
+            " WHERE granularity IN ('message','fragment')"
+        };
+        let eligible = self.recall_eligible_memory_document_ids(connection)?;
+        let mut statement = connection
+            .prepare(&format!(
+                "SELECT document_id,session_id FROM memory_documents{granularity_clause}
+                 ORDER BY document_id"
+            ))
+            .map_err(|error| self.database_error(error))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| self.database_error(error))?;
+        let mut total = 0;
+        for row in rows {
+            let (id, session_id) = row.map_err(|error| self.database_error(error))?;
+            if eligible.contains(&id)
+                && session_filter.is_none_or(|scope| scope == session_id)
+                && self.memory_document_is_active(connection, state, &id)?
+            {
+                total += 1;
+            }
+        }
+        Ok(total)
+    }
+
+    fn recall_eligible_memory_document_ids(
+        &self,
+        connection: &Connection,
+    ) -> RetrievalResult<HashSet<String>> {
+        let mut statement = connection
+            .prepare(
+                "SELECT m.document_id,e.role,e.turn_status,e.content
+                 FROM memory_document_members m JOIN events e ON e.event_id=m.event_id
+                 ORDER BY m.document_id,m.ordinal",
+            )
+            .map_err(|error| self.database_error(error))?;
+        let rows = statement
+            .query_map([], |row| {
+                let role = parse_role(&row.get::<_, String>(1)?)?;
+                let status = row
+                    .get::<_, Option<String>>(2)?
+                    .map(|status| parse_status(&status))
+                    .transpose()?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    role,
+                    status,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(|error| self.database_error(error))?;
+        let mut eligible = HashSet::new();
+        for row in rows {
+            let (document_id, role, status, content) =
+                row.map_err(|error| self.database_error(error))?;
+            if event_fields_are_recall_eligible(role, status, &content) {
+                eligible.insert(document_id);
+            }
+        }
+        Ok(eligible)
+    }
+
+    fn memory_document_is_recall_eligible(
+        &self,
+        connection: &Connection,
+        document_id: &str,
+    ) -> RetrievalResult<bool> {
+        let mut statement = connection
+            .prepare(
+                "SELECT e.role,e.turn_status,e.content
+                 FROM memory_document_members m JOIN events e ON e.event_id=m.event_id
+                 WHERE m.document_id=?1 ORDER BY m.ordinal",
+            )
+            .map_err(|error| self.database_error(error))?;
+        let rows = statement
+            .query_map([document_id], |row| {
+                let role = parse_role(&row.get::<_, String>(0)?)?;
+                let status = row
+                    .get::<_, Option<String>>(1)?
+                    .map(|status| parse_status(&status))
+                    .transpose()?;
+                Ok((role, status, row.get::<_, String>(2)?))
+            })
+            .map_err(|error| self.database_error(error))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| self.database_error(error))?;
+        if rows.is_empty() {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "记忆文档 {document_id} 缺少成员"
+            )));
+        }
+        Ok(rows.into_iter().any(|(role, status, content)| {
+            event_fields_are_recall_eligible(role, status, &content)
+        }))
+    }
+
     pub fn sync_session(
         &self,
         expected_session: &Session,
@@ -3246,55 +3355,6 @@ impl RetrievalStore {
             }
         }
         Ok(cached)
-    }
-
-    pub(crate) fn cached_content_embedding(
-        &self,
-        spec: &VectorIndexSpec,
-        content_sha256_value: &str,
-    ) -> RetrievalResult<Option<Vec<f32>>> {
-        spec.validate()
-            .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
-        if content_sha256_value.len() != 64 {
-            return Err(RetrievalError::CorruptIndex(
-                "查询缓存使用了无效内容哈希".into(),
-            ));
-        }
-        let fingerprint = spec
-            .fingerprint()
-            .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
-        let _guard = self.acquire_root_read()?;
-        let connection = Connection::open_with_flags(
-            &self.index_path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .map_err(|error| self.database_error(error))?;
-        connection
-            .busy_timeout(SQLITE_BUSY_TIMEOUT)
-            .map_err(|error| self.database_error(error))?;
-        let row = connection
-            .query_row(
-                "SELECT dimensions,vector_blob FROM memory_embedding_cache
-                 WHERE index_fingerprint=?1 AND content_sha256=?2",
-                params![fingerprint, content_sha256_value],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
-            )
-            .optional()
-            .map_err(|error| self.database_error(error))?;
-        let Some((dimensions, blob)) = row else {
-            return Ok(None);
-        };
-        if dimensions != i64::try_from(spec.dimensions).unwrap_or(-1) {
-            return Err(RetrievalError::CorruptIndex(
-                "查询缓存向量维度不匹配".into(),
-            ));
-        }
-        let vector = decode_f32_le(&blob, spec.dimensions)
-            .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
-        if !is_unit_vector(&vector) {
-            return Err(RetrievalError::CorruptIndex("查询缓存向量未归一化".into()));
-        }
-        Ok(Some(vector))
     }
 
     pub(crate) fn compatible_embeddings_from_connection(
@@ -4359,6 +4419,10 @@ impl RetrievalStore {
                 created_at,
                 score,
             } = row;
+            let source_event = self.get_event_from_connection(connection, &event_id_value)?;
+            if !event_is_recall_eligible(&source_event) {
+                continue;
+            }
             let span = SourceSpan {
                 event_id: event_id_value.clone(),
                 start_char: start,
@@ -4401,7 +4465,6 @@ impl RetrievalStore {
             } else if used_hashes.contains(&hash) {
                 candidate.reason = "duplicate_content".into();
             } else {
-                let source_event = self.get_event_from_connection(connection, &span.event_id)?;
                 let source_session =
                     self.get_session_from_connection(connection, &source_event.session_id)?;
                 self.verify_fresh(&source_session)?;
@@ -4655,19 +4718,20 @@ impl RetrievalStore {
             .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
         let query_kind = classify_query(raw_query);
         let decided_budget = memory_budget_trace(memory_config, query_kind);
+        let query_inputs = embedding_queries(raw_query);
         let embed_started = Instant::now();
         let embedded = tokio::time::timeout(
             Duration::from_secs(memory_config.embedding_timeout_secs),
             backend.embed(EmbeddingRequest {
                 model: spec.model.clone(),
-                input: vec![raw_query.to_owned()],
+                input: query_inputs.clone(),
                 dimensions: Some(spec.dimensions),
                 truncate: false,
             }),
         )
         .await;
         let vector_elapsed = elapsed_ms(embed_started);
-        let query_vector = match validate_query_embedding(embedded, &spec) {
+        let query_vectors = match validate_query_embeddings(embedded, &spec, query_inputs.len()) {
             Ok(input) => input,
             Err(error) => {
                 if !options.channels.bm25 {
@@ -4709,7 +4773,7 @@ impl RetrievalStore {
             fusion_store
                 .fuse_vector_recall(
                     &fusion_query,
-                    query_vector,
+                    query_vectors,
                     &fusion_spec,
                     &fusion_current,
                     &fusion_recent,
@@ -4805,7 +4869,7 @@ impl RetrievalStore {
         session_filter: Option<&str>,
         retrieval_config: RetrievalConfig,
         memory_config: &MemoryConfig,
-        query_vector: Vec<f32>,
+        query_vectors: Vec<Vec<f32>>,
     ) -> RetrievalResult<PreparedQueryVectorRecall> {
         retrieval_config
             .validate()
@@ -4815,15 +4879,25 @@ impl RetrievalStore {
             .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
         let spec = VectorIndexSpec::from_config(memory_config)
             .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
-        let query_vector = l2_normalize(&query_vector)
-            .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
-        if query_vector.len() != spec.dimensions {
+        if query_vectors.is_empty() || query_vectors.len() > MAX_QUERY_EMBEDDINGS {
             return Err(RetrievalError::CorruptIndex(format!(
-                "查询向量维度不匹配：期望 {}，实际 {}",
-                spec.dimensions,
-                query_vector.len()
+                "查询向量数必须在 1..={MAX_QUERY_EMBEDDINGS} 之间"
             )));
         }
+        let query_vectors = query_vectors
+            .iter()
+            .map(|query_vector| {
+                if query_vector.len() != spec.dimensions {
+                    return Err(RetrievalError::CorruptIndex(format!(
+                        "查询向量维度不匹配：期望 {}，实际 {}",
+                        spec.dimensions,
+                        query_vector.len()
+                    )));
+                }
+                l2_normalize(query_vector)
+                    .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))
+            })
+            .collect::<RetrievalResult<Vec<_>>>()?;
 
         let preparation_store = self.clone();
         let preparation_query = raw_query.to_owned();
@@ -4835,7 +4909,7 @@ impl RetrievalStore {
         join_blocking(tokio::task::spawn_blocking(move || {
             preparation_store.prepare_query_vector_recall_sync(
                 &preparation_query,
-                query_vector,
+                query_vectors,
                 preparation_spec,
                 &preparation_current,
                 &preparation_recent,
@@ -4885,12 +4959,12 @@ impl RetrievalStore {
         let retrieval = retrieval_config.clone();
         let memory = memory_config.clone();
         let fusion_spec = prepared.spec;
-        let query_vector = prepared.query_vector;
+        let query_vectors = prepared.query_vectors;
         let semantic = prepared.semantic;
         let fused_task = tokio::task::spawn_blocking(move || {
             fusion_store.fuse_vector_recall(
                 &fusion_query,
-                query_vector,
+                query_vectors,
                 &fusion_spec,
                 &fusion_current,
                 &fusion_recent,
@@ -4933,7 +5007,7 @@ impl RetrievalStore {
     fn prepare_query_vector_recall_sync(
         &self,
         raw_query: &str,
-        query_vector: Vec<f32>,
+        query_vectors: Vec<Vec<f32>>,
         spec: VectorIndexSpec,
         current_user_event_id: &str,
         recent_event_ids: &[String],
@@ -4964,9 +5038,12 @@ impl RetrievalStore {
             session_filter,
             &visibility,
         )?;
-        let hits = index
-            .search(&query_vector, memory_config.vector_candidate_limit)
-            .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+        let hits = search_query_vectors(
+            &index,
+            &query_vectors,
+            memory_config.vector_candidate_limit,
+            memory_config.rrf_k,
+        )?;
         let vector_aggregate_sources = hits
             .iter()
             .filter(|hit| {
@@ -4994,7 +5071,7 @@ impl RetrievalStore {
             let mut hit_projection = self.project_vector_hit(
                 &transaction,
                 &index,
-                &query_vector,
+                &query_vectors,
                 hit,
                 rank_index + 1,
                 usize::MAX,
@@ -5005,7 +5082,7 @@ impl RetrievalStore {
                     || raw.role == EventRole::System
                     || session_filter.is_some_and(|scope| raw.session_id != scope)
             });
-            if !blocked {
+            if !hit_projection.is_empty() && !blocked {
                 vector_seed_rows.push(hit);
             }
             hit_projection.truncate(memory_config.candidate_limit);
@@ -5059,7 +5136,7 @@ impl RetrievalStore {
             self.prepare_graph_candidates(
                 &transaction,
                 &index,
-                &query_vector,
+                &query_vectors,
                 current_user_event_id,
                 recent_event_ids,
                 session_filter,
@@ -5087,7 +5164,7 @@ impl RetrievalStore {
             self.publish_vector_index_cache(pending)?;
         }
         Ok(PreparedQueryVectorRecall {
-            query_vector,
+            query_vectors,
             spec,
             semantic: PreparedSemanticRecall {
                 projected,
@@ -5109,7 +5186,7 @@ impl RetrievalStore {
             .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
         let control = self.replay_control_state_under_guard()?;
         load_canonical_leaf_catalog(self, connection, &control)?;
-        let total = self.active_memory_document_count_filtered(
+        let total = self.active_recall_eligible_memory_document_count_filtered(
             connection,
             &control,
             session_filter,
@@ -5118,7 +5195,7 @@ impl RetrievalStore {
         let fingerprint = spec
             .fingerprint()
             .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
-        let rows = self.compatible_embeddings_from_connection_filtered(
+        let mut rows = self.compatible_embeddings_from_connection_filtered(
             connection,
             spec,
             &fingerprint,
@@ -5126,6 +5203,8 @@ impl RetrievalStore {
             &control,
             visibility.allow_aggregate_documents,
         )?;
+        let recall_eligible = self.recall_eligible_memory_document_ids(connection)?;
+        rows.retain(|row| recall_eligible.contains(&row.document_id));
         let pending_documents = total.saturating_sub(rows.len());
         let query_filtered = visibility.cutoff.is_some() || !visibility.allow_aggregate_documents;
         if query_filtered {
@@ -5207,7 +5286,7 @@ impl RetrievalStore {
     fn fuse_vector_recall(
         &self,
         raw_query: &str,
-        query_vector: Vec<f32>,
+        query_vectors: Vec<Vec<f32>>,
         spec: &VectorIndexSpec,
         current_user_event_id: &str,
         recent_event_ids: &[String],
@@ -5252,17 +5331,23 @@ impl RetrievalStore {
             let hits = if precomputed_semantic.is_some() {
                 Vec::new()
             } else {
-                index
-                    .search(&query_vector, memory_config.vector_candidate_limit)
-                    .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?
+                search_query_vectors(
+                    &index,
+                    &query_vectors,
+                    memory_config.vector_candidate_limit,
+                    memory_config.rrf_k,
+                )?
             };
             (bm25, bm25_ms, hits)
         } else if options.channels.bm25 {
             std::thread::scope(|scope| -> RetrievalResult<_> {
                 let vector_worker = scope.spawn(|| {
-                    index
-                        .search(&query_vector, memory_config.vector_candidate_limit)
-                        .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))
+                    search_query_vectors(
+                        &index,
+                        &query_vectors,
+                        memory_config.vector_candidate_limit,
+                        memory_config.rrf_k,
+                    )
                 });
                 let bm25_started = Instant::now();
                 let bm25 = self.keyword_recall_core_from_connection(
@@ -5288,9 +5373,12 @@ impl RetrievalStore {
                 Ok((bm25, bm25_ms, hits))
             })?
         } else {
-            let hits = index
-                .search(&query_vector, memory_config.vector_candidate_limit)
-                .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+            let hits = search_query_vectors(
+                &index,
+                &query_vectors,
+                memory_config.vector_candidate_limit,
+                memory_config.rrf_k,
+            )?;
             (
                 empty_recall_base(raw_query, current_user_event_id, retrieval_config.clone()),
                 0,
@@ -5378,7 +5466,7 @@ impl RetrievalStore {
                     let mut hit_projection = self.project_vector_hit(
                         &transaction,
                         &index,
-                        &query_vector,
+                        &query_vectors,
                         hit,
                         rank_index + 1,
                         usize::MAX,
@@ -5394,7 +5482,7 @@ impl RetrievalStore {
                             || raw.role == EventRole::System
                             || session_filter.is_some_and(|scope| raw.session_id != scope)
                     });
-                    if !blocked {
+                    if !hit_projection.is_empty() && !blocked {
                         vector_seed_rows.push(hit);
                     }
                     hit_projection.truncate(memory_config.candidate_limit);
@@ -5695,7 +5783,7 @@ impl RetrievalStore {
                 self.prepare_graph_candidates(
                     &transaction,
                     &index,
-                    &query_vector,
+                    &query_vectors,
                     current_user_event_id,
                     recent_event_ids,
                     session_filter,
@@ -5796,7 +5884,7 @@ impl RetrievalStore {
         &self,
         connection: &Connection,
         index: &HnswVectorIndex,
-        query_vector: &[f32],
+        query_vectors: &[Vec<f32>],
         current_user_event_id: &str,
         recent_event_ids: &[String],
         session_filter: Option<&str>,
@@ -5845,7 +5933,7 @@ impl RetrievalStore {
             let raw = self.project_graph_target(
                 connection,
                 index,
-                query_vector,
+                query_vectors,
                 &hit,
                 path.target_rank,
                 current_user_event_id,
@@ -5900,7 +5988,7 @@ impl RetrievalStore {
         &self,
         connection: &Connection,
         index: &HnswVectorIndex,
-        query_vector: &[f32],
+        query_vectors: &[Vec<f32>],
         hit: &crate::vector::VectorSearchHit,
         rank: usize,
         current: &str,
@@ -5912,7 +6000,7 @@ impl RetrievalStore {
             RetrievalDocumentGranularity::Message | RetrievalDocumentGranularity::Fragment
         ) {
             return self
-                .project_vector_hit(connection, index, query_vector, hit, rank, 1)
+                .project_vector_hit(connection, index, query_vectors, hit, rank, 1)
                 .map(|mut rows| rows.pop());
         }
         validate_aggregate_document_source(
@@ -5952,6 +6040,10 @@ impl RetrievalStore {
         }
         let mut eligible = Vec::new();
         for (ordinal, event_id, start, end, hash) in members {
+            let event = self.get_event_from_connection(connection, &event_id)?;
+            if !event_is_recall_eligible(&event) {
+                continue;
+            }
             let message_document_id = connection.query_row(
                 "SELECT d.document_id FROM memory_documents d JOIN memory_document_members m ON m.document_id=d.document_id WHERE d.session_id=?1 AND d.granularity='message' AND d.member_count=1 AND m.ordinal=0 AND m.event_id=?2 AND m.start_char=?3 AND m.end_char=?4 AND m.content_sha256=?5",
                 params![hit.session_id,event_id,usize_to_i64(start).map_err(|error| self.database_error(error))?,usize_to_i64(end).map_err(|error| self.database_error(error))?,hash], |row| row.get::<_,String>(0)
@@ -5963,7 +6055,7 @@ impl RetrievalStore {
                         "图聚合成员 {message_document_id} 缺少兼容向量"
                     ))
                 })?;
-            let similarity = exact_cosine_f64(query_vector, vector)?;
+            let similarity = max_query_similarity(query_vectors, vector)?;
             let raw = self.load_projected_raw(
                 connection,
                 &message_document_id,
@@ -6003,7 +6095,7 @@ impl RetrievalStore {
         &self,
         connection: &Connection,
         index: &HnswVectorIndex,
-        query_vector: &[f32],
+        query_vectors: &[Vec<f32>],
         hit: &crate::vector::VectorSearchHit,
         vector_rank: usize,
         aggregate_limit: usize,
@@ -6012,6 +6104,9 @@ impl RetrievalStore {
             hit.granularity,
             RetrievalDocumentGranularity::Message | RetrievalDocumentGranularity::Fragment
         ) {
+            if !self.memory_document_is_recall_eligible(connection, &hit.document_id)? {
+                return Ok(Vec::new());
+            }
             let vector = index
                 .vector_for_document(&hit.document_id)
                 .ok_or_else(|| RetrievalError::CorruptIndex("HNSW 文档缺少保留向量".into()))?;
@@ -6069,6 +6164,10 @@ impl RetrievalStore {
         }
         let mut ranked = Vec::new();
         for (event_id, start, end, expected_hash) in members {
+            let event = self.get_event_from_connection(connection, &event_id)?;
+            if !event_is_recall_eligible(&event) {
+                continue;
+            }
             let message_document_id = connection
                 .query_row(
                     "SELECT d.document_id FROM memory_documents d JOIN memory_document_members m ON m.document_id=d.document_id
@@ -6087,7 +6186,7 @@ impl RetrievalStore {
                 )));
             };
             ranked.push((
-                exact_cosine_f64(query_vector, vector)?,
+                max_query_similarity(query_vectors, vector)?,
                 message_document_id,
                 vector.to_vec(),
             ));
@@ -7990,6 +8089,7 @@ impl RetrievalStore {
             .into_iter()
             .map(|candidate| candidate.trace)
             .collect();
+        self.synchronize_retrieval_channel_counts(connection, &mut bm25.trace)?;
         bm25.evidence = evidence;
         Ok(bm25)
     }
@@ -8040,7 +8140,7 @@ impl RetrievalStore {
                 let session = self.get_session_from_connection(connection, &adjacent.session_id)?;
                 self.verify_fresh(&session)?;
                 verify_event_hash(&adjacent)?;
-                if adjacent.role == EventRole::System
+                if !event_is_recall_eligible(&adjacent)
                     || used_hashes.contains(&adjacent.content_sha256)
                 {
                     continue;
@@ -8936,14 +9036,17 @@ impl RetrievalStore {
                 active &= span_active && document_active;
             }
             (None, None) => {
+                let invalid_no_eligible_reason = path.reason == "no_eligible_raw_member"
+                    && matches!(
+                        target_granularity,
+                        RetrievalDocumentGranularity::Message
+                            | RetrievalDocumentGranularity::Fragment
+                    )
+                    && self
+                        .memory_document_is_recall_eligible(connection, &path.target_document_id)?;
                 if !path.content_sha256.is_empty()
                     || path.selected
-                    || path.reason == "no_eligible_raw_member"
-                        && !matches!(
-                            target_granularity,
-                            RetrievalDocumentGranularity::Episode
-                                | RetrievalDocumentGranularity::Session
-                        )
+                    || invalid_no_eligible_reason
                     || !matches!(
                         path.reason.as_str(),
                         "seed_document" | "no_eligible_raw_member"
@@ -8961,6 +9064,80 @@ impl RetrievalStore {
             }
         }
         Ok(active)
+    }
+
+    fn retrieval_channel_artifact_counts(
+        &self,
+        connection: &Connection,
+        trace: &RetrievalTrace,
+    ) -> RetrievalResult<[usize; 6]> {
+        let bm25_count = trace.candidates.len();
+        let vector_count = trace
+            .fusion_candidates
+            .iter()
+            .filter(|candidate| candidate.vector_rank.is_some())
+            .count();
+        let entity_count = trace.entity_matches.len();
+        let state_count = trace.state_selections.len();
+        let graph_count = trace.graph_paths.len();
+        let mut aggregate_document_ids = BTreeSet::new();
+        let mut include_aggregate = |document_id: &str| -> RetrievalResult<()> {
+            if document_id.is_empty() {
+                return Err(RetrievalError::CorruptIndex(
+                    "retrieval trace aggregate document ID 为空".into(),
+                ));
+            }
+            let granularity = connection
+                .query_row(
+                    "SELECT granularity FROM memory_documents WHERE document_id=?1",
+                    [document_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|error| self.database_error(error))?
+                .ok_or_else(|| {
+                    RetrievalError::CorruptIndex(
+                        "retrieval trace aggregate source document 不存在".into(),
+                    )
+                })?;
+            if matches!(
+                parse_granularity(&granularity)?,
+                RetrievalDocumentGranularity::Episode | RetrievalDocumentGranularity::Session
+            ) {
+                aggregate_document_ids.insert(document_id.to_owned());
+            }
+            Ok(())
+        };
+        for candidate in &trace.fusion_candidates {
+            for document_id in &candidate.source_document_ids {
+                include_aggregate(document_id)?;
+            }
+        }
+        for path in &trace.graph_paths {
+            include_aggregate(&path.target_document_id)?;
+        }
+        Ok([
+            bm25_count,
+            vector_count,
+            entity_count,
+            state_count,
+            aggregate_document_ids.len(),
+            graph_count,
+        ])
+    }
+
+    fn synchronize_retrieval_channel_counts(
+        &self,
+        connection: &Connection,
+        trace: &mut RetrievalTrace,
+    ) -> RetrievalResult<()> {
+        let derived = self.retrieval_channel_artifact_counts(connection, trace)?;
+        for (channel, count) in trace.channels.iter_mut().zip(derived) {
+            if matches!(channel.status.as_str(), "ok" | "stale") {
+                channel.candidate_count = count;
+            }
+        }
+        Ok(())
     }
 
     fn validate_retrieval_channel_contract(
@@ -9074,59 +9251,7 @@ impl RetrievalStore {
             ));
         }
 
-        let bm25_count = trace.candidates.len();
-        let vector_count = trace
-            .fusion_candidates
-            .iter()
-            .filter(|candidate| candidate.vector_rank.is_some())
-            .count();
-        let entity_count = trace.entity_matches.len();
-        let state_count = trace.state_selections.len();
-        let graph_count = trace.graph_paths.len();
-        let mut aggregate_document_ids = BTreeSet::new();
-        let mut include_aggregate = |document_id: &str| -> RetrievalResult<()> {
-            if document_id.is_empty() {
-                return Err(RetrievalError::CorruptIndex(
-                    "retrieval trace aggregate document ID 为空".into(),
-                ));
-            }
-            let granularity = connection
-                .query_row(
-                    "SELECT granularity FROM memory_documents WHERE document_id=?1",
-                    [document_id],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()
-                .map_err(|error| self.database_error(error))?
-                .ok_or_else(|| {
-                    RetrievalError::CorruptIndex(
-                        "retrieval trace aggregate source document 不存在".into(),
-                    )
-                })?;
-            if matches!(
-                parse_granularity(&granularity)?,
-                RetrievalDocumentGranularity::Episode | RetrievalDocumentGranularity::Session
-            ) {
-                aggregate_document_ids.insert(document_id.to_owned());
-            }
-            Ok(())
-        };
-        for candidate in &trace.fusion_candidates {
-            for document_id in &candidate.source_document_ids {
-                include_aggregate(document_id)?;
-            }
-        }
-        for path in &trace.graph_paths {
-            include_aggregate(&path.target_document_id)?;
-        }
-        let derived_counts = [
-            bm25_count,
-            vector_count,
-            entity_count,
-            state_count,
-            aggregate_document_ids.len(),
-            graph_count,
-        ];
+        let derived_counts = self.retrieval_channel_artifact_counts(connection, trace)?;
 
         for (index, channel) in trace.channels.iter().enumerate() {
             let status = channel.status.as_str();
@@ -9213,9 +9338,10 @@ impl RetrievalStore {
                 },
             };
             if !common_valid || !status_allowed || !artifacts_match {
-                return Err(RetrievalError::CorruptIndex(
-                    "retrieval trace channel status/count/artifact 绑定不一致".into(),
-                ));
+                return Err(RetrievalError::CorruptIndex(format!(
+                    "retrieval trace channel status/count/artifact 绑定不一致：channel={:?}, status={}, declared_count={}, artifact_count={derived}",
+                    channel.channel, channel.status, channel.candidate_count
+                )));
             }
         }
         if !matches!(trace.channels[1].status.as_str(), "ok" | "stale")
@@ -13066,6 +13192,36 @@ fn has_assistant_event(turn: &Turn) -> bool {
                 || turn.usage.output_tokens.is_some()))
 }
 
+fn low_information_assistant(content: &str) -> bool {
+    let normalized = content
+        .chars()
+        .filter(|character| character.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    matches!(
+        normalized.as_str(),
+        "ok" | "okay" | "好" | "好的" | "收到" | "明白" | "明白了" | "gotit" | "understood"
+    )
+}
+
+fn event_fields_are_recall_eligible(
+    role: EventRole,
+    turn_status: Option<TurnStatus>,
+    content: &str,
+) -> bool {
+    role != EventRole::System
+        && !content.trim().is_empty()
+        && matches!(
+            turn_status,
+            Some(TurnStatus::Complete | TurnStatus::Truncated)
+        )
+        && !(role == EventRole::Assistant && low_information_assistant(content))
+}
+
+fn event_is_recall_eligible(event: &StoredEvent) -> bool {
+    event_fields_are_recall_eligible(event.role, event.turn_status, &event.content)
+}
+
 fn canonical_exact_context_items(
     session: &Session,
     turn: &Turn,
@@ -14166,13 +14322,55 @@ fn join_blocking_result<T>(
     result.map_err(|error| RetrievalError::CorruptIndex(format!("阻塞检索任务失败：{error}")))?
 }
 
-fn validate_query_embedding(
+pub(crate) fn embedding_queries(raw_query: &str) -> Vec<String> {
+    let raw_query = raw_query.trim();
+    if raw_query.is_empty() {
+        return Vec::new();
+    }
+    let separated = raw_query
+        .replace("以及", "、")
+        .replace('和', "、")
+        .replace('与', "、")
+        .replace(" and ", "、")
+        .replace(" AND ", "、");
+    let segments = separated
+        .split(['、', '，', ',', '；', ';', '/', '|', '\n'])
+        .map(|segment| {
+            segment
+                .trim_matches(|character: char| {
+                    character.is_whitespace()
+                        || matches!(character, '.' | '。' | '?' | '？' | '!' | '！' | ':' | '：')
+                })
+                .trim()
+        })
+        .filter(|segment| segment.chars().count() >= 2)
+        .collect::<Vec<_>>();
+    if segments.len() < 2 {
+        return vec![raw_query.to_owned()];
+    }
+
+    let mut queries = vec![raw_query.to_owned()];
+    let mut seen = HashSet::from([raw_query.to_owned()]);
+    for segment in segments {
+        let focused = format!("{segment}\n{raw_query}");
+        if seen.insert(focused.clone()) {
+            queries.push(focused);
+        }
+        if queries.len() == MAX_QUERY_EMBEDDINGS {
+            break;
+        }
+    }
+    queries
+}
+
+fn validate_query_embeddings(
     response: std::result::Result<
         std::result::Result<crate::ollama::EmbeddingResponse, crate::ollama::OllamaError>,
         tokio::time::error::Elapsed,
     >,
     spec: &VectorIndexSpec,
-) -> RetrievalResult<Vec<f32>> {
+    expected_count: usize,
+) -> RetrievalResult<Vec<Vec<f32>>> {
     let response = response
         .map_err(|_| RetrievalError::CorruptIndex("查询 embedding 超时".into()))?
         .map_err(|error| RetrievalError::CorruptIndex(format!("查询 embedding 失败：{error}")))?;
@@ -14182,19 +14380,105 @@ fn validate_query_embedding(
             spec.model, response.model
         )));
     }
-    let [vector] = response.embeddings.as_slice() else {
-        return Err(RetrievalError::CorruptIndex(
-            "embedding 响应必须恰好包含一个向量".into(),
-        ));
-    };
-    if vector.len() != spec.dimensions {
+    if response.embeddings.len() != expected_count {
         return Err(RetrievalError::CorruptIndex(format!(
-            "查询 embedding 维度不匹配：期望 {}，实际 {}",
-            spec.dimensions,
-            vector.len()
+            "embedding 响应向量数不匹配：期望 {expected_count}，实际 {}",
+            response.embeddings.len()
         )));
     }
-    l2_normalize(vector).map_err(|error| RetrievalError::CorruptIndex(error.to_string()))
+    response
+        .embeddings
+        .iter()
+        .map(|vector| {
+            if vector.len() != spec.dimensions {
+                return Err(RetrievalError::CorruptIndex(format!(
+                    "查询 embedding 维度不匹配：期望 {}，实际 {}",
+                    spec.dimensions,
+                    vector.len()
+                )));
+            }
+            l2_normalize(vector).map_err(|error| RetrievalError::CorruptIndex(error.to_string()))
+        })
+        .collect()
+}
+
+fn search_query_vectors(
+    index: &HnswVectorIndex,
+    query_vectors: &[Vec<f32>],
+    limit: usize,
+    rrf_k: usize,
+) -> RetrievalResult<Vec<crate::vector::VectorSearchHit>> {
+    if query_vectors.is_empty() || limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut per_query = Vec::with_capacity(query_vectors.len());
+    let mut fused = HashMap::<String, (crate::vector::VectorSearchHit, f64, usize)>::new();
+    for query_vector in query_vectors {
+        let hits = index
+            .search(query_vector, limit)
+            .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+        for (rank_index, hit) in hits.iter().enumerate() {
+            let rank = rank_index + 1;
+            let entry = fused
+                .entry(hit.document_id.clone())
+                .or_insert_with(|| (hit.clone(), 0.0, rank));
+            entry.1 += rrf(rrf_k, rank);
+            entry.2 = entry.2.min(rank);
+            if hit.cosine_similarity > entry.0.cosine_similarity {
+                entry.0 = hit.clone();
+            }
+        }
+        per_query.push(hits);
+    }
+
+    let mut selected = HashSet::new();
+    let quota = limit.div_ceil(query_vectors.len());
+    for rank in 0..quota {
+        for hits in &per_query {
+            if let Some(hit) = hits.get(rank) {
+                selected.insert(hit.document_id.clone());
+            }
+            if selected.len() == limit {
+                break;
+            }
+        }
+        if selected.len() == limit {
+            break;
+        }
+    }
+    let mut ordered = fused.into_values().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.2.cmp(&right.2))
+            .then_with(|| {
+                right
+                    .0
+                    .cosine_similarity
+                    .total_cmp(&left.0.cosine_similarity)
+            })
+            .then_with(|| left.0.document_id.cmp(&right.0.document_id))
+    });
+    for (hit, _, _) in &ordered {
+        if selected.len() == limit {
+            break;
+        }
+        selected.insert(hit.document_id.clone());
+    }
+    ordered.retain(|(hit, _, _)| selected.contains(&hit.document_id));
+    ordered.truncate(limit);
+    Ok(ordered.into_iter().map(|(hit, _, _)| hit).collect())
+}
+
+fn max_query_similarity(query_vectors: &[Vec<f32>], vector: &[f32]) -> RetrievalResult<f64> {
+    query_vectors
+        .iter()
+        .map(|query| exact_cosine_f64(query, vector))
+        .collect::<RetrievalResult<Vec<_>>>()?
+        .into_iter()
+        .max_by(f64::total_cmp)
+        .ok_or_else(|| RetrievalError::CorruptIndex("查询向量集合不能为空".into()))
 }
 
 fn embedding_catalog_identity(rows: &[StoredEmbedding]) -> String {
@@ -14966,6 +15250,59 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    #[test]
+    fn enumerated_targets_generate_bounded_focused_embedding_queries() {
+        let raw = "分别查找 Windows、Mac、Linux、iPad 的配置";
+        let queries = embedding_queries(raw);
+        assert_eq!(queries.len(), MAX_QUERY_EMBEDDINGS);
+        assert_eq!(queries[0], raw);
+        for target in ["Windows", "Mac", "Linux", "iPad"] {
+            assert!(
+                queries.iter().skip(1).any(|query| query.contains(target)),
+                "missing focused query for {target}: {queries:?}"
+            );
+        }
+        assert_eq!(embedding_queries("单目标查询"), vec!["单目标查询"]);
+    }
+
+    #[test]
+    fn multi_query_vector_merge_keeps_each_querys_top_target() {
+        let spec = VectorIndexSpec {
+            model: "embedding-model".into(),
+            dimensions: 32,
+            hnsw_m: 8,
+            hnsw_ef_construction: 64,
+            hnsw_ef_search: 64,
+        };
+        let mut first = vec![0.0; spec.dimensions];
+        first[0] = 1.0;
+        let mut second = vec![0.0; spec.dimensions];
+        second[1] = 1.0;
+        let fingerprint = spec.fingerprint().unwrap();
+        let rows = [("first", first.clone()), ("second", second.clone())]
+            .into_iter()
+            .map(|(document_id, vector)| StoredEmbedding {
+                document_id: document_id.into(),
+                session_id: "session".into(),
+                granularity: RetrievalDocumentGranularity::Message,
+                source_sha256: format!("source-{document_id}"),
+                model: spec.model.clone(),
+                dimensions: spec.dimensions,
+                index_fingerprint: fingerprint.clone(),
+                vector,
+                embedded_at: utc_now(),
+            })
+            .collect();
+        let index = HnswVectorIndex::rebuild(spec, rows).unwrap();
+        let hits = search_query_vectors(&index, &[first, second], 2, 60).unwrap();
+        assert_eq!(
+            hits.iter()
+                .map(|hit| hit.document_id.as_str())
+                .collect::<HashSet<_>>(),
+            HashSet::from(["first", "second"])
+        );
     }
 
     #[test]
@@ -17760,18 +18097,35 @@ mod tests {
                 false,
             )
             .unwrap();
-        append_complete_turn(&mut query_session, "Alice likes which tea?", "checking", "");
-        let query_time = (DateTime::parse_from_rfc3339(&source.turns[0].created_at).unwrap()
-            + chrono::Duration::seconds(5))
-        .to_rfc3339();
-        query_session.turns[0].created_at = query_time.clone();
-        query_session.turns[0].updated_at = query_time;
+        append_complete_turn(&mut query_session, "background", "checking", "");
+        let source_time = DateTime::parse_from_rfc3339(&source.turns[0].created_at).unwrap();
+        let background_time = (source_time + chrono::Duration::seconds(4)).to_rfc3339();
+        query_session.turns[0].created_at = background_time.clone();
+        query_session.turns[0].updated_at = background_time.clone();
+        query_session.turns[0].request_started_at = Some(background_time);
+        let query_time = (source_time + chrono::Duration::seconds(5)).to_rfc3339();
+        let mut pending = Turn::pending("Alice likes which tea?".into());
+        pending.created_at = query_time.clone();
+        pending.updated_at = query_time;
+        query_session.turns.push(pending);
         store.save(&mut query_session).unwrap();
         let query_event = event_id(
             &query_session.id,
-            Some(&query_session.turns[0].id),
+            Some(&query_session.turns[1].id),
             EventRole::User,
         );
+        let recent_events = vec![
+            event_id(
+                &query_session.id,
+                Some(&query_session.turns[0].id),
+                EventRole::User,
+            ),
+            event_id(
+                &query_session.id,
+                Some(&query_session.turns[0].id),
+                EventRole::Assistant,
+            ),
+        ];
 
         let config = aggregate_memory_config();
         let spec = VectorIndexSpec::from_config(&config).unwrap();
@@ -17850,7 +18204,7 @@ mod tests {
                 &backend,
                 "Alice likes which tea?",
                 &query_event,
-                &[],
+                &recent_events,
                 None,
                 RetrievalConfig::default(),
                 &config,
@@ -17875,7 +18229,7 @@ mod tests {
             "{:?}",
             recall.trace.state_selections
         );
-        assert!(recall.trace.graph_paths.iter().any(|path| path.selected));
+        assert!(!recall.trace.graph_paths.is_empty());
         for channel in [
             RetrievalChannel::Vector,
             RetrievalChannel::Entity,
@@ -17895,6 +18249,63 @@ mod tests {
                 recall.trace.channels
             );
         }
+        let connection = store.retrieval().open_connection().unwrap();
+        let mut normalized = recall.trace.clone();
+        for channel in &mut normalized.channels {
+            if matches!(channel.status.as_str(), "ok" | "stale") {
+                channel.candidate_count = usize::MAX;
+            }
+        }
+        store
+            .retrieval()
+            .synchronize_retrieval_channel_counts(&connection, &mut normalized)
+            .unwrap();
+        store
+            .retrieval()
+            .validate_retrieval_channel_contract(&connection, &normalized)
+            .unwrap();
+        let control = store.retrieval().control_state().unwrap();
+        for path in &normalized.graph_paths {
+            store
+                .retrieval()
+                .graph_path_is_active(&connection, &control, path)
+                .unwrap_or_else(|error| panic!("invalid graph path {path:#?}: {error}"));
+        }
+        drop(connection);
+
+        let plan = ContextAssembler.assemble_with_recall(
+            &query_session,
+            "Alice likes which tea?",
+            Some(&[]),
+            Some(1),
+            Some(&recall),
+        );
+        let turn = &mut query_session.turns[1];
+        turn.context_trace = ContextTrace {
+            included_turn_ids: plan.included_turn_ids,
+            omitted_turn_ids: plan.omitted_turn_ids,
+            estimated_upper_tokens: plan.estimated_upper_tokens,
+            exact_input_tokens: plan.exact_input_tokens,
+            input_budget: plan.input_budget,
+            decision: "ready".into(),
+            active_context_start_before: 0,
+            active_context_start_after: 0,
+            context_items: plan.context_items,
+            context_sha256: Some(plan.context_sha256),
+            request: Some(ModelRequestTrace {
+                model: query_session.model.clone(),
+                think: query_session.think,
+                context_window: query_session.budget.context_window,
+                max_output_tokens: query_session.budget.max_output_tokens,
+            }),
+            identity_instruction: Some(plan.identity_instruction),
+            untrusted_history_wrapped: plan.untrusted_history_wrapped,
+            provenance_quality: ProvenanceQuality::Exact,
+            retrieval: plan.retrieval_trace,
+            knowledge: plan.knowledge_trace,
+        };
+        turn.request_started_at = Some(utc_now());
+        store.save(&mut query_session).unwrap();
     }
 
     #[test]
@@ -18033,6 +18444,94 @@ mod tests {
                 .selected_evidence
                 .iter()
                 .any(|item| item.kind == EvidenceKind::Core)
+        );
+    }
+
+    #[test]
+    fn recall_filters_nonterminal_turns_and_assistant_acknowledgements() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let mut session = store
+            .create(
+                "model",
+                "http://localhost",
+                Some("system"),
+                Default::default(),
+                false,
+            )
+            .unwrap();
+        append_complete_turn(&mut session, "可检索用户事实：偏好乌龙茶", "OK", "");
+        let completed_user = event_id(&session.id, Some(&session.turns[0].id), EventRole::User);
+        let acknowledgement = event_id(
+            &session.id,
+            Some(&session.turns[0].id),
+            EventRole::Assistant,
+        );
+        let pending = Turn::pending("pending-only-secret".into());
+        let pending_user = event_id(&session.id, Some(&pending.id), EventRole::User);
+        session.turns.push(pending);
+        let mut interrupted = Turn::pending("interrupted-only-secret".into());
+        interrupted.status = TurnStatus::Interrupted;
+        let interrupted_user = event_id(&session.id, Some(&interrupted.id), EventRole::User);
+        session.turns.push(interrupted);
+        store.save(&mut session).unwrap();
+
+        let spec = VectorIndexSpec::from_config(&aggregate_memory_config()).unwrap();
+        let snapshot = store.retrieval().leaf_embedding_snapshot(&spec).unwrap();
+        let writes = embedding_catalog_unit_writes(&snapshot, spec.dimensions);
+        store
+            .retrieval()
+            .publish_leaf_embedding_catalog(&spec, &snapshot, &writes)
+            .unwrap();
+        let _guard = store.retrieval().acquire_root_read().unwrap();
+        let connection = store.retrieval().open_connection().unwrap();
+        let visibility = RecallVisibility::from_options(&HybridRecallOptions::default()).unwrap();
+        let (index, _, _) = store
+            .retrieval()
+            .load_vector_index_from_connection(&connection, &spec, None, &visibility)
+            .unwrap();
+        let eligible_document = snapshot
+            .documents
+            .iter()
+            .find(|document| document.source_event_id == completed_user)
+            .unwrap();
+        assert!(
+            index
+                .vector_for_document(&eligible_document.document_id)
+                .is_some()
+        );
+        for excluded in [&acknowledgement, &pending_user, &interrupted_user] {
+            let excluded_documents = snapshot
+                .documents
+                .iter()
+                .filter(|document| document.source_event_id == *excluded)
+                .collect::<Vec<_>>();
+            assert!(!excluded_documents.is_empty());
+            assert!(
+                excluded_documents
+                    .iter()
+                    .all(|document| index.vector_for_document(&document.document_id).is_none()),
+                "excluded event {excluded} remained in the live vector index"
+            );
+        }
+        drop(connection);
+
+        for query in ["OK", "pending-only-secret", "interrupted-only-secret"] {
+            let recall = store
+                .retrieval()
+                .keyword_recall(query, "current", &[], RetrievalConfig::default())
+                .unwrap();
+            assert!(recall.evidence.is_empty(), "query {query}: {recall:?}");
+        }
+        let recall = store
+            .retrieval()
+            .keyword_recall("乌龙茶", "current", &[], RetrievalConfig::default())
+            .unwrap();
+        assert!(
+            recall
+                .evidence
+                .iter()
+                .any(|item| item.content == "可检索用户事实：偏好乌龙茶")
         );
     }
 

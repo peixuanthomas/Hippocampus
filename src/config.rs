@@ -127,7 +127,7 @@ impl Default for MemoryConfig {
             rrf_k: 60,
             consolidation_timeout_secs: 600,
             embedding_timeout_secs: 600,
-            search_timeout_ms: 1_000,
+            search_timeout_ms: 15_000,
             episode_gap_minutes: 30,
             hnsw_m: 16,
             hnsw_ef_construction: 200,
@@ -466,7 +466,7 @@ location = "https://example.com/docs"
         assert_eq!(memory.rrf_k, 60);
         assert_eq!(memory.consolidation_timeout_secs, 600);
         assert_eq!(memory.embedding_timeout_secs, 600);
-        assert_eq!(memory.search_timeout_ms, 1_000);
+        assert_eq!(memory.search_timeout_ms, 15_000);
         assert_eq!(memory.episode_gap_minutes, 30);
         assert_eq!(memory.hnsw_m, 16);
         assert_eq!(memory.hnsw_ef_construction, 200);

@@ -29,7 +29,7 @@ use crate::ollama::StructuredChatRequest;
 use crate::ollama::{ChatBackend, ChatRequest, EmbeddingRequest, OllamaError};
 use crate::retrieval::{
     AggregateEmbeddingSnapshot, LeafEmbeddingSnapshot, PreparedQueryVectorRecall, RecallResult,
-    RecalledEvidence, RetrievalError,
+    RecalledEvidence, RetrievalError, embedding_queries,
 };
 use crate::store::SessionStore;
 use crate::vector::{
@@ -227,9 +227,9 @@ enum LiveSearchEvent {
         elapsed_ms: u64,
     },
     Embedding {
-        result: std::result::Result<Vec<f32>, String>,
+        result: std::result::Result<Vec<Vec<f32>>, String>,
         elapsed_ms: u64,
-        cache_hit: bool,
+        cache_hits: usize,
     },
     SemanticPrepared {
         result: std::result::Result<PreparedQueryVectorRecall, String>,
@@ -1252,7 +1252,7 @@ impl<B: ChatBackend> ChatEngine<B> {
 
         if memory_config.enabled {
             let client = self.client.clone();
-            let embedding_query = user_content.to_owned();
+            let embedding_inputs = embedding_queries(user_content);
             let embedding_model = memory_config.embedding_model.clone();
             let embedding_dimensions = memory_config.embedding_dimensions;
             let embedding_spec = VectorIndexSpec::from_config(&memory_config);
@@ -1270,23 +1270,48 @@ impl<B: ChatBackend> ChatEngine<B> {
                     barrier.wait().await;
                 }
                 let task_started = Instant::now();
-                let query_hash = content_sha256(&embedding_query);
                 let cached = match embedding_spec {
-                    Ok(spec) => tokio::task::spawn_blocking(move || {
-                        embedding_store.cached_content_embedding(&spec, &query_hash)
-                    })
+                    Ok(spec) => {
+                        let cached_inputs = embedding_inputs.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let cached = embedding_store.cached_content_embeddings(&spec)?;
+                            Ok::<_, RetrievalError>(
+                                cached_inputs
+                                    .iter()
+                                    .map(|input| cached.get(&content_sha256(input)).cloned())
+                                    .collect::<Vec<_>>(),
+                            )
+                        })
                     .await
                     .map_err(|error| format!("查询向量缓存任务失败: {error}"))
-                    .and_then(|result| result.map_err(|error| error.to_string())),
+                    .and_then(|result| result.map_err(|error| error.to_string()))
+                    }
                     Err(error) => Err(error.to_string()),
                 };
-                let (result, cache_hit) = match cached {
-                    Ok(Some(vector)) => (Ok(vector), true),
-                    Ok(None) => {
-                        let result = client
+                let (result, cache_hits) = match cached {
+                    Ok(cached_vectors) => {
+                        let cache_hits = cached_vectors.iter().flatten().count();
+                        let missing = cached_vectors
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, vector)| vector.is_none())
+                            .map(|(index, _)| (index, embedding_inputs[index].clone()))
+                            .collect::<Vec<_>>();
+                        if missing.is_empty() {
+                            (
+                                Ok(cached_vectors.into_iter().flatten().collect()),
+                                cache_hits,
+                            )
+                        } else {
+                            let missing_inputs = missing
+                                .iter()
+                                .map(|(_, input)| input.clone())
+                                .collect::<Vec<_>>();
+                            let expected = missing_inputs.len();
+                            let embedded = client
                             .embed(EmbeddingRequest {
                                 model: embedding_model.clone(),
-                                input: vec![embedding_query],
+                                input: missing_inputs,
                                 dimensions: Some(embedding_dimensions),
                                 truncate: false,
                             })
@@ -1294,31 +1319,40 @@ impl<B: ChatBackend> ChatEngine<B> {
                             .map_err(|error| error.to_string())
                             .and_then(|response| {
                                 if response.model != embedding_model
-                                    || response.embeddings.len() != 1
+                                    || response.embeddings.len() != expected
                                 {
                                     return Err("查询 Embedding 响应与请求不匹配".into());
                                 }
-                                let vector = response
+                                response
                                     .embeddings
                                     .into_iter()
-                                    .next()
-                                    .expect("validated one query embedding");
-                                if vector.len() != embedding_dimensions {
-                                    return Err(format!(
-                                        "查询向量维度不匹配：期望 {embedding_dimensions}，实际 {}",
-                                        vector.len()
-                                    ));
-                                }
-                                l2_normalize(&vector).map_err(|error| error.to_string())
+                                    .map(|vector| {
+                                        if vector.len() != embedding_dimensions {
+                                            return Err(format!(
+                                                "查询向量维度不匹配：期望 {embedding_dimensions}，实际 {}",
+                                                vector.len()
+                                            ));
+                                        }
+                                        l2_normalize(&vector).map_err(|error| error.to_string())
+                                    })
+                                    .collect::<std::result::Result<Vec<_>, _>>()
                             });
-                        (result, false)
+                            let result = embedded.map(|embedded| {
+                                let mut vectors = cached_vectors;
+                                for ((index, _), vector) in missing.into_iter().zip(embedded) {
+                                    vectors[index] = Some(vector);
+                                }
+                                vectors.into_iter().flatten().collect::<Vec<_>>()
+                            });
+                            (result, cache_hits)
+                        }
                     }
-                    Err(error) => (Err(error), false),
+                    Err(error) => (Err(error), 0),
                 };
                 let _ = embedding_sender.send(LiveSearchEvent::Embedding {
                     result,
                     elapsed_ms: elapsed_millis(task_started),
-                    cache_hit,
+                    cache_hits,
                 });
             }));
         }
@@ -1331,6 +1365,7 @@ impl<B: ChatBackend> ChatEngine<B> {
         let mut knowledge_error = None;
         let mut knowledge_elapsed_ms = 0;
         let mut query_embedding: Option<Vec<f32>> = None;
+        let mut query_embeddings: Option<Vec<Vec<f32>>> = None;
         let mut embedding_finished = !memory_config.enabled;
         let mut embedding_error = None;
         let mut embedding_elapsed_ms = 0;
@@ -1415,21 +1450,23 @@ impl<B: ChatBackend> ChatEngine<B> {
                         LiveSearchEvent::Embedding {
                             result,
                             elapsed_ms,
-                            cache_hit,
+                            cache_hits,
                         } => {
                             embedding_finished = true;
                             embedding_elapsed_ms = elapsed_ms;
                             match result {
-                                Ok(vector) => {
+                                Ok(vectors) => {
                                     log::debug!(
                                         target: "hippocampus::retrieval",
-                                        "query embedding completed event_id={} dimensions={} cache_hit={} elapsed_ms={}",
+                                        "query embedding completed event_id={} queries={} dimensions={} cache_hits={} elapsed_ms={}",
                                         current_event_id,
-                                        vector.len(),
-                                        cache_hit,
+                                        vectors.len(),
+                                        vectors.first().map_or(0, Vec::len),
+                                        cache_hits,
                                         elapsed_ms,
                                     );
-                                    query_embedding = Some(vector);
+                                    query_embedding = vectors.first().cloned();
+                                    query_embeddings = Some(vectors);
                                 }
                                 Err(error) => {
                                     log::warn!(
@@ -1508,7 +1545,7 @@ impl<B: ChatBackend> ChatEngine<B> {
                 }
             }
 
-            if !semantic_preparation_started && let Some(vector) = query_embedding.as_ref() {
+            if !semantic_preparation_started && let Some(vectors) = query_embeddings.as_ref() {
                 semantic_preparation_started = true;
                 let semantic_store = self.store.retrieval().clone();
                 let semantic_query = user_content.to_owned();
@@ -1516,7 +1553,7 @@ impl<B: ChatBackend> ChatEngine<B> {
                 let semantic_recent = recent_event_ids.to_vec();
                 let semantic_retrieval = retrieval_config.clone();
                 let semantic_memory = memory_config.clone();
-                let semantic_vector = vector.clone();
+                let semantic_vectors = vectors.clone();
                 let semantic_sender = sender.clone();
                 tasks.push(tokio::spawn(async move {
                     let task_started = Instant::now();
@@ -1528,7 +1565,7 @@ impl<B: ChatBackend> ChatEngine<B> {
                             None,
                             semantic_retrieval,
                             &semantic_memory,
-                            semantic_vector,
+                            semantic_vectors,
                         )
                         .await
                         .map_err(|error| error.to_string());
@@ -4464,6 +4501,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn enumerated_live_query_batches_target_embeddings() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let mut session = store
+            .create("model", "http://localhost", None, roomy_budget(), false)
+            .unwrap();
+        let client = FakeClient::new(100);
+        let requests = client.embed_requests.clone();
+        let prepared = ChatEngine::with_config(store, client, enabled_memory_config(5_000))
+            .prepare_turn(
+                &mut session,
+                "分别查找 Windows、Mac、Linux、iPad 的配置".into(),
+            )
+            .await
+            .unwrap();
+        assert!(prepared.query_embedding.is_some());
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].input.len(), 5);
+        assert_eq!(
+            requests[0].input[0],
+            "分别查找 Windows、Mac、Linux、iPad 的配置"
+        );
+    }
+
+    #[tokio::test]
     async fn live_search_starts_bm25_embedding_and_knowledge_concurrently() {
         let root = tempfile::tempdir().unwrap();
         let store = SessionStore::new(root.path()).unwrap();
@@ -4598,10 +4661,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 (RetrievalChannel::Bm25, "ok", false),
-                (RetrievalChannel::Vector, "stale", false),
-                (RetrievalChannel::Entity, "stale", false),
-                (RetrievalChannel::State, "stale", false),
-                (RetrievalChannel::Episode, "stale", false),
+                (RetrievalChannel::Vector, "ok", false),
+                (RetrievalChannel::Entity, "ok", false),
+                (RetrievalChannel::State, "ok", false),
+                (RetrievalChannel::Episode, "ok", false),
                 (RetrievalChannel::Graph, "error", true),
             ],
             "warnings: {:#?}",
@@ -4664,11 +4727,7 @@ mod tests {
             .iter()
             .find(|channel| channel.channel == RetrievalChannel::Vector)
             .expect("live search records vector status");
-        assert_eq!(
-            vector_channel.status, "stale",
-            "warnings: {:#?}",
-            second.plan.retrieval_trace.warnings
-        );
+        assert_eq!(vector_channel.status, "ok");
         assert!(!second.plan.retrieval_trace.fusion_candidates.is_empty());
         assert_eq!(
             requests
