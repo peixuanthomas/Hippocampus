@@ -12997,7 +12997,9 @@ fn load_validated_consolidation_watermark(
         })
         .map_err(|error| aggregate_corruption(format!("读取 applied 巩固批次失败：{error}")))?;
     if applied.is_empty() {
-        return Ok(Some(through_sequence));
+        return Err(aggregate_corruption(format!(
+            "会话 {session_id} 的 boundary 水位缺少 immutable applied attempt"
+        )));
     }
     let matching_latest = applied
         .iter()
@@ -13037,20 +13039,6 @@ fn require_boundary_stage_caught_up(
     control: &ControlState,
     session_id: &str,
 ) -> RetrievalResult<()> {
-    let facts_started = connection
-        .query_row(
-            "SELECT 1 FROM memory_stage_attempts
-             WHERE session_id=?1 AND stage='facts' LIMIT 1",
-            [session_id],
-            |_| Ok(()),
-        )
-        .optional()
-        .map_err(|error| aggregate_corruption(format!("读取 facts stage 水位失败：{error}")))?
-        .is_some();
-    if !facts_started {
-        return Ok(());
-    }
-    let watermark = load_validated_consolidation_watermark(connection, session_id)?;
     let mut statement = connection
         .prepare(
             "SELECT event_id,sequence,content,turn_id FROM events
@@ -13083,7 +13071,11 @@ fn require_boundary_stage_caught_up(
             })?);
         }
     }
-    if watermark != latest {
+    let Some(latest) = latest else {
+        return Ok(());
+    };
+    let watermark = load_validated_consolidation_watermark(connection, session_id)?;
+    if watermark != Some(latest) {
         return Err(RetrievalError::StaleIndex {
             session_id: session_id.to_owned(),
         });
@@ -16151,6 +16143,7 @@ mod tests {
             .retrieval()
             .publish_leaf_embedding_catalog(&spec, &leaf, &leaf_writes)
             .unwrap();
+        publish_boundary_stage_for_test(&store, &session, usize::MAX);
         store
             .retrieval()
             .materialize_episode_documents(&session.id, &aggregate_memory_config())
@@ -16300,6 +16293,7 @@ mod tests {
             .retrieval()
             .publish_leaf_embedding_catalog(&spec, &leaf, &writes)
             .unwrap();
+        publish_boundary_stage_for_test(&store, &session, usize::MAX);
         store
             .retrieval()
             .materialize_episode_documents(&session.id, &aggregate_memory_config())
@@ -16415,6 +16409,7 @@ mod tests {
             .publish_leaf_embedding_catalog(&spec, &leaf, &writes)
             .unwrap();
         for session in &sessions {
+            publish_boundary_stage_for_test(&store, session, usize::MAX);
             store
                 .retrieval()
                 .materialize_episode_documents(&session.id, &config)
@@ -16536,6 +16531,7 @@ mod tests {
             .retrieval()
             .publish_leaf_embedding_catalog(&spec, &leaf, &writes)
             .unwrap();
+        publish_boundary_stage_for_test(&store, &session, usize::MAX);
         store
             .retrieval()
             .materialize_episode_documents(&session.id, &aggregate_memory_config())
@@ -16768,6 +16764,20 @@ mod tests {
             enabled: true,
             ..Default::default()
         };
+        assert!(matches!(
+            store
+                .retrieval()
+                .materialize_episode_documents(&session.id, &config),
+            Err(RetrievalError::StaleIndex { .. })
+        ));
+        publish_boundary_stage_for_test(&store, &session, 0);
+        assert!(matches!(
+            store
+                .retrieval()
+                .materialize_episode_documents(&session.id, &config),
+            Err(RetrievalError::StaleIndex { .. })
+        ));
+        publish_boundary_stage_for_test(&store, &session, usize::MAX);
         let first = store
             .retrieval()
             .materialize_episode_documents(&session.id, &config)
@@ -16843,6 +16853,7 @@ mod tests {
             enabled: true,
             ..Default::default()
         };
+        publish_boundary_stage_for_test(&store, &session, usize::MAX);
         store
             .retrieval()
             .materialize_episode_documents(&session.id, &config)
@@ -16890,6 +16901,7 @@ mod tests {
         let path = store.save(&mut session).unwrap();
         store.retrieval().sync_session(&session, &path).unwrap();
         let config = aggregate_memory_config();
+        publish_boundary_stage_for_test(&store, &session, usize::MAX);
         let plan = store
             .retrieval()
             .materialize_episode_documents(&session.id, &config)
@@ -17099,6 +17111,7 @@ mod tests {
             store.retrieval().sync_session(&session, &path).unwrap();
             let config = aggregate_memory_config();
             let spec = VectorIndexSpec::from_config(&config).unwrap();
+            publish_boundary_stage_for_test(&store, &session, usize::MAX);
             store
                 .retrieval()
                 .materialize_episode_documents(&session.id, &config)
@@ -18629,6 +18642,7 @@ mod tests {
         session: &Session,
         config: &MemoryConfig,
     ) -> (VectorIndexSpec, EpisodeMaterializationReport) {
+        publish_boundary_stage_for_test(store, session, usize::MAX);
         store
             .retrieval()
             .materialize_episode_documents(&session.id, config)
@@ -18641,6 +18655,131 @@ mod tests {
             .materialize_episode_documents(&session.id, config)
             .unwrap();
         (spec, report)
+    }
+
+    fn publish_boundary_stage_for_test(
+        store: &SessionStore,
+        session: &Session,
+        through_user_index: usize,
+    ) {
+        let users = store
+            .retrieval()
+            .replay_session(&session.id)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.role == EventRole::User && !event.content.trim().is_empty())
+            .collect::<Vec<_>>();
+        if users.is_empty() {
+            return;
+        }
+        let through_index = through_user_index.min(users.len() - 1);
+        let covered = &users[..=through_index];
+        let last = covered.last().unwrap();
+        let connection = Connection::open(store.retrieval().index_path()).unwrap();
+        let already_published = connection
+            .query_row(
+                "SELECT through_sequence FROM memory_stage_watermarks
+                 WHERE session_id=?1 AND stage='boundaries'",
+                [&session.id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .unwrap()
+            == Some(usize_to_i64(last.sequence).unwrap());
+        if already_published {
+            return;
+        }
+        let event_ids = covered
+            .iter()
+            .map(|event| event.id.as_str())
+            .collect::<Vec<_>>();
+        let event_hashes = covered
+            .iter()
+            .map(|event| event.content_sha256.as_str())
+            .collect::<Vec<_>>();
+        let work_units = covered
+            .iter()
+            .map(|event| format!("event:{}", event.id))
+            .collect::<Vec<_>>();
+        let attempt_id = format!("boundary-test-{}-{}", session.id, last.sequence);
+        let completed_at = last.created_at.clone();
+        let request_json = serde_json::json!({"stage":"boundaries","units":work_units}).to_string();
+        let response_json = serde_json::json!({"decisions":covered.len()}).to_string();
+        connection
+            .execute(
+                "INSERT INTO memory_stage_attempts
+                 (attempt_id,stage,request_kind,parent_attempt_id,work_unit_ids,retry_ordinal,
+                  batch_key,session_id,from_sequence,through_sequence,trigger,model,
+                  request_json,request_sha256,input_event_ids,input_event_hashes,
+                  response_json,response_sha256,status,input_tokens,output_tokens,latency_ms,
+                  started_at,completed_at,validation_json,error_json,done_reason,
+                 canonical_delta_json,canonical_delta_sha256,projection_schema_version)
+                 VALUES(?1,'boundaries','deterministic',NULL,?2,0,?3,?4,?5,?6,
+                        'test',?14,?7,?8,?9,?10,?11,?12,'applied',
+                        0,0,0,?13,?13,'{\"valid\":true}',NULL,'stop',NULL,NULL,4)",
+                params![
+                    attempt_id,
+                    serde_json::to_string(&work_units).unwrap(),
+                    format!("boundary-test:{}:{}", session.id, last.sequence),
+                    session.id,
+                    usize_to_i64(covered[0].sequence).unwrap(),
+                    usize_to_i64(last.sequence).unwrap(),
+                    request_json,
+                    content_sha256(&request_json),
+                    serde_json::to_string(&event_ids).unwrap(),
+                    serde_json::to_string(&event_hashes).unwrap(),
+                    response_json,
+                    content_sha256(&response_json),
+                    completed_at,
+                    crate::config::CONSOLIDATION_MODEL,
+                ],
+            )
+            .unwrap();
+        for event in covered {
+            connection
+                .execute(
+                    "INSERT INTO memory_boundary_decisions
+                     (session_id,before_event_id,sequence,is_boundary,generator,signals_json,
+                      evidence_json,input_sha256,attempt_id,decided_at)
+                     VALUES(?1,?2,?3,0,'rust','[]','[]',?4,?5,?6)
+                     ON CONFLICT(session_id,before_event_id) DO UPDATE SET
+                       sequence=excluded.sequence,is_boundary=excluded.is_boundary,
+                       generator=excluded.generator,signals_json=excluded.signals_json,
+                       evidence_json=excluded.evidence_json,input_sha256=excluded.input_sha256,
+                       attempt_id=excluded.attempt_id,decided_at=excluded.decided_at",
+                    params![
+                        session.id,
+                        event.id,
+                        usize_to_i64(event.sequence).unwrap(),
+                        content_sha256(&format!(
+                            "boundary-test:{}:{}:{}",
+                            session.id, event.id, event.content_sha256
+                        )),
+                        attempt_id,
+                        completed_at,
+                    ],
+                )
+                .unwrap();
+        }
+        connection
+            .execute(
+                "INSERT INTO memory_stage_watermarks
+                 (session_id,stage,through_sequence,through_event_id,through_event_sha256,updated_at)
+                 VALUES(?1,'boundaries',?2,?3,?4,?5)
+                 ON CONFLICT(session_id,stage) DO UPDATE SET
+                   through_sequence=excluded.through_sequence,
+                   through_event_id=excluded.through_event_id,
+                   through_event_sha256=excluded.through_event_sha256,
+                   updated_at=excluded.updated_at",
+                params![
+                    session.id,
+                    usize_to_i64(last.sequence).unwrap(),
+                    last.id,
+                    last.content_sha256,
+                    completed_at,
+                ],
+            )
+            .unwrap();
     }
 
     fn aggregate_writes(
@@ -18813,6 +18952,8 @@ mod tests {
             .retrieval()
             .publish_leaf_embedding_catalog(&spec, &leaf, &leaf_writes)
             .unwrap();
+        publish_boundary_stage_for_test(&store, &source, usize::MAX);
+        publish_boundary_stage_for_test(&store, &query_session, usize::MAX);
         for session_id in [&source.id, &query_session.id] {
             store
                 .retrieval()

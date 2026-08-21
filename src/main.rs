@@ -6,7 +6,7 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use hippocampus::config::AppConfig;
+use hippocampus::config::{AppConfig, CONSOLIDATION_MODEL};
 use hippocampus::engine::PreparationStatus;
 use hippocampus::model::{
     BudgetConfig, ChatEvent, ChatEventKind, ChatMessage, RetrievalConfig, Session, TokenUsage,
@@ -1468,7 +1468,10 @@ async fn run_memory_consolidate(
             break;
         }
         if !json_output && config.memory.enabled {
-            eprintln!("巩固中：会话 {}（模型 {}）…", session.id, session.model);
+            eprintln!(
+                "巩固中：会话 {}（专用巩固模型 {}）…",
+                session.id, CONSOLIDATION_MODEL
+            );
         }
         let client = match OllamaClient::new(&session.ollama_host) {
             Ok(client) => client,
@@ -1538,7 +1541,7 @@ async fn run_tui_exit_maintenance(
     if config.memory.enabled {
         eprintln!(
             "分阶段整理中：会话 {}（专用巩固模型 {}；raw_vectors/facts/boundaries 独立提交）…",
-            session.id, config.memory.consolidation_model
+            session.id, CONSOLIDATION_MODEL
         );
     }
     let report = consolidate_for_session(
@@ -1689,7 +1692,7 @@ fn synthetic_consolidation_report(
     ConsolidationRunReport {
         session_id: session.id.clone(),
         trigger,
-        model: session.model.clone(),
+        model: CONSOLIDATION_MODEL.to_owned(),
         status,
         batches_attempted: 0,
         batches_applied: 0,
@@ -1719,7 +1722,7 @@ fn format_consolidation_report(report: &ConsolidationRunReport) -> String {
     format!(
         "会话 {}｜巩固模型 {}｜{}｜批次 {}/{} 事件 {}/{} 水位 {}→{}｜facts {} 水位 {}→{} 批次 {}/{} 单元 {}/{} token {}/{} 延迟 {}ms 实体 {}/{} 声明 {}/{}｜boundaries {} 水位 {}→{} 批次 {}/{} 单元 {}/{} token {}/{} 延迟 {}ms｜raw_vectors {} 水位 {}→{} 批次 {}/{} 单元 {}/{} 延迟 {}ms",
         report.session_id,
-        report.model,
+        CONSOLIDATION_MODEL,
         consolidation_status_label(report.status),
         report.batches_applied,
         report.batches_attempted,
@@ -2391,7 +2394,7 @@ mod tests {
             .map(|(index, status)| ConsolidationRunReport {
                 session_id: format!("session-{index}"),
                 trigger: ConsolidationTrigger::Manual,
-                model: format!("model-{index}"),
+                model: CONSOLIDATION_MODEL.to_owned(),
                 status,
                 batches_attempted: 2,
                 batches_applied: 1,
@@ -2428,9 +2431,10 @@ mod tests {
             assert_eq!(report["status"], expected_status);
         }
         for report in &reports {
+            assert_eq!(report.model, CONSOLIDATION_MODEL);
             let human = format_consolidation_report(report);
             assert!(human.contains(&report.session_id));
-            assert!(human.contains(&report.model));
+            assert!(human.contains(CONSOLIDATION_MODEL));
             assert!(human.contains("批次 1/2"));
             assert!(human.contains("事件 3/4"));
             assert!(human.contains("水位 8→9"));
