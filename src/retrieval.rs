@@ -14329,7 +14329,8 @@ pub(crate) fn embedding_queries(raw_query: &str) -> Vec<String> {
     }
     let separated = raw_query
         .replace("以及", "、")
-        .replace(['和', '与'], "、")
+        .replace(" 和 ", "、")
+        .replace(" 与 ", "、")
         .replace(" and ", "、")
         .replace(" AND ", "、");
     let segments = separated
@@ -15264,6 +15265,19 @@ mod tests {
             );
         }
         assert_eq!(embedding_queries("单目标查询"), vec!["单目标查询"]);
+        assert_eq!(
+            embedding_queries("中华人民共和国的首都是什么？"),
+            vec!["中华人民共和国的首都是什么？"]
+        );
+        assert_eq!(
+            embedding_queries("请说明和平与发展的关系"),
+            vec!["请说明和平与发展的关系"]
+        );
+
+        let spaced_conjunction = embedding_queries("对比 Windows 和 Mac 的配置");
+        assert_eq!(spaced_conjunction.len(), 3);
+        assert!(spaced_conjunction[1].contains("Windows"));
+        assert!(spaced_conjunction[2].contains("Mac"));
     }
 
     #[test]
