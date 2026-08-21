@@ -182,8 +182,10 @@ location = "./knowledge"
 启用仓库配置后，巩固使用该会话写入时冻结的聊天模型（新会话默认模型为 `qwen3.8:27b-mlx`，旧会话仍使用各自保存的模型）提取可追溯结构，并使用 `[memory].embedding_model`（当前为 `qwen3-embedding:8b`）生成向量。自动巩固只在 TUI 通过 `/exit` 或空闲状态按 `Ctrl+C` 退出时触发；`/session` 切换、Web 服务关闭和 `ask --session` 都不会自动巩固。手动命令如下：
 
 ```bash
-./build/hippocampus memory consolidate 20260811-abcdef12
-./build/hippocampus memory consolidate --all
+./build/hippocampus memory consolidate 20260811-abcdef12 --stage facts
+./build/hippocampus memory consolidate --all --stage all
+./build/hippocampus memory consolidate 20260811-abcdef12 --stage boundaries
+./build/hippocampus memory consolidate 20260811-abcdef12 --stage raw-vectors
 ./build/hippocampus memory consolidate 20260811-abcdef12 --json
 
 ./build/hippocampus memory status
@@ -204,7 +206,9 @@ location = "./knowledge"
 ./build/hippocampus memory restore event EVENT_ID
 ```
 
-`--channels` 接受逗号分隔的 `bm25,vector,entity,state,episode,graph`。`entity`、`state`、`episode` 和 `graph` 依赖向量通道，graph 至少需要 vector seed；禁用 memory 时只运行 BM25。`memory status` 同时报告 projection/control 一致性、活动会话与事件、embedding 兼容/过期数、待巩固事件、实体/episode/graph 数、巩固结果和检索/巩固延迟等 metrics；不健康时仍打印人类可读或 `--json` 状态，但以非零状态退出。
+`memory consolidate --stage` 接受 `facts`、`boundaries`、`raw-vectors` 或 `all`。三个 stage 分别维护独立的 attempt、unit 和 watermark；raw vector 覆盖活动且非空的 user/assistant 原始事件。只有 boundaries 追平后才发布 episode/session aggregate；即使 boundaries 尚有缺口，raw vector 与 facts 检索仍可使用。
+
+`--channels` 接受逗号分隔的 `bm25,vector,entity,state,episode,graph`。`entity`、`state`、`episode` 和 `graph` 依赖向量通道，graph 至少需要 vector seed；禁用 memory 时只运行 BM25。`memory status` 同时报告 projection/control 一致性、活动会话与事件、embedding 兼容/过期数、每个 stage 的 watermark、事件缺口和最近失败，以及实体/episode/graph 数、巩固结果和检索/巩固延迟等 metrics；不健康时仍打印人类可读或 `--json` 状态，但以非零状态退出。
 
 `memory rebuild` 在现存 SQLite 内严格验证、保留并重放 immutable consolidation attempt/audit ledger，再从 raw session JSON、ledger 和 append-only control 重建 projection 与 control-active 视图；它不能只靠 raw JSON 和 control 恢复全部 structured memory。默认复用兼容 embedding，`--reembed` 强制重新生成向量且要求启用 memory。巩固调用强制使用 JSON Schema 结构化输出并执行确定性校验；校验失败最多尝试三次，每次非法原始输出都会封装为合法 JSON 后写入失败审计，只有成功应用才推进水位。非 JSON 模式会逐批输出尝试、重试和水位进度。SQLite 连接使用 30 秒 busy timeout，连接初始化遇到瞬态 writer lock 时执行有限指数退避。exclude/restore 只追加 control 记录，不删除或改写原文。
 

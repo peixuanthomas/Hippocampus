@@ -1717,10 +1717,16 @@ struct ConsolidationReports<'a> {
 
 fn format_consolidation_report(report: &ConsolidationRunReport) -> String {
     format!(
-        "会话 {}｜巩固模型 {}｜{}｜facts {} 水位 {}→{} 批次 {}/{} 单元 {}/{} token {}/{} 延迟 {}ms 实体 {}/{} 声明 {}/{}｜boundaries {} 水位 {}→{} 批次 {}/{} 单元 {}/{} token {}/{} 延迟 {}ms｜raw_vectors {} 水位 {}→{} 批次 {}/{} 单元 {}/{} 延迟 {}ms",
+        "会话 {}｜巩固模型 {}｜{}｜批次 {}/{} 事件 {}/{} 水位 {}→{}｜facts {} 水位 {}→{} 批次 {}/{} 单元 {}/{} token {}/{} 延迟 {}ms 实体 {}/{} 声明 {}/{}｜boundaries {} 水位 {}→{} 批次 {}/{} 单元 {}/{} token {}/{} 延迟 {}ms｜raw_vectors {} 水位 {}→{} 批次 {}/{} 单元 {}/{} 延迟 {}ms",
         report.session_id,
         report.model,
         consolidation_status_label(report.status),
+        report.batches_applied,
+        report.batches_attempted,
+        report.events_applied,
+        report.events_attempted,
+        report.watermark_before,
+        report.watermark_after,
         consolidation_status_label(report.facts.status),
         report.facts.watermark_before,
         report.facts.watermark_after,

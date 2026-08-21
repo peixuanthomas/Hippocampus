@@ -3272,6 +3272,32 @@ impl RetrievalStore {
                 .iter()
                 .map(|event| format!("event:{}", event.id))
                 .collect::<Vec<_>>();
+            if let Some(last) = active.last() {
+                let unchanged = transaction
+                    .query_row(
+                        "SELECT through_sequence,through_event_id,through_event_sha256
+                         FROM memory_stage_watermarks
+                         WHERE session_id=?1 AND stage='raw_vectors'",
+                        [&session_id],
+                        |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, Option<String>>(1)?,
+                                row.get::<_, Option<String>>(2)?,
+                            ))
+                        },
+                    )
+                    .optional()
+                    .map_err(|error| self.database_error(error))?
+                    .is_some_and(|(sequence, event_id, source_sha256)| {
+                        sequence == i64::try_from(last.sequence).unwrap_or(-1)
+                            && event_id.as_deref() == Some(last.id.as_str())
+                            && source_sha256.as_deref() == Some(last.content_sha256.as_str())
+                    });
+                if unchanged {
+                    continue;
+                }
+            }
             let attempt_id = format!(
                 "raw_attempt_{}",
                 content_sha256(&format!(
@@ -3281,7 +3307,7 @@ impl RetrievalStore {
                         .last()
                         .map(|event| event.content_sha256.as_str())
                         .unwrap_or("empty"),
-                    updated_at
+                    work_unit_ids.join(",")
                 ))
             );
             for event in &active {
@@ -3936,6 +3962,7 @@ impl RetrievalStore {
                 session_id: session_id.to_owned(),
             });
         }
+        require_boundary_stage_caught_up(&transaction, &control, session_id)?;
         let (messages, watermark, suggestions, ledger_snapshot_sha256) =
             load_episode_snapshot(&transaction, session_id, &spec, &fingerprint)?;
         let plan = plan_episodes(&EpisodePlanInput {
@@ -13005,6 +13032,65 @@ fn load_validated_consolidation_watermark(
     Ok(Some(through_sequence))
 }
 
+fn require_boundary_stage_caught_up(
+    connection: &Connection,
+    control: &ControlState,
+    session_id: &str,
+) -> RetrievalResult<()> {
+    let facts_started = connection
+        .query_row(
+            "SELECT 1 FROM memory_stage_attempts
+             WHERE session_id=?1 AND stage='facts' LIMIT 1",
+            [session_id],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|error| aggregate_corruption(format!("读取 facts stage 水位失败：{error}")))?
+        .is_some();
+    if !facts_started {
+        return Ok(());
+    }
+    let watermark = load_validated_consolidation_watermark(connection, session_id)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT event_id,sequence,content,turn_id FROM events
+             WHERE session_id=?1 AND role='user' ORDER BY sequence",
+        )
+        .map_err(|error| aggregate_corruption(format!("读取 boundary stage 输入失败：{error}")))?;
+    let rows = statement
+        .query_map([session_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })
+        .map_err(|error| aggregate_corruption(format!("读取 boundary stage 输入失败：{error}")))?;
+    let mut latest = None;
+    for row in rows {
+        let (event_id, sequence, content, turn_id) = row.map_err(|error| {
+            aggregate_corruption(format!("读取 boundary stage 输入失败：{error}"))
+        })?;
+        if !content.trim().is_empty()
+            && control.allows_event(session_id, &event_id)
+            && turn_id
+                .as_deref()
+                .is_none_or(|turn| control.allows_turn(session_id, turn))
+        {
+            latest = Some(i64_to_u64(sequence).map_err(|error| {
+                aggregate_corruption(format!("boundary stage 输入序号损坏：{error}"))
+            })?);
+        }
+    }
+    if watermark != latest {
+        return Err(RetrievalError::StaleIndex {
+            session_id: session_id.to_owned(),
+        });
+    }
+    Ok(())
+}
+
 fn is_sha256_hex(value: &str) -> bool {
     value.len() == 64
         && value
@@ -16645,7 +16731,7 @@ mod tests {
     }
 
     #[test]
-    fn memory_state_v4_fresh_index_records_current_schema() {
+    fn memory_state_v5_fresh_index_records_current_schema() {
         let root = tempfile::tempdir().unwrap();
         let store = RetrievalStore::new(root.path()).unwrap();
         let connection = store.open_connection().unwrap();
@@ -16663,7 +16749,7 @@ mod tests {
                     |row| row.get::<_, i64>(0)
                 )
                 .unwrap(),
-            4
+            MEMORY_STATE_SCHEMA_VERSION
         );
     }
 
@@ -18420,6 +18506,26 @@ mod tests {
             .retrieval()
             .apply_consolidation_attempt(&batch, &candidates, &attempt)
             .unwrap();
+        Connection::open(store.retrieval().index_path())
+            .unwrap()
+            .execute_batch(&format!(
+                "INSERT INTO memory_stage_watermarks
+                 (session_id,stage,through_sequence,through_event_id,through_event_sha256,updated_at)
+                 SELECT session_id,'boundaries',through_sequence,through_event_id,
+                        through_event_sha256,updated_at
+                 FROM memory_stage_watermarks WHERE session_id='{session_id}' AND stage='facts';
+                 INSERT INTO memory_stage_attempts
+                 SELECT attempt_id || '-boundaries','boundaries','deterministic',attempt_id,
+                        work_unit_ids,retry_ordinal,batch_key,session_id,from_sequence,
+                        through_sequence,trigger,model,request_json,request_sha256,
+                        input_event_ids,input_event_hashes,response_json,response_sha256,status,
+                        input_tokens,output_tokens,latency_ms,started_at,completed_at,
+                        validation_json,error_json,done_reason,canonical_delta_json,
+                        canonical_delta_sha256,projection_schema_version
+                 FROM memory_stage_attempts
+                 WHERE session_id='{session_id}' AND stage='facts' AND status='applied';"
+            ))
+            .unwrap();
     }
 
     fn aggregate_memory_config() -> MemoryConfig {
@@ -19355,7 +19461,7 @@ mod tests {
                  );
                  INSERT INTO memory_stage_attempts VALUES
                      ('future-attempt', 'future-applied', '{\"future\":true}');
-                 PRAGMA user_version=10;",
+                 PRAGMA user_version=11;",
             )
             .unwrap();
         drop(connection);
@@ -19364,7 +19470,7 @@ mod tests {
         let store = RetrievalStore::new(root.path()).unwrap();
         assert!(matches!(
             store.rebuild(),
-            Err(RetrievalError::UnsupportedIndexVersion(10))
+            Err(RetrievalError::UnsupportedIndexVersion(11))
         ));
         assert!(index.is_file());
         assert_eq!(fs::read(&index).unwrap(), original_bytes);
@@ -19374,7 +19480,7 @@ mod tests {
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            10
+            11
         );
         assert_eq!(
             connection
