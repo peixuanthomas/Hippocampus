@@ -350,6 +350,7 @@ fn consolidation_failure_json(kind: &str, message: impl AsRef<str>) -> String {
 
 const CONSOLIDATION_VALIDATION_ATTEMPTS: usize = 2;
 const CONSOLIDATION_NETWORK_ATTEMPTS: usize = 3;
+const CONSOLIDATION_MODEL: &str = "qwen3.5:9b";
 
 #[derive(Debug, Clone)]
 struct FactWork {
@@ -894,6 +895,7 @@ impl<B: ChatBackend> ChatEngine<B> {
                 "leaf snapshot 包含重复会话".into(),
             ));
         }
+        let mut aggregates_ready = true;
         for session_id in session_ids {
             let retrieval = self.store.retrieval().clone();
             let readiness_session_id = session_id.clone();
@@ -910,6 +912,7 @@ impl<B: ChatBackend> ChatEngine<B> {
                 source,
             })?;
             if !boundary_ready {
+                aggregates_ready = false;
                 continue;
             }
             let retrieval = self.store.retrieval().clone();
@@ -927,6 +930,17 @@ impl<B: ChatBackend> ChatEngine<B> {
                 session_id: error_session_id,
                 source,
             })?;
+        }
+
+        if !aggregates_ready {
+            return Ok(EmbeddingRefreshReport {
+                leaf_documents: leaf_snapshot.documents.len(),
+                leaf_reused: leaf_publish.reused,
+                leaf_embedded_inputs: pending.len(),
+                backend_batches,
+                aggregate_documents: 0,
+                leaf_committed: leaf_publish.changed,
+            });
         }
 
         let retrieval = self.store.retrieval().clone();
@@ -1022,7 +1036,7 @@ impl<B: ChatBackend> ChatEngine<B> {
             }
             ConsolidationStageSelection::Boundaries => {
                 let mut report = consolidation_report(session, trigger);
-                report.model = self.config.memory.consolidation_model.clone();
+                report.model = CONSOLIDATION_MODEL.into();
                 report.boundaries = self
                     .consolidate_boundaries(session, trigger, cancellation)
                     .await;
@@ -1090,6 +1104,14 @@ impl<B: ChatBackend> ChatEngine<B> {
     where
         F: FnMut(ConsolidationProgress),
     {
+        if !self.config.memory.enabled {
+            let mut report = consolidation_report(session, trigger);
+            report.status = ConsolidationRunStatus::Disabled;
+            report.facts.status = ConsolidationRunStatus::Disabled;
+            report.boundaries.status = ConsolidationRunStatus::Disabled;
+            report.raw_vectors.status = ConsolidationRunStatus::Disabled;
+            return report;
+        }
         let raw_before = self
             .store
             .retrieval()
@@ -1134,7 +1156,7 @@ impl<B: ChatBackend> ChatEngine<B> {
             },
             watermark_before: raw_before,
             watermark_after: raw_after,
-            batches_attempted: usize::from(raw_result.is_ok()),
+            batches_attempted: 1,
             batches_applied: usize::from(raw_result.is_ok()),
             units_attempted: raw_result.as_ref().map_or(0, |value| value.leaf_documents),
             units_applied: raw_result.as_ref().map_or(0, |value| value.leaf_documents),
@@ -1219,7 +1241,7 @@ impl<B: ChatBackend> ChatEngine<B> {
                 return report;
             }
         };
-        report.model = self.config.memory.consolidation_model.clone();
+        report.model = CONSOLIDATION_MODEL.into();
         if cancellation.is_cancelled() {
             report.status = ConsolidationRunStatus::Cancelled;
             return report;
@@ -1307,7 +1329,7 @@ impl<B: ChatBackend> ChatEngine<B> {
                 }
             };
             let prepared_request = match prepare_fact_request(
-                self.config.memory.consolidation_model.clone(),
+                CONSOLIDATION_MODEL.into(),
                 &batch,
                 &candidates,
                 &preceding_contexts,
@@ -1412,7 +1434,7 @@ impl<B: ChatBackend> ChatEngine<B> {
                 match self
                     .client
                     .check_model(
-                        &self.config.memory.consolidation_model,
+                        CONSOLIDATION_MODEL,
                         self.config.memory.consolidation_context_window,
                     )
                     .await
@@ -1491,7 +1513,7 @@ impl<B: ChatBackend> ChatEngine<B> {
                         from_sequence: batch.from_sequence,
                         through_sequence: batch.through_sequence,
                         trigger: trigger.as_str().into(),
-                        model: self.config.memory.consolidation_model.clone(),
+                        model: CONSOLIDATION_MODEL.into(),
                         request_json: initial_request_json.clone(),
                         request_sha256: content_sha256(&initial_request_json),
                         input_event_ids: batch.events.iter().map(|event| event.event_id.clone()).collect(),
@@ -1646,7 +1668,7 @@ impl<B: ChatBackend> ChatEngine<B> {
                         from_sequence: batch.from_sequence,
                         through_sequence: batch.through_sequence,
                         trigger: trigger.as_str().into(),
-                        model: self.config.memory.consolidation_model.clone(),
+                        model: CONSOLIDATION_MODEL.into(),
                         request_json: request_json.clone(),
                         request_sha256: content_sha256(&request_json),
                         input_event_ids: batch
@@ -1887,6 +1909,11 @@ impl<B: ChatBackend> ChatEngine<B> {
                                 &response_json,
                                 &validation_json,
                             );
+                            progress(ConsolidationProgress::ValidationRetry {
+                                session_id: persisted.id.clone(),
+                                next_attempt: validation_attempt + 1,
+                                max_attempts: CONSOLIDATION_VALIDATION_ATTEMPTS,
+                            });
                             report.warnings.push(
                                 "fact v2 语义校验失败，正在执行唯一一次带错误路径的 repair".into(),
                             );
@@ -2194,7 +2221,7 @@ impl<B: ChatBackend> ChatEngine<B> {
                         match self
                             .client
                             .check_model(
-                                &self.config.memory.consolidation_model,
+                                CONSOLIDATION_MODEL,
                                 self.config.memory.consolidation_context_window,
                             )
                             .await
@@ -2203,7 +2230,7 @@ impl<B: ChatBackend> ChatEngine<B> {
                             Ok(_) => {
                                 report.warnings.push(format!(
                                     "专用巩固模型 {} 未声明 thinking 能力",
-                                    self.config.memory.consolidation_model
+                                    CONSOLIDATION_MODEL
                                 ));
                                 report.status = if report.batches_applied == 0 {
                                     ConsolidationRunStatus::Failed
@@ -2226,7 +2253,7 @@ impl<B: ChatBackend> ChatEngine<B> {
                         }
                     }
                     let initial = prepare_boundary_request(
-                        self.config.memory.consolidation_model.clone(),
+                        CONSOLIDATION_MODEL.into(),
                         &input,
                         self.config.memory.consolidation_context_window,
                         self.config.memory.consolidation_max_output_tokens,
@@ -4895,6 +4922,7 @@ mod tests {
         count: u64,
         history_cost: Option<(u64, u64)>,
         render_supported: bool,
+        checked_models: Arc<Mutex<Vec<String>>>,
         probes: Arc<Mutex<usize>>,
         events: Vec<ChatEvent>,
         stream_error: Option<OllamaError>,
@@ -4919,6 +4947,7 @@ mod tests {
                 count,
                 history_cost: None,
                 render_supported: true,
+                checked_models: Arc::new(Mutex::new(Vec::new())),
                 probes: Arc::new(Mutex::new(0)),
                 events: vec![
                     ChatEvent::text(ChatEventKind::Thinking, "reason".into(), 1),
@@ -4963,6 +4992,7 @@ mod tests {
     #[async_trait]
     impl ChatBackend for FakeClient {
         async fn check_model(&self, model: &str, _: u64) -> Result<ModelInfo, OllamaError> {
+            self.checked_models.lock().unwrap().push(model.into());
             Ok(ModelInfo {
                 version: "test".into(),
                 name: model.into(),
@@ -5170,6 +5200,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deterministic_empty_facts_skip_every_model_operation() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let mut session = store
+            .create("chat-model", "http://localhost", None, budget(), true)
+            .unwrap();
+        let mut turn = Turn::pending("你好".into());
+        turn.status = TurnStatus::Complete;
+        session.turns.push(turn);
+        store.save(&mut session).unwrap();
+        let client = FakeClient::new(100);
+        let mut config = AppConfig::default();
+        config.memory.enabled = true;
+        let engine = ChatEngine::with_config(store, client.clone(), config);
+
+        let report = engine
+            .consolidate_session_stage(
+                &session,
+                ConsolidationTrigger::Manual,
+                CancellationToken::new(),
+                ConsolidationStageSelection::Facts,
+            )
+            .await;
+
+        assert_eq!(
+            report.status,
+            ConsolidationRunStatus::Completed,
+            "{:?}",
+            report.warnings
+        );
+        assert!(client.checked_models.lock().unwrap().is_empty());
+        assert_eq!(*client.probes.lock().unwrap(), 0);
+        assert!(client.structured_requests.lock().unwrap().is_empty());
+    }
+
+    /// Opt-in local canary: requires Ollama on `OLLAMA_HOST` (default localhost:11434)
+    /// with `qwen3.5:9b` installed. The tiny output cap deliberately exercises the real
+    /// length/split path; persisted audit output must contain final content only.
+    #[tokio::test]
+    #[ignore = "requires a local Ollama qwen3.5:9b model"]
+    async fn local_qwen_canary_separates_thinking_and_audits_length_split() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let host = std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://127.0.0.1:11434".into());
+        let mut session = store
+            .create("unrelated-chat-model", &host, None, budget(), true)
+            .unwrap();
+        let mut turn = Turn::pending(
+            "Alice moved from Paris to Berlin in 2024 and now works for Example Labs.".into(),
+        );
+        turn.status = TurnStatus::Complete;
+        session.turns.push(turn);
+        store.save(&mut session).unwrap();
+        let client = crate::ollama::OllamaClient::new(&host).unwrap();
+        let mut config = AppConfig::default();
+        config.memory.enabled = true;
+        config.memory.consolidation_max_output_tokens = 1;
+        let engine = ChatEngine::with_config(store.clone(), client, config);
+
+        let report = engine
+            .consolidate_session_stage(
+                &session,
+                ConsolidationTrigger::Manual,
+                CancellationToken::new(),
+                ConsolidationStageSelection::Facts,
+            )
+            .await;
+        assert_eq!(report.model, CONSOLIDATION_MODEL);
+        let attempts = store
+            .retrieval()
+            .consolidation_attempts(&session.id)
+            .unwrap();
+        assert!(attempts.iter().any(|attempt| {
+            attempt.status == ConsolidationAttemptStatus::Split
+                && attempt.done_reason.as_deref() == Some("length")
+        }));
+        assert!(attempts.iter().all(|attempt| {
+            attempt.model == CONSOLIDATION_MODEL
+                && !attempt
+                    .response_json
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("<think>")
+        }));
+    }
+
+    #[tokio::test]
     async fn consolidation_uses_persisted_session_contract_and_applies_batches() {
         let root = tempfile::tempdir().unwrap();
         let store = SessionStore::new(root.path()).unwrap();
@@ -5207,26 +5324,44 @@ mod tests {
         config.memory.enabled = true;
         let engine = ChatEngine::with_config(store.clone(), client.clone(), config);
         let report = engine
-            .consolidate_session(
+            .consolidate_session_stage(
                 &stale,
                 ConsolidationTrigger::Manual,
                 CancellationToken::new(),
+                ConsolidationStageSelection::Facts,
             )
             .await;
-        assert_eq!(report.status, ConsolidationRunStatus::Completed);
+        assert_eq!(
+            report.status,
+            ConsolidationRunStatus::Completed,
+            "{:?}",
+            report.warnings
+        );
         assert_eq!(report.batches_applied, 2);
         assert_eq!(report.watermark_after, 33);
         assert_eq!(serde_json::to_vec(&session).unwrap(), before);
         let requests = client.structured_requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
+        assert_eq!(
+            client.checked_models.lock().unwrap().as_slice(),
+            [CONSOLIDATION_MODEL]
+        );
         for request in requests.iter() {
-            assert_eq!(request.model, "persisted-model");
-            assert_eq!(request.num_ctx, budget().context_window);
-            assert_eq!(request.num_predict, budget().max_output_tokens);
+            assert_eq!(request.model, CONSOLIDATION_MODEL);
+            assert!(request.think);
+            assert_eq!(
+                request.num_ctx,
+                engine.config.memory.consolidation_context_window
+            );
+            assert_eq!(
+                request.num_predict,
+                engine.config.memory.consolidation_max_output_tokens
+            );
             assert_eq!(request.messages.len(), 2);
             let payload: Value = serde_json::from_str(&request.messages[1].content).unwrap();
-            assert!(payload.get("batch").is_some());
-            assert!(payload.get("candidate_snapshot").is_some());
+            assert!(payload.get("source_clauses").is_some());
+            assert!(payload.get("candidate_snapshot_sha256").is_some());
+            assert!(payload.get("candidates").is_some());
         }
         let attempts = store
             .retrieval()
@@ -5276,11 +5411,11 @@ mod tests {
         let progress = Arc::new(Mutex::new(Vec::new()));
         let observed_progress = progress.clone();
         let report = engine
-            .consolidate_session_with_progress(
+            .consolidate_facts_with_progress(
                 &session,
                 ConsolidationTrigger::Manual,
                 CancellationToken::new(),
-                move |event| observed_progress.lock().unwrap().push(event),
+                &mut move |event| observed_progress.lock().unwrap().push(event),
             )
             .await;
         assert_eq!(report.status, ConsolidationRunStatus::Completed);
@@ -5292,15 +5427,9 @@ mod tests {
         assert_eq!(attempts.len(), 2);
         assert_eq!(attempts[0].status, ConsolidationAttemptStatus::Rejected);
         assert_eq!(attempts[1].status, ConsolidationAttemptStatus::Applied);
-        let wrapped: Value =
-            serde_json::from_str(attempts[0].response_json.as_deref().unwrap()).unwrap();
         assert_eq!(
-            wrapped["raw_output"],
-            Value::String("malformed raw output".into())
-        );
-        assert_eq!(
-            wrapped["raw_sha256"],
-            Value::String(content_sha256("malformed raw output"))
+            attempts[0].response_json.as_deref(),
+            Some("malformed raw output")
         );
         assert_eq!(
             attempts[0].response_sha256.as_deref(),
@@ -5309,19 +5438,23 @@ mod tests {
         assert!(
             serde_json::from_str::<Value>(attempts[0].validation_json.as_deref().unwrap()).is_ok()
         );
-        assert!(matches!(
-            progress.lock().unwrap().as_slice(),
-            [
-                ConsolidationProgress::AttemptStarted { attempt: 1, .. },
-                ConsolidationProgress::ValidationRetry {
-                    next_attempt: 2,
-                    max_attempts: CONSOLIDATION_VALIDATION_ATTEMPTS,
-                    ..
-                },
-                ConsolidationProgress::AttemptStarted { attempt: 2, .. },
-                ConsolidationProgress::BatchApplied { .. },
-            ]
-        ));
+        let progress = progress.lock().unwrap();
+        assert!(
+            matches!(
+                progress.as_slice(),
+                [
+                    ConsolidationProgress::AttemptStarted { attempt: 1, .. },
+                    ConsolidationProgress::ValidationRetry {
+                        next_attempt: 2,
+                        max_attempts: CONSOLIDATION_VALIDATION_ATTEMPTS,
+                        ..
+                    },
+                    ConsolidationProgress::AttemptStarted { attempt: 2, .. },
+                    ConsolidationProgress::BatchApplied { .. },
+                ]
+            ),
+            "{progress:?}"
+        );
 
         let mut second = store
             .create("model", "http://localhost", None, budget(), true)
@@ -5343,7 +5476,7 @@ mod tests {
                 CancellationToken::new(),
             )
             .await;
-        assert_eq!(report.status, ConsolidationRunStatus::Failed);
+        assert_eq!(report.status, ConsolidationRunStatus::Partial);
         let failure = store
             .retrieval()
             .consolidation_attempts(&second.id)
@@ -5376,7 +5509,7 @@ mod tests {
                 CancellationToken::new(),
             )
             .await;
-        assert_eq!(report.status, ConsolidationRunStatus::Failed);
+        assert_eq!(report.status, ConsolidationRunStatus::Partial);
         assert_eq!(report.batches_attempted, 1);
         assert_eq!(report.watermark_after, 0);
         let failures = store
@@ -5482,7 +5615,8 @@ mod tests {
         assert!(attempts[0].response_json.is_none());
         assert!(attempts[0].input_tokens.is_none() && attempts[0].output_tokens.is_none());
 
-        // C: timeout is a model error with no response and leaves the batch retryable.
+        // C: timeout is a model error with no response and leaves the batch retryable;
+        // the independently successful raw-vector stage makes the all-stage report partial.
         let root = tempfile::tempdir().unwrap();
         let store = SessionStore::new(root.path()).unwrap();
         let session = seeded(&store, 1);
@@ -5495,7 +5629,7 @@ mod tests {
                 CancellationToken::new(),
             )
             .await;
-        assert_eq!(report.status, ConsolidationRunStatus::Failed);
+        assert_eq!(report.status, ConsolidationRunStatus::Partial);
         let timeout = store
             .retrieval()
             .consolidation_attempts(&session.id)
@@ -5548,7 +5682,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 ConsolidationAttemptStatus::Applied,
-                ConsolidationAttemptStatus::Rejected,
                 ConsolidationAttemptStatus::Rejected,
                 ConsolidationAttemptStatus::Rejected
             ]
@@ -6136,6 +6269,18 @@ mod tests {
             .await
             .unwrap();
         engine.wait_for_background_embeddings().await;
+        let boundary_report = engine
+            .consolidate_session_stage(
+                &session,
+                ConsolidationTrigger::Manual,
+                CancellationToken::new(),
+                ConsolidationStageSelection::Boundaries,
+            )
+            .await;
+        assert!(matches!(
+            boundary_report.status,
+            ConsolidationRunStatus::Completed | ConsolidationRunStatus::UpToDate
+        ));
         engine
             .refresh_embeddings(CancellationToken::new())
             .await
