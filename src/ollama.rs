@@ -1123,6 +1123,30 @@ mod tests {
     }
 
     #[test]
+    fn transient_error_classification_is_allowlisted() {
+        for status in [408, 429, 500, 502, 503, 504] {
+            assert!(OllamaError::Other(format!("Ollama HTTP {status}: retry")).is_transient());
+        }
+        assert!(
+            OllamaError::Connection {
+                host: "http://localhost".into(),
+                message: "connection reset".into(),
+            }
+            .is_transient()
+        );
+        assert!(!OllamaError::Other("Ollama HTTP 400: invalid".into()).is_transient());
+        assert!(!OllamaError::ModelNotFound("missing".into()).is_transient());
+        assert!(
+            !OllamaError::ContextLength {
+                message: "too long".into(),
+                prompt_tokens: Some(9),
+                context_tokens: Some(8),
+            }
+            .is_transient()
+        );
+    }
+
+    #[test]
     fn embedding_payload_and_parser_follow_the_batch_contract() {
         let request = embedding_request();
         let payload = embedding_payload(&request);
@@ -1392,13 +1416,24 @@ mod tests {
 
     #[test]
     fn streamed_structured_chat_concatenates_chunks_and_accepts_final_without_newline() {
-        let bytes = br#"{"message":{"content":"{\"name\":"},"done":false}
+        let bytes = br#"{"message":{"thinking":"SECRET_THINKING_ONE"},"done":false}
+{"message":{"thinking":"SECRET_THINKING_TWO","content":""},"done":false}
+{"message":{"content":"{\"name\":"},"done":false}
 {"message":{"content":"\"Ada\"}"},"done":true,"prompt_eval_count":12,"eval_count":5,"done_reason":"stop"}"#;
         let events = parse_chat_event_bytes(bytes).unwrap();
         let response = parse_structured_chat_events(&events).unwrap();
         assert_eq!(response.content, "{\"name\":\"Ada\"}");
         assert_eq!(response.usage, TokenUsage::new(Some(12), Some(5)));
         assert_eq!(response.done_reason.as_deref(), Some("stop"));
+        let audited = serde_json::to_string(&response).unwrap();
+        assert!(!audited.contains("SECRET_THINKING_ONE"));
+        assert!(!audited.contains("SECRET_THINKING_TWO"));
+
+        let mut streamed = StructuredResponseAccumulator::default();
+        for line in bytes.split(|byte| *byte == b'\n') {
+            streamed.push_line(line).unwrap();
+        }
+        assert_eq!(streamed.finish().unwrap(), response);
     }
 
     #[test]

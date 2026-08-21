@@ -655,8 +655,9 @@ fn split_single_clause(clause: &SourceClause) -> Option<(Vec<SourceClause>, Vec<
             if chars.len() <= 64 {
                 return None;
             }
-            let overlap = 32.min(midpoint).min(chars.len().saturating_sub(midpoint));
-            (midpoint + overlap, midpoint.saturating_sub(overlap))
+            let overlap = 32.min(chars.len().saturating_sub(2));
+            let left_end = (midpoint + overlap / 2).min(chars.len() - 1);
+            (left_end, left_end.saturating_sub(overlap).max(1))
         };
     let left_text = chars[..left_end].iter().collect::<String>();
     let right_text = chars[right_start..].iter().collect::<String>();
@@ -1173,5 +1174,115 @@ mod tests {
         });
         let map = HashMap::from([(clause.clause_id.as_str(), clause)]);
         assert!(resolve_source_refs(&mut value, &map, "$.quote").is_err());
+    }
+
+    #[test]
+    fn provenance_rejects_wrong_offsets_event_and_exact_text_for_unicode() {
+        let clauses = source_clauses(&batch("我爱🙂Cafe\u{301}。"));
+        let clause = &clauses[0];
+        let map = HashMap::from([(clause.clause_id.as_str(), clause)]);
+        let valid = || {
+            json!({
+                "clause_id":clause.clause_id,
+                "event_id":clause.event_id,
+                "start_char":3,
+                "end_char":8,
+                "text":"Cafe\u{301}"
+            })
+        };
+        let mut exact = valid();
+        resolve_source_refs(&mut exact, &map, "$.quote").unwrap();
+        assert_eq!(exact["content_sha256"], content_sha256("Cafe\u{301}"));
+
+        let mut wrong_event = valid();
+        wrong_event["event_id"] = json!("other");
+        assert!(resolve_source_refs(&mut wrong_event, &map, "$.quote").is_err());
+        let mut out_of_bounds = valid();
+        out_of_bounds["end_char"] = json!(99);
+        assert!(resolve_source_refs(&mut out_of_bounds, &map, "$.quote").is_err());
+        let mut rewritten = valid();
+        rewritten["text"] = json!("Café");
+        assert!(resolve_source_refs(&mut rewritten, &map, "$.quote").is_err());
+    }
+
+    #[test]
+    fn confirmation_keeps_only_user_speech_act_and_context_id() {
+        let source = batch("对。");
+        let clauses = source_clauses(&source);
+        let clause = &clauses[0];
+        let context = AssistantContext {
+            context_id: assistant_context_id("assistant-event", "你住在北京。"),
+            text: "你住在北京。".into(),
+            extractable: false,
+            assistant_event_id: "assistant-event".into(),
+        };
+        let source_ref = json!({
+            "clause_id":clause.clause_id,
+            "event_id":clause.event_id,
+            "start_char":0,
+            "end_char":1,
+            "text":"对"
+        });
+        let response = json!({
+            "entities":[],
+            "claims":[{
+                "local_id":"local_confirm",
+                "subject_ref":"ent_self",
+                "predicate_key":"residence.city",
+                "object":{"kind":"text","text":"北京","entity_ref":null,"span":null},
+                "polarity":"assert",
+                "cardinality":"single",
+                "certainty":"certain",
+                "disposition":"confirm",
+                "replaces_claim_ids":[],
+                "conflicts_with_claim_ids":[],
+                "event_time":null,
+                "valid_from":null,
+                "valid_to":null,
+                "evidence":[{
+                    "kind":"user_confirmation",
+                    "quote":source_ref,
+                    "subject_span":null,
+                    "relation_span":null,
+                    "object_span":null,
+                    "speech_act_span":source_ref,
+                    "context_id":context.context_id
+                }]
+            }]
+        })
+        .to_string();
+        let output =
+            parse_and_resolve_fact_output(&response, &clauses, &[context.clone()]).unwrap();
+        let evidence = &output.claims[0].evidence[0];
+        assert!(evidence.subject_span.is_none());
+        assert!(evidence.relation_span.is_none());
+        assert!(evidence.object_span.is_none());
+        assert_eq!(
+            evidence.context_id.as_deref(),
+            Some(context.context_id.as_str())
+        );
+        assert_eq!(
+            evidence.speech_act_span.as_ref().unwrap().content_sha256,
+            content_sha256("对")
+        );
+    }
+
+    #[test]
+    fn clause_work_splits_by_weight_then_weak_punctuation_and_hard_overlap() {
+        let strong = source_clauses(&batch("甲。乙很长。丙。"));
+        let (left, right) = split_clause_work(&strong).unwrap();
+        assert!(!left.is_empty() && !right.is_empty());
+        assert_eq!(left.len() + right.len(), strong.len());
+
+        let weak = source_clauses(&batch("甲，乙"));
+        let (left, right) = split_clause_work(&weak).unwrap();
+        assert_eq!(left[0].text, "甲，");
+        assert_eq!(right[0].text, "乙");
+
+        let hard = source_clauses(&batch(&"字".repeat(100)));
+        let (left, right) = split_clause_work(&hard).unwrap();
+        assert_eq!(left[0].end_char - right[0].start_char, 32);
+        assert!(left[0].text.chars().count() < 100);
+        assert!(right[0].text.chars().count() < 100);
     }
 }
