@@ -1,3 +1,5 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -13,6 +15,15 @@ use crate::model::{
 };
 
 const MAX_WEB_RESPONSE_BYTES: usize = 1024 * 1024;
+const MODEL_UNLOAD_TIMEOUT: Duration = Duration::from_secs(10);
+
+type LoadedModels = BTreeMap<String, BTreeSet<String>>;
+
+static LOADED_MODELS: OnceLock<Mutex<LoadedModels>> = OnceLock::new();
+
+fn loaded_models() -> &'static Mutex<LoadedModels> {
+    LOADED_MODELS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WebSearchResult {
@@ -235,6 +246,7 @@ impl OllamaClient {
         let response = self
             .request_json(reqwest::Method::POST, "/api/embed", Some(payload))
             .await?;
+        self.record_model_use(&request.model);
         parse_embedding_response(response, &request)
     }
 
@@ -244,8 +256,41 @@ impl OllamaClient {
     ) -> Result<StructuredChatResponse, OllamaError> {
         validate_structured_chat_request(&request)?;
         let payload = structured_chat_payload(&request);
-        let events = self.request_chat_events(payload).await?;
+        let events = self.request_chat_events(&request.model, payload).await?;
         parse_structured_chat_events(&events)
+    }
+
+    /// Unloads every model successfully used by this process from its Ollama host.
+    pub async fn unload_tracked_models() -> Result<(), OllamaError> {
+        let tracked = {
+            let mut guard = loaded_models()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::take(&mut *guard)
+        };
+        let mut failures = Vec::new();
+        for (host, models) in tracked {
+            let client = match Self::with_timeout(&host, MODEL_UNLOAD_TIMEOUT) {
+                Ok(client) => client,
+                Err(error) => {
+                    failures.push(format!("{host}: {error}"));
+                    continue;
+                }
+            };
+            for model in models {
+                if let Err(error) = client.unload_model(&model).await {
+                    failures.push(format!("{host} / {model}: {error}"));
+                }
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(OllamaError::Other(format!(
+                "退出时未能卸载部分 Ollama 模型：{}",
+                failures.join("；")
+            )))
+        }
     }
 
     pub async fn web_search(
@@ -360,7 +405,11 @@ impl OllamaClient {
         Ok(payload)
     }
 
-    async fn request_chat_events(&self, payload: Value) -> Result<Vec<Value>, OllamaError> {
+    async fn request_chat_events(
+        &self,
+        model: &str,
+        payload: Value,
+    ) -> Result<Vec<Value>, OllamaError> {
         let response = self
             .client
             .post(format!("{}/api/chat", self.host))
@@ -379,6 +428,7 @@ impl OllamaClient {
                 .unwrap_or_else(|_| json!({"error": String::from_utf8_lossy(&bytes)}));
             return Err(api_error(&payload, Some(status)));
         }
+        self.record_model_use(model);
         let mut stream = response.bytes_stream();
         let mut buffer = Vec::new();
         let mut events = Vec::new();
@@ -395,6 +445,26 @@ impl OllamaClient {
             events.push(event);
         }
         Ok(events)
+    }
+
+    async fn unload_model(&self, model: &str) -> Result<(), OllamaError> {
+        self.request_json(
+            reqwest::Method::POST,
+            "/api/generate",
+            Some(model_unload_payload(model)),
+        )
+        .await?;
+        Ok(())
+    }
+
+    fn record_model_use(&self, model: &str) {
+        let mut guard = loaded_models()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard
+            .entry(self.host.clone())
+            .or_default()
+            .insert(model.to_owned());
     }
 
     fn connection(&self, error: reqwest::Error) -> OllamaError {
@@ -474,6 +544,10 @@ fn embedding_payload(request: &EmbeddingRequest) -> Value {
             .insert("dimensions".into(), Value::from(dimensions));
     }
     payload
+}
+
+fn model_unload_payload(model: &str) -> Value {
+    json!({"model": model, "keep_alive": 0})
 }
 
 fn parse_embedding_response(
@@ -836,7 +910,7 @@ impl ChatBackend for OllamaClient {
             .as_object_mut()
             .expect("chat payload is an object")
             .insert("_debug_render_only".into(), Value::Bool(true));
-        let events = self.request_chat_events(payload).await?;
+        let events = self.request_chat_events(model, payload).await?;
         Ok(events.iter().rev().find_map(|response| {
             response
                 .get("_debug_info")
@@ -860,7 +934,7 @@ impl ChatBackend for OllamaClient {
             .expect("chat options are an object");
         options.insert("temperature".into(), Value::from(0));
         options.insert("seed".into(), Value::from(0));
-        let events = self.request_chat_events(payload).await?;
+        let events = self.request_chat_events(model, payload).await?;
         let response = events
             .last()
             .ok_or_else(|| OllamaError::Protocol("精确探测响应为空".into()))?;
@@ -909,6 +983,7 @@ impl ChatBackend for OllamaClient {
                 .unwrap_or_else(|_| json!({"error": String::from_utf8_lossy(&bytes)}));
             return Err(api_error(&payload, Some(status)));
         }
+        self.record_model_use(&request.model);
 
         let mut stream = response.bytes_stream();
         let mut buffer = Vec::<u8>::new();
@@ -976,7 +1051,7 @@ impl ChatBackend for OllamaClient {
         options.insert("num_predict".into(), Value::from(1));
         options.insert("temperature".into(), Value::from(0));
         options.insert("seed".into(), Value::from(0));
-        let events = self.request_chat_events(payload).await?;
+        let events = self.request_chat_events(&request.model, payload).await?;
         let response = events
             .last()
             .ok_or_else(|| OllamaError::Protocol("工具请求精确探测响应为空".into()))?;
@@ -1018,6 +1093,7 @@ impl ChatBackend for OllamaClient {
                 .unwrap_or_else(|_| json!({"error": String::from_utf8_lossy(&bytes)}));
             return Err(api_error(&payload, Some(status)));
         }
+        self.record_model_use(&request.model);
         let mut stream = response.bytes_stream();
         let mut buffer = Vec::<u8>::new();
         let mut accumulator = AgentAccumulator::default();
@@ -1547,6 +1623,42 @@ mod tests {
             structured_chat_payload(&structured_request())["stream"],
             true
         );
+    }
+
+    #[tokio::test]
+    async fn unload_tracked_models_posts_zero_keep_alive_once_per_model() {
+        use axum::extract::State;
+        use axum::routing::post;
+        use axum::{Json, Router};
+        use tokio::sync::mpsc;
+
+        async fn capture(
+            State(sender): State<mpsc::UnboundedSender<Value>>,
+            Json(payload): Json<Value>,
+        ) -> Json<Value> {
+            sender.send(payload).unwrap();
+            Json(json!({"done": true, "done_reason": "unload"}))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let host = format!("http://{}", listener.local_addr().unwrap());
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let app = Router::new()
+            .route("/api/generate", post(capture))
+            .with_state(sender);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let client = OllamaClient::new(&host).unwrap();
+        client.record_model_use("chat-model");
+        client.record_model_use("chat-model");
+        OllamaClient::unload_tracked_models().await.unwrap();
+
+        assert_eq!(
+            receiver.recv().await.unwrap(),
+            json!({"model": "chat-model", "keep_alive": 0})
+        );
+        assert!(receiver.try_recv().is_err());
+        server.abort();
     }
 
     #[test]

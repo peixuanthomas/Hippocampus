@@ -307,11 +307,23 @@ impl AskArgs {
 
 #[tokio::main]
 async fn main() {
-    if let Err(error) = run().await {
+    let run_result = run().await;
+    let unload_result = OllamaClient::unload_tracked_models().await;
+    if let Err(error) = run_result {
         if error.is::<SilentCliExit>() {
+            if let Err(unload_error) = unload_result {
+                eprintln!("警告：{unload_error}");
+            }
             std::process::exit(1);
         }
         eprintln!("错误：{error:#}");
+        if let Err(unload_error) = unload_result {
+            eprintln!("警告：{unload_error}");
+        }
+        std::process::exit(1);
+    }
+    if let Err(error) = unload_result {
+        eprintln!("错误：{error}");
         std::process::exit(1);
     }
 }
