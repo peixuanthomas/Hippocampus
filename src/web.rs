@@ -19,7 +19,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{Mutex, Notify, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use crate::engine::{ChatEngine, LimitAction, PreparationStatus};
+use crate::engine::{ChatEngine, LimitAction, PreparationProgress, PreparationStatus};
 use crate::knowledge::KnowledgeEvidence;
 use crate::model::{ChatEvent, ChatEventKind, Session, TokenUsage, Turn, WebSourceTrace};
 use crate::ollama::{ChatBackend, ModelInfo, OllamaClient};
@@ -353,7 +353,17 @@ async fn generate<B: ChatBackend>(
 ) -> Result<()> {
     let mut session = state.session.lock().await;
     send_event(event_tx, "status", json!({ "message": "正在组装上下文…" }));
-    let mut prepared = state.engine.prepare_turn(&mut session, message).await?;
+    let progress_tx = event_tx.clone();
+    let mut prepared = state
+        .engine
+        .prepare_turn_with_progress(&mut session, message, move |progress| match progress {
+            PreparationProgress::ExactContextCheckStarted { .. } => send_event(
+                &progress_tx,
+                "status",
+                json!({ "message": "上下文接近上限，正在进行一次精确检查…" }),
+            ),
+        })
+        .await?;
     if prepared.needs_limit_decision() {
         send_event(event_tx, "limit", json!({ "message": prepared.message }));
         let action = tokio::select! {
@@ -387,6 +397,11 @@ async fn generate<B: ChatBackend>(
             "exact": prepared.plan.exact_input_tokens.is_some(),
             "included": prepared.plan.included_turn_ids.len(),
             "omitted": prepared.plan.omitted_turn_ids.len(),
+            "search_elapsed_ms": prepared.plan.retrieval_trace.elapsed_ms,
+            "search_deadline_ms": prepared.plan.retrieval_trace.deadline_ms,
+            "search_timed_out": prepared.plan.retrieval_trace.deadline_exceeded,
+            "fast_fallback_used": prepared.plan.retrieval_trace.fast_fallback_used,
+            "search_debug": prepared.plan.retrieval_trace.warnings,
         }),
     );
     let stream_tx = event_tx.clone();
@@ -864,6 +879,9 @@ mod tests {
             let body = response.into_body().collect().await.unwrap().to_bytes();
             let stream = String::from_utf8(body.to_vec()).unwrap();
             assert!(!stream.contains("event: error\n"), "{stream}");
+            assert!(stream.contains("event: prepared\n"), "{stream}");
+            assert!(stream.contains("\"search_deadline_ms\":1000"), "{stream}");
+            assert!(stream.contains("\"search_timed_out\":false"), "{stream}");
             assert!(stream.contains("event: done\n"), "{stream}");
         }
 

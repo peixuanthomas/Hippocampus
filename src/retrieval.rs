@@ -46,7 +46,7 @@ use crate::vector::{
 pub const INDEX_FILENAME: &str = ".hippocampus-index.sqlite3";
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 const SQLITE_BUSY_RETRY_ATTEMPTS: usize = 8;
-const INDEX_SCHEMA_VERSION: i64 = 7;
+const INDEX_SCHEMA_VERSION: i64 = 8;
 const MEMORY_STATE_SCHEMA_VERSION: i64 = 4;
 const DEFERRED_HARD_LIMIT: usize = usize::MAX;
 
@@ -909,6 +909,7 @@ struct GraphSidecar {
     aggregate_source_count: usize,
     elapsed_ms: u64,
     warning: Option<String>,
+    status: String,
 }
 
 struct ClaimEvidenceSelection {
@@ -2341,6 +2342,62 @@ impl RetrievalStore {
         crate::graph::refresh_graph(self, config)
     }
 
+    pub fn mark_graph_organized(&self) -> RetrievalResult<()> {
+        let _guard = self.acquire_root_write()?;
+        let control = self.replay_control_state_under_guard()?;
+        let mut connection = self.open_connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| self.database_error(error))?;
+        let materialization_count: i64 = transaction
+            .query_row(
+                "SELECT count(*) FROM memory_graph_materializations WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| self.database_error(error))?;
+        if materialization_count != 1 {
+            return Err(RetrievalError::CorruptIndex(
+                "关系图整理水位缺少完整 materialization".into(),
+            ));
+        }
+        transaction
+            .execute("DELETE FROM memory_graph_watermarks", [])
+            .map_err(|error| self.database_error(error))?;
+        let generation = control.generation_sha256();
+        let updated_at = Utc::now().to_rfc3339();
+        let mut statement = transaction
+            .prepare(
+                "SELECT s.session_id,COALESCE(MAX(e.sequence),0)
+                 FROM indexed_sessions s LEFT JOIN events e ON e.session_id=s.session_id
+                 GROUP BY s.session_id ORDER BY s.session_id",
+            )
+            .map_err(|error| self.database_error(error))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(|error| self.database_error(error))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| self.database_error(error))?;
+        drop(statement);
+        for (session_id, through_sequence) in rows {
+            transaction
+                .execute(
+                    "INSERT INTO memory_graph_watermarks
+                     (session_id,through_sequence,control_generation_sha256,updated_at)
+                     VALUES(?1,?2,?3,?4)",
+                    params![session_id, through_sequence, generation, updated_at],
+                )
+                .map_err(|error| self.database_error(error))?;
+        }
+        self.require_unchanged_control_state(&control)?;
+        transaction
+            .commit()
+            .map_err(|error| self.database_error(error))?;
+        Ok(())
+    }
+
     fn rebuild_under_root_write(&self, options: RebuildOptions) -> RetrievalResult<RebuildReport> {
         let state = self.replay_control_state_under_guard()?;
         let all_sources = self.load_all_sources()?;
@@ -3087,6 +3144,151 @@ impl RetrievalStore {
             compatible,
             stale: total.saturating_sub(compatible),
         })
+    }
+
+    pub(crate) fn cache_content_embedding(
+        &self,
+        spec: &VectorIndexSpec,
+        content_sha256_value: &str,
+        vector: &[f32],
+    ) -> RetrievalResult<()> {
+        spec.validate()
+            .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+        if content_sha256_value.len() != 64
+            || vector.len() != spec.dimensions
+            || !is_unit_vector(vector)
+        {
+            return Err(RetrievalError::CorruptIndex(
+                "待缓存向量的哈希、维度或归一化状态无效".into(),
+            ));
+        }
+        let fingerprint = spec
+            .fingerprint()
+            .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+        let blob = encode_f32_le(vector)
+            .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+        let _guard = self.acquire_root_write()?;
+        let connection = self.open_connection()?;
+        connection
+            .execute(
+                "INSERT INTO memory_embedding_cache
+                 (index_fingerprint,content_sha256,dimensions,vector_blob,cached_at)
+                 VALUES(?1,?2,?3,?4,?5)
+                 ON CONFLICT(index_fingerprint,content_sha256) DO UPDATE SET
+                   dimensions=excluded.dimensions,vector_blob=excluded.vector_blob,
+                   cached_at=excluded.cached_at",
+                params![
+                    fingerprint,
+                    content_sha256_value,
+                    usize_to_i64(spec.dimensions).map_err(|error| self.database_error(error))?,
+                    blob,
+                    Utc::now().to_rfc3339(),
+                ],
+            )
+            .map_err(|error| self.database_error(error))?;
+        Ok(())
+    }
+
+    pub(crate) fn cached_content_embeddings(
+        &self,
+        spec: &VectorIndexSpec,
+    ) -> RetrievalResult<HashMap<String, Vec<f32>>> {
+        spec.validate()
+            .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+        let fingerprint = spec
+            .fingerprint()
+            .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+        let _guard = self.acquire_root_read()?;
+        let connection = Connection::open_with_flags(
+            &self.index_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|error| self.database_error(error))?;
+        connection
+            .busy_timeout(SQLITE_BUSY_TIMEOUT)
+            .map_err(|error| self.database_error(error))?;
+        let mut statement = connection
+            .prepare(
+                "SELECT content_sha256,dimensions,vector_blob
+                 FROM memory_embedding_cache WHERE index_fingerprint=?1
+                 ORDER BY content_sha256",
+            )
+            .map_err(|error| self.database_error(error))?;
+        let rows = statement
+            .query_map([fingerprint], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            })
+            .map_err(|error| self.database_error(error))?;
+        let mut cached = HashMap::new();
+        for row in rows {
+            let (hash, dimensions, blob) = row.map_err(|error| self.database_error(error))?;
+            if dimensions != i64::try_from(spec.dimensions).unwrap_or(-1) {
+                return Err(RetrievalError::CorruptIndex(format!(
+                    "缓存向量 {hash} 的维度不匹配"
+                )));
+            }
+            let vector = decode_f32_le(&blob, spec.dimensions)
+                .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+            if !is_unit_vector(&vector) || cached.insert(hash.clone(), vector).is_some() {
+                return Err(RetrievalError::CorruptIndex(format!(
+                    "缓存向量 {hash} 无效或重复"
+                )));
+            }
+        }
+        Ok(cached)
+    }
+
+    pub(crate) fn cached_content_embedding(
+        &self,
+        spec: &VectorIndexSpec,
+        content_sha256_value: &str,
+    ) -> RetrievalResult<Option<Vec<f32>>> {
+        spec.validate()
+            .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+        if content_sha256_value.len() != 64 {
+            return Err(RetrievalError::CorruptIndex(
+                "查询缓存使用了无效内容哈希".into(),
+            ));
+        }
+        let fingerprint = spec
+            .fingerprint()
+            .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+        let _guard = self.acquire_root_read()?;
+        let connection = Connection::open_with_flags(
+            &self.index_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|error| self.database_error(error))?;
+        connection
+            .busy_timeout(SQLITE_BUSY_TIMEOUT)
+            .map_err(|error| self.database_error(error))?;
+        let row = connection
+            .query_row(
+                "SELECT dimensions,vector_blob FROM memory_embedding_cache
+                 WHERE index_fingerprint=?1 AND content_sha256=?2",
+                params![fingerprint, content_sha256_value],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()
+            .map_err(|error| self.database_error(error))?;
+        let Some((dimensions, blob)) = row else {
+            return Ok(None);
+        };
+        if dimensions != i64::try_from(spec.dimensions).unwrap_or(-1) {
+            return Err(RetrievalError::CorruptIndex(
+                "查询缓存向量维度不匹配".into(),
+            ));
+        }
+        let vector = decode_f32_le(&blob, spec.dimensions)
+            .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+        if !is_unit_vector(&vector) {
+            return Err(RetrievalError::CorruptIndex("查询缓存向量未归一化".into()));
+        }
+        Ok(Some(vector))
     }
 
     pub(crate) fn compatible_embeddings_from_connection(
@@ -4510,6 +4712,7 @@ impl RetrievalStore {
                     memory,
                     vector_elapsed,
                     fusion_options,
+                    None,
                 )
                 .map_err(|error| match error {
                     RetrievalError::HybridRecall(_) => error,
@@ -4586,13 +4789,97 @@ impl RetrievalStore {
         Ok(result)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn hybrid_recall_from_query_vector(
+        &self,
+        raw_query: &str,
+        current_user_event_id: &str,
+        recent_event_ids: &[String],
+        session_filter: Option<&str>,
+        retrieval_config: RetrievalConfig,
+        memory_config: &MemoryConfig,
+        query_vector: Vec<f32>,
+        vector_elapsed_ms: u64,
+        fast_bm25: RecallResult,
+        bm25_elapsed_ms: u64,
+    ) -> RetrievalResult<RecallResult> {
+        retrieval_config
+            .validate()
+            .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+        memory_config
+            .validate()
+            .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+        let spec = VectorIndexSpec::from_config(memory_config)
+            .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+        let query_vector = l2_normalize(&query_vector)
+            .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+        if query_vector.len() != spec.dimensions {
+            return Err(RetrievalError::CorruptIndex(format!(
+                "查询向量维度不匹配：期望 {}，实际 {}",
+                spec.dimensions,
+                query_vector.len()
+            )));
+        }
+
+        let started = Instant::now();
+        let options = HybridRecallOptions::default();
+        let fallback = fast_bm25.clone();
+        let fusion_store = self.clone();
+        let fusion_query = raw_query.to_owned();
+        let fusion_scope = session_filter.map(str::to_owned);
+        let fusion_current = current_user_event_id.to_owned();
+        let fusion_recent = recent_event_ids.to_vec();
+        let retrieval = retrieval_config.clone();
+        let memory = memory_config.clone();
+        let fusion_spec = spec.clone();
+        let fused_task = tokio::task::spawn_blocking(move || {
+            fusion_store.fuse_vector_recall(
+                &fusion_query,
+                query_vector,
+                &fusion_spec,
+                &fusion_current,
+                &fusion_recent,
+                fusion_scope.as_deref(),
+                retrieval,
+                memory,
+                vector_elapsed_ms,
+                options,
+                Some((fast_bm25, bm25_elapsed_ms)),
+            )
+        });
+        let mut result = match join_blocking(fused_task).await {
+            Ok(result) => result,
+            Err(error) => {
+                let mut fallback = fallback;
+                apply_vector_fallback(
+                    &mut fallback,
+                    bm25_elapsed_ms,
+                    vector_elapsed_ms,
+                    error.to_string(),
+                    RecallChannels::all(),
+                );
+                fallback
+            }
+        };
+        if let Some(channel) = result
+            .trace
+            .channels
+            .iter_mut()
+            .find(|channel| channel.channel == RetrievalChannel::Vector)
+        {
+            channel.elapsed_ms = vector_elapsed_ms;
+        }
+        result.trace.elapsed_ms = elapsed_ms(started).saturating_add(vector_elapsed_ms);
+        Ok(result)
+    }
+
     fn load_vector_index_from_connection(
         &self,
         connection: &Connection,
         spec: &VectorIndexSpec,
         session_filter: Option<&str>,
         visibility: &RecallVisibility,
-    ) -> RetrievalResult<(Arc<HnswVectorIndex>, Option<PendingVectorIndexCache>)> {
+    ) -> RetrievalResult<(Arc<HnswVectorIndex>, Option<PendingVectorIndexCache>, usize)> {
         spec.validate()
             .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
         let control = self.replay_control_state_under_guard()?;
@@ -4614,12 +4901,7 @@ impl RetrievalStore {
             &control,
             visibility.allow_aggregate_documents,
         )?;
-        if total != rows.len() {
-            return Err(RetrievalError::CorruptIndex(format!(
-                "向量目录不完整：文档总数 {total}，兼容 embedding 数 {}",
-                rows.len()
-            )));
-        }
+        let pending_documents = total.saturating_sub(rows.len());
         let query_filtered = visibility.cutoff.is_some() || !visibility.allow_aggregate_documents;
         if query_filtered {
             let mut filtered = Vec::with_capacity(rows.len());
@@ -4635,13 +4917,13 @@ impl RetrievalStore {
             }
             return HnswVectorIndex::rebuild(spec.clone(), filtered)
                 .map(Arc::new)
-                .map(|index| (index, None))
+                .map(|index| (index, None, pending_documents))
                 .map_err(|error| RetrievalError::CorruptIndex(error.to_string()));
         }
         if session_filter.is_some() {
             return HnswVectorIndex::rebuild(spec.clone(), rows)
                 .map(Arc::new)
-                .map(|index| (index, None))
+                .map(|index| (index, None, pending_documents))
                 .map_err(|error| RetrievalError::CorruptIndex(error.to_string()));
         }
         let catalog_sha256 = embedding_catalog_identity(&rows);
@@ -4654,7 +4936,7 @@ impl RetrievalStore {
                 && cache.fingerprint == fingerprint
                 && cache.catalog_sha256 == catalog_sha256
             {
-                return Ok((Arc::clone(&cache.index), None));
+                return Ok((Arc::clone(&cache.index), None, pending_documents));
             }
             cache
                 .as_ref()
@@ -4670,7 +4952,7 @@ impl RetrievalStore {
             index: Arc::clone(&index),
             observed_identity,
         };
-        Ok((index, Some(pending)))
+        Ok((index, Some(pending), pending_documents))
     }
 
     fn publish_vector_index_cache(&self, pending: PendingVectorIndexCache) -> RetrievalResult<()> {
@@ -4709,6 +4991,7 @@ impl RetrievalStore {
         memory_config: MemoryConfig,
         vector_ms: u64,
         options: HybridRecallOptions,
+        precomputed_bm25: Option<(RecallResult, u64)>,
     ) -> RetrievalResult<RecallResult> {
         let visibility = RecallVisibility::from_options(&options)?;
         let _guard = self.acquire_root_read()?;
@@ -4736,13 +5019,15 @@ impl RetrievalStore {
             self.validate_recall_input_id(&transaction, &control, event_id, session_filter)?;
         }
         self.require_current_control_projection(&transaction, &control)?;
-        let (index, pending_vector_cache) = self.load_vector_index_from_connection(
-            &transaction,
-            spec,
-            session_filter,
-            &visibility,
-        )?;
-        let (mut bm25, bm25_ms, hits) = if options.channels.bm25 {
+        let (index, pending_vector_cache, pending_documents) = self
+            .load_vector_index_from_connection(&transaction, spec, session_filter, &visibility)?;
+        let (mut bm25, bm25_ms, hits) = if let Some((bm25, bm25_ms)) = precomputed_bm25 {
+            self.validate_recall_evidence_active(&transaction, &control, &bm25, &visibility)?;
+            let hits = index
+                .search(&query_vector, memory_config.vector_candidate_limit)
+                .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+            (bm25, bm25_ms, hits)
+        } else if options.channels.bm25 {
             std::thread::scope(|scope| -> RetrievalResult<_> {
                 let vector_worker = scope.spawn(|| {
                     index
@@ -5142,7 +5427,7 @@ impl RetrievalStore {
             .filter_map(|seed| seed.document_id.clone())
             .collect::<BTreeSet<_>>();
         let mut graph_sidecar = if options.channels.graph {
-            let graph = crate::graph::recall_graph_from_connection(
+            let graph_result = crate::graph::recall_graph_from_connection(
                 self,
                 &transaction,
                 &memory_config,
@@ -5152,29 +5437,32 @@ impl RetrievalStore {
                     cutoff: visibility.cutoff(),
                     allow_aggregate_documents: visibility.allows_aggregate_documents(),
                 },
-            )
-            .map_err(|error| {
-                HybridRecallFailure::timed(HybridRecallStage::Graph, error, graph_started)
-            })?;
-            let graph_ms = elapsed_ms(graph_started);
-            bm25.trace.budget_allocation =
-                memory_budget_trace(&memory_config, bm25.trace.query_kind);
-            self.prepare_graph_candidates(
-                &transaction,
-                &index,
-                &query_vector,
-                current_user_event_id,
-                recent_event_ids,
-                session_filter,
-                &graph_seed_documents,
-                &vector_aggregate_sources,
-                graph,
-                graph_ms,
-                options.channels.episode,
-            )
-            .map_err(|error| {
-                HybridRecallFailure::timed(HybridRecallStage::Graph, error, graph_started)
-            })?
+            );
+            match graph_result.and_then(|graph| {
+                let graph_ms = elapsed_ms(graph_started);
+                self.prepare_graph_candidates(
+                    &transaction,
+                    &index,
+                    &query_vector,
+                    current_user_event_id,
+                    recent_event_ids,
+                    session_filter,
+                    &graph_seed_documents,
+                    &vector_aggregate_sources,
+                    graph,
+                    graph_ms,
+                    options.channels.episode,
+                )
+            }) {
+                Ok(sidecar) => sidecar,
+                Err(error) => {
+                    let mut sidecar = empty_graph_sidecar();
+                    sidecar.elapsed_ms = elapsed_ms(graph_started);
+                    sidecar.warning = Some(format!("关系图使用上次整理结果失败：{error}"));
+                    sidecar.status = "error".into();
+                    sidecar
+                }
+            }
         } else {
             empty_graph_sidecar()
         };
@@ -5198,6 +5486,22 @@ impl RetrievalStore {
                 options.channels,
             )
             .map_err(|error| HybridRecallFailure::new(HybridRecallStage::EntityState, error))?;
+        if pending_documents > 0 {
+            for channel in &mut result.trace.channels {
+                if matches!(
+                    channel.channel,
+                    RetrievalChannel::Vector
+                        | RetrievalChannel::Entity
+                        | RetrievalChannel::State
+                        | RetrievalChannel::Episode
+                ) {
+                    channel.status = "stale".into();
+                }
+            }
+            result.trace.warnings.push(format!(
+                "有 {pending_documents} 个记忆文档尚未整理，本轮语义搜索只使用上次发布的结果"
+            ));
+        }
         let recent = recent_event_ids.iter().map(String::as_str).collect();
         let mut expansion_events = result
             .evidence
@@ -5335,6 +5639,7 @@ impl RetrievalStore {
             aggregate_source_count: aggregate_sources.len(),
             elapsed_ms: graph_ms,
             warning: graph.warning,
+            status: if graph.stale { "stale" } else { "ok" }.into(),
         })
     }
 
@@ -7257,14 +7562,17 @@ impl RetrievalStore {
                 RetrievalChannel::Graph,
                 if !channels.graph {
                     "disabled"
-                } else if graph.candidate_count == 0 {
-                    "empty"
                 } else {
-                    "ok"
+                    graph.status.as_str()
                 },
                 graph.candidate_count,
                 graph.elapsed_ms,
-                None,
+                (channels.graph && graph.status == "error").then(|| {
+                    graph
+                        .warning
+                        .clone()
+                        .unwrap_or_else(|| "graph search failed".into())
+                }),
             ),
         ];
         if let Some(warning) = graph.warning {
@@ -8591,41 +8899,62 @@ impl RetrievalStore {
                 }
                 "empty" | "skipped" => channel.candidate_count == 0 && channel.error.is_none(),
                 "error" => channel.candidate_count == 0 && error_nonempty,
+                "timeout" => channel.candidate_count == 0 && error_nonempty,
+                "stale" => channel.error.is_none(),
                 "ok" => channel.error.is_none(),
                 "discarded" => channel.candidate_count == 0,
                 _ => false,
             };
             let status_allowed = match channel.channel {
-                RetrievalChannel::Bm25 => matches!(status, "ok" | "disabled"),
+                RetrievalChannel::Bm25 => {
+                    matches!(status, "ok" | "disabled" | "timeout" | "error")
+                }
                 RetrievalChannel::Vector => {
-                    matches!(status, "ok" | "disabled" | "error" | "discarded")
-                        && (status != "discarded" || error_nonempty)
+                    matches!(
+                        status,
+                        "ok" | "stale" | "disabled" | "timeout" | "error" | "discarded"
+                    ) && (status != "discarded" || error_nonempty)
                 }
                 RetrievalChannel::Entity | RetrievalChannel::State => {
                     matches!(
                         status,
-                        "ok" | "empty" | "disabled" | "skipped" | "discarded" | "error"
+                        "ok" | "stale"
+                            | "empty"
+                            | "disabled"
+                            | "skipped"
+                            | "discarded"
+                            | "timeout"
+                            | "error"
                     ) && (status != "discarded" || channel.error.is_none())
                 }
                 RetrievalChannel::Episode => {
                     matches!(
                         status,
-                        "ok" | "empty" | "disabled" | "skipped" | "discarded"
+                        "ok" | "stale"
+                            | "empty"
+                            | "disabled"
+                            | "skipped"
+                            | "discarded"
+                            | "timeout"
+                            | "error"
                     ) && (status != "discarded" || channel.error.is_none())
                 }
                 RetrievalChannel::Graph => {
-                    matches!(status, "ok" | "empty" | "disabled" | "skipped" | "error")
+                    matches!(
+                        status,
+                        "ok" | "stale" | "empty" | "disabled" | "skipped" | "timeout" | "error"
+                    )
                 }
             };
             let derived = derived_counts[index];
             let artifacts_match = match channel.channel {
                 RetrievalChannel::Bm25 => match status {
-                    "ok" => channel.candidate_count == derived,
+                    "ok" | "stale" => channel.candidate_count == derived,
                     "disabled" => derived == 0,
                     _ => false,
                 },
                 RetrievalChannel::Vector => {
-                    if status == "ok" {
+                    if matches!(status, "ok" | "stale") {
                         channel.candidate_count == derived
                     } else {
                         derived == 0
@@ -8635,7 +8964,7 @@ impl RetrievalStore {
                 | RetrievalChannel::State
                 | RetrievalChannel::Episode
                 | RetrievalChannel::Graph => match status {
-                    "ok" => derived > 0 && channel.candidate_count == derived,
+                    "ok" | "stale" => channel.candidate_count == derived,
                     "empty" => derived == 0 && channel.candidate_count == 0,
                     _ => derived == 0,
                 },
@@ -8646,7 +8975,9 @@ impl RetrievalStore {
                 ));
             }
         }
-        if trace.channels[1].status != "ok" && !trace.fusion_candidates.is_empty() {
+        if !matches!(trace.channels[1].status.as_str(), "ok" | "stale")
+            && !trace.fusion_candidates.is_empty()
+        {
             return Err(RetrievalError::CorruptIndex(
                 "非 ok Vector channel 包含 fusion artifacts".into(),
             ));
@@ -8983,6 +9314,87 @@ impl RetrievalStore {
     ) -> RetrievalResult<SyncReport> {
         Self::require_active_session(control, &source.session.id)?;
         let source_file = source_file_name(&self.root, &source.path)?;
+        let all_events = derive_events(&source.session);
+        let organized_watermark = transaction
+            .query_row(
+                "SELECT through_sequence FROM memory_graph_watermarks WHERE session_id=?1",
+                [&source.session.id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| self.database_error(error))?;
+        let has_graph: i64 = transaction
+            .query_row(
+                "SELECT count(*) FROM memory_graph_materializations WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| self.database_error(error))?;
+        let mut preserve_organized_prefix = has_graph == 1;
+        if let Some(watermark) = organized_watermark {
+            let expected = all_events
+                .iter()
+                .filter(|event| i64::try_from(event.sequence).is_ok_and(|value| value <= watermark))
+                .map(|event| (event.id.as_str(), event))
+                .collect::<HashMap<_, _>>();
+            let mut statement = transaction
+                .prepare(
+                    "SELECT event_id,session_id,turn_id,sequence,role,created_at,content,
+                            content_sha256,reply_to_event_id,token_count,turn_status,done_reason,error
+                     FROM events WHERE session_id=?1 AND sequence<=?2 ORDER BY sequence",
+                )
+                .map_err(|error| self.database_error(error))?;
+            let persisted = statement
+                .query_map(params![source.session.id, watermark], map_event)
+                .map_err(|error| self.database_error(error))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|error| self.database_error(error))?;
+            preserve_organized_prefix &= persisted.iter().all(|event| {
+                expected.get(event.id.as_str()).is_some_and(|value| {
+                    !(event.role == EventRole::Assistant
+                        && event.content.is_empty()
+                        && !value.content.is_empty())
+                })
+            });
+            drop(statement);
+
+            let expected_traces = source
+                .session
+                .turns
+                .iter()
+                .map(|turn| {
+                    (
+                        event_id(&source.session.id, Some(&turn.id), EventRole::Assistant),
+                        turn.context_trace.retrieval.clone(),
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+            let mut statement = transaction
+                .prepare(
+                    "SELECT r.answer_event_id,r.trace_json FROM retrieval_runs r
+                     JOIN events e ON e.event_id=r.answer_event_id
+                     WHERE e.session_id=?1 AND e.sequence<=?2 ORDER BY e.sequence",
+                )
+                .map_err(|error| self.database_error(error))?;
+            let persisted_traces = statement
+                .query_map(params![source.session.id, watermark], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|error| self.database_error(error))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|error| self.database_error(error))?;
+            preserve_organized_prefix &= persisted_traces.iter().all(|(id, trace)| {
+                serde_json::from_str::<RetrievalTrace>(trace)
+                    .ok()
+                    .zip(expected_traces.get(id))
+                    .is_some_and(|(persisted, expected)| &persisted == expected)
+            });
+        }
+        if has_graph == 1 && !preserve_organized_prefix {
+            transaction
+                .execute("DELETE FROM memory_graph_materializations", [])
+                .map_err(|error| self.database_error(error))?;
+        }
         transaction.execute("DELETE FROM retrieval_documents_fts WHERE rowid IN (SELECT rowid FROM retrieval_documents WHERE event_id IN (SELECT event_id FROM events WHERE session_id=?1))", [source.session.id.as_str()]).map_err(|e| self.database_error(e))?;
         transaction.execute("DELETE FROM retrieval_documents WHERE event_id IN (SELECT event_id FROM events WHERE session_id=?1)", [source.session.id.as_str()]).map_err(|e| self.database_error(e))?;
         transaction.execute("DELETE FROM retrieval_runs WHERE answer_event_id IN (SELECT event_id FROM events WHERE session_id=?1)", [source.session.id.as_str()]).map_err(|e| self.database_error(e))?;
@@ -9008,14 +9420,14 @@ impl RetrievalStore {
                 ],
             )
             .map_err(|error| self.database_error(error))?;
-        transaction
-            .execute(
-                "DELETE FROM memory_episode_materializations WHERE session_id=?1",
-                [&source.session.id],
-            )
-            .map_err(|error| self.database_error(error))?;
-
-        let all_events = derive_events(&source.session);
+        if !preserve_organized_prefix {
+            transaction
+                .execute(
+                    "DELETE FROM memory_episode_materializations WHERE session_id=?1",
+                    [&source.session.id],
+                )
+                .map_err(|error| self.database_error(error))?;
+        }
         let all_event_by_id = all_events
             .iter()
             .map(|event| (event.id.clone(), event))
@@ -9485,6 +9897,7 @@ impl RetrievalStore {
             "memory_documents",
             "memory_document_members",
             "memory_embeddings",
+            "memory_embedding_cache",
             "memory_episode_boundaries",
             "memory_episode_materializations",
             "consolidation_watermarks",
@@ -9500,6 +9913,7 @@ impl RetrievalStore {
             "memory_graph_nodes",
             "memory_graph_edges",
             "memory_graph_materializations",
+            "memory_graph_watermarks",
         ];
         let mut table_statement = connection
             .prepare("SELECT type FROM sqlite_schema WHERE name=?1")
@@ -9529,6 +9943,7 @@ impl RetrievalStore {
             "SELECT document_id,session_id,granularity,source_sha256,start_sequence,end_sequence,member_count FROM memory_documents LIMIT 0",
             "SELECT document_id,ordinal,event_id,start_char,end_char,content_sha256 FROM memory_document_members LIMIT 0",
             "SELECT document_id,model,dimensions,source_sha256,index_fingerprint,vector_blob,embedded_at FROM memory_embeddings LIMIT 0",
+            "SELECT index_fingerprint,content_sha256,dimensions,vector_blob,cached_at FROM memory_embedding_cache LIMIT 0",
             "SELECT session_id,before_event_id,decision_json,input_sha256 FROM memory_episode_boundaries LIMIT 0",
             "SELECT session_id,source_session_sha256,ledger_snapshot_sha256,vector_index_fingerprint,plan_input_sha256,algorithm_version,gap_minutes,topic_similarity_threshold,episode_count,boundary_count,materialized_at FROM memory_episode_materializations LIMIT 0",
             "SELECT session_id,through_sequence,through_event_id,through_event_sha256,updated_at FROM consolidation_watermarks LIMIT 0",
@@ -9544,6 +9959,7 @@ impl RetrievalStore {
             "SELECT node_id,node_kind,source_id,session_id,granularity,source_sha256 FROM memory_graph_nodes LIMIT 0",
             "SELECT edge_id,edge_type,source_node_id,target_node_id,weight,directed,provenance_json,provenance_sha256 FROM memory_graph_edges LIMIT 0",
             "SELECT singleton,algorithm_version,vector_index_fingerprint,config_sha256,source_sha256,catalog_sha256,node_count,edge_count,materialized_at FROM memory_graph_materializations LIMIT 0",
+            "SELECT session_id,through_sequence,control_generation_sha256,updated_at FROM memory_graph_watermarks LIMIT 0",
         ];
         for query in REQUIRED_STATUS_COLUMNS {
             connection
@@ -9566,7 +9982,10 @@ impl RetrievalStore {
         let version = connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .map_err(|source| self.database_error(source))?;
-        if !matches!(version, 0 | 1 | 2 | 3 | 4 | 5 | 6 | INDEX_SCHEMA_VERSION) {
+        if !matches!(
+            version,
+            0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | INDEX_SCHEMA_VERSION
+        ) {
             return Err(RetrievalError::UnsupportedIndexVersion(version));
         }
         let existing_memory_version = read_existing_memory_state_version(&connection)
@@ -9689,6 +10108,33 @@ impl RetrievalStore {
                 .pragma_update(None, "user_version", INDEX_SCHEMA_VERSION)
                 .map_err(|e| self.database_error(e))?;
             transaction.commit().map_err(|e| self.database_error(e))?;
+        }
+        if version == 7 {
+            let materializations: i64 = connection
+                .query_row(
+                    "SELECT count(*) FROM memory_graph_materializations WHERE singleton=1",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|error| self.database_error(error))?;
+            let watermarks: i64 = connection
+                .query_row("SELECT count(*) FROM memory_graph_watermarks", [], |row| {
+                    row.get(0)
+                })
+                .map_err(|error| self.database_error(error))?;
+            if materializations == 1 && watermarks == 0 {
+                let generation = self.replay_control_state_under_guard()?.generation_sha256();
+                connection
+                    .execute(
+                        "INSERT INTO memory_graph_watermarks
+                         (session_id,through_sequence,control_generation_sha256,updated_at)
+                         SELECT s.session_id,COALESCE(MAX(e.sequence),0),?1,?2
+                         FROM indexed_sessions s LEFT JOIN events e ON e.session_id=s.session_id
+                         GROUP BY s.session_id",
+                        params![generation, Utc::now().to_rfc3339()],
+                    )
+                    .map_err(|error| self.database_error(error))?;
+            }
         }
         Ok(connection)
     }
@@ -10012,13 +10458,12 @@ fn insert_memory_document(
         ],
     )?;
     transaction.execute(
-        "DELETE FROM memory_document_members WHERE document_id=?1",
-        [&document_id],
-    )?;
-    transaction.execute(
         "INSERT INTO memory_document_members
          (document_id, ordinal, event_id, start_char, end_char, content_sha256)
-         VALUES (?1, 0, ?2, ?3, ?4, ?5)",
+         VALUES (?1, 0, ?2, ?3, ?4, ?5)
+         ON CONFLICT(document_id,ordinal) DO UPDATE SET
+         event_id=excluded.event_id,start_char=excluded.start_char,
+         end_char=excluded.end_char,content_sha256=excluded.content_sha256",
         params![
             document_id,
             event.id,
@@ -13229,6 +13674,15 @@ CREATE TABLE IF NOT EXISTS memory_embeddings (
     embedded_at TEXT NOT NULL CHECK(length(embedded_at) > 0)
 );
 
+CREATE TABLE IF NOT EXISTS memory_embedding_cache (
+    index_fingerprint TEXT NOT NULL CHECK(length(index_fingerprint) = 64),
+    content_sha256 TEXT NOT NULL CHECK(length(content_sha256) = 64),
+    dimensions INTEGER NOT NULL CHECK(dimensions > 0),
+    vector_blob BLOB NOT NULL CHECK(length(vector_blob) = dimensions * 4),
+    cached_at TEXT NOT NULL CHECK(length(cached_at) > 0),
+    PRIMARY KEY(index_fingerprint, content_sha256)
+);
+
 -- A provenance source is immutable but rebuild and corruption recovery may
 -- delete it.  Remove the entire derived document before the source span goes
 -- away, so an aggregate can never retain a partial member list or embedding.
@@ -13557,26 +14011,34 @@ CREATE TABLE IF NOT EXISTS memory_graph_materializations (
     materialized_at TEXT NOT NULL CHECK(length(materialized_at)>0)
 );
 
-CREATE TRIGGER IF NOT EXISTS graph_invalidate_indexed_sessions_insert AFTER INSERT ON indexed_sessions BEGIN DELETE FROM memory_graph_materializations; END;
-CREATE TRIGGER IF NOT EXISTS graph_invalidate_indexed_sessions_update AFTER UPDATE ON indexed_sessions BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TABLE IF NOT EXISTS memory_graph_watermarks (
+    session_id TEXT PRIMARY KEY REFERENCES indexed_sessions(session_id) ON DELETE CASCADE,
+    through_sequence INTEGER NOT NULL CHECK(through_sequence >= 0),
+    control_generation_sha256 TEXT NOT NULL CHECK(length(control_generation_sha256) = 64),
+    updated_at TEXT NOT NULL CHECK(length(updated_at) > 0)
+);
+
+DROP TRIGGER IF EXISTS graph_invalidate_indexed_sessions_insert;
+DROP TRIGGER IF EXISTS graph_invalidate_indexed_sessions_update;
+DROP TRIGGER IF EXISTS graph_invalidate_events_insert;
+DROP TRIGGER IF EXISTS graph_invalidate_events_update;
+DROP TRIGGER IF EXISTS graph_invalidate_source_spans_insert;
+DROP TRIGGER IF EXISTS graph_invalidate_source_spans_update;
+DROP TRIGGER IF EXISTS graph_invalidate_retrieval_runs_insert;
+DROP TRIGGER IF EXISTS graph_invalidate_retrieval_runs_update;
+DROP TRIGGER IF EXISTS graph_invalidate_retrieval_runs_delete;
+DROP TRIGGER IF EXISTS graph_invalidate_retrieval_documents_insert;
+DROP TRIGGER IF EXISTS graph_invalidate_retrieval_documents_update;
+DROP TRIGGER IF EXISTS graph_invalidate_retrieval_documents_delete;
+DROP TRIGGER IF EXISTS graph_invalidate_memory_documents_insert;
+DROP TRIGGER IF EXISTS graph_invalidate_memory_documents_update;
+DROP TRIGGER IF EXISTS graph_invalidate_memory_document_members_insert;
+DROP TRIGGER IF EXISTS graph_invalidate_memory_document_members_update;
+
 CREATE TRIGGER IF NOT EXISTS graph_invalidate_indexed_sessions_delete AFTER DELETE ON indexed_sessions BEGIN DELETE FROM memory_graph_materializations; END;
-CREATE TRIGGER IF NOT EXISTS graph_invalidate_events_insert AFTER INSERT ON events BEGIN DELETE FROM memory_graph_materializations; END;
-CREATE TRIGGER IF NOT EXISTS graph_invalidate_events_update AFTER UPDATE ON events BEGIN DELETE FROM memory_graph_materializations; END;
 CREATE TRIGGER IF NOT EXISTS graph_invalidate_events_delete AFTER DELETE ON events BEGIN DELETE FROM memory_graph_materializations; END;
-CREATE TRIGGER IF NOT EXISTS graph_invalidate_source_spans_insert AFTER INSERT ON source_spans BEGIN DELETE FROM memory_graph_materializations; END;
-CREATE TRIGGER IF NOT EXISTS graph_invalidate_source_spans_update AFTER UPDATE ON source_spans BEGIN DELETE FROM memory_graph_materializations; END;
 CREATE TRIGGER IF NOT EXISTS graph_invalidate_source_spans_delete AFTER DELETE ON source_spans BEGIN DELETE FROM memory_graph_materializations; END;
-CREATE TRIGGER IF NOT EXISTS graph_invalidate_retrieval_runs_insert AFTER INSERT ON retrieval_runs BEGIN DELETE FROM memory_graph_materializations; END;
-CREATE TRIGGER IF NOT EXISTS graph_invalidate_retrieval_runs_update AFTER UPDATE ON retrieval_runs BEGIN DELETE FROM memory_graph_materializations; END;
-CREATE TRIGGER IF NOT EXISTS graph_invalidate_retrieval_runs_delete AFTER DELETE ON retrieval_runs BEGIN DELETE FROM memory_graph_materializations; END;
-CREATE TRIGGER IF NOT EXISTS graph_invalidate_retrieval_documents_insert AFTER INSERT ON retrieval_documents BEGIN DELETE FROM memory_graph_materializations; END;
-CREATE TRIGGER IF NOT EXISTS graph_invalidate_retrieval_documents_update AFTER UPDATE ON retrieval_documents BEGIN DELETE FROM memory_graph_materializations; END;
-CREATE TRIGGER IF NOT EXISTS graph_invalidate_retrieval_documents_delete AFTER DELETE ON retrieval_documents BEGIN DELETE FROM memory_graph_materializations; END;
-CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_documents_insert AFTER INSERT ON memory_documents BEGIN DELETE FROM memory_graph_materializations; END;
-CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_documents_update AFTER UPDATE ON memory_documents BEGIN DELETE FROM memory_graph_materializations; END;
 CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_documents_delete AFTER DELETE ON memory_documents BEGIN DELETE FROM memory_graph_materializations; END;
-CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_document_members_insert AFTER INSERT ON memory_document_members BEGIN DELETE FROM memory_graph_materializations; END;
-CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_document_members_update AFTER UPDATE ON memory_document_members BEGIN DELETE FROM memory_graph_materializations; END;
 CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_document_members_delete AFTER DELETE ON memory_document_members BEGIN DELETE FROM memory_graph_materializations; END;
 CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_embeddings_insert AFTER INSERT ON memory_embeddings BEGIN DELETE FROM memory_graph_materializations; END;
 CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_embeddings_update AFTER UPDATE ON memory_embeddings BEGIN DELETE FROM memory_graph_materializations; END;
@@ -13769,6 +14231,7 @@ fn empty_graph_sidecar() -> GraphSidecar {
         aggregate_source_count: 0,
         elapsed_ms: 0,
         warning: None,
+        status: "ok".into(),
     }
 }
 
@@ -15204,7 +15667,7 @@ mod tests {
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            7
+            INDEX_SCHEMA_VERSION
         );
         assert_eq!(
             connection
@@ -15565,7 +16028,7 @@ CREATE INDEX memory_boundary_suggestions_session_event
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            7
+            INDEX_SCHEMA_VERSION
         );
         for table in [
             "memory_episode_boundaries",
@@ -15806,7 +16269,7 @@ CREATE INDEX memory_boundary_suggestions_session_event
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            7
+            INDEX_SCHEMA_VERSION
         );
         assert_eq!(
             connection
@@ -18450,7 +18913,7 @@ CREATE INDEX memory_boundary_suggestions_session_event
                  );
                  INSERT INTO consolidation_batches VALUES
                      ('future-attempt', 'future-applied', '{\"future\":true}');
-                 PRAGMA user_version=8;",
+                 PRAGMA user_version=9;",
             )
             .unwrap();
         drop(connection);
@@ -18459,7 +18922,7 @@ CREATE INDEX memory_boundary_suggestions_session_event
         let store = RetrievalStore::new(root.path()).unwrap();
         assert!(matches!(
             store.rebuild(),
-            Err(RetrievalError::UnsupportedIndexVersion(8))
+            Err(RetrievalError::UnsupportedIndexVersion(9))
         ));
         assert!(index.is_file());
         assert_eq!(fs::read(&index).unwrap(), original_bytes);
@@ -18469,7 +18932,7 @@ CREATE INDEX memory_boundary_suggestions_session_event
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            8
+            9
         );
         assert_eq!(
             connection

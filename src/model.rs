@@ -294,16 +294,6 @@ impl BudgetAllocationTrace {
             probe.usage.refresh();
         }
     }
-
-    pub fn mandatory_probe_input_tokens(&self) -> Option<u64> {
-        self.probes.iter().find_map(|probe| {
-            (probe.stage == "mandatory_probe"
-                && !probe.request_sha256.is_empty()
-                && matches!(probe.kind.as_str(), "normal" | "agent"))
-            .then_some(probe.usage.input_tokens)
-            .flatten()
-        })
-    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -544,6 +534,12 @@ pub struct RetrievalTrace {
     pub warnings: Vec<String>,
     #[serde(default)]
     pub elapsed_ms: u64,
+    #[serde(default)]
+    pub deadline_ms: u64,
+    #[serde(default)]
+    pub deadline_exceeded: bool,
+    #[serde(default)]
+    pub fast_fallback_used: bool,
 }
 
 impl Default for RetrievalTrace {
@@ -565,6 +561,9 @@ impl Default for RetrievalTrace {
             budget_allocation: BudgetAllocationTrace::default(),
             warnings: Vec::new(),
             elapsed_ms: 0,
+            deadline_ms: 0,
+            deadline_exceeded: false,
+            fast_fallback_used: false,
         }
     }
 }

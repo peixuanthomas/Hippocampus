@@ -107,6 +107,7 @@ pub struct MemoryConfig {
     pub rrf_k: usize,
     pub consolidation_timeout_secs: u64,
     pub embedding_timeout_secs: u64,
+    pub search_timeout_ms: u64,
     pub episode_gap_minutes: u64,
     pub hnsw_m: usize,
     pub hnsw_ef_construction: usize,
@@ -129,6 +130,7 @@ impl Default for MemoryConfig {
             rrf_k: 60,
             consolidation_timeout_secs: 600,
             embedding_timeout_secs: 600,
+            search_timeout_ms: 1_000,
             episode_gap_minutes: 30,
             hnsw_m: 16,
             hnsw_ef_construction: 200,
@@ -160,6 +162,9 @@ impl MemoryConfig {
             if !(1..=512).contains(&value) {
                 bail!("memory.{name} 必须在 1..=512 之间");
             }
+        }
+        if !(1..=60_000).contains(&self.search_timeout_ms) {
+            bail!("memory.search_timeout_ms 必须在 1..=60000 之间");
         }
         if !(1..=2).contains(&self.max_graph_depth) {
             bail!("memory.max_graph_depth 必须在 1..=2 之间");
@@ -507,6 +512,7 @@ location = "notes"
         assert_eq!(memory.rrf_k, 60);
         assert_eq!(memory.consolidation_timeout_secs, 600);
         assert_eq!(memory.embedding_timeout_secs, 600);
+        assert_eq!(memory.search_timeout_ms, 1_000);
         assert_eq!(memory.episode_gap_minutes, 30);
         assert_eq!(memory.hnsw_m, 16);
         assert_eq!(memory.hnsw_ef_construction, 200);
@@ -534,6 +540,7 @@ location = "notes"
             |memory: &mut MemoryConfig| memory.max_graph_depth = 3,
             |memory: &mut MemoryConfig| memory.rrf_k = 0,
             |memory: &mut MemoryConfig| memory.embedding_timeout_secs = 3_601,
+            |memory: &mut MemoryConfig| memory.search_timeout_ms = 0,
             |memory: &mut MemoryConfig| memory.episode_gap_minutes = 0,
             |memory: &mut MemoryConfig| memory.hnsw_m = 1,
             |memory: &mut MemoryConfig| memory.hnsw_ef_search = 4_097,

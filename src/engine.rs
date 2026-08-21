@@ -1,8 +1,11 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
+use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -16,11 +19,12 @@ use crate::context::ContextAssembler;
 use crate::knowledge::{KnowledgeRecall, KnowledgeTrace};
 use crate::model::{
     AgentChatRequest, AgentMessage, AgentRoundResult, BudgetBucket, BudgetExclusionTrace,
-    BudgetProbeTrace, BudgetReflowTrace, BudgetStageLatencyTrace, BudgetTokenBreakdown, ChatEvent,
-    ChatEventKind, ContextPlan, ContextTrace, EvidenceKind, ModelRequestTrace, ProvenanceQuality,
-    RetrievalChannel, RetrievalDocumentGranularity, Session, SessionStatus, TokenUsage, ToolCall,
-    ToolDefinition, ToolFunctionDefinition, ToolResultTrace, ToolRoundTrace, Turn, TurnStatus,
-    WebSourceTrace, WebTrace, agent_context_sha256, content_sha256, utc_now,
+    BudgetProbeTrace, BudgetReflowTrace, BudgetStageLatencyTrace, BudgetTokenBreakdown,
+    ChannelTrace, ChatEvent, ChatEventKind, ContextPlan, ContextTrace, EvidenceKind,
+    ModelRequestTrace, ProvenanceQuality, RetrievalChannel, RetrievalDocumentGranularity,
+    RetrievalTrace, Session, SessionStatus, TokenUsage, ToolCall, ToolDefinition,
+    ToolFunctionDefinition, ToolResultTrace, ToolRoundTrace, Turn, TurnStatus, WebSourceTrace,
+    WebTrace, agent_context_sha256, content_sha256, utc_now,
 };
 #[cfg(test)]
 use crate::ollama::StructuredChatRequest;
@@ -49,6 +53,15 @@ pub enum PreparationStatus {
     LimitWarning,
     Blocked,
     Ended,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreparationProgress {
+    ExactContextCheckStarted {
+        estimated_input_tokens: u64,
+        probe_threshold: u64,
+        input_budget: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,6 +164,7 @@ pub struct PreparedTurn {
     pub plan: ContextPlan,
     pub status: PreparationStatus,
     pub message: String,
+    pub(crate) query_embedding: Option<Vec<f32>>,
 }
 
 impl PreparedTurn {
@@ -169,6 +183,12 @@ pub struct ChatEngine<B: ChatBackend> {
     client: B,
     assembler: ContextAssembler,
     config: AppConfig,
+    background_embedding_gates: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    background_embedding_pending: Arc<AtomicUsize>,
+    background_embedding_notify: Arc<Notify>,
+    background_embedding_cancellation: Arc<Mutex<CancellationToken>>,
+    #[cfg(test)]
+    live_search_barrier: Arc<Mutex<Option<Arc<tokio::sync::Barrier>>>>,
 }
 
 struct StreamSnapshot<'a> {
@@ -192,6 +212,25 @@ struct BudgetEvidenceGroup {
 struct PreparationProbeCache {
     usages: HashMap<String, TokenUsage>,
     traces: Vec<BudgetProbeTrace>,
+}
+
+struct LiveSearchOutcome {
+    recall: RecallResult,
+    knowledge: KnowledgeRecall,
+    query_embedding: Option<Vec<f32>>,
+}
+
+enum LiveSearchEvent {
+    Fast {
+        result: std::result::Result<RecallResult, String>,
+        elapsed_ms: u64,
+    },
+    Knowledge(std::result::Result<KnowledgeRecall, String>),
+    Embedding {
+        result: std::result::Result<Vec<f32>, String>,
+        elapsed_ms: u64,
+    },
+    Semantic(std::result::Result<RecallResult, String>),
 }
 
 #[derive(Debug, Clone)]
@@ -472,6 +511,12 @@ impl<B: ChatBackend> ChatEngine<B> {
             client,
             assembler: ContextAssembler,
             config,
+            background_embedding_gates: Arc::new(Mutex::new(HashMap::new())),
+            background_embedding_pending: Arc::new(AtomicUsize::new(0)),
+            background_embedding_notify: Arc::new(Notify::new()),
+            background_embedding_cancellation: Arc::new(Mutex::new(CancellationToken::new())),
+            #[cfg(test)]
+            live_search_barrier: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -517,6 +562,14 @@ impl<B: ChatBackend> ChatEngine<B> {
                     stage: EmbeddingRefreshStage::LeafSnapshot,
                     source,
                 })?;
+        let cached_vectors = self
+            .store
+            .retrieval()
+            .cached_content_embeddings(&spec)
+            .map_err(|source| EmbeddingRefreshError::Retrieval {
+                stage: EmbeddingRefreshStage::LeafSnapshot,
+                source,
+            })?;
 
         let mut vectors = vec![None; leaf_snapshot.documents.len()];
         let mut pending = Vec::new();
@@ -526,6 +579,8 @@ impl<B: ChatBackend> ChatEngine<B> {
                 RetrievalDocumentGranularity::Fragment => {
                     if let Some(vector) = &document.reusable_vector {
                         vectors[index] = Some(vector.clone());
+                    } else if let Some(vector) = cached_vectors.get(&document.source_sha256) {
+                        vectors[index] = Some(vector.clone());
                     } else {
                         pending.push((index, document.content.clone()));
                     }
@@ -533,6 +588,8 @@ impl<B: ChatBackend> ChatEngine<B> {
                 RetrievalDocumentGranularity::Message => {
                     if document.content.chars().count() <= 240 {
                         if let Some(vector) = &document.reusable_vector {
+                            vectors[index] = Some(vector.clone());
+                        } else if let Some(vector) = cached_vectors.get(&document.source_sha256) {
                             vectors[index] = Some(vector.clone());
                         } else {
                             pending.push((index, document.content.clone()));
@@ -1097,11 +1154,473 @@ impl<B: ChatBackend> ChatEngine<B> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn live_search(
+        &self,
+        user_content: &str,
+        current_event_id: &str,
+        recent_event_ids: &[String],
+        retrieval_config: crate::model::RetrievalConfig,
+        memory_config: crate::config::MemoryConfig,
+    ) -> LiveSearchOutcome {
+        let started = Instant::now();
+        let deadline_ms = memory_config.search_timeout_ms;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(deadline_ms);
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let mut tasks = Vec::new();
+
+        let fast_store = self.store.retrieval().clone();
+        let fast_query = user_content.to_owned();
+        let fast_current = current_event_id.to_owned();
+        let fast_recent = recent_event_ids.to_vec();
+        let fast_config = retrieval_config.clone();
+        let fast_sender = sender.clone();
+        #[cfg(test)]
+        let fast_barrier = self
+            .live_search_barrier
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        tasks.push(tokio::spawn(async move {
+            #[cfg(test)]
+            if let Some(barrier) = fast_barrier {
+                barrier.wait().await;
+            }
+            let task_started = Instant::now();
+            let result = tokio::task::spawn_blocking(move || {
+                fast_store.keyword_recall(&fast_query, &fast_current, &fast_recent, fast_config)
+            })
+            .await
+            .map_err(|error| format!("快速搜索任务失败: {error}"))
+            .and_then(|result| result.map_err(|error| error.to_string()));
+            let _ = fast_sender.send(LiveSearchEvent::Fast {
+                result,
+                elapsed_ms: elapsed_millis(task_started),
+            });
+        }));
+
+        let knowledge_store = self.store.knowledge().clone();
+        let knowledge_query = user_content.to_owned();
+        let knowledge_config = self.config.knowledge.clone();
+        let knowledge_sender = sender.clone();
+        #[cfg(test)]
+        let knowledge_barrier = self
+            .live_search_barrier
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        tasks.push(tokio::spawn(async move {
+            #[cfg(test)]
+            if let Some(barrier) = knowledge_barrier {
+                barrier.wait().await;
+            }
+            let result = tokio::task::spawn_blocking(move || {
+                knowledge_store.recall(&knowledge_query, &knowledge_config)
+            })
+            .await
+            .map_err(|error| format!("知识搜索任务失败: {error}"))
+            .and_then(|result| result.map_err(|error| format!("{error:#}")));
+            let _ = knowledge_sender.send(LiveSearchEvent::Knowledge(result));
+        }));
+
+        if memory_config.enabled {
+            let client = self.client.clone();
+            let embedding_query = user_content.to_owned();
+            let embedding_model = memory_config.embedding_model.clone();
+            let embedding_dimensions = memory_config.embedding_dimensions;
+            let embedding_spec = VectorIndexSpec::from_config(&memory_config);
+            let embedding_store = self.store.retrieval().clone();
+            let embedding_sender = sender.clone();
+            #[cfg(test)]
+            let embedding_barrier = self
+                .live_search_barrier
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            tasks.push(tokio::spawn(async move {
+                #[cfg(test)]
+                if let Some(barrier) = embedding_barrier {
+                    barrier.wait().await;
+                }
+                let task_started = Instant::now();
+                let query_hash = content_sha256(&embedding_query);
+                let cached = match embedding_spec {
+                    Ok(spec) => tokio::task::spawn_blocking(move || {
+                        embedding_store.cached_content_embedding(&spec, &query_hash)
+                    })
+                    .await
+                    .map_err(|error| format!("查询向量缓存任务失败: {error}"))
+                    .and_then(|result| result.map_err(|error| error.to_string())),
+                    Err(error) => Err(error.to_string()),
+                };
+                let result = match cached {
+                    Ok(Some(vector)) => Ok(vector),
+                    Ok(None) => client
+                        .embed(EmbeddingRequest {
+                            model: embedding_model.clone(),
+                            input: vec![embedding_query],
+                            dimensions: Some(embedding_dimensions),
+                            truncate: false,
+                        })
+                        .await
+                        .map_err(|error| error.to_string())
+                        .and_then(|response| {
+                            if response.model != embedding_model || response.embeddings.len() != 1 {
+                                return Err("查询 Embedding 响应与请求不匹配".into());
+                            }
+                            let vector = response
+                                .embeddings
+                                .into_iter()
+                                .next()
+                                .expect("validated one query embedding");
+                            if vector.len() != embedding_dimensions {
+                                return Err(format!(
+                                    "查询向量维度不匹配：期望 {embedding_dimensions}，实际 {}",
+                                    vector.len()
+                                ));
+                            }
+                            l2_normalize(&vector).map_err(|error| error.to_string())
+                        }),
+                    Err(error) => Err(error),
+                };
+                let _ = embedding_sender.send(LiveSearchEvent::Embedding {
+                    result,
+                    elapsed_ms: elapsed_millis(task_started),
+                });
+            }));
+        }
+        let mut fast: Option<RecallResult> = None;
+        let mut fast_finished = false;
+        let mut fast_error = None;
+        let mut fast_elapsed_ms = 0;
+        let mut knowledge: Option<KnowledgeRecall> = None;
+        let mut knowledge_finished = false;
+        let mut knowledge_error = None;
+        let mut query_embedding: Option<Vec<f32>> = None;
+        let mut embedding_finished = !memory_config.enabled;
+        let mut embedding_error = None;
+        let mut embedding_elapsed_ms = 0;
+        let mut semantic: Option<RecallResult> = None;
+        let mut semantic_finished = !memory_config.enabled;
+        let mut semantic_error = None;
+        let mut semantic_started = false;
+        let mut deadline_exceeded = false;
+
+        loop {
+            if fast_finished
+                && knowledge_finished
+                && (semantic_finished
+                    || (embedding_finished && (embedding_error.is_some() || fast.is_none())))
+            {
+                break;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => {
+                    deadline_exceeded = true;
+                    break;
+                }
+                event = receiver.recv() => {
+                    let Some(event) = event else { break; };
+                    match event {
+                        LiveSearchEvent::Fast { result, elapsed_ms } => {
+                            fast_finished = true;
+                            fast_elapsed_ms = elapsed_ms;
+                            match result {
+                                Ok(result) => fast = Some(result),
+                                Err(error) => fast_error = Some(error),
+                            }
+                        }
+                        LiveSearchEvent::Knowledge(result) => {
+                            knowledge_finished = true;
+                            match result {
+                                Ok(result) => knowledge = Some(result),
+                                Err(error) => knowledge_error = Some(error),
+                            }
+                        }
+                        LiveSearchEvent::Embedding { result, elapsed_ms } => {
+                            embedding_finished = true;
+                            embedding_elapsed_ms = elapsed_ms;
+                            match result {
+                                Ok(vector) => query_embedding = Some(vector),
+                                Err(error) => embedding_error = Some(error),
+                            }
+                        }
+                        LiveSearchEvent::Semantic(result) => {
+                            semantic_finished = true;
+                            match result {
+                                Ok(result) => semantic = Some(result),
+                                Err(error) => semantic_error = Some(error),
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !semantic_started
+                && let (Some(fast_result), Some(vector)) = (&fast, &query_embedding)
+            {
+                semantic_started = true;
+                let semantic_store = self.store.retrieval().clone();
+                let semantic_query = user_content.to_owned();
+                let semantic_current = current_event_id.to_owned();
+                let semantic_recent = recent_event_ids.to_vec();
+                let semantic_retrieval = retrieval_config.clone();
+                let semantic_memory = memory_config.clone();
+                let semantic_fast = fast_result.clone();
+                let semantic_vector = vector.clone();
+                let semantic_sender = sender.clone();
+                tasks.push(tokio::spawn(async move {
+                    let result = semantic_store
+                        .hybrid_recall_from_query_vector(
+                            &semantic_query,
+                            &semantic_current,
+                            &semantic_recent,
+                            None,
+                            semantic_retrieval,
+                            &semantic_memory,
+                            semantic_vector,
+                            embedding_elapsed_ms,
+                            semantic_fast,
+                            fast_elapsed_ms,
+                        )
+                        .await
+                        .map_err(|error| error.to_string());
+                    let _ = semantic_sender.send(LiveSearchEvent::Semantic(result));
+                }));
+            }
+        }
+
+        for task in tasks {
+            task.abort();
+        }
+
+        let mut missing = Vec::new();
+        if fast.is_none() {
+            missing.push("bm25");
+        }
+        if memory_config.enabled && semantic.is_none() {
+            missing.extend(["vector", "entity", "state", "episode", "graph"]);
+        }
+        if knowledge.is_none() {
+            missing.push("knowledge");
+        }
+
+        let fast_available = fast.is_some();
+        let fast_fallback_used = memory_config.enabled
+            && (semantic.is_none()
+                || semantic
+                    .as_ref()
+                    .is_some_and(|result| result.trace.status == "bm25_fallback"));
+        let mut recall = semantic.unwrap_or_else(|| {
+            fast.unwrap_or_else(|| {
+                empty_live_recall(
+                    current_event_id,
+                    retrieval_config.clone(),
+                    &memory_config,
+                    fast_error.as_deref(),
+                )
+            })
+        });
+        if semantic_error.is_some() || embedding_error.is_some() {
+            let message = semantic_error
+                .or(embedding_error)
+                .unwrap_or_else(|| "语义搜索不可用".into());
+            recall.trace.warnings.push(message);
+        }
+        if deadline_exceeded {
+            recall.trace.warnings.push(format!(
+                "搜索超过 {deadline_ms}ms，已采用快速搜索结果；未完成通道：{}",
+                missing.join(", ")
+            ));
+        }
+        recall.trace.deadline_ms = deadline_ms;
+        recall.trace.deadline_exceeded = deadline_exceeded;
+        recall.trace.fast_fallback_used = fast_fallback_used;
+        recall.trace.elapsed_ms = elapsed_millis(started);
+        ensure_live_channel_statuses(
+            &mut recall.trace,
+            memory_config.enabled,
+            deadline_exceeded,
+            fast_available,
+            fast_elapsed_ms,
+            embedding_elapsed_ms,
+        );
+
+        let knowledge = knowledge.unwrap_or_else(|| KnowledgeRecall {
+            trace: KnowledgeTrace {
+                status: if deadline_exceeded {
+                    "timeout"
+                } else {
+                    "failed"
+                }
+                .into(),
+                candidate_limit: self.config.knowledge.candidate_limit,
+                max_selected: self.config.knowledge.max_selected,
+                evidence_char_budget: self.config.knowledge.evidence_char_budget,
+                error: knowledge_error,
+                warnings: if deadline_exceeded {
+                    vec![format!("知识搜索超过 {deadline_ms}ms，本轮未注入知识结果")]
+                } else {
+                    Vec::new()
+                },
+                ..Default::default()
+            },
+        });
+
+        LiveSearchOutcome {
+            recall,
+            knowledge,
+            query_embedding,
+        }
+    }
+
+    fn cache_prepared_query_embedding(&self, session: &Session, prepared: &PreparedTurn) {
+        if !self.config.memory.enabled {
+            return;
+        }
+        let Some(vector) = prepared.query_embedding.as_deref() else {
+            return;
+        };
+        let Some(turn) = session.turns.get(prepared.turn_index) else {
+            return;
+        };
+        if turn.assistant_content.is_empty() {
+            return;
+        }
+        let Ok(spec) = VectorIndexSpec::from_config(&self.config.memory) else {
+            return;
+        };
+        let _ = self.store.retrieval().cache_content_embedding(
+            &spec,
+            &content_sha256(&turn.user_content),
+            vector,
+        );
+    }
+
+    fn pause_background_embeddings(&self) {
+        let mut cancellation = self
+            .background_embedding_cancellation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cancellation.cancel();
+        *cancellation = CancellationToken::new();
+    }
+
+    fn enqueue_turn_embedding_cache(&self, session: &Session, turn_index: usize) {
+        if !self.config.memory.enabled {
+            return;
+        }
+        let Some(turn) = session.turns.get(turn_index) else {
+            return;
+        };
+        if turn.assistant_content.is_empty() {
+            return;
+        }
+        let inputs = turn_leaf_embedding_inputs(&turn.user_content, &turn.assistant_content);
+        if inputs.is_empty() {
+            return;
+        }
+        let cancellation = self
+            .background_embedding_cancellation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let gate = self
+            .background_embedding_gates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(session.id.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let engine = self.clone();
+        self.background_embedding_pending
+            .fetch_add(1, Ordering::SeqCst);
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            let _gate = gate.lock().await;
+            if !cancellation.is_cancelled() {
+                let _ = engine
+                    .cache_embedding_inputs(inputs, cancellation.clone())
+                    .await;
+            }
+            engine
+                .background_embedding_pending
+                .fetch_sub(1, Ordering::SeqCst);
+            engine.background_embedding_notify.notify_waiters();
+        });
+    }
+
+    async fn cache_embedding_inputs(
+        &self,
+        inputs: Vec<String>,
+        cancellation: CancellationToken,
+    ) -> Result<()> {
+        let spec = VectorIndexSpec::from_config(&self.config.memory)?;
+        let cached = self.store.retrieval().cached_content_embeddings(&spec)?;
+        let mut pending = HashMap::<String, String>::new();
+        for input in inputs {
+            let hash = content_sha256(&input);
+            if !cached.contains_key(&hash) {
+                pending.entry(hash).or_insert(input);
+            }
+        }
+        let pending = pending.into_iter().collect::<Vec<_>>();
+        for chunk in pending.chunks(self.config.memory.embedding_batch_size) {
+            if cancellation.is_cancelled() {
+                break;
+            }
+            let request = EmbeddingRequest {
+                model: spec.model.clone(),
+                input: chunk.iter().map(|(_, input)| input.clone()).collect(),
+                dimensions: Some(spec.dimensions),
+                truncate: false,
+            };
+            let response = tokio::select! {
+                _ = cancellation.cancelled() => break,
+                response = self.client.embed(request) => response?,
+            };
+            if response.model != spec.model || response.embeddings.len() != chunk.len() {
+                bail!("后台 Embedding 响应与请求不匹配");
+            }
+            for ((hash, _), vector) in chunk.iter().zip(response.embeddings) {
+                let vector = l2_normalize(&vector)?;
+                self.store
+                    .retrieval()
+                    .cache_content_embedding(&spec, hash, &vector)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn wait_for_background_embeddings(&self) {
+        loop {
+            let notified = self.background_embedding_notify.notified();
+            if self.background_embedding_pending.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+
     pub async fn prepare_turn(
         &self,
         session: &mut Session,
         user_content: String,
     ) -> Result<PreparedTurn> {
+        self.prepare_turn_with_progress(session, user_content, |_| {})
+            .await
+    }
+
+    pub async fn prepare_turn_with_progress<F>(
+        &self,
+        session: &mut Session,
+        user_content: String,
+        mut progress: F,
+    ) -> Result<PreparedTurn>
+    where
+        F: FnMut(PreparationProgress) + Send,
+    {
+        self.pause_background_embeddings();
         let controls = self.store.control_state()?;
         if !controls.allows_session(&session.id) {
             bail!("会话已排除: {}", session.id);
@@ -1129,7 +1648,14 @@ impl<B: ChatBackend> ChatEngine<B> {
         self.store.save(session)?;
 
         let prepared = self
-            .prepare_persisted_turn(session, turn_index, user_content, start_before, &controls)
+            .prepare_persisted_turn(
+                session,
+                turn_index,
+                user_content,
+                start_before,
+                &controls,
+                &mut progress,
+            )
             .await;
         if let Err(error) = &prepared
             && session.turns[turn_index].status == TurnStatus::Pending
@@ -1151,6 +1677,7 @@ impl<B: ChatBackend> ChatEngine<B> {
         user_content: String,
         start_before: usize,
         controls: &crate::control::ControlState,
+        progress: &mut (dyn FnMut(PreparationProgress) + Send),
     ) -> Result<PreparedTurn> {
         let history = session
             .eligible_turns(Some(turn_index), true)
@@ -1184,239 +1711,24 @@ impl<B: ChatBackend> ChatEngine<B> {
         let classify_started = Instant::now();
         let memory_query_kind = crate::retrieval::classify_query(&user_content);
         let classify_elapsed = elapsed_millis(classify_started);
-        let memory_budget =
-            crate::retrieval::memory_budget_trace(&self.config.memory, memory_query_kind);
         let retrieval_pool_config = crate::retrieval::candidate_pool_config(&session.retrieval);
-        let mut memory_pool_config = self.config.memory.clone();
-        memory_pool_config.graph_candidate_limit = memory_pool_config.candidate_limit;
-        let mut recall = if self.config.memory.enabled {
-            let refresh_started = Instant::now();
-            match self.refresh_embeddings(CancellationToken::new()).await {
-                Ok(_) => {
-                    let graph_store = self.store.retrieval().clone();
-                    let graph_config = self.config.memory.clone();
-                    let graph_started = Instant::now();
-                    match tokio::task::spawn_blocking(move || {
-                        graph_store.refresh_graph(&graph_config)
-                    })
-                    .await
-                    {
-                        Ok(Ok(_)) => {
-                            self.store
-                                .retrieval()
-                                .hybrid_recall(
-                                    &self.client,
-                                    &user_content,
-                                    &current_event_id,
-                                    &recent_event_ids,
-                                    None,
-                                    retrieval_pool_config.clone(),
-                                    &memory_pool_config,
-                                )
-                                .await
-                        }
-                        graph_result => {
-                            let graph_elapsed = elapsed_millis(graph_started);
-                            let cause = match graph_result {
-                                Ok(Err(error)) => error.to_string(),
-                                Err(error) => {
-                                    format!("blocking graph refresh task failed: {error}")
-                                }
-                                Ok(Ok(_)) => unreachable!(),
-                            };
-                            let message = format!("graph refresh failed: {cause}");
-                            let fallback_started = Instant::now();
-                            self.store
-                                .retrieval()
-                                .keyword_recall(
-                                    &user_content,
-                                    &current_event_id,
-                                    &recent_event_ids,
-                                    retrieval_pool_config.clone(),
-                                )
-                                .map(|mut recall| {
-                                    let bm25_elapsed = elapsed_millis(fallback_started);
-                                    recall.trace.status = "bm25_fallback".into();
-                                    recall.trace.query_kind = memory_query_kind;
-                                    recall.trace.budget_allocation = memory_budget.clone();
-                                    recall.trace.warnings.push(message.clone());
-                                    recall.trace.elapsed_ms =
-                                        graph_elapsed.saturating_add(bm25_elapsed);
-                                    recall.trace.channels = vec![
-                                        crate::model::ChannelTrace {
-                                            channel: RetrievalChannel::Bm25,
-                                            status: "ok".into(),
-                                            candidate_count: recall.trace.candidates.len(),
-                                            elapsed_ms: bm25_elapsed,
-                                            error: None,
-                                        },
-                                        crate::model::ChannelTrace {
-                                            channel: RetrievalChannel::Vector,
-                                            status: "skipped".into(),
-                                            ..Default::default()
-                                        },
-                                        crate::model::ChannelTrace {
-                                            channel: RetrievalChannel::Entity,
-                                            status: "skipped".into(),
-                                            ..Default::default()
-                                        },
-                                        crate::model::ChannelTrace {
-                                            channel: RetrievalChannel::State,
-                                            status: "skipped".into(),
-                                            ..Default::default()
-                                        },
-                                        crate::model::ChannelTrace {
-                                            channel: RetrievalChannel::Episode,
-                                            status: "skipped".into(),
-                                            ..Default::default()
-                                        },
-                                        crate::model::ChannelTrace {
-                                            channel: RetrievalChannel::Graph,
-                                            status: "error".into(),
-                                            elapsed_ms: graph_elapsed,
-                                            error: Some(message.clone()),
-                                            ..Default::default()
-                                        },
-                                    ];
-                                    recall
-                                })
-                        }
-                    }
-                }
-                Err(error) => {
-                    let refresh_elapsed = elapsed_millis(refresh_started);
-                    let fallback_started = Instant::now();
-                    self.store
-                        .retrieval()
-                        .keyword_recall(
-                            &user_content,
-                            &current_event_id,
-                            &recent_event_ids,
-                            retrieval_pool_config.clone(),
-                        )
-                        .map(|mut recall| {
-                            let bm25_elapsed = elapsed_millis(fallback_started);
-                            let message = format!("embedding refresh failed: {error}");
-                            recall.trace.status = "bm25_fallback".into();
-                            recall.trace.query_kind = memory_query_kind;
-                            recall.trace.budget_allocation = memory_budget.clone();
-                            recall.trace.warnings.push(message.clone());
-                            recall.trace.elapsed_ms = refresh_elapsed.saturating_add(bm25_elapsed);
-                            recall.trace.channels = vec![
-                                crate::model::ChannelTrace {
-                                    channel: RetrievalChannel::Bm25,
-                                    status: "ok".into(),
-                                    candidate_count: recall.trace.candidates.len(),
-                                    elapsed_ms: bm25_elapsed,
-                                    error: None,
-                                },
-                                crate::model::ChannelTrace {
-                                    channel: RetrievalChannel::Vector,
-                                    status: "error".into(),
-                                    candidate_count: 0,
-                                    elapsed_ms: refresh_elapsed,
-                                    error: Some(message),
-                                },
-                                crate::model::ChannelTrace {
-                                    channel: RetrievalChannel::Entity,
-                                    status: "skipped".into(),
-                                    ..Default::default()
-                                },
-                                crate::model::ChannelTrace {
-                                    channel: RetrievalChannel::State,
-                                    status: "skipped".into(),
-                                    ..Default::default()
-                                },
-                                crate::model::ChannelTrace {
-                                    channel: RetrievalChannel::Episode,
-                                    status: "skipped".into(),
-                                    ..Default::default()
-                                },
-                                crate::model::ChannelTrace {
-                                    channel: RetrievalChannel::Graph,
-                                    status: "skipped".into(),
-                                    ..Default::default()
-                                },
-                            ];
-                            recall
-                        })
-                }
-            }
-        } else {
-            self.store
-                .retrieval()
-                .keyword_recall(
-                    &user_content,
-                    &current_event_id,
-                    &recent_event_ids,
-                    retrieval_pool_config.clone(),
-                )
-                .map(|mut recall| {
-                    recall.trace.query_kind = memory_query_kind;
-                    recall.trace.budget_allocation = memory_budget.clone();
-                    recall.trace.channels = vec![
-                        crate::model::ChannelTrace {
-                            channel: RetrievalChannel::Bm25,
-                            status: "ok".into(),
-                            candidate_count: recall.trace.candidates.len(),
-                            ..Default::default()
-                        },
-                        crate::model::ChannelTrace {
-                            channel: RetrievalChannel::Vector,
-                            status: "disabled".into(),
-                            ..Default::default()
-                        },
-                        crate::model::ChannelTrace {
-                            channel: RetrievalChannel::Entity,
-                            status: "disabled".into(),
-                            ..Default::default()
-                        },
-                        crate::model::ChannelTrace {
-                            channel: RetrievalChannel::State,
-                            status: "disabled".into(),
-                            ..Default::default()
-                        },
-                        crate::model::ChannelTrace {
-                            channel: RetrievalChannel::Episode,
-                            status: "disabled".into(),
-                            ..Default::default()
-                        },
-                        crate::model::ChannelTrace {
-                            channel: RetrievalChannel::Graph,
-                            status: "disabled".into(),
-                            ..Default::default()
-                        },
-                    ];
-                    recall
-                })
-        }
-        .inspect_err(|error| {
-            session.turns[turn_index].context_trace.retrieval = crate::model::RetrievalTrace {
-                status: "failed".into(),
-                current_query_event_id: current_event_id.clone(),
-                error: Some(error.to_string()),
-                config: session.retrieval.clone(),
-                query_kind: memory_query_kind,
-                budget_allocation: memory_budget.clone(),
-                ..Default::default()
-            };
-        })?;
+        let memory_pool_config = self.config.memory.clone();
+        let LiveSearchOutcome {
+            mut recall,
+            knowledge,
+            query_embedding,
+        } = self
+            .live_search(
+                &user_content,
+                &current_event_id,
+                &recent_event_ids,
+                retrieval_pool_config.clone(),
+                memory_pool_config.clone(),
+            )
+            .await;
         recall.trace.config = session.retrieval.clone();
-        let knowledge = self
-            .store
-            .knowledge()
-            .recall(&user_content, &self.config.knowledge)
-            .unwrap_or_else(|error| KnowledgeRecall {
-                trace: KnowledgeTrace {
-                    status: "failed".into(),
-                    candidate_limit: self.config.knowledge.candidate_limit,
-                    max_selected: self.config.knowledge.max_selected,
-                    evidence_char_budget: self.config.knowledge.evidence_char_budget,
-                    error: Some(format!("{error:#}")),
-                    warnings: vec![format!("知识检索失败：{error:#}")],
-                    ..Default::default()
-                },
-            });
+        recall.trace.query_kind = memory_query_kind;
+        recall.trace.budget_allocation.query_kind = memory_query_kind;
         // Retrieval has succeeded independently of rendering/probing. Persist
         // it now so a later planning failure remains diagnosable.
         session.turns[turn_index].context_trace.retrieval = recall.trace.clone();
@@ -1439,35 +1751,38 @@ impl<B: ChatBackend> ChatEngine<B> {
             }
         }
         let full_recall = recall_for_groups(&recall, &full_groups);
-        let full_plan = self
-            .assemble_and_probe(
-                session,
-                turn_index,
-                &history,
-                &user_content,
-                &full_recall,
-                &knowledge,
-                &mut probe_cache,
-                "full_candidate_probe",
-            )
-            .await;
-        let full_plan = match full_plan {
-            Ok(plan) => plan,
-            Err(error) => {
-                session.turns[turn_index].context_trace.decision =
-                    if error.to_string().starts_with("render_failed:") {
-                        "render_failed"
-                    } else {
-                        "probe_failed"
-                    }
-                    .into();
+        let mut full_plan = self.assemble_estimated(
+            session,
+            turn_index,
+            &history,
+            &user_content,
+            &full_recall,
+            &knowledge,
+        );
+        let estimated_full_metric = plan_metric(&full_plan)?;
+        if estimated_full_metric >= session.budget.probe_threshold() {
+            progress(PreparationProgress::ExactContextCheckStarted {
+                estimated_input_tokens: estimated_full_metric,
+                probe_threshold: session.budget.probe_threshold(),
+                input_budget: session.budget.input_budget(),
+            });
+            if let Err(error) = self
+                .budget_probe_plan(
+                    session,
+                    &mut full_plan,
+                    &mut probe_cache,
+                    "near_limit_probe",
+                )
+                .await
+            {
+                session.turns[turn_index].context_trace.decision = "probe_failed".into();
                 session.turns[turn_index].touch();
                 self.store.save(session)?;
                 return Err(error);
             }
-        };
+        }
         let full_metric = plan_metric(&full_plan)?;
-        let plan = match self
+        let mut plan = match self
             .allocate_adaptive_plan(
                 session,
                 turn_index,
@@ -1478,7 +1793,7 @@ impl<B: ChatBackend> ChatEngine<B> {
                 classify_elapsed,
                 &mut probe_cache,
                 if full_metric >= session.budget.warning_threshold() {
-                    session.budget.trim_target()
+                    session.budget.trim_target().saturating_sub(1)
                 } else {
                     session.budget.input_budget()
                 },
@@ -1487,13 +1802,7 @@ impl<B: ChatBackend> ChatEngine<B> {
         {
             Ok(plan) => plan,
             Err(error) => {
-                session.turns[turn_index].context_trace.decision =
-                    if error.to_string().starts_with("render_failed:") {
-                        "render_failed"
-                    } else {
-                        "probe_failed"
-                    }
-                    .into();
+                session.turns[turn_index].context_trace.decision = "planning_failed".into();
                 let mut failed_trace = recall.trace.clone();
                 failed_trace
                     .budget_allocation
@@ -1514,9 +1823,9 @@ impl<B: ChatBackend> ChatEngine<B> {
                     .exclusions
                     .push(BudgetExclusionTrace {
                         bucket: BudgetBucket::RecentHistory,
-                        candidate_group_id: "budget_probe".into(),
+                        candidate_group_id: "local_budget".into(),
                         stage: "error".into(),
-                        reason: "probe_failed".into(),
+                        reason: "planning_failed".into(),
                         exact_increment_tokens: None,
                     });
                 session.turns[turn_index].context_trace.retrieval = failed_trace;
@@ -1525,6 +1834,12 @@ impl<B: ChatBackend> ChatEngine<B> {
                 return Err(error);
             }
         };
+        if plan.context_sha256 == full_plan.context_sha256 {
+            plan.exact_input_tokens = full_plan.exact_input_tokens;
+        }
+        if let Some(probe) = probe_cache.traces.last() {
+            session.turns[turn_index].probe_usage.add(probe.usage);
+        }
 
         if plan
             .retrieval_trace
@@ -1532,7 +1847,9 @@ impl<B: ChatBackend> ChatEngine<B> {
             .mandatory_input_tokens
             > session.budget.input_budget()
         {
-            return self.block_mandatory(session, turn_index, plan, start_before);
+            let mut prepared = self.block_mandatory(session, turn_index, plan, start_before)?;
+            prepared.query_embedding = query_embedding;
+            return Ok(prepared);
         }
 
         if full_metric >= session.budget.warning_threshold() {
@@ -1546,13 +1863,15 @@ impl<B: ChatBackend> ChatEngine<B> {
             );
             session.turns[turn_index].touch();
             self.store.save(session)?;
-            return Ok(self.prepared(
+            let mut prepared = self.prepared(
                 session,
                 turn_index,
                 plan,
                 PreparationStatus::LimitWarning,
                 "上下文已达到临界阈值；请选择丢弃最旧完整轮次后继续，或暂停当前会话。",
-            ));
+            );
+            prepared.query_embedding = query_embedding;
+            return Ok(prepared);
         }
 
         apply_trace(
@@ -1565,7 +1884,9 @@ impl<B: ChatBackend> ChatEngine<B> {
         );
         session.turns[turn_index].touch();
         self.store.save(session)?;
-        Ok(self.prepared(session, turn_index, plan, PreparationStatus::Ready, ""))
+        let mut prepared = self.prepared(session, turn_index, plan, PreparationStatus::Ready, "");
+        prepared.query_embedding = query_embedding;
+        Ok(prepared)
     }
 
     pub async fn resolve_limit(
@@ -1598,14 +1919,10 @@ impl<B: ChatBackend> ChatEngine<B> {
         }
 
         let selected_plan = prepared.plan.clone();
+        let query_embedding = prepared.query_embedding.clone();
         let budget_allocation = &selected_plan.retrieval_trace.budget_allocation;
-        let mandatory_tokens = budget_allocation
-            .mandatory_probe_input_tokens()
-            .ok_or_else(|| anyhow!("prepared adaptive plan 缺少精确 mandatory probe provenance"))?;
-        if mandatory_tokens != budget_allocation.mandatory_input_tokens {
-            bail!("prepared adaptive plan 的 mandatory probe 与 token 记录不一致");
-        }
-        if mandatory_tokens > session.budget.trim_target() {
+        let mandatory_tokens = budget_allocation.mandatory_input_tokens;
+        if mandatory_tokens >= session.budget.trim_target() {
             let message = "系统提示与当前输入超过 80% 安全裁剪目标，请缩短系统提示或当前输入";
             apply_trace(
                 session,
@@ -1650,13 +1967,15 @@ impl<B: ChatBackend> ChatEngine<B> {
         );
         session.turns[prepared.turn_index].touch();
         self.store.save(session)?;
-        Ok(self.prepared(
+        let mut resolved = self.prepared(
             session,
             prepared.turn_index,
             selected_plan,
             PreparationStatus::Ready,
             &format!("已保留最近 {retained} 个完整轮次并继续。"),
-        ))
+        );
+        resolved.query_embedding = query_embedding;
+        Ok(resolved)
     }
 
     pub async fn stream_turn<F>(
@@ -1678,9 +1997,14 @@ impl<B: ChatBackend> ChatEngine<B> {
         turn.touch();
         self.store.save(session)?;
         if self.config.web_search.enabled {
-            return self
+            let result = self
                 .stream_agent_turn(session, prepared, cancellation, &mut emit)
                 .await;
+            if result.is_ok() {
+                self.cache_prepared_query_embedding(session, prepared);
+                self.enqueue_turn_embedding_cache(session, prepared.turn_index);
+            }
+            return result;
         }
         let mut thinking = String::new();
         let mut content = String::new();
@@ -1782,6 +2106,8 @@ impl<B: ChatBackend> ChatEngine<B> {
         turn.touch();
         session.status = SessionStatus::Active;
         self.store.save(session)?;
+        self.cache_prepared_query_embedding(session, prepared);
+        self.enqueue_turn_embedding_cache(session, prepared.turn_index);
         Ok(())
     }
 
@@ -2049,57 +2375,36 @@ impl<B: ChatBackend> ChatEngine<B> {
         );
         let prepared_probe = (round == 1)
             .then(|| {
-                session.turns[turn_index]
-                    .context_trace
+                let trace = &session.turns[turn_index].context_trace;
+                trace
                     .retrieval
                     .budget_allocation
                     .probes
                     .iter()
                     .rev()
-                    .find(|probe| {
-                        probe.stage == "final_probe"
-                            && probe.kind == "agent"
-                            && probe.request_sha256 == request_sha256
-                    })
+                    .find(|probe| probe.kind == "agent" && probe.request_sha256 == request_sha256)
                     .map(|probe| probe.usage)
+                    .or_else(|| {
+                        trace
+                            .exact_input_tokens
+                            .map(|input| TokenUsage::new(Some(input), Some(0)))
+                    })
             })
             .flatten();
-        let probe = if let Some(usage) = prepared_probe {
-            Ok(usage)
-        } else {
-            tokio::select! {
-                _ = cancellation.cancelled() => Err(OllamaError::Cancelled { live_output_tokens: 0 }),
-                result = self.client.probe_agent(&request) => result,
-            }
-        };
-        let probe = match probe {
-            Ok(probe) => probe,
-            Err(error) => {
-                let step = trace.steps.last_mut().expect("step was pushed");
-                step.completed_at = utc_now();
-                step.error = Some(format!("上下文探测失败：{error}"));
-                self.persist_web_trace(session, turn_index, trace)
-                    .map_err(|save| OllamaError::Other(format!("无法保存探测错误：{save:#}")))?;
-                return Err(error);
-            }
-        };
-        if prepared_probe.is_none() {
-            session.turns[turn_index].probe_usage.add(probe);
+        if let Some(usage) = prepared_probe {
+            trace
+                .steps
+                .last_mut()
+                .expect("step was pushed")
+                .exact_input_tokens = usage.input_tokens;
         }
-        trace
-            .steps
-            .last_mut()
-            .expect("step was pushed")
-            .exact_input_tokens = probe.input_tokens;
-        self.persist_web_trace(session, turn_index, trace)
-            .map_err(|error| OllamaError::Other(format!("无法保存工具探测：{error:#}")))?;
-        if probe
-            .input_tokens
-            .is_some_and(|tokens| tokens > session.budget.input_budget())
-        {
+        let budget_metric = prepared_probe
+            .and_then(|usage| usage.input_tokens)
+            .unwrap_or(estimated);
+        if budget_metric > session.budget.input_budget() {
             let error = OllamaError::ContextLength {
                 message: "工具请求超过会话输入预算".into(),
-                prompt_tokens: probe.input_tokens,
+                prompt_tokens: Some(budget_metric),
                 context_tokens: Some(session.budget.context_window),
             };
             let step = trace.steps.last_mut().expect("step was pushed");
@@ -2444,28 +2749,23 @@ impl<B: ChatBackend> ChatEngine<B> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn assemble_and_probe(
+    fn assemble_estimated(
         &self,
-        session: &mut Session,
+        session: &Session,
         turn_index: usize,
         history: &[usize],
         user_content: &str,
         recall: &RecallResult,
         knowledge: &KnowledgeRecall,
-        cache: &mut PreparationProbeCache,
-        stage: &str,
-    ) -> Result<ContextPlan> {
-        let mut plan = self.assembler.assemble_with_recall_and_knowledge(
+    ) -> ContextPlan {
+        self.assembler.assemble_with_recall_and_knowledge(
             session,
             user_content,
             Some(history),
             Some(turn_index),
             Some(recall),
             Some(knowledge),
-        );
-        self.budget_probe_plan(session, &mut plan, cache, stage)
-            .await?;
-        Ok(plan)
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2486,18 +2786,14 @@ impl<B: ChatBackend> ChatEngine<B> {
             evidence: Vec::new(),
         };
         let mandatory_started = Instant::now();
-        let mandatory = self
-            .assemble_and_probe(
-                session,
-                turn_index,
-                &[],
-                user_content,
-                &empty_recall,
-                knowledge,
-                probe_cache,
-                "mandatory_probe",
-            )
-            .await?;
+        let mandatory = self.assemble_estimated(
+            session,
+            turn_index,
+            &[],
+            user_content,
+            &empty_recall,
+            knowledge,
+        );
         let mandatory_tokens = plan_metric(&mandatory)?;
         let input_budget = session.budget.input_budget();
         let available = allocation_limit.saturating_sub(mandatory_tokens);
@@ -2519,15 +2815,12 @@ impl<B: ChatBackend> ChatEngine<B> {
             elapsed_ms: recall.trace.elapsed_ms,
         });
         budget.stage_latencies.push(BudgetStageLatencyTrace {
-            stage: "mandatory_probe".into(),
+            stage: "mandatory_estimate".into(),
             elapsed_ms: elapsed_millis(mandatory_started),
         });
         if mandatory_tokens > input_budget {
             let mut blocked = mandatory;
             budget.probes = probe_cache.traces.clone();
-            if let Some(probe) = budget.probes.last() {
-                session.turns[turn_index].probe_usage.add(probe.usage);
-            }
             blocked.retrieval_trace.budget_allocation = budget;
             return Ok(blocked);
         }
@@ -2575,18 +2868,14 @@ impl<B: ChatBackend> ChatEngine<B> {
         for index in history.iter().rev() {
             let mut proposed = accepted_history.clone();
             proposed.insert(0, *index);
-            let candidate = self
-                .assemble_and_probe(
-                    session,
-                    turn_index,
-                    &proposed,
-                    user_content,
-                    &empty_recall,
-                    knowledge,
-                    probe_cache,
-                    "initial_recent",
-                )
-                .await?;
+            let candidate = self.assemble_estimated(
+                session,
+                turn_index,
+                &proposed,
+                user_content,
+                &empty_recall,
+                knowledge,
+            );
             let tokens = plan_metric(&candidate)?;
             if tokens <= recent_limit && tokens <= allocation_limit {
                 accepted_history = proposed;
@@ -2642,18 +2931,14 @@ impl<B: ChatBackend> ChatEngine<B> {
                 let mut proposed_groups = accepted_groups.clone();
                 proposed_groups.push(group.clone());
                 let proposed_recall = recall_for_groups(recall, &proposed_groups);
-                let candidate = self
-                    .assemble_and_probe(
-                        session,
-                        turn_index,
-                        &accepted_history,
-                        user_content,
-                        &proposed_recall,
-                        knowledge,
-                        probe_cache,
-                        &format!("initial_{}", budget_bucket_name(bucket)),
-                    )
-                    .await?;
+                let candidate = self.assemble_estimated(
+                    session,
+                    turn_index,
+                    &accepted_history,
+                    user_content,
+                    &proposed_recall,
+                    knowledge,
+                );
                 let tokens = plan_metric(&candidate)?;
                 let increment = tokens.saturating_sub(current_tokens);
                 if tokens <= allocation_limit && tokens.saturating_sub(bucket_base) <= share {
@@ -2694,18 +2979,14 @@ impl<B: ChatBackend> ChatEngine<B> {
                     let mut proposed = accepted_history.clone();
                     proposed.insert(0, *index);
                     let proposed_recall = recall_for_groups(recall, &accepted_groups);
-                    let candidate = self
-                        .assemble_and_probe(
-                            session,
-                            turn_index,
-                            &proposed,
-                            user_content,
-                            &proposed_recall,
-                            knowledge,
-                            probe_cache,
-                            "reflow_recent",
-                        )
-                        .await?;
+                    let candidate = self.assemble_estimated(
+                        session,
+                        turn_index,
+                        &proposed,
+                        user_content,
+                        &proposed_recall,
+                        knowledge,
+                    );
                     let tokens = plan_metric(&candidate)?;
                     let increment = tokens.saturating_sub(current_tokens);
                     if tokens <= allocation_limit && increment <= reflow_pool {
@@ -2745,18 +3026,14 @@ impl<B: ChatBackend> ChatEngine<B> {
                     let mut proposed_groups = accepted_groups.clone();
                     proposed_groups.push(group.clone());
                     let proposed_recall = recall_for_groups(recall, &proposed_groups);
-                    let candidate = self
-                        .assemble_and_probe(
-                            session,
-                            turn_index,
-                            &accepted_history,
-                            user_content,
-                            &proposed_recall,
-                            knowledge,
-                            probe_cache,
-                            &format!("reflow_{}", budget_bucket_name(bucket)),
-                        )
-                        .await?;
+                    let candidate = self.assemble_estimated(
+                        session,
+                        turn_index,
+                        &accepted_history,
+                        user_content,
+                        &proposed_recall,
+                        knowledge,
+                    );
                     let tokens = plan_metric(&candidate)?;
                     let increment = tokens.saturating_sub(current_tokens);
                     if tokens <= allocation_limit && increment <= reflow_pool {
@@ -2825,18 +3102,14 @@ impl<B: ChatBackend> ChatEngine<B> {
 
         let final_started = Instant::now();
         let mut final_recall = recall_for_groups(recall, &accepted_groups);
-        let mut current = self
-            .assemble_and_probe(
-                session,
-                turn_index,
-                &accepted_history,
-                user_content,
-                &final_recall,
-                knowledge,
-                probe_cache,
-                "final_probe",
-            )
-            .await?;
+        let mut current = self.assemble_estimated(
+            session,
+            turn_index,
+            &accepted_history,
+            user_content,
+            &final_recall,
+            knowledge,
+        );
         current_tokens = plan_metric(&current)?;
         while current_tokens > allocation_limit {
             let Some(removed) = acceptance_log.pop() else {
@@ -2870,32 +3143,28 @@ impl<B: ChatBackend> ChatEngine<B> {
                 }
             };
             budget.exclusions.retain(|exclusion| {
-                exclusion.candidate_group_id != group_id || exclusion.stage == "final_probe"
+                exclusion.candidate_group_id != group_id || exclusion.stage == "final_estimate"
             });
             if !budget.exclusions.iter().any(|exclusion| {
-                exclusion.candidate_group_id == group_id && exclusion.stage == "final_probe"
+                exclusion.candidate_group_id == group_id && exclusion.stage == "final_estimate"
             }) {
                 budget.exclusions.push(BudgetExclusionTrace {
                     bucket,
                     candidate_group_id: group_id,
-                    stage: "final_probe".into(),
-                    reason: "final_probe_over_budget".into(),
+                    stage: "final_estimate".into(),
+                    reason: "final_estimate_over_budget".into(),
                     exact_increment_tokens: Some(removed_increment),
                 });
             }
             final_recall = recall_for_groups(recall, &accepted_groups);
-            current = self
-                .assemble_and_probe(
-                    session,
-                    turn_index,
-                    &accepted_history,
-                    user_content,
-                    &final_recall,
-                    knowledge,
-                    probe_cache,
-                    "final_probe",
-                )
-                .await?;
+            current = self.assemble_estimated(
+                session,
+                turn_index,
+                &accepted_history,
+                user_content,
+                &final_recall,
+                knowledge,
+            );
             current_tokens = plan_metric(&current)?;
         }
         budget.actual_tokens = BudgetTokenBreakdown::default();
@@ -2965,19 +3234,11 @@ impl<B: ChatBackend> ChatEngine<B> {
         }
         budget.final_input_tokens = Some(current_tokens);
         budget.stage_latencies.push(BudgetStageLatencyTrace {
-            stage: "final_probe".into(),
+            stage: "final_estimate".into(),
             elapsed_ms: elapsed_millis(final_started),
         });
         apply_budget_exclusion_reasons(&mut current.retrieval_trace, &groups, &budget.exclusions);
         budget.probes = probe_cache.traces.clone();
-        if let Some(probe) = budget
-            .probes
-            .iter()
-            .rev()
-            .find(|probe| probe.stage == "final_probe")
-        {
-            session.turns[turn_index].probe_usage.add(probe.usage);
-        }
         current.retrieval_trace.budget_allocation = budget;
         Ok(current)
     }
@@ -3019,30 +3280,6 @@ impl<B: ChatBackend> ChatEngine<B> {
             if let Some(usage) = cache.usages.get(&request_sha256).copied() {
                 (request_sha256, "agent", usage)
             } else {
-                let rendered_messages = request
-                    .messages
-                    .iter()
-                    .map(|message| crate::model::ChatMessage {
-                        role: message.role.clone(),
-                        content: message.content.clone(),
-                    })
-                    .collect::<Vec<_>>();
-                match self
-                    .client
-                    .render_prompt(
-                        &session.model,
-                        &rendered_messages,
-                        session.think,
-                        session.budget.context_window,
-                    )
-                    .await
-                {
-                    Ok(Some(rendered)) => {
-                        ContextAssembler::apply_rendered_upper_bound(plan, &rendered)
-                    }
-                    Ok(None) => {}
-                    Err(error) => return Err(anyhow!("render_failed: {error}")),
-                }
                 let usage = match self.client.probe_agent(&request).await {
                     Ok(usage) => usage,
                     Err(OllamaError::ContextLength { prompt_tokens, .. }) => TokenUsage::new(
@@ -3069,22 +3306,6 @@ impl<B: ChatBackend> ChatEngine<B> {
             if let Some(usage) = cache.usages.get(&request_sha256).copied() {
                 (request_sha256, "normal", usage)
             } else {
-                match self
-                    .client
-                    .render_prompt(
-                        &session.model,
-                        &plan.messages,
-                        session.think,
-                        session.budget.context_window,
-                    )
-                    .await
-                {
-                    Ok(Some(rendered)) => {
-                        ContextAssembler::apply_rendered_upper_bound(plan, &rendered)
-                    }
-                    Ok(None) => {}
-                    Err(error) => return Err(anyhow!("render_failed: {error}")),
-                }
                 let usage = match self
                     .client
                     .probe(
@@ -3236,12 +3457,134 @@ impl<B: ChatBackend> ChatEngine<B> {
             plan,
             status,
             message: message.to_owned(),
+            query_embedding: None,
         }
     }
 }
 
 fn elapsed_millis(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn empty_live_recall(
+    current_event_id: &str,
+    retrieval_config: crate::model::RetrievalConfig,
+    memory_config: &crate::config::MemoryConfig,
+    error: Option<&str>,
+) -> RecallResult {
+    let query_kind = crate::model::QueryKind::GeneralSemantic;
+    RecallResult {
+        trace: RetrievalTrace {
+            status: "fast_search_unavailable".into(),
+            current_query_event_id: current_event_id.into(),
+            config: retrieval_config,
+            error: error.map(str::to_owned),
+            query_kind,
+            budget_allocation: crate::retrieval::memory_budget_trace(memory_config, query_kind),
+            ..Default::default()
+        },
+        evidence: Vec::new(),
+    }
+}
+
+fn turn_leaf_embedding_inputs(user: &str, assistant: &str) -> Vec<String> {
+    [user, assistant]
+        .into_iter()
+        .filter(|content| !content.trim().is_empty())
+        .flat_map(|content| {
+            let characters = content.chars().collect::<Vec<_>>();
+            if characters.len() <= 240 {
+                return vec![content.to_owned()];
+            }
+            let mut fragments = Vec::new();
+            let mut start = 0usize;
+            while start < characters.len() {
+                let end = start.saturating_add(240).min(characters.len());
+                fragments.push(characters[start..end].iter().collect());
+                if end == characters.len() {
+                    break;
+                }
+                start = start.saturating_add(200);
+            }
+            fragments
+        })
+        .collect()
+}
+
+fn ensure_live_channel_statuses(
+    trace: &mut RetrievalTrace,
+    memory_enabled: bool,
+    deadline_exceeded: bool,
+    fast_available: bool,
+    bm25_elapsed_ms: u64,
+    vector_elapsed_ms: u64,
+) {
+    let semantic_status = if !memory_enabled {
+        "disabled"
+    } else if trace.fast_fallback_used && deadline_exceeded {
+        "timeout"
+    } else if trace.fast_fallback_used {
+        "error"
+    } else {
+        "ok"
+    };
+    let expected = [
+        (
+            RetrievalChannel::Bm25,
+            if fast_available {
+                "ok"
+            } else if deadline_exceeded {
+                "timeout"
+            } else {
+                "error"
+            },
+            bm25_elapsed_ms,
+        ),
+        (RetrievalChannel::Vector, semantic_status, vector_elapsed_ms),
+        (RetrievalChannel::Entity, semantic_status, 0),
+        (RetrievalChannel::State, semantic_status, 0),
+        (RetrievalChannel::Episode, semantic_status, 0),
+        (RetrievalChannel::Graph, semantic_status, 0),
+    ];
+    for (channel, status, elapsed_ms) in expected {
+        if let Some(existing) = trace
+            .channels
+            .iter_mut()
+            .find(|existing| existing.channel == channel)
+        {
+            if channel == RetrievalChannel::Bm25 {
+                existing.status = status.into();
+                if existing.elapsed_ms == 0 {
+                    existing.elapsed_ms = elapsed_ms;
+                }
+            } else if !memory_enabled || trace.fast_fallback_used {
+                existing.status = status.into();
+                if status == "timeout" {
+                    existing.error = Some("live search deadline exceeded".into());
+                } else if status == "error" && existing.error.is_none() {
+                    existing.error = Some("live semantic search unavailable".into());
+                }
+            } else if existing.status == "empty" {
+                existing.status = "ok".into();
+            }
+            continue;
+        }
+        trace.channels.push(ChannelTrace {
+            channel,
+            status: status.into(),
+            candidate_count: if channel == RetrievalChannel::Bm25 {
+                trace.candidates.len()
+            } else {
+                0
+            },
+            elapsed_ms,
+            error: match status {
+                "timeout" => Some("live search deadline exceeded".into()),
+                "error" => Some("live search unavailable".into()),
+                _ => None,
+            },
+        });
+    }
 }
 
 impl ToolExecution {
@@ -3942,6 +4285,9 @@ mod tests {
         stream_calls: Arc<Mutex<usize>>,
         render_error: Option<OllamaError>,
         probe_error: Option<OllamaError>,
+        embed_requests: Arc<Mutex<Vec<EmbeddingRequest>>>,
+        embed_delay: Arc<Mutex<Option<Duration>>>,
+        embed_error: Option<OllamaError>,
         structured_responses:
             Arc<Mutex<VecDeque<Result<crate::ollama::StructuredChatResponse, OllamaError>>>>,
         structured_requests: Arc<Mutex<Vec<StructuredChatRequest>>>,
@@ -3973,6 +4319,9 @@ mod tests {
                 stream_calls: Arc::new(Mutex::new(0)),
                 render_error: None,
                 probe_error: None,
+                embed_requests: Arc::new(Mutex::new(Vec::new())),
+                embed_delay: Arc::new(Mutex::new(None)),
+                embed_error: None,
                 structured_responses: Arc::new(Mutex::new(VecDeque::new())),
                 structured_requests: Arc::new(Mutex::new(Vec::new())),
                 structured_delay: Arc::new(Mutex::new(None)),
@@ -4030,6 +4379,37 @@ mod tests {
                 return Err(error.clone());
             }
             Ok(TokenUsage::new(Some(self.count_for(messages)), Some(1)))
+        }
+
+        async fn embed(
+            &self,
+            request: EmbeddingRequest,
+        ) -> Result<crate::ollama::EmbeddingResponse, OllamaError> {
+            self.embed_requests.lock().unwrap().push(request.clone());
+            let delay = *self.embed_delay.lock().unwrap();
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
+            if let Some(error) = &self.embed_error {
+                return Err(error.clone());
+            }
+            let dimensions = request.dimensions.unwrap_or(4);
+            Ok(crate::ollama::EmbeddingResponse {
+                model: request.model,
+                embeddings: request
+                    .input
+                    .iter()
+                    .enumerate()
+                    .map(|(index, _)| {
+                        let mut vector = vec![0.0; dimensions];
+                        vector[index % dimensions] = 1.0;
+                        vector
+                    })
+                    .collect(),
+                prompt_eval_count: None,
+                total_duration: None,
+                load_duration: None,
+            })
         }
 
         async fn stream_chat(
@@ -4267,6 +4647,30 @@ mod tests {
             warning_ratio: 0.9,
             trim_target_ratio: 0.8,
         }
+    }
+
+    fn roomy_budget() -> BudgetConfig {
+        BudgetConfig::default()
+    }
+
+    fn enabled_memory_config(search_timeout_ms: u64) -> AppConfig {
+        let mut config = AppConfig::default();
+        config.memory.enabled = true;
+        config.memory.search_timeout_ms = search_timeout_ms;
+        config
+    }
+
+    fn input_reaching_estimate(session: &Session, target: u64) -> String {
+        let mut input = String::new();
+        while ContextAssembler
+            .assemble(session, &input, Some(&[]), None)
+            .estimated_upper_tokens
+            .unwrap_or_default()
+            < target
+        {
+            input.push('x');
+        }
+        input
     }
 
     #[tokio::test]
@@ -4813,7 +5217,8 @@ mod tests {
             .await
             .unwrap();
         assert!(prepared.ready());
-        assert_eq!(*client.probes.lock().unwrap(), 1);
+        assert_eq!(*client.probes.lock().unwrap(), 0);
+        assert_eq!(session.turns[0].probe_usage, TokenUsage::zero());
         engine
             .stream_turn(&mut session, &prepared, CancellationToken::new(), |_| {})
             .await
@@ -4876,11 +5281,9 @@ mod tests {
         let mut session = store
             .create("model", "http://localhost", None, budget(), true)
             .unwrap();
+        let input = input_reaching_estimate(&session, session.budget.probe_threshold());
         let engine = ChatEngine::new(store, FakeClient::new(850));
-        let prepared = engine
-            .prepare_turn(&mut session, "hello".into())
-            .await
-            .unwrap();
+        let prepared = engine.prepare_turn(&mut session, input).await.unwrap();
         assert!(prepared.needs_limit_decision());
         let ended = engine
             .resolve_limit(&mut session, prepared, LimitAction::EndSession)
@@ -4901,7 +5304,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn render_fallback_forces_exact_probe() {
+    async fn ordinary_context_skips_render_and_exact_probe() {
         let root = tempfile::tempdir().unwrap();
         let store = SessionStore::new(root.path()).unwrap();
         let mut session = store
@@ -4914,9 +5317,321 @@ mod tests {
             .prepare_turn(&mut session, "hello".into())
             .await
             .unwrap();
-        assert_eq!(prepared.plan.exact_input_tokens, Some(100));
-        assert_eq!(*probes.lock().unwrap(), 1);
-        assert_eq!(session.turns[0].probe_usage.total_tokens, Some(101));
+        assert_eq!(prepared.plan.exact_input_tokens, None);
+        assert_eq!(*probes.lock().unwrap(), 0);
+        assert_eq!(session.turns[0].probe_usage, TokenUsage::zero());
+    }
+
+    #[tokio::test]
+    async fn live_search_deadline_uses_fast_fallback_and_marks_timeout_channels() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let mut session = store
+            .create("model", "http://localhost", None, roomy_budget(), false)
+            .unwrap();
+        let client = FakeClient::new(100);
+        *client.embed_delay.lock().unwrap() = Some(Duration::from_millis(1_500));
+        let engine = ChatEngine::with_config(store, client, enabled_memory_config(1_000));
+        let prepared = engine
+            .prepare_turn(&mut session, "deadline query".into())
+            .await
+            .unwrap();
+        let trace = &prepared.plan.retrieval_trace;
+        assert!((900..1_300).contains(&trace.elapsed_ms));
+        assert_eq!(trace.deadline_ms, 1_000);
+        assert!(trace.deadline_exceeded);
+        assert!(trace.fast_fallback_used);
+        assert!(trace.warnings.iter().any(|warning| {
+            warning.contains("搜索超过 1000ms，已采用快速搜索结果；未完成通道：")
+        }));
+        assert!(trace.channels.iter().any(|channel| {
+            channel.channel == RetrievalChannel::Bm25 && channel.status == "ok"
+        }));
+        assert!(trace.channels.iter().any(|channel| {
+            channel.channel == RetrievalChannel::Vector && channel.status == "timeout"
+        }));
+        assert!(prepared.query_embedding.is_none());
+    }
+
+    #[tokio::test]
+    async fn live_search_starts_bm25_embedding_and_knowledge_concurrently() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let mut session = store
+            .create("model", "http://localhost", None, roomy_budget(), false)
+            .unwrap();
+        let engine =
+            ChatEngine::with_config(store, FakeClient::new(100), enabled_memory_config(1_000));
+        *engine
+            .live_search_barrier
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(Arc::new(tokio::sync::Barrier::new(3)));
+        let prepared = tokio::time::timeout(
+            Duration::from_millis(500),
+            engine.prepare_turn(&mut session, "parallel query".into()),
+        )
+        .await
+        .expect("all three search workers must reach the shared barrier")
+        .unwrap();
+        assert!(!prepared.plan.retrieval_trace.deadline_exceeded);
+    }
+
+    #[tokio::test]
+    async fn knowledge_failure_does_not_discard_fast_memory_results() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        std::fs::create_dir_all(store.knowledge().index_path()).unwrap();
+        let mut session = store
+            .create("model", "http://localhost", None, roomy_budget(), false)
+            .unwrap();
+        let prepared = ChatEngine::new(store, FakeClient::new(100))
+            .prepare_turn(&mut session, "knowledge failure".into())
+            .await
+            .unwrap();
+        assert!(prepared.ready());
+        assert!(
+            prepared
+                .plan
+                .retrieval_trace
+                .channels
+                .iter()
+                .any(|channel| {
+                    channel.channel == RetrievalChannel::Bm25 && channel.status == "ok"
+                })
+        );
+        assert_eq!(prepared.plan.knowledge_trace.status, "failed");
+        assert!(prepared.plan.knowledge_trace.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn short_query_embedding_is_reused_by_exit_refresh() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let mut session = store
+            .create("model", "http://localhost", None, roomy_budget(), false)
+            .unwrap();
+        let client = FakeClient::new(100);
+        let requests = client.embed_requests.clone();
+        let config = enabled_memory_config(1_000);
+        let engine = ChatEngine::with_config(store.clone(), client, config.clone());
+        let user = "short cache query".to_owned();
+        let prepared = engine
+            .prepare_turn(&mut session, user.clone())
+            .await
+            .unwrap();
+        assert!(prepared.query_embedding.is_some());
+        assert_eq!(
+            prepared
+                .plan
+                .retrieval_trace
+                .channels
+                .iter()
+                .map(|channel| (
+                    channel.channel,
+                    channel.status.as_str(),
+                    channel.error.is_some(),
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (RetrievalChannel::Bm25, "ok", false),
+                (RetrievalChannel::Vector, "stale", false),
+                (RetrievalChannel::Entity, "stale", false),
+                (RetrievalChannel::State, "stale", false),
+                (RetrievalChannel::Episode, "stale", false),
+                (RetrievalChannel::Graph, "error", true),
+            ]
+        );
+        let before_answer = Connection::open(store.retrieval().index_path()).unwrap();
+        let cached_before: i64 = before_answer
+            .query_row("SELECT count(*) FROM memory_embedding_cache", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let published_before: i64 = before_answer
+            .query_row("SELECT count(*) FROM memory_embeddings", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!((cached_before, published_before), (0, 0));
+        drop(before_answer);
+        engine
+            .stream_turn(&mut session, &prepared, CancellationToken::new(), |_| {})
+            .await
+            .unwrap();
+        engine.wait_for_background_embeddings().await;
+        let spec = VectorIndexSpec::from_config(&config.memory).unwrap();
+        let cached = store.retrieval().cached_content_embeddings(&spec).unwrap();
+        assert!(cached.contains_key(&content_sha256(&user)));
+        let user_calls_before_refresh = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|request| request.input.iter())
+            .filter(|input| *input == &user)
+            .count();
+        assert_eq!(user_calls_before_refresh, 1);
+        let report = engine
+            .refresh_embeddings(CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(report.leaf_embedded_inputs, 0);
+        let user_calls_after_refresh = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|request| request.input.iter())
+            .filter(|input| *input == &user)
+            .count();
+        assert_eq!(user_calls_after_refresh, 1);
+
+        let mut second_session = store
+            .create("model", "http://localhost", None, roomy_budget(), false)
+            .unwrap();
+        let second = engine
+            .prepare_turn(&mut second_session, user.clone())
+            .await
+            .unwrap();
+        let vector_channel = second
+            .plan
+            .retrieval_trace
+            .channels
+            .iter()
+            .find(|channel| channel.channel == RetrievalChannel::Vector)
+            .expect("live search records vector status");
+        assert_eq!(vector_channel.status, "stale");
+        assert!(!second.plan.retrieval_trace.fusion_candidates.is_empty());
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .flat_map(|request| request.input.iter())
+                .filter(|input| *input == &user)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn long_query_uses_cached_overlapping_fragments_not_whole_query_vector() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let mut session = store
+            .create("model", "http://localhost", None, roomy_budget(), false)
+            .unwrap();
+        let client = FakeClient::new(100);
+        let requests = client.embed_requests.clone();
+        let config = enabled_memory_config(1_000);
+        let engine = ChatEngine::with_config(store.clone(), client, config.clone());
+        let user = "长消息".repeat(100);
+        assert!(user.chars().count() > 240);
+        let prepared = engine
+            .prepare_turn(&mut session, user.clone())
+            .await
+            .unwrap();
+        engine
+            .stream_turn(&mut session, &prepared, CancellationToken::new(), |_| {})
+            .await
+            .unwrap();
+        engine.wait_for_background_embeddings().await;
+        let spec = VectorIndexSpec::from_config(&config.memory).unwrap();
+        let cached = store.retrieval().cached_content_embeddings(&spec).unwrap();
+        let query_vector = cached
+            .get(&content_sha256(&user))
+            .expect("completed query vector is cached")
+            .clone();
+        let fragments = turn_leaf_embedding_inputs(&user, "answer")
+            .into_iter()
+            .filter(|input| input != "answer")
+            .collect::<Vec<_>>();
+        assert!(fragments.len() > 1);
+        assert!(
+            fragments
+                .iter()
+                .all(|fragment| cached.contains_key(&content_sha256(fragment)))
+        );
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .flat_map(|request| request.input.iter())
+                .filter(|input| *input == &user)
+                .count(),
+            1
+        );
+        let report = engine
+            .refresh_embeddings(CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(report.leaf_embedded_inputs, 0);
+        let message_vector = store
+            .retrieval()
+            .compatible_embeddings(&spec)
+            .unwrap()
+            .into_iter()
+            .find(|embedding| {
+                embedding.granularity == RetrievalDocumentGranularity::Message
+                    && embedding.source_sha256 == content_sha256(&user)
+            })
+            .expect("long message embedding was published from fragments")
+            .vector;
+        assert_ne!(message_vector, query_vector);
+    }
+
+    #[tokio::test]
+    async fn organized_graph_prefix_survives_append_and_is_reported_stale() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let mut session = store
+            .create("model", "http://localhost", None, roomy_budget(), false)
+            .unwrap();
+        let config = enabled_memory_config(1_000);
+        let engine = ChatEngine::with_config(store.clone(), FakeClient::new(100), config.clone());
+        let first = engine
+            .prepare_turn(&mut session, "first organized fact".into())
+            .await
+            .unwrap();
+        engine
+            .stream_turn(&mut session, &first, CancellationToken::new(), |_| {})
+            .await
+            .unwrap();
+        engine.wait_for_background_embeddings().await;
+        engine
+            .refresh_embeddings(CancellationToken::new())
+            .await
+            .unwrap();
+        store.retrieval().refresh_graph(&config.memory).unwrap();
+        store.retrieval().mark_graph_organized().unwrap();
+
+        let second = engine
+            .prepare_turn(&mut session, "second pending fact".into())
+            .await
+            .unwrap();
+        let connection = Connection::open(store.retrieval().index_path()).unwrap();
+        let materializations: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM memory_graph_materializations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(materializations, 1);
+        let graph_channel = second
+            .plan
+            .retrieval_trace
+            .channels
+            .iter()
+            .find(|channel| channel.channel == RetrievalChannel::Graph)
+            .expect("live search records graph status");
+        assert_eq!(
+            (
+                graph_channel.status.as_str(),
+                graph_channel.error.as_deref()
+            ),
+            ("stale", None)
+        );
     }
 
     #[tokio::test]
@@ -4928,7 +5643,7 @@ mod tests {
                 "model",
                 "http://localhost",
                 Some("a-system"),
-                budget(),
+                roomy_budget(),
                 false,
             )
             .unwrap();
@@ -4949,7 +5664,7 @@ mod tests {
                 "model",
                 "http://localhost",
                 Some("b-system"),
-                budget(),
+                roomy_budget(),
                 false,
             )
             .unwrap();
@@ -5071,7 +5786,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tampered_external_retrieval_artifacts_fail_before_model_stream() {
+    async fn bm25_corruption_falls_back_to_recent_context_without_streaming() {
         for (column, value, table) in [
             ("exact_content", "tampered", "retrieval_documents"),
             ("content_sha256", "bad-hash", "retrieval_documents"),
@@ -5114,26 +5829,48 @@ mod tests {
             }
             drop(connection);
             let mut b = store
-                .create("model", "http://localhost", Some("b"), budget(), false)
+                .create(
+                    "model",
+                    "http://localhost",
+                    Some("b"),
+                    roomy_budget(),
+                    false,
+                )
                 .unwrap();
+            b.turns.push(completed_turn(0));
+            store.save(&mut b).unwrap();
+            let recent_turn_id = b.turns[0].id.clone();
             let client = FakeClient::new(100);
             let calls = client.stream_calls.clone();
             let requests = client.captured_requests.clone();
             let engine_b = ChatEngine::new(store.clone(), client);
+            let prepared = engine_b
+                .prepare_turn(&mut b, "青瓷月亮暗号".into())
+                .await
+                .unwrap();
+            assert!(prepared.ready());
+            assert!(prepared.plan.included_turn_ids.contains(&recent_turn_id));
+            assert_eq!(
+                prepared.plan.retrieval_trace.status,
+                "fast_search_unavailable"
+            );
             assert!(
-                engine_b
-                    .prepare_turn(&mut b, "青瓷月亮暗号".into())
-                    .await
-                    .is_err()
+                prepared
+                    .plan
+                    .retrieval_trace
+                    .channels
+                    .iter()
+                    .any(|channel| channel.channel == RetrievalChannel::Bm25
+                        && channel.status == "error")
             );
             assert_eq!(*calls.lock().unwrap(), 0);
             assert!(requests.lock().unwrap().is_empty());
             assert!(
                 b.turns
                     .last()
-                    .is_some_and(|turn| turn.status == TurnStatus::Failed
+                    .is_some_and(|turn| turn.status == TurnStatus::Pending
                         && turn.request_started_at.is_none()
-                        && turn.context_trace.retrieval.status == "failed")
+                        && turn.context_trace.retrieval.status == "fast_search_unavailable")
             );
             assert_eq!(
                 std::fs::read(root.path().join(format!("{}.json", a.id))).unwrap(),
@@ -5143,12 +5880,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn successful_recall_survives_render_and_probe_failures() {
+    async fn ordinary_recall_does_not_depend_on_render_or_probe() {
         for probe_case in [false, true] {
             let root = tempfile::tempdir().unwrap();
             let store = SessionStore::new(root.path()).unwrap();
             let mut a = store
-                .create("model", "http://localhost", Some("a"), budget(), false)
+                .create(
+                    "model",
+                    "http://localhost",
+                    Some("a"),
+                    roomy_budget(),
+                    false,
+                )
                 .unwrap();
             let ea = ChatEngine::new(store.clone(), FakeClient::new(100));
             let pa = ea
@@ -5159,7 +5902,13 @@ mod tests {
                 .await
                 .unwrap();
             let mut b = store
-                .create("model", "http://localhost", Some("b"), budget(), false)
+                .create(
+                    "model",
+                    "http://localhost",
+                    Some("b"),
+                    roomy_budget(),
+                    false,
+                )
                 .unwrap();
             let mut client = FakeClient::new(if probe_case { 800 } else { 100 });
             client.render_supported = probe_case;
@@ -5169,27 +5918,21 @@ mod tests {
                 client.render_error = Some(OllamaError::Protocol("render failure".into()));
             }
             let calls = client.stream_calls.clone();
+            let probes = client.probes.clone();
             let engine = ChatEngine::new(store.clone(), client);
-            assert!(
-                engine
-                    .prepare_turn(&mut b, "琥珀钥匙在哪里".into())
-                    .await
-                    .is_err()
-            );
+            let prepared = engine
+                .prepare_turn(&mut b, "琥珀钥匙在哪里".into())
+                .await
+                .unwrap();
+            assert!(prepared.ready());
+            assert_eq!(*probes.lock().unwrap(), 0);
             let reloaded = store.load(&b.id).unwrap();
             let turn = reloaded.turns.last().unwrap();
             assert_eq!(turn.context_trace.retrieval.status, "ok");
             assert!(!turn.context_trace.retrieval.candidates.is_empty());
             assert!(!turn.context_trace.retrieval.selected_evidence.is_empty());
-            assert_eq!(
-                turn.context_trace.decision,
-                if probe_case {
-                    "probe_failed"
-                } else {
-                    "render_failed"
-                }
-            );
-            assert_eq!(turn.status, TurnStatus::Failed);
+            assert_eq!(turn.context_trace.decision, "ready");
+            assert_eq!(turn.status, TurnStatus::Pending);
             assert!(turn.request_started_at.is_none());
             assert_eq!(*calls.lock().unwrap(), 0);
         }
@@ -5211,18 +5954,29 @@ mod tests {
             .await
             .unwrap();
         let mut b = store
-            .create("model", "http://localhost", Some("b"), budget(), false)
+            .create(
+                "model",
+                "http://localhost",
+                Some("b"),
+                BudgetConfig {
+                    context_window: 4_000,
+                    max_output_tokens: 500,
+                    safety_margin_tokens: 0,
+                    probe_ratio: 0.5,
+                    warning_ratio: 0.9,
+                    trim_target_ratio: 0.5,
+                },
+                false,
+            )
             .unwrap();
         let mut client = FakeClient::new(100);
         client.render_supported = false;
         let probes = client.probes.clone();
         let engine = ChatEngine::new(store.clone(), client);
-        let prepared = engine
-            .prepare_turn(&mut b, "翡翠罗盘是什么".into())
-            .await
-            .unwrap();
-        // Mandatory baseline and evidence-bearing final requests are distinct exact probes.
-        assert_eq!(*probes.lock().unwrap(), 2);
+        let mut input = input_reaching_estimate(&b, b.budget.probe_threshold());
+        input.push_str(" 翡翠罗盘是什么");
+        let prepared = engine.prepare_turn(&mut b, input).await.unwrap();
+        assert_eq!(*probes.lock().unwrap(), 1);
         assert!(!prepared.plan.retrieval_trace.selected_evidence.is_empty());
         assert_eq!(
             store
@@ -5251,12 +6005,21 @@ mod tests {
                 .unwrap();
             let client = FakeClient::new(count);
             let probes = client.probes.clone();
+            let input = input_reaching_estimate(&session, session.budget.probe_threshold());
+            let progress = Arc::new(Mutex::new(Vec::new()));
+            let observed_progress = progress.clone();
             let prepared = ChatEngine::new(store, client)
-                .prepare_turn(&mut session, "hello".into())
+                .prepare_turn_with_progress(&mut session, input, move |event| {
+                    observed_progress.lock().unwrap().push(event);
+                })
                 .await
                 .unwrap();
             assert_eq!(prepared.status, expected);
-            assert!(*probes.lock().unwrap() >= 1);
+            assert_eq!(*probes.lock().unwrap(), 1);
+            assert!(matches!(
+                progress.lock().unwrap().as_slice(),
+                [PreparationProgress::ExactContextCheckStarted { .. }]
+            ));
         }
     }
 
@@ -5272,13 +6035,16 @@ mod tests {
     async fn continue_keeps_maximum_recent_suffix_at_trim_target() {
         let root = tempfile::tempdir().unwrap();
         let store = SessionStore::new(root.path()).unwrap();
+        let mut trim_budget = budget();
+        trim_budget.context_window = 1_200;
         let mut session = store
-            .create("model", "http://localhost", None, budget(), true)
+            .create("model", "http://localhost", None, trim_budget, true)
             .unwrap();
         session.turns = (0..3).map(completed_turn).collect();
         store.save(&mut session).unwrap();
         let mut client = FakeClient::new(100);
         client.history_cost = Some((300, 250));
+        let probes = client.probes.clone();
         let engine = ChatEngine::new(store, client);
         let prepared = engine
             .prepare_turn(&mut session, "current".into())
@@ -5288,7 +6054,9 @@ mod tests {
             .resolve_limit(&mut session, prepared, LimitAction::ContinueWithTrim)
             .await
             .unwrap();
-        assert_eq!(resumed.plan.exact_input_tokens, Some(550));
+        assert_eq!(resumed.plan.exact_input_tokens, None);
+        assert_eq!(*probes.lock().unwrap(), 1);
+        assert!(plan_metric(&resumed.plan).unwrap() < session.budget.trim_target());
         assert_eq!(
             resumed.plan.included_turn_ids,
             vec![session.turns[2].id.clone()]
@@ -5422,10 +6190,8 @@ mod tests {
         let client = FakeClient::new(850);
         let calls = client.stream_calls.clone();
         let eb = ChatEngine::new(store.clone(), client);
-        let prepared = eb
-            .prepare_turn(&mut b, "松烟墨盒是什么".into())
-            .await
-            .unwrap();
+        let input = input_reaching_estimate(&b, b.budget.trim_target().saturating_add(1));
+        let prepared = eb.prepare_turn(&mut b, input).await.unwrap();
         assert!(prepared.needs_limit_decision());
         let trace = prepared.plan.retrieval_trace.clone();
         let evidence = prepared.plan.evidence.clone();
@@ -5447,7 +6213,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let store = SessionStore::new(root.path()).unwrap();
         let mut session = store
-            .create("model", "http://localhost", None, budget(), true)
+            .create("model", "http://localhost", None, roomy_budget(), true)
             .unwrap();
         let client = AgentFakeClient::new(
             vec![
@@ -5534,7 +6300,7 @@ mod tests {
         assert_eq!(turn.thinking, "final-thinking");
         assert_eq!(turn.assistant_content, "Verified at https://example.com/a");
         assert_eq!(turn.usage, TokenUsage::new(Some(450), Some(18)));
-        assert_eq!(turn.probe_usage, TokenUsage::new(Some(450), Some(3)));
+        assert_eq!(turn.probe_usage, TokenUsage::zero());
         assert_eq!(turn.context_trace.exact_input_tokens, Some(200));
         let web = &turn.context_trace.web;
         assert_eq!(web.status, "verified");
@@ -5604,7 +6370,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let store = SessionStore::new(root.path()).unwrap();
         let mut session = store
-            .create("model", "http://localhost", None, budget(), false)
+            .create("model", "http://localhost", None, roomy_budget(), false)
             .unwrap();
         let client = AgentFakeClient::new(
             vec![
@@ -5674,7 +6440,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let store = SessionStore::new(root.path()).unwrap();
         let mut session = store
-            .create("model", "http://localhost", None, budget(), false)
+            .create("model", "http://localhost", None, roomy_budget(), false)
             .unwrap();
         let client = AgentFakeClient::new(
             vec![
@@ -5740,7 +6506,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let store = SessionStore::new(root.path()).unwrap();
         let mut session = store
-            .create("model", "http://localhost", None, budget(), false)
+            .create("model", "http://localhost", None, roomy_budget(), false)
             .unwrap();
         let client = AgentFakeClient::new(
             vec![
@@ -5783,7 +6549,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let store = SessionStore::new(root.path()).unwrap();
         let mut session = store
-            .create("model", "http://localhost", None, budget(), false)
+            .create("model", "http://localhost", None, roomy_budget(), false)
             .unwrap();
         let client = AgentFakeClient::new(
             vec![
@@ -5831,11 +6597,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn call_limit_skips_tools_and_context_is_reprobed_before_fallback() {
+    async fn call_limit_skips_tools_without_another_probe() {
         let root = tempfile::tempdir().unwrap();
         let store = SessionStore::new(root.path()).unwrap();
         let mut session = store
-            .create("model", "http://localhost", None, budget(), false)
+            .create("model", "http://localhost", None, roomy_budget(), false)
             .unwrap();
         let client = AgentFakeClient::new(
             vec![
@@ -5876,15 +6642,15 @@ mod tests {
                 .iter()
                 .any(|warning| warning.contains("调用上限"))
         );
-        assert_eq!(session.turns[0].probe_usage.input_tokens, Some(220));
+        assert_eq!(session.turns[0].probe_usage, TokenUsage::zero());
     }
 
     #[tokio::test]
-    async fn each_subsequent_round_rechecks_budget_and_cancellation_is_terminal() {
+    async fn subsequent_rounds_skip_probe_and_cancellation_is_terminal() {
         let root = tempfile::tempdir().unwrap();
         let store = SessionStore::new(root.path()).unwrap();
         let mut session = store
-            .create("model", "http://localhost", None, budget(), false)
+            .create("model", "http://localhost", None, roomy_budget(), false)
             .unwrap();
         let client = AgentFakeClient::new(
             vec![
@@ -5924,22 +6690,16 @@ mod tests {
             .await
             .unwrap();
         let turn = &session.turns[0];
-        assert_eq!(turn.context_trace.web.steps.len(), 3);
-        assert!(
-            turn.context_trace.web.steps[1]
-                .error
-                .as_deref()
-                .unwrap()
-                .contains("输入预算")
-        );
+        assert_eq!(turn.context_trace.web.steps.len(), 2);
         assert_eq!(client.agent_requests.lock().unwrap().len(), 2);
         assert_eq!(turn.usage, TokenUsage::new(Some(220), Some(5)));
-        assert_eq!(turn.probe_usage, TokenUsage::new(Some(1121), Some(3)));
+        assert_eq!(turn.probe_usage, TokenUsage::zero());
+        assert_eq!(client.probes.lock().unwrap().len(), 3);
 
         let second_root = tempfile::tempdir().unwrap();
         let second_store = SessionStore::new(second_root.path()).unwrap();
         let mut second_session = second_store
-            .create("model", "http://localhost", None, budget(), false)
+            .create("model", "http://localhost", None, roomy_budget(), false)
             .unwrap();
         let cancelled = AgentFakeClient::new(
             vec![TokenUsage::new(Some(100), Some(1))],
@@ -6000,7 +6760,7 @@ mod tests {
         let turn = session.turns.last().unwrap();
         assert_eq!(turn.status, TurnStatus::Interrupted);
         assert_eq!(turn.usage, TokenUsage::new(None, Some(2)));
-        assert_eq!(turn.probe_usage, TokenUsage::new(Some(750), Some(1)));
+        assert_eq!(turn.probe_usage, TokenUsage::zero());
         assert!(!turn.context_eligible());
     }
 }

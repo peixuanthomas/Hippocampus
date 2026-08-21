@@ -739,16 +739,20 @@ async fn run_new_tui(
         .check_model(&session.model, session.budget.context_window)
         .await?;
     let engine = ChatEngine::with_config(store.clone(), client, config.clone());
+    let maintenance_engine = engine.clone();
     let outcome = hippocampus::tui::run(engine, session, info).await?;
     let mut session = outcome.session;
     store.save(&mut session)?;
-    run_tui_exit_consolidation(
-        &store,
-        &session,
-        config,
-        consolidation_trigger_for_tui_exit(outcome.exit_reason),
-    )
-    .await;
+    if should_run_tui_exit_maintenance(outcome.exit_reason) {
+        run_tui_exit_maintenance(
+            &maintenance_engine,
+            &store,
+            &session,
+            config,
+            ConsolidationTrigger::TuiExit,
+        )
+        .await;
+    }
     Ok(())
 }
 
@@ -761,16 +765,20 @@ async fn run_resume_tui(store: SessionStore, identifier: &str, config: &AppConfi
         .check_model(&session.model, session.budget.context_window)
         .await?;
     let engine = ChatEngine::with_config(store.clone(), client, config.clone());
+    let maintenance_engine = engine.clone();
     let outcome = hippocampus::tui::run(engine, session, info).await?;
     let mut session = outcome.session;
     store.save(&mut session)?;
-    run_tui_exit_consolidation(
-        &store,
-        &session,
-        config,
-        consolidation_trigger_for_tui_exit(outcome.exit_reason),
-    )
-    .await;
+    if should_run_tui_exit_maintenance(outcome.exit_reason) {
+        run_tui_exit_maintenance(
+            &maintenance_engine,
+            &store,
+            &session,
+            config,
+            ConsolidationTrigger::TuiExit,
+        )
+        .await;
+    }
     Ok(())
 }
 
@@ -801,7 +809,13 @@ async fn run_contextual_ask(
         .check_model(&session.model, session.budget.context_window)
         .await?;
     let engine = ChatEngine::with_config(store, client, config.clone());
-    let mut prepared = engine.prepare_turn(&mut session, args.prompt).await?;
+    let mut prepared = engine
+        .prepare_turn_with_progress(&mut session, args.prompt, |progress| match progress {
+            hippocampus::PreparationProgress::ExactContextCheckStarted { .. } => {
+                eprintln!("上下文接近上限，正在进行一次精确检查…");
+            }
+        })
+        .await?;
     if prepared.needs_limit_decision() {
         if !args.trim {
             engine
@@ -840,21 +854,7 @@ async fn run_contextual_ask(
             .context("生成完成但会话中没有对应轮次")?;
         println!(
             "{}",
-            serde_json::to_string(&json!({
-                "event": "done",
-                "session_id": session.id,
-                "stateless": false,
-                "turn_id": turn.id,
-                "status": turn.status,
-                "thinking": turn.thinking,
-                "content": turn.assistant_content,
-                "usage": turn.usage,
-                "knowledge": turn.context_trace.knowledge,
-                "web": turn.context_trace.web,
-                "knowledge_sources": turn.context_trace.knowledge.selected_evidence,
-                "web_sources": turn.context_trace.web.sources,
-                "warnings": turn_warnings(turn),
-            }))?
+            serde_json::to_string(&contextual_done_json(&session, turn))?
         );
     } else {
         println!();
@@ -1461,21 +1461,19 @@ fn order_sessions_for_bulk_consolidation(sessions: &mut [Session]) {
     });
 }
 
-fn consolidation_trigger_for_tui_exit(
-    exit_reason: hippocampus::tui::TuiExitReason,
-) -> ConsolidationTrigger {
-    match exit_reason {
-        hippocampus::tui::TuiExitReason::ExitCommand => ConsolidationTrigger::TuiExit,
-        hippocampus::tui::TuiExitReason::IdleCtrlC => ConsolidationTrigger::TuiIdleCtrlC,
-    }
+fn should_run_tui_exit_maintenance(exit_reason: hippocampus::tui::TuiExitReason) -> bool {
+    exit_reason == hippocampus::tui::TuiExitReason::ExitCommand
 }
 
-async fn run_tui_exit_consolidation(
+async fn run_tui_exit_maintenance(
+    engine: &ChatEngine<OllamaClient>,
     store: &SessionStore,
     session: &Session,
     config: &AppConfig,
     trigger: ConsolidationTrigger,
 ) {
+    eprintln!("整理中：等待本轮向量缓存任务完成…");
+    engine.wait_for_background_embeddings().await;
     if config.memory.enabled {
         eprintln!("巩固中：会话 {}（模型 {}）…", session.id, session.model);
     }
@@ -1491,6 +1489,45 @@ async fn run_tui_exit_consolidation(
     eprintln!("{}", format_consolidation_report(&report));
     for warning in &report.warnings {
         eprintln!("警告：{warning}");
+    }
+    if !config.memory.enabled {
+        return;
+    }
+    if !matches!(
+        report.status,
+        ConsolidationRunStatus::Completed | ConsolidationRunStatus::UpToDate
+    ) {
+        eprintln!("警告：会话巩固未完成，本次不发布向量或关系图，待处理状态已保留");
+        return;
+    }
+    eprintln!("整理中：发布完整向量目录…");
+    match engine.refresh_embeddings(cancellation_on_ctrl_c()).await {
+        Ok(report) => eprintln!(
+            "向量整理完成：leaf={} reused={} embedded={} batches={} aggregates={}",
+            report.leaf_documents,
+            report.leaf_reused,
+            report.leaf_embedded_inputs,
+            report.backend_batches,
+            report.aggregate_documents,
+        ),
+        Err(error) => {
+            eprintln!("警告：向量整理失败：{error}");
+            return;
+        }
+    }
+    eprintln!("整理中：刷新记忆关系图…");
+    let retrieval = store.retrieval().clone();
+    let memory = config.memory.clone();
+    match tokio::task::spawn_blocking(move || retrieval.refresh_graph(&memory)).await {
+        Ok(Ok(report)) => match store.retrieval().mark_graph_organized() {
+            Ok(()) => eprintln!(
+                "关系图整理完成：nodes={} edges={}，整理水位已更新",
+                report.node_count, report.edge_count
+            ),
+            Err(error) => eprintln!("警告：关系图已刷新，但整理水位更新失败：{error}"),
+        },
+        Ok(Err(error)) => eprintln!("警告：关系图整理失败：{error}"),
+        Err(error) => eprintln!("警告：关系图整理任务失败：{error}"),
     }
 }
 
@@ -1787,6 +1824,25 @@ fn json_stream_event(event: &ChatEvent) -> Value {
     }
 }
 
+fn contextual_done_json(session: &Session, turn: &Turn) -> Value {
+    json!({
+        "event": "done",
+        "session_id": session.id,
+        "stateless": false,
+        "turn_id": turn.id,
+        "status": turn.status,
+        "thinking": turn.thinking,
+        "content": turn.assistant_content,
+        "usage": turn.usage,
+        "retrieval": turn.context_trace.retrieval,
+        "knowledge": turn.context_trace.knowledge,
+        "web": turn.context_trace.web,
+        "knowledge_sources": turn.context_trace.knowledge.selected_evidence,
+        "web_sources": turn.context_trace.web.sources,
+        "warnings": turn_warnings(turn),
+    })
+}
+
 fn print_json_stream_event(event: &ChatEvent) {
     if let Ok(line) = serde_json::to_string(&json_stream_event(event)) {
         println!("{line}");
@@ -1977,6 +2033,28 @@ mod tests {
         assert_eq!(json_stream_event(&content)["delta"], "delta");
         assert_eq!(json_stream_event(&completed)["event"], "completed");
         assert_eq!(json_stream_event(&completed)["usage"]["input_tokens"], 3);
+    }
+
+    #[test]
+    fn contextual_json_exposes_live_search_deadline_trace() {
+        let mut session = Session::new(
+            "session".into(),
+            "model".into(),
+            "http://localhost".into(),
+            "system".into(),
+            BudgetConfig::default(),
+            false,
+        )
+        .unwrap();
+        let mut turn = Turn::pending("query".into());
+        turn.context_trace.retrieval.deadline_ms = 1_000;
+        turn.context_trace.retrieval.deadline_exceeded = true;
+        turn.context_trace.retrieval.fast_fallback_used = true;
+        session.turns.push(turn);
+        let output = contextual_done_json(&session, &session.turns[0]);
+        assert_eq!(output["retrieval"]["deadline_ms"], 1_000);
+        assert_eq!(output["retrieval"]["deadline_exceeded"], true);
+        assert_eq!(output["retrieval"]["fast_fallback_used"], true);
     }
 
     #[test]
@@ -2176,15 +2254,13 @@ mod tests {
     }
 
     #[test]
-    fn tui_exit_reasons_map_to_exact_consolidation_triggers() {
-        assert_eq!(
-            consolidation_trigger_for_tui_exit(hippocampus::tui::TuiExitReason::ExitCommand),
-            ConsolidationTrigger::TuiExit
-        );
-        assert_eq!(
-            consolidation_trigger_for_tui_exit(hippocampus::tui::TuiExitReason::IdleCtrlC),
-            ConsolidationTrigger::TuiIdleCtrlC
-        );
+    fn only_explicit_exit_runs_full_tui_maintenance() {
+        assert!(should_run_tui_exit_maintenance(
+            hippocampus::tui::TuiExitReason::ExitCommand
+        ));
+        assert!(!should_run_tui_exit_maintenance(
+            hippocampus::tui::TuiExitReason::IdleCtrlC
+        ));
     }
 
     #[test]

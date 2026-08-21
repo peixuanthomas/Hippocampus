@@ -24,7 +24,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use unicode_width::UnicodeWidthChar;
 
-use crate::engine::{ChatEngine, LimitAction, PreparationStatus};
+use crate::engine::{ChatEngine, LimitAction, PreparationProgress, PreparationStatus};
 use crate::model::{ChatEvent, ChatEventKind, Session, Turn};
 use crate::ollama::{ChatBackend, ModelInfo, OllamaClient};
 use crate::store::IndexSyncAfterSourceCommit;
@@ -176,7 +176,17 @@ impl App {
 
         tokio::spawn(async move {
             let result: Result<()> = async {
-                let mut prepared = engine.prepare_turn(&mut session, input).await?;
+                let progress_tx = ui_tx.clone();
+                let mut prepared = engine
+                    .prepare_turn_with_progress(&mut session, input, move |progress| match progress
+                    {
+                        PreparationProgress::ExactContextCheckStarted { .. } => {
+                            let _ = progress_tx.send(BackgroundEvent::Status(
+                                "上下文接近上限，正在进行一次精确检查…".into(),
+                            ));
+                        }
+                    })
+                    .await?;
                 if prepared.needs_limit_decision() {
                     let _ = ui_tx.send(BackgroundEvent::LimitWarning(prepared.message.clone()));
                     let action = decision_rx.recv().await.unwrap_or(LimitAction::EndSession);
@@ -696,6 +706,17 @@ fn format_prepared_turn(session: &Session, prepared: &crate::engine::PreparedTur
             "retrieval_selected={} knowledge_selected={}",
             prepared.plan.retrieval_trace.selected_evidence.len(),
             prepared.plan.knowledge_trace.selected_evidence.len()
+        ),
+        format!(
+            "search_elapsed_ms={} deadline_ms={} deadline_exceeded={} fast_fallback_used={}",
+            prepared.plan.retrieval_trace.elapsed_ms,
+            prepared.plan.retrieval_trace.deadline_ms,
+            prepared.plan.retrieval_trace.deadline_exceeded,
+            prepared.plan.retrieval_trace.fast_fallback_used,
+        ),
+        format!(
+            "search_warnings=[{}]",
+            prepared.plan.retrieval_trace.warnings.join(" | ")
         ),
         "--- assembled messages ---".to_owned(),
     ];
@@ -1695,6 +1716,7 @@ mod tests {
             },
             status: PreparationStatus::Ready,
             message: String::new(),
+            query_embedding: None,
         };
         let output = format_prepared_turn(&session, &prepared);
         assert!(output.contains("messages=2 per_role=[system=1, user=1]"));

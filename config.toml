@@ -29,6 +29,7 @@ max_graph_depth = 2
 rrf_k = 60
 consolidation_timeout_secs = 600
 embedding_timeout_secs = 600
+search_timeout_ms = 1000
 episode_gap_minutes = 30
 hnsw_m = 16
 hnsw_ef_construction = 200

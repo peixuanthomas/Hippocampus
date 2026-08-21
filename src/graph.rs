@@ -122,6 +122,7 @@ pub(crate) struct GraphRecallFilter {
 pub(crate) struct GraphRecallResult {
     pub paths: Vec<GraphPathTrace>,
     pub warning: Option<String>,
+    pub stale: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -664,6 +665,78 @@ pub(crate) fn refresh_graph(
     ))
 }
 
+fn organized_prefix_is_valid(
+    store: &RetrievalStore,
+    connection: &Connection,
+    control_generation_sha256: &str,
+    vector_index_fingerprint: &str,
+    config_sha256: &str,
+) -> RetrievalResult<bool> {
+    let Some((stored_fingerprint, stored_config, stored_catalog, node_count, edge_count)) =
+        connection
+            .query_row(
+                "SELECT vector_index_fingerprint,config_sha256,catalog_sha256,node_count,edge_count
+             FROM memory_graph_materializations WHERE singleton=1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| store.database_error(error))?
+    else {
+        return Ok(false);
+    };
+    if stored_fingerprint != vector_index_fingerprint || stored_config != config_sha256 {
+        return Ok(false);
+    }
+    let watermark_count: i64 = connection
+        .query_row("SELECT count(*) FROM memory_graph_watermarks", [], |row| {
+            row.get(0)
+        })
+        .map_err(|error| store.database_error(error))?;
+    if watermark_count == 0 {
+        return Ok(false);
+    }
+    let invalid_watermarks: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM memory_graph_watermarks
+             WHERE control_generation_sha256<>?1",
+            [control_generation_sha256],
+            |row| row.get(0),
+        )
+        .map_err(|error| store.database_error(error))?;
+    if invalid_watermarks != 0 {
+        return Ok(false);
+    }
+    let invalid_documents: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM memory_graph_nodes n
+             JOIN memory_documents d ON d.document_id=n.source_id
+             LEFT JOIN memory_graph_watermarks w ON w.session_id=d.session_id
+             WHERE n.node_kind='document'
+               AND (w.session_id IS NULL OR d.end_sequence>w.through_sequence
+                    OR n.source_sha256<>d.source_sha256)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| store.database_error(error))?;
+    if invalid_documents != 0 {
+        return Ok(false);
+    }
+    let nodes = read_nodes(store, connection)?;
+    let edges = read_edges(store, connection)?;
+    Ok(usize::try_from(node_count).ok() == Some(nodes.len())
+        && usize::try_from(edge_count).ok() == Some(edges.len())
+        && catalog_hash(&nodes, &edges) == stored_catalog)
+}
+
 pub(crate) fn recall_graph_from_connection(
     store: &RetrievalStore,
     connection: &Connection,
@@ -689,101 +762,136 @@ pub(crate) fn recall_graph_from_connection(
         .fingerprint()
         .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
     let control = store.replay_control_state_under_guard()?;
-    let leaf_snapshot =
-        load_leaf_embedding_snapshot_with_control(store, connection, &spec, &control)?;
-    let aggregate_snapshot = if filter.allow_aggregate_documents {
-        let aggregate =
-            load_aggregate_embedding_snapshot_with_control(store, connection, &spec, &control)?;
-        if leaf_snapshot.control_generation_sha256 != aggregate.control_generation_sha256 {
-            return Err(RetrievalError::ControlStateChanged);
-        }
-        aggregate
-    } else {
-        crate::retrieval::AggregateEmbeddingSnapshot {
-            catalog_sha256: String::new(),
-            control_generation_sha256: leaf_snapshot.control_generation_sha256.clone(),
-            documents: Vec::new(),
-        }
-    };
-    validate_full_derived_integrity(connection)?;
-    let embeddings = store.compatible_embeddings_from_connection_filtered(
-        connection,
-        &spec,
-        &fingerprint,
-        None,
-        &control,
-        filter.allow_aggregate_documents,
-    )?;
-    validate_graph_embeddings(&embeddings)?;
-    let granularity_clause = if filter.allow_aggregate_documents {
-        ""
-    } else {
-        " WHERE granularity IN ('message','fragment')"
-    };
-    let document_count: i64 = connection
-        .query_row(
-            &format!("SELECT count(*) FROM memory_documents{granularity_clause}"),
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|error| store.database_error(error))?;
-    if usize::try_from(document_count).ok() != Some(embeddings.len()) {
-        return Err(RetrievalError::CorruptIndex(
-            "memory_documents 未被 compatible embeddings 完整覆盖".into(),
-        ));
-    }
-    let runs = store.validated_retrieval_runs_from_connection_with_control(connection, &control)?;
-    let (expected_nodes, leaves, event_rows) =
-        build_nodes(store, connection, &leaf_snapshot, &aggregate_snapshot)?;
-    let expected_edges = build_edges(
+    let use_organized_prefix = organized_prefix_is_valid(
         store,
         connection,
-        config,
-        &expected_nodes,
-        &leaves,
-        &event_rows,
-        &embeddings,
-        &runs,
-        filter.allow_aggregate_documents,
+        &control.generation_sha256(),
+        &fingerprint,
+        &config_hash(config, &fingerprint),
     )?;
-    let (nodes, edges) = if filter.cutoff.is_none() && filter.allow_aggregate_documents {
-        let config_sha256 = config_hash(config, &fingerprint);
-        let source_sha256 = source_hash(
-            store,
-            connection,
-            &leaf_snapshot.control_generation_sha256,
-            &leaf_snapshot.catalog_sha256,
-            &aggregate_snapshot.catalog_sha256,
-            &fingerprint,
-            &embeddings,
-            &runs,
-        )?;
-        let catalog_sha256 = catalog_hash(&expected_nodes, &expected_edges);
-        if exact_existing_catalog(
-            store,
-            connection,
-            &expected_nodes,
-            &expected_edges,
-            &fingerprint,
-            &config_sha256,
-            &source_sha256,
-            &catalog_sha256,
-        )?
-        .is_none()
-        {
-            return Err(RetrievalError::CorruptIndex(
-                "图 materialization 缺失或已过期".into(),
-            ));
-        }
+    let organized_prefix_stale = if use_organized_prefix {
+        connection
+            .query_row(
+                "SELECT count(*) FROM indexed_sessions s
+                 LEFT JOIN memory_graph_watermarks w ON w.session_id=s.session_id
+                 WHERE w.session_id IS NULL OR EXISTS(
+                   SELECT 1 FROM events e
+                   WHERE e.session_id=s.session_id AND e.sequence>w.through_sequence
+                 )",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| store.database_error(error))?
+            > 0
+    } else {
+        false
+    };
+    let (nodes, edges) = if use_organized_prefix {
         (
             read_nodes(store, connection)?,
             read_edges(store, connection)?,
         )
     } else {
-        (expected_nodes, expected_edges)
+        let leaf_snapshot =
+            load_leaf_embedding_snapshot_with_control(store, connection, &spec, &control)?;
+        let aggregate_snapshot = if filter.allow_aggregate_documents {
+            let aggregate =
+                load_aggregate_embedding_snapshot_with_control(store, connection, &spec, &control)?;
+            if leaf_snapshot.control_generation_sha256 != aggregate.control_generation_sha256 {
+                return Err(RetrievalError::ControlStateChanged);
+            }
+            aggregate
+        } else {
+            crate::retrieval::AggregateEmbeddingSnapshot {
+                catalog_sha256: String::new(),
+                control_generation_sha256: leaf_snapshot.control_generation_sha256.clone(),
+                documents: Vec::new(),
+            }
+        };
+        validate_full_derived_integrity(connection)?;
+        let embeddings = store.compatible_embeddings_from_connection_filtered(
+            connection,
+            &spec,
+            &fingerprint,
+            None,
+            &control,
+            filter.allow_aggregate_documents,
+        )?;
+        validate_graph_embeddings(&embeddings)?;
+        let granularity_clause = if filter.allow_aggregate_documents {
+            ""
+        } else {
+            " WHERE granularity IN ('message','fragment')"
+        };
+        let document_count: i64 = connection
+            .query_row(
+                &format!("SELECT count(*) FROM memory_documents{granularity_clause}"),
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| store.database_error(error))?;
+        if usize::try_from(document_count).ok() != Some(embeddings.len()) {
+            return Err(RetrievalError::CorruptIndex(
+                "memory_documents 未被 compatible embeddings 完整覆盖".into(),
+            ));
+        }
+        let runs =
+            store.validated_retrieval_runs_from_connection_with_control(connection, &control)?;
+        let (expected_nodes, leaves, event_rows) =
+            build_nodes(store, connection, &leaf_snapshot, &aggregate_snapshot)?;
+        let expected_edges = build_edges(
+            store,
+            connection,
+            config,
+            &expected_nodes,
+            &leaves,
+            &event_rows,
+            &embeddings,
+            &runs,
+            filter.allow_aggregate_documents,
+        )?;
+        if filter.cutoff.is_none() && filter.allow_aggregate_documents {
+            let config_sha256 = config_hash(config, &fingerprint);
+            let source_sha256 = source_hash(
+                store,
+                connection,
+                &leaf_snapshot.control_generation_sha256,
+                &leaf_snapshot.catalog_sha256,
+                &aggregate_snapshot.catalog_sha256,
+                &fingerprint,
+                &embeddings,
+                &runs,
+            )?;
+            let catalog_sha256 = catalog_hash(&expected_nodes, &expected_edges);
+            if exact_existing_catalog(
+                store,
+                connection,
+                &expected_nodes,
+                &expected_edges,
+                &fingerprint,
+                &config_sha256,
+                &source_sha256,
+                &catalog_sha256,
+            )?
+            .is_none()
+            {
+                return Err(RetrievalError::CorruptIndex(
+                    "图 materialization 缺失或已过期".into(),
+                ));
+            }
+            (
+                read_nodes(store, connection)?,
+                read_edges(store, connection)?,
+            )
+        } else {
+            (expected_nodes, expected_edges)
+        }
     };
     if seeds.is_empty() {
-        return Ok(GraphRecallResult::default());
+        return Ok(GraphRecallResult {
+            stale: organized_prefix_stale,
+            ..Default::default()
+        });
     }
     let by_id = nodes
         .iter()
@@ -817,15 +925,17 @@ pub(crate) fn recall_graph_from_connection(
             GraphNodeKind::Document
         };
         let id = node_id(kind, &seed.source_id);
-        let node = by_id
-            .get(id.as_str())
-            .ok_or_else(|| RetrievalError::CorruptIndex(format!("图 seed 节点缺失：{id}")))?;
-        if allowed(node) {
+        if let Some(node) = by_id.get(id.as_str())
+            && allowed(node)
+        {
             eligible_seeds.push(seed);
         }
     }
     if eligible_seeds.is_empty() {
-        return Ok(GraphRecallResult::default());
+        return Ok(GraphRecallResult {
+            stale: organized_prefix_stale,
+            ..Default::default()
+        });
     }
     for seed in &eligible_seeds {
         *channel_counts.entry(channel_key(seed.channel)).or_default() += 1.0 / seed.rank as f64;
@@ -1109,6 +1219,7 @@ pub(crate) fn recall_graph_from_connection(
     Ok(GraphRecallResult {
         paths,
         warning: (!converged).then(|| "graph PPR did not converge after 50 iterations".into()),
+        stale: organized_prefix_stale,
     })
 }
 

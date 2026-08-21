@@ -40,7 +40,7 @@ pub use control::{
 };
 pub use engine::{
     ChatEngine, ConsolidationProgress, EmbeddingRefreshError, EmbeddingRefreshReport,
-    EmbeddingRefreshStage, LimitAction, PreparedTurn,
+    EmbeddingRefreshStage, LimitAction, PreparationProgress, PreparedTurn,
 };
 pub use episode::{
     EMBEDDING_COSINE_SIMILARITY_THRESHOLD, ENTITY_JACCARD_DISTANCE_THRESHOLD,
