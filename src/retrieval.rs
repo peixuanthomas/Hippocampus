@@ -31,10 +31,10 @@ use crate::graph::GraphRecallSeed;
 use crate::knowledge::{KnowledgeStore, KnowledgeTrace};
 use crate::model::{
     BudgetAllocationTrace, ChannelTrace, ChatMessage, ContextItemTrace, EntityMatchTrace,
-    EventRole, EvidenceKind, FusionCandidateTrace, ModelRequestTrace, ProvenanceQuality, QueryKind,
-    RankedCandidate, RetrievalChannel, RetrievalConfig, RetrievalDocumentGranularity,
-    RetrievalTrace, SelectedEvidence, Session, SourceSpan, StateSelectionTrace, Turn, TurnStatus,
-    content_sha256, context_sha256, event_id,
+    EventRole, EvidenceKind, FusionCandidateTrace, KNOWLEDGE_MESSAGE_ROLE, MEMORY_MESSAGE_ROLE,
+    ModelRequestTrace, ProvenanceQuality, QueryKind, RankedCandidate, RetrievalChannel,
+    RetrievalConfig, RetrievalDocumentGranularity, RetrievalTrace, SelectedEvidence, Session,
+    SourceSpan, StateSelectionTrace, Turn, TurnStatus, content_sha256, context_sha256, event_id,
 };
 use crate::ollama::{ChatBackend, EmbeddingRequest};
 use crate::vector::{
@@ -8491,7 +8491,9 @@ impl RetrievalStore {
                 inserted_generated = true;
             }
             messages.push(ChatMessage {
-                role: role.as_str().to_owned(),
+                role: wrapped_source_role
+                    .map_or(role.as_str(), |_| MEMORY_MESSAGE_ROLE)
+                    .to_owned(),
                 content: content.clone(),
             });
             if !inserted_generated && role == EventRole::System && !generated_before_item {
@@ -10143,7 +10145,9 @@ impl RetrievalStore {
                     inserted_generated = true;
                 }
                 context_messages.push(ChatMessage {
-                    role: item.role.as_str().to_owned(),
+                    role: wrapped_source_role
+                        .map_or(item.role.as_str(), |_| MEMORY_MESSAGE_ROLE)
+                        .to_owned(),
                     content: selected.clone(),
                 });
                 if !inserted_generated && item.role == EventRole::System && !generated_before_item {
@@ -13668,12 +13672,15 @@ fn push_generated_messages(
     identity_instruction: Option<&str>,
     knowledge_message: Option<&str>,
 ) {
-    for content in [identity_instruction, knowledge_message]
-        .into_iter()
-        .flatten()
-    {
+    if let Some(content) = identity_instruction {
         messages.push(ChatMessage {
             role: EventRole::System.as_str().to_owned(),
+            content: content.to_owned(),
+        });
+    }
+    if let Some(content) = knowledge_message {
+        messages.push(ChatMessage {
+            role: KNOWLEDGE_MESSAGE_ROLE.to_owned(),
             content: content.to_owned(),
         });
     }

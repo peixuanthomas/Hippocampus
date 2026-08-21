@@ -3567,7 +3567,7 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::*;
-    use crate::model::{BudgetConfig, ChatMessage};
+    use crate::model::{BudgetConfig, ChatMessage, KNOWLEDGE_MESSAGE_ROLE, MEMORY_MESSAGE_ROLE};
     use crate::ollama::ModelInfo;
 
     #[derive(Clone, Default)]
@@ -4950,21 +4950,45 @@ mod tests {
         let mut messages = before
             .items
             .iter()
-            .map(|item| ChatMessage {
-                role: item.role.as_str().into(),
-                content: item.resolved.content.clone(),
+            .map(|item| {
+                let role = if before
+                    .retrieval_trace
+                    .selected_evidence
+                    .iter()
+                    .any(|selected| {
+                        selected.span == item.resolved.span
+                            && selected.content_sha256 == item.resolved.content_sha256
+                    }) {
+                    MEMORY_MESSAGE_ROLE
+                } else {
+                    item.role.as_str()
+                };
+                ChatMessage {
+                    role: role.into(),
+                    content: item.resolved.content.clone(),
+                }
             })
             .collect::<Vec<_>>();
+        let mut generated_position = messages
+            .iter()
+            .take_while(|message| message.role == "system")
+            .count();
         if let Some(identity) = &before.identity_instruction {
-            let position = messages
-                .iter()
-                .position(|message| message.role == "system")
-                .map_or(0, |index| index + 1);
             messages.insert(
-                position,
+                generated_position,
                 ChatMessage {
                     role: "system".into(),
                     content: identity.clone(),
+                },
+            );
+            generated_position += 1;
+        }
+        if let Some(knowledge) = &before.knowledge_trace.injected_message {
+            messages.insert(
+                generated_position,
+                ChatMessage {
+                    role: KNOWLEDGE_MESSAGE_ROLE.into(),
+                    content: knowledge.clone(),
                 },
             );
         }

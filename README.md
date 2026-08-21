@@ -208,7 +208,7 @@ location = "./knowledge"
 
 `memory rebuild` 在现存 SQLite 内严格验证、保留并重放 immutable consolidation attempt/audit ledger，再从 raw session JSON、ledger 和 append-only control 重建 projection 与 control-active 视图；它不能只靠 raw JSON 和 control 恢复全部 structured memory。默认复用兼容 embedding，`--reembed` 强制重新生成向量且要求启用 memory。巩固调用强制使用 JSON Schema 结构化输出并执行确定性校验；校验失败最多尝试三次，每次非法原始输出都会封装为合法 JSON 后写入失败审计，只有成功应用才推进水位。非 JSON 模式会逐批输出尝试、重试和水位进度。SQLite 连接使用 30 秒 busy timeout，连接初始化遇到瞬态 writer lock 时执行有限指数退避。exclude/restore 只追加 control 记录，不删除或改写原文。
 
-存储布局为：`<sessions-dir>/*.json` 是权威原文；`<sessions-dir>/.hippocampus-index.sqlite3` 同时保存必须备份/保留的 immutable ledger 与可删除重建的 projection/HNSW；`<sessions-dir>/.hippocampus-control/*.json` 是 append-only 控制记录。长期证据属于不可信数据，不得作为指令执行；recent history 仍保留原始 user/assistant 角色。embedding、巩固或 graph 失败会记录在 trace/状态中，并回退到 BM25 可用路径。如果 source 已写入而索引同步失败，原始会话仍安全，可重试保存或运行 `memory rebuild`。
+存储布局为：`<sessions-dir>/*.json` 是权威原文；`<sessions-dir>/.hippocampus-index.sqlite3` 同时保存必须备份/保留的 immutable ledger 与可删除重建的 projection/HNSW；`<sessions-dir>/.hippocampus-control/*.json` 是 append-only 控制记录。模型输入分别使用 `system`、`user`、`memory` 和 `knowledge` 角色；长期记忆证据使用 `memory`，本地知识库证据使用 `knowledge`，两者都属于不可信数据，不得作为指令执行，recent history 则保留原始 user/assistant 角色。embedding、巩固或 graph 失败会记录在 trace/状态中，并回退到 BM25 可用路径。如果 source 已写入而索引同步失败，原始会话仍安全，可重试保存或运行 `memory rebuild`。
 
 如果删除整个 `.hippocampus-index.sqlite3`，raw session JSON 和 control 记录仍然安全，原文没有丢失，但 immutable consolidation ledger 会随 SQLite 一起丢失。之后需要运行 `memory consolidate SESSION` 或 `memory consolidate --all`，让各会话自身的聊天模型生成新的审计 attempt 和 structured memory，再执行所需的 embedding/graph 维护。
 
