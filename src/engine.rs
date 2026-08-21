@@ -1274,13 +1274,11 @@ impl<B: ChatBackend> ChatEngine<B> {
                     Ok(spec) => {
                         let cached_inputs = embedding_inputs.clone();
                         tokio::task::spawn_blocking(move || {
-                            let cached = embedding_store.cached_content_embeddings(&spec)?;
-                            Ok::<_, RetrievalError>(
-                                cached_inputs
-                                    .iter()
-                                    .map(|input| cached.get(&content_sha256(input)).cloned())
-                                    .collect::<Vec<_>>(),
-                            )
+                            let hashes = cached_inputs
+                                .iter()
+                                .map(|input| content_sha256(input))
+                                .collect::<Vec<_>>();
+                            embedding_store.cached_content_embeddings_for_hashes(&spec, &hashes)
                         })
                     .await
                     .map_err(|error| format!("查询向量缓存任务失败: {error}"))

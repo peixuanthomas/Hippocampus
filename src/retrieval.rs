@@ -3357,6 +3357,77 @@ impl RetrievalStore {
         Ok(cached)
     }
 
+    pub(crate) fn cached_content_embeddings_for_hashes(
+        &self,
+        spec: &VectorIndexSpec,
+        content_hashes: &[String],
+    ) -> RetrievalResult<Vec<Option<Vec<f32>>>> {
+        spec.validate()
+            .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+        if content_hashes.is_empty() {
+            return Ok(Vec::new());
+        }
+        if content_hashes.iter().any(|hash| hash.len() != 64) {
+            return Err(RetrievalError::CorruptIndex(
+                "待查询缓存向量的内容哈希无效".into(),
+            ));
+        }
+        let fingerprint = spec
+            .fingerprint()
+            .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+        let _guard = self.acquire_root_read()?;
+        let connection = Connection::open_with_flags(
+            &self.index_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|error| self.database_error(error))?;
+        connection
+            .busy_timeout(SQLITE_BUSY_TIMEOUT)
+            .map_err(|error| self.database_error(error))?;
+        let mut statement = connection
+            .prepare(
+                "SELECT dimensions,vector_blob
+                 FROM memory_embedding_cache
+                 WHERE index_fingerprint=?1 AND content_sha256=?2",
+            )
+            .map_err(|error| self.database_error(error))?;
+        let expected_dimensions = i64::try_from(spec.dimensions).unwrap_or(-1);
+        let mut decoded = HashMap::<String, Option<Vec<f32>>>::new();
+        for hash in content_hashes {
+            if decoded.contains_key(hash) {
+                continue;
+            }
+            let row = statement
+                .query_row(params![&fingerprint, hash], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })
+                .optional()
+                .map_err(|error| self.database_error(error))?;
+            let vector = row
+                .map(|(dimensions, blob)| {
+                    if dimensions != expected_dimensions {
+                        return Err(RetrievalError::CorruptIndex(format!(
+                            "缓存向量 {hash} 的维度不匹配"
+                        )));
+                    }
+                    let vector = decode_f32_le(&blob, spec.dimensions)
+                        .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?;
+                    if !is_unit_vector(&vector) {
+                        return Err(RetrievalError::CorruptIndex(format!(
+                            "缓存向量 {hash} 无效"
+                        )));
+                    }
+                    Ok(vector)
+                })
+                .transpose()?;
+            decoded.insert(hash.clone(), vector);
+        }
+        Ok(content_hashes
+            .iter()
+            .map(|hash| decoded.get(hash).cloned().flatten())
+            .collect())
+    }
+
     pub(crate) fn compatible_embeddings_from_connection(
         &self,
         connection: &Connection,
@@ -15278,6 +15349,53 @@ mod tests {
         assert_eq!(spaced_conjunction.len(), 3);
         assert!(spaced_conjunction[1].contains("Windows"));
         assert!(spaced_conjunction[2].contains("Mac"));
+    }
+
+    #[test]
+    fn bounded_embedding_cache_lookup_ignores_unrequested_corrupt_rows() {
+        let (_root, store, _session, spec) = embedding_catalog_fixture("cache lookup fixture");
+        let requested_hash = content_sha256("requested query");
+        let missing_hash = content_sha256("missing query");
+        let corrupt_hash = content_sha256("unrelated corrupt query");
+        let mut requested_vector = vec![0.0; spec.dimensions];
+        requested_vector[0] = 1.0;
+        store
+            .retrieval()
+            .cache_content_embedding(&spec, &requested_hash, &requested_vector)
+            .unwrap();
+
+        let connection = Connection::open(store.retrieval().index_path()).unwrap();
+        connection
+            .execute(
+                "INSERT INTO memory_embedding_cache
+                 (index_fingerprint,content_sha256,dimensions,vector_blob,cached_at)
+                 VALUES(?1,?2,1,?3,?4)",
+                params![
+                    spec.fingerprint().unwrap(),
+                    corrupt_hash,
+                    encode_f32_le(&[1.0]).unwrap(),
+                    Utc::now().to_rfc3339(),
+                ],
+            )
+            .unwrap();
+        drop(connection);
+
+        let requested = vec![requested_hash.clone(), missing_hash, requested_hash.clone()];
+        let cached = store
+            .retrieval()
+            .cached_content_embeddings_for_hashes(&spec, &requested)
+            .unwrap();
+        assert_eq!(cached.len(), requested.len());
+        assert_eq!(cached[0].as_deref(), Some(requested_vector.as_slice()));
+        assert!(cached[1].is_none());
+        assert_eq!(cached[2].as_deref(), Some(requested_vector.as_slice()));
+        assert!(store.retrieval().cached_content_embeddings(&spec).is_err());
+        assert!(
+            store
+                .retrieval()
+                .cached_content_embeddings_for_hashes(&spec, &[corrupt_hash])
+                .is_err()
+        );
     }
 
     #[test]
