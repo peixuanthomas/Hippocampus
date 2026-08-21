@@ -5438,23 +5438,25 @@ mod tests {
         assert!(
             serde_json::from_str::<Value>(attempts[0].validation_json.as_deref().unwrap()).is_ok()
         );
-        let progress = progress.lock().unwrap();
-        assert!(
-            matches!(
-                progress.as_slice(),
-                [
-                    ConsolidationProgress::AttemptStarted { attempt: 1, .. },
-                    ConsolidationProgress::ValidationRetry {
-                        next_attempt: 2,
-                        max_attempts: CONSOLIDATION_VALIDATION_ATTEMPTS,
-                        ..
-                    },
-                    ConsolidationProgress::AttemptStarted { attempt: 2, .. },
-                    ConsolidationProgress::BatchApplied { .. },
-                ]
-            ),
-            "{progress:?}"
-        );
+        {
+            let progress = progress.lock().unwrap();
+            assert!(
+                matches!(
+                    progress.as_slice(),
+                    [
+                        ConsolidationProgress::AttemptStarted { attempt: 1, .. },
+                        ConsolidationProgress::ValidationRetry {
+                            next_attempt: 2,
+                            max_attempts: CONSOLIDATION_VALIDATION_ATTEMPTS,
+                            ..
+                        },
+                        ConsolidationProgress::AttemptStarted { attempt: 2, .. },
+                        ConsolidationProgress::BatchApplied { .. },
+                    ]
+                ),
+                "{progress:?}"
+            );
+        }
 
         let mut second = store
             .create("model", "http://localhost", None, budget(), true)

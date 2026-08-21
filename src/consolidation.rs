@@ -673,6 +673,7 @@ pub struct ConsolidationCandidateSnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[cfg(test)]
 pub(crate) struct ConsolidationRequestPayload {
     pub batch: ConsolidationInputBatch,
     pub candidate_snapshot: ConsolidationCandidateSnapshot,

@@ -1252,7 +1252,8 @@ mod tests {
         })
         .to_string();
         let output =
-            parse_and_resolve_fact_output(&response, &clauses, &[context.clone()]).unwrap();
+            parse_and_resolve_fact_output(&response, &clauses, std::slice::from_ref(&context))
+                .unwrap();
         let evidence = &output.claims[0].evidence[0];
         assert!(evidence.subject_span.is_none());
         assert!(evidence.relation_span.is_none());
