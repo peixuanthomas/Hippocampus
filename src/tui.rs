@@ -1515,6 +1515,7 @@ mod tests {
                 version: "test".into(),
                 name: "model-name".into(),
                 context_length: 32_768,
+                supports_thinking: true,
             },
         )
     }

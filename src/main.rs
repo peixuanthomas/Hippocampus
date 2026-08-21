@@ -15,10 +15,11 @@ use hippocampus::model::{
 use hippocampus::ollama::{ChatBackend, ChatRequest};
 use hippocampus::{
     ChatEngine, ConsolidationProgress, ConsolidationRunReport, ConsolidationRunStatus,
-    ConsolidationTrigger, ControlRecord, ControlTarget, ControlTargetKind, EmbeddingRefreshReport,
-    EvalBenchmark, EvalRunOptions, EvalRunReport, GraphMaterializationReport, HybridRecallOptions,
-    KnowledgeSyncReport, LimitAction, MemoryStatus, OllamaClient, RebuildOptions, RebuildReport,
-    RecallChannels, RecallQueryOrigin, RecallResult, SessionStore, load_eval_corpus,
+    ConsolidationStageSelection, ConsolidationTrigger, ControlRecord, ControlTarget,
+    ControlTargetKind, EmbeddingRefreshReport, EvalBenchmark, EvalRunOptions, EvalRunReport,
+    GraphMaterializationReport, HybridRecallOptions, KnowledgeSyncReport, LimitAction,
+    MemoryStageKind, MemoryStageRunReport, MemoryStatus, OllamaClient, RebuildOptions,
+    RebuildReport, RecallChannels, RecallQueryOrigin, RecallResult, SessionStore, load_eval_corpus,
     run_evaluation, validate_eval_paths,
 };
 use serde::Serialize;
@@ -120,6 +121,8 @@ enum MemoryCommand {
         all: bool,
         #[arg(long)]
         json: bool,
+        #[arg(long, value_enum, default_value_t = MemoryConsolidationStage::All)]
+        stage: MemoryConsolidationStage,
     },
     /// 查看派生记忆健康状态
     Status {
@@ -162,6 +165,25 @@ enum MemoryChannel {
     State,
     Episode,
     Graph,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum MemoryConsolidationStage {
+    All,
+    Facts,
+    Boundaries,
+    RawVectors,
+}
+
+impl From<MemoryConsolidationStage> for ConsolidationStageSelection {
+    fn from(value: MemoryConsolidationStage) -> Self {
+        match value {
+            MemoryConsolidationStage::All => Self::All,
+            MemoryConsolidationStage::Facts => Self::Facts,
+            MemoryConsolidationStage::Boundaries => Self::Boundaries,
+            MemoryConsolidationStage::RawVectors => Self::RawVectors,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -977,9 +999,12 @@ async fn run_memory(
     config: &AppConfig,
 ) -> Result<()> {
     match args.command {
-        MemoryCommand::Consolidate { session, all, json } => {
-            run_memory_consolidate(store, session, all, json, config).await
-        }
+        MemoryCommand::Consolidate {
+            session,
+            all,
+            json,
+            stage,
+        } => run_memory_consolidate(store, session, all, json, stage, config).await,
         MemoryCommand::Status { session, json } => {
             run_memory_status(&store, session.as_deref(), json, config)
         }
@@ -1076,6 +1101,16 @@ fn print_memory_status(status: &MemoryStatus) {
             "pending_consolidation_events: {}",
             metrics.pending_consolidation_events
         );
+        for stage in &metrics.stages {
+            println!(
+                "stage_{}: watermark={} gap_events={} last_failure_at={} last_failure={}",
+                stage.stage,
+                display_optional(stage.watermark),
+                stage.gap_events,
+                stage.last_failure_at.as_deref().unwrap_or("none"),
+                stage.last_failure.as_deref().unwrap_or("none"),
+            );
+        }
         println!("entity_count: {}", metrics.entity_count);
         println!("episode_count: {}", metrics.episode_count);
         println!("graph_current: {}", metrics.graph_current);
@@ -1410,6 +1445,7 @@ async fn run_memory_consolidate(
     identifier: Option<String>,
     all: bool,
     json_output: bool,
+    stage: MemoryConsolidationStage,
     config: &AppConfig,
 ) -> Result<()> {
     let sessions = if all {
@@ -1434,15 +1470,27 @@ async fn run_memory_consolidate(
         if !json_output && config.memory.enabled {
             eprintln!("巩固中：会话 {}（模型 {}）…", session.id, session.model);
         }
-        let report = consolidate_for_session(
-            &store,
-            &session,
-            config,
-            ConsolidationTrigger::Manual,
-            cancellation.clone(),
-            !json_output,
-        )
-        .await;
+        let client = match OllamaClient::new(&session.ollama_host) {
+            Ok(client) => client,
+            Err(error) => {
+                reports.push(synthetic_consolidation_report(
+                    &session,
+                    ConsolidationTrigger::Manual,
+                    ConsolidationRunStatus::Failed,
+                    vec![format!("无法创建 Ollama 客户端: {error}")],
+                ));
+                continue;
+            }
+        };
+        let engine = ChatEngine::with_config(store.clone(), client, config.clone());
+        let report = engine
+            .consolidate_session_stage(
+                &session,
+                ConsolidationTrigger::Manual,
+                cancellation.clone(),
+                stage.into(),
+            )
+            .await;
         let stop = report.status == ConsolidationRunStatus::Cancelled;
         reports.push(report);
         if stop || cancellation.is_cancelled() {
@@ -1488,7 +1536,10 @@ async fn run_tui_exit_maintenance(
     eprintln!("整理中：等待本轮向量缓存任务完成…");
     engine.wait_for_background_embeddings().await;
     if config.memory.enabled {
-        eprintln!("巩固中：会话 {}（模型 {}）…", session.id, session.model);
+        eprintln!(
+            "分阶段整理中：会话 {}（专用巩固模型 {}；raw_vectors/facts/boundaries 独立提交）…",
+            session.id, config.memory.consolidation_model
+        );
     }
     let report = consolidate_for_session(
         store,
@@ -1507,13 +1558,21 @@ async fn run_tui_exit_maintenance(
         return;
     }
     if !matches!(
-        report.status,
+        report.facts.status,
         ConsolidationRunStatus::Completed | ConsolidationRunStatus::UpToDate
     ) {
-        eprintln!("警告：会话巩固未完成，本次不发布向量或关系图，待处理状态已保留");
+        eprintln!("警告：facts 未完成；raw vectors 与此前已验证 facts 保持发布");
         return;
     }
-    eprintln!("整理中：发布完整向量目录…");
+    if !matches!(
+        report.boundaries.status,
+        ConsolidationRunStatus::Completed | ConsolidationRunStatus::UpToDate
+    ) {
+        eprintln!(
+            "提示：boundaries 未追平，episode/session aggregate 暂缓；facts、state 与 raw vectors 仍可检索"
+        );
+    }
+    eprintln!("整理中：发布可用向量；仅对 boundary 已追平会话生成 aggregate…");
     match engine.refresh_embeddings(cancellation_on_ctrl_c()).await {
         Ok(report) => eprintln!(
             "向量整理完成：leaf={} reused={} embedded={} batches={} aggregates={}",
@@ -1645,6 +1704,9 @@ fn synthetic_consolidation_report(
         watermark_before: 0,
         watermark_after: 0,
         warnings,
+        facts: MemoryStageRunReport::new(MemoryStageKind::Facts),
+        boundaries: MemoryStageRunReport::new(MemoryStageKind::Boundaries),
+        raw_vectors: MemoryStageRunReport::new(MemoryStageKind::RawVectors),
     }
 }
 
@@ -1655,22 +1717,42 @@ struct ConsolidationReports<'a> {
 
 fn format_consolidation_report(report: &ConsolidationRunReport) -> String {
     format!(
-        "会话 {}｜模型 {}｜{}｜批次 {}/{}｜事件 {}/{}｜实体 {}/{}｜声明 {}/{}｜边界 {}/{}｜水位 {}→{}",
+        "会话 {}｜巩固模型 {}｜{}｜facts {} 水位 {}→{} 批次 {}/{} 单元 {}/{} token {}/{} 延迟 {}ms 实体 {}/{} 声明 {}/{}｜boundaries {} 水位 {}→{} 批次 {}/{} 单元 {}/{} token {}/{} 延迟 {}ms｜raw_vectors {} 水位 {}→{} 批次 {}/{} 单元 {}/{} 延迟 {}ms",
         report.session_id,
         report.model,
         consolidation_status_label(report.status),
-        report.batches_applied,
-        report.batches_attempted,
-        report.events_applied,
-        report.events_attempted,
+        consolidation_status_label(report.facts.status),
+        report.facts.watermark_before,
+        report.facts.watermark_after,
+        report.facts.batches_applied,
+        report.facts.batches_attempted,
+        report.facts.units_applied,
+        report.facts.units_attempted,
+        report.facts.input_tokens,
+        report.facts.output_tokens,
+        report.facts.latency_ms,
         report.entities_applied,
         report.entities_attempted,
         report.claims_applied,
         report.claims_attempted,
-        report.boundaries_applied,
-        report.boundaries_attempted,
-        report.watermark_before,
-        report.watermark_after,
+        consolidation_status_label(report.boundaries.status),
+        report.boundaries.watermark_before,
+        report.boundaries.watermark_after,
+        report.boundaries.batches_applied,
+        report.boundaries.batches_attempted,
+        report.boundaries.units_applied,
+        report.boundaries.units_attempted,
+        report.boundaries.input_tokens,
+        report.boundaries.output_tokens,
+        report.boundaries.latency_ms,
+        consolidation_status_label(report.raw_vectors.status),
+        report.raw_vectors.watermark_before,
+        report.raw_vectors.watermark_after,
+        report.raw_vectors.batches_applied,
+        report.raw_vectors.batches_attempted,
+        report.raw_vectors.units_applied,
+        report.raw_vectors.units_attempted,
+        report.raw_vectors.latency_ms,
     )
 }
 
@@ -2198,6 +2280,7 @@ mod tests {
                     session: Some(session),
                     all: false,
                     json: false,
+                    stage: MemoryConsolidationStage::All,
                 },
             })) if session == "session-a"
         ));
@@ -2211,6 +2294,26 @@ mod tests {
                     session: None,
                     all: true,
                     json: true,
+                    stage: MemoryConsolidationStage::All,
+                },
+            }))
+        ));
+
+        let facts = Cli::try_parse_from([
+            "hippocampus",
+            "memory",
+            "consolidate",
+            "session-a",
+            "--stage",
+            "facts",
+        ])
+        .unwrap();
+        assert!(matches!(
+            facts.command,
+            Some(Command::Memory(MemoryArgs {
+                command: MemoryCommand::Consolidate {
+                    stage: MemoryConsolidationStage::Facts,
+                    ..
                 },
             }))
         ));
@@ -2297,6 +2400,9 @@ mod tests {
                 watermark_before: 8,
                 watermark_after: 9,
                 warnings: Vec::new(),
+                facts: MemoryStageRunReport::new(MemoryStageKind::Facts),
+                boundaries: MemoryStageRunReport::new(MemoryStageKind::Boundaries),
+                raw_vectors: MemoryStageRunReport::new(MemoryStageKind::RawVectors),
             })
             .collect::<Vec<_>>();
         let encoded = serde_json::to_value(ConsolidationReports { reports: &reports }).unwrap();

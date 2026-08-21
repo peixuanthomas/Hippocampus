@@ -102,6 +102,10 @@ pub struct MemoryConfig {
     pub graph_candidate_limit: usize,
     pub max_graph_depth: usize,
     pub rrf_k: usize,
+    pub consolidation_model: String,
+    pub consolidation_context_window: u64,
+    pub consolidation_input_target_tokens: u64,
+    pub consolidation_max_output_tokens: u64,
     pub consolidation_timeout_secs: u64,
     pub embedding_timeout_secs: u64,
     pub search_timeout_ms: u64,
@@ -115,7 +119,7 @@ pub struct MemoryConfig {
 impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
-            config_version: 1,
+            config_version: 2,
             enabled: false,
             embedding_model: "qwen3-embedding:8b".into(),
             embedding_dimensions: 1_024,
@@ -125,7 +129,11 @@ impl Default for MemoryConfig {
             graph_candidate_limit: 32,
             max_graph_depth: 2,
             rrf_k: 60,
-            consolidation_timeout_secs: 600,
+            consolidation_model: "qwen3.5:9b".into(),
+            consolidation_context_window: 16_384,
+            consolidation_input_target_tokens: 4_096,
+            consolidation_max_output_tokens: 4_096,
+            consolidation_timeout_secs: 300,
             embedding_timeout_secs: 600,
             search_timeout_ms: 15_000,
             episode_gap_minutes: 30,
@@ -139,8 +147,8 @@ impl Default for MemoryConfig {
 
 impl MemoryConfig {
     pub fn validate(&self) -> Result<()> {
-        if self.config_version != 1 {
-            bail!("memory.config_version 仅支持版本 1");
+        if self.config_version != 2 {
+            bail!("memory.config_version 仅支持版本 2");
         }
         if self.embedding_model.trim().is_empty() {
             bail!("memory.embedding_model 不能为空");
@@ -168,6 +176,25 @@ impl MemoryConfig {
         }
         if !(1..=1_000).contains(&self.rrf_k) {
             bail!("memory.rrf_k 必须在 1..=1000 之间");
+        }
+        if self.consolidation_model.trim().is_empty() {
+            bail!("memory.consolidation_model 不能为空");
+        }
+        if !(4_096..=262_144).contains(&self.consolidation_context_window) {
+            bail!("memory.consolidation_context_window 必须在 4096..=262144 之间");
+        }
+        if !(256..=32_768).contains(&self.consolidation_input_target_tokens) {
+            bail!("memory.consolidation_input_target_tokens 必须在 256..=32768 之间");
+        }
+        if !(1_024..=32_768).contains(&self.consolidation_max_output_tokens) {
+            bail!("memory.consolidation_max_output_tokens 必须在 1024..=32768 之间");
+        }
+        if self
+            .consolidation_input_target_tokens
+            .checked_add(self.consolidation_max_output_tokens)
+            .is_none_or(|required| required >= self.consolidation_context_window)
+        {
+            bail!("巩固输入目标与输出上限之和必须小于 consolidation_context_window");
         }
         for (name, value) in [
             (
@@ -453,9 +480,9 @@ location = "https://example.com/docs"
     }
 
     #[test]
-    fn memory_defaults_match_the_version_one_table() {
+    fn memory_defaults_match_the_version_two_table() {
         let memory = MemoryConfig::default();
-        assert_eq!(memory.config_version, 1);
+        assert_eq!(memory.config_version, 2);
         assert_eq!(memory.embedding_model, "qwen3-embedding:8b");
         assert_eq!(memory.embedding_dimensions, 1_024);
         assert_eq!(memory.embedding_batch_size, 16);
@@ -464,7 +491,11 @@ location = "https://example.com/docs"
         assert_eq!(memory.graph_candidate_limit, 32);
         assert_eq!(memory.max_graph_depth, 2);
         assert_eq!(memory.rrf_k, 60);
-        assert_eq!(memory.consolidation_timeout_secs, 600);
+        assert_eq!(memory.consolidation_model, "qwen3.5:9b");
+        assert_eq!(memory.consolidation_context_window, 16_384);
+        assert_eq!(memory.consolidation_input_target_tokens, 4_096);
+        assert_eq!(memory.consolidation_max_output_tokens, 4_096);
+        assert_eq!(memory.consolidation_timeout_secs, 300);
         assert_eq!(memory.embedding_timeout_secs, 600);
         assert_eq!(memory.search_timeout_ms, 15_000);
         assert_eq!(memory.episode_gap_minutes, 30);
@@ -487,12 +518,15 @@ location = "https://example.com/docs"
     #[test]
     fn memory_validation_rejects_representative_invalid_values() {
         let invalid = [
-            |memory: &mut MemoryConfig| memory.config_version = 2,
+            |memory: &mut MemoryConfig| memory.config_version = 1,
             |memory: &mut MemoryConfig| memory.embedding_dimensions = 31,
             |memory: &mut MemoryConfig| memory.embedding_batch_size = 0,
             |memory: &mut MemoryConfig| memory.graph_candidate_limit = 513,
             |memory: &mut MemoryConfig| memory.max_graph_depth = 3,
             |memory: &mut MemoryConfig| memory.rrf_k = 0,
+            |memory: &mut MemoryConfig| memory.consolidation_context_window = 4_095,
+            |memory: &mut MemoryConfig| memory.consolidation_input_target_tokens = 255,
+            |memory: &mut MemoryConfig| memory.consolidation_max_output_tokens = 1_023,
             |memory: &mut MemoryConfig| memory.embedding_timeout_secs = 3_601,
             |memory: &mut MemoryConfig| memory.search_timeout_ms = 0,
             |memory: &mut MemoryConfig| memory.episode_gap_minutes = 0,

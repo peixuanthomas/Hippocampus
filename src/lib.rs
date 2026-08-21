@@ -1,5 +1,6 @@
 pub mod config;
 pub mod consolidation;
+pub mod consolidation_v2;
 pub mod context;
 pub mod control;
 pub mod engine;
@@ -27,10 +28,11 @@ pub use consolidation::{
     ConsolidationAttemptStatus, ConsolidationBoundaryOutput, ConsolidationCandidateSnapshot,
     ConsolidationClaimEvidence, ConsolidationClaimObjectKind, ConsolidationEvent,
     ConsolidationEvidenceKind, ConsolidationInputBatch, ConsolidationQuote, ConsolidationRunReport,
-    ConsolidationRunStatus, ConsolidationTrigger, ConsolidationWatermark, EntityAliasOutput,
-    EntityDisambiguation, EntityResolution, EntityResolutionBasis, MemoryAliasCandidate,
-    MemoryAliasKind, MemoryClaimCandidate, MemoryClaimEvidenceCandidate, MemoryClaimState,
-    MemoryEntityCandidate, MemoryEntityKind, StructuredConsolidationOutput,
+    ConsolidationRunStatus, ConsolidationStageSelection, ConsolidationTrigger,
+    ConsolidationWatermark, EntityAliasOutput, EntityDisambiguation, EntityResolution,
+    EntityResolutionBasis, MemoryAliasCandidate, MemoryAliasKind, MemoryClaimCandidate,
+    MemoryClaimEvidenceCandidate, MemoryClaimState, MemoryEntityCandidate, MemoryEntityKind,
+    MemoryStageKind, MemoryStageRunReport, StructuredConsolidationOutput,
     structured_consolidation_schema,
 };
 pub use context::ContextAssembler;

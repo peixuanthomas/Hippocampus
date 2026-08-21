@@ -665,6 +665,7 @@ mod tests {
                 version: "test".into(),
                 name: "model".into(),
                 context_length: 32_768,
+                supports_thinking: true,
             },
             runtime: Arc::new(Mutex::new(RuntimeState::default())),
             generation_finished: Arc::new(Notify::new()),
@@ -681,6 +682,7 @@ mod tests {
                 version: "test".into(),
                 name: model.into(),
                 context_length: 32_768,
+                supports_thinking: true,
             })
         }
 
@@ -741,6 +743,7 @@ mod tests {
                 version: "test".into(),
                 name: "model".into(),
                 context_length: 32_768,
+                supports_thinking: true,
             },
             runtime: Arc::new(Mutex::new(RuntimeState::default())),
             generation_finished: Arc::new(Notify::new()),

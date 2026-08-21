@@ -16,7 +16,7 @@ use thiserror::Error;
 use crate::config::{MemoryBudgetConfig, MemoryConfig};
 use crate::consolidation::{
     consolidation_ledger_snapshot, normalize_match, original_claim_valid_to_by_id,
-    prepare_consolidation_replay, replay_prepared_consolidation,
+    prepare_consolidation_replay, replay_boundary_stage, replay_prepared_consolidation,
     validate_consolidation_ledger_semantics, validate_full_derived_integrity,
 };
 use crate::context::{WrappedHistoryCursor, wrapped_history_identity};
@@ -45,8 +45,9 @@ use crate::vector::{
 pub const INDEX_FILENAME: &str = ".hippocampus-index.sqlite3";
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 const SQLITE_BUSY_RETRY_ATTEMPTS: usize = 8;
-const INDEX_SCHEMA_VERSION: i64 = 9;
-const MEMORY_STATE_SCHEMA_VERSION: i64 = 4;
+const INDEX_SCHEMA_VERSION: i64 = 10;
+const MEMORY_STATE_SCHEMA_VERSION: i64 = 5;
+const PREVIOUS_INDEX_SCHEMA_VERSION: i64 = 9;
 const DEFERRED_HARD_LIMIT: usize = usize::MAX;
 const MAX_QUERY_EMBEDDINGS: usize = 5;
 
@@ -588,6 +589,15 @@ pub struct MemoryAttemptCounts {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryStageStatusMetrics {
+    pub stage: String,
+    pub watermark: Option<usize>,
+    pub gap_events: usize,
+    pub last_failure: Option<String>,
+    pub last_failure_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MemoryStatusMetrics {
     pub active_sessions: usize,
     pub active_events: usize,
@@ -595,6 +605,7 @@ pub struct MemoryStatusMetrics {
     pub embedding_compatible: usize,
     pub embedding_stale: usize,
     pub pending_consolidation_events: usize,
+    pub stages: Vec<MemoryStageStatusMetrics>,
     pub entity_count: usize,
     pub episode_count: usize,
     pub graph_current: bool,
@@ -1315,10 +1326,12 @@ impl RetrievalStore {
                 for attempt in attempts {
                     use crate::consolidation::ConsolidationAttemptStatus;
                     match attempt.status {
-                        ConsolidationAttemptStatus::Applied => consolidation_attempts.applied += 1,
-                        ConsolidationAttemptStatus::Rejected => {
-                            consolidation_attempts.rejected += 1
+                        ConsolidationAttemptStatus::Applied | ConsolidationAttemptStatus::Empty => {
+                            consolidation_attempts.applied += 1
                         }
+                        ConsolidationAttemptStatus::Rejected
+                        | ConsolidationAttemptStatus::Split
+                        | ConsolidationAttemptStatus::Stale => consolidation_attempts.rejected += 1,
                         ConsolidationAttemptStatus::ModelError => {
                             consolidation_attempts.model_error += 1
                         }
@@ -1359,6 +1372,104 @@ impl RetrievalStore {
                     }
                     retrieval_latencies.push(trace.elapsed_ms);
                 }
+                let mut stages = Vec::new();
+                for stage in ["facts", "boundaries", "raw_vectors"] {
+                    let mut scoped_watermark = None::<usize>;
+                    let mut gap_events = 0usize;
+                    let mut stage_sessions = transaction
+                        .prepare("SELECT session_id FROM indexed_sessions ORDER BY session_id")
+                        .map_err(|error| self.database_error(error))?;
+                    let stage_session_ids = stage_sessions
+                        .query_map([], |row| row.get::<_, String>(0))
+                        .map_err(|error| self.database_error(error))?
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .map_err(|error| self.database_error(error))?;
+                    for stage_session_id in stage_session_ids {
+                        if !control.allows_session(&stage_session_id)
+                            || session_id.is_some_and(|scope| scope != stage_session_id)
+                        {
+                            continue;
+                        }
+                        let watermark = transaction
+                            .query_row(
+                                "SELECT through_sequence FROM memory_stage_watermarks
+                                 WHERE session_id=?1 AND stage=?2",
+                                params![stage_session_id, stage],
+                                |row| row.get::<_, i64>(0),
+                            )
+                            .optional()
+                            .map_err(|error| self.database_error(error))?
+                            .map(|value| {
+                                usize::try_from(value).map_err(|_| {
+                                    RetrievalError::CorruptIndex(
+                                        "stage watermark 不是非负整数".into(),
+                                    )
+                                })
+                            })
+                            .transpose()?
+                            .unwrap_or(0);
+                        scoped_watermark =
+                            Some(scoped_watermark.map_or(watermark, |value| value.min(watermark)));
+                        let mut event_statement = transaction
+                            .prepare(
+                                "SELECT event_id,sequence,role,content,turn_id FROM events
+                                 WHERE session_id=?1 AND sequence>?2 ORDER BY sequence",
+                            )
+                            .map_err(|error| self.database_error(error))?;
+                        let event_rows = event_statement
+                            .query_map(
+                                params![
+                                    stage_session_id,
+                                    i64::try_from(watermark).unwrap_or(i64::MAX)
+                                ],
+                                |row| {
+                                    Ok((
+                                        row.get::<_, String>(0)?,
+                                        row.get::<_, String>(2)?,
+                                        row.get::<_, String>(3)?,
+                                        row.get::<_, Option<String>>(4)?,
+                                    ))
+                                },
+                            )
+                            .map_err(|error| self.database_error(error))?;
+                        for row in event_rows {
+                            let (event_id, role, content, turn_id) =
+                                row.map_err(|error| self.database_error(error))?;
+                            let eligible = if stage == "raw_vectors" {
+                                role != "system" && !content.trim().is_empty()
+                            } else {
+                                role == "user"
+                            };
+                            if eligible
+                                && control.allows_event(&stage_session_id, &event_id)
+                                && turn_id
+                                    .as_deref()
+                                    .is_none_or(|turn| control.allows_turn(&stage_session_id, turn))
+                            {
+                                gap_events = gap_events.saturating_add(1);
+                            }
+                        }
+                    }
+                    let failure = transaction
+                        .query_row(
+                            "SELECT error_json,completed_at FROM memory_stage_attempts
+                             WHERE stage=?1
+                               AND status IN ('rejected','model_error','cancelled','stale')
+                               AND (?2 IS NULL OR session_id=?2)
+                             ORDER BY completed_at DESC,attempt_id DESC LIMIT 1",
+                            params![stage, session_id],
+                            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
+                        )
+                        .optional()
+                        .map_err(|error| self.database_error(error))?;
+                    stages.push(MemoryStageStatusMetrics {
+                        stage: stage.to_owned(),
+                        watermark: scoped_watermark,
+                        gap_events,
+                        last_failure: failure.as_ref().and_then(|(error, _)| error.clone()),
+                        last_failure_at: failure.map(|(_, completed_at)| completed_at),
+                    });
+                }
                 Ok(MemoryStatusMetrics {
                     active_sessions,
                     active_events,
@@ -1366,6 +1477,7 @@ impl RetrievalStore {
                     embedding_compatible,
                     embedding_stale,
                     pending_consolidation_events,
+                    stages,
                     entity_count,
                     episode_count,
                     graph_current: graph.current,
@@ -2554,14 +2666,18 @@ impl RetrievalStore {
                  DELETE FROM retrieval_runs;
                  DELETE FROM answer_context_items;
                  DELETE FROM answer_contexts;
+                 DELETE FROM memory_claim_context_links;
+                 DELETE FROM memory_provenance_spans;
                  DELETE FROM memory_claim_transitions;
                  DELETE FROM memory_claim_evidence;
                  DELETE FROM memory_entity_mentions;
                  DELETE FROM memory_boundary_suggestions;
+                 DELETE FROM memory_boundary_decisions;
                  DELETE FROM memory_claims;
                  DELETE FROM memory_entity_aliases;
                  DELETE FROM memory_entities;
-                 DELETE FROM consolidation_watermarks;
+                 DELETE FROM memory_stage_units;
+                 DELETE FROM memory_stage_watermarks;
                  DELETE FROM source_spans;
                  DELETE FROM events;
                  DELETE FROM indexed_sessions;",
@@ -2581,7 +2697,10 @@ impl RetrievalStore {
             let report = self.write_session(&transaction, source, true, &state)?;
             total.answer_contexts += report.answer_contexts;
         }
-        let replay_report = replay_prepared_consolidation(&transaction, &state, replay)?;
+        let mut replay_report = replay_prepared_consolidation(&transaction, &state, replay)?;
+        replay_report.replayed = replay_report
+            .replayed
+            .saturating_add(replay_boundary_stage(&transaction, &state)?);
         let embeddings_reused =
             self.restore_reusable_leaf_embeddings(&transaction, &state, &reusable_embeddings)?;
         transaction
@@ -3116,6 +3235,177 @@ impl RetrievalStore {
             reused,
             changed: !changed_sessions.is_empty(),
         })
+    }
+
+    pub fn mark_raw_vector_watermarks(&self) -> RetrievalResult<()> {
+        let _guard = self.acquire_root_write()?;
+        let control = self.replay_control_state_under_guard()?;
+        let mut connection = self.open_connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| self.database_error(error))?;
+        self.require_current_control_projection(&transaction, &control)?;
+        let session_ids = transaction
+            .prepare("SELECT session_id FROM indexed_sessions ORDER BY session_id")
+            .and_then(|mut statement| {
+                statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .map_err(|error| self.database_error(error))?;
+        let updated_at = Utc::now().to_rfc3339();
+        for session_id in session_ids {
+            let source = self.authoritative_indexed_session_source(&transaction, &session_id)?;
+            let active = derive_events(&source.session)
+                .into_iter()
+                .filter(|event| {
+                    event.role != EventRole::System
+                        && !event.content.trim().is_empty()
+                        && control.allows_event(&session_id, &event.id)
+                        && event
+                            .turn_id
+                            .as_deref()
+                            .is_none_or(|turn_id| control.allows_turn(&session_id, turn_id))
+                })
+                .collect::<Vec<_>>();
+            let work_unit_ids = active
+                .iter()
+                .map(|event| format!("event:{}", event.id))
+                .collect::<Vec<_>>();
+            let attempt_id = format!(
+                "raw_attempt_{}",
+                content_sha256(&format!(
+                    "{}:{}:{}",
+                    session_id,
+                    active
+                        .last()
+                        .map(|event| event.content_sha256.as_str())
+                        .unwrap_or("empty"),
+                    updated_at
+                ))
+            );
+            for event in &active {
+                let end = event.content.chars().count();
+                let complete: i64 = transaction
+                    .query_row(
+                        "SELECT count(*) FROM memory_embeddings e
+                         JOIN memory_documents d ON d.document_id=e.document_id
+                         WHERE d.document_id=?1 AND d.session_id=?2 AND d.granularity='message'
+                           AND e.source_sha256=d.source_sha256",
+                        params![format!("{}:0:{end}", event.id), session_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| self.database_error(error))?;
+                if complete != 1 {
+                    return Err(RetrievalError::CorruptIndex(format!(
+                        "raw vector 事件 {} 缺少已发布 message embedding",
+                        event.id
+                    )));
+                }
+                transaction
+                    .execute(
+                        "INSERT INTO memory_stage_units
+                         (session_id,stage,unit_id,event_id,sequence,source_sha256,status,attempt_id,completed_at)
+                         VALUES(?1,'raw_vectors',?2,?3,?4,?5,'applied',?6,?7)
+                         ON CONFLICT(session_id,stage,unit_id) DO UPDATE SET
+                           source_sha256=excluded.source_sha256,status='applied',completed_at=excluded.completed_at",
+                        params![
+                            session_id,
+                            format!("event:{}", event.id),
+                            event.id,
+                            usize_to_i64(event.sequence).map_err(|error| self.database_error(error))?,
+                            event.content_sha256,
+                            attempt_id,
+                            updated_at,
+                        ],
+                    )
+                    .map_err(|error| self.database_error(error))?;
+            }
+            if let Some(last) = active.last() {
+                let model = transaction
+                    .query_row(
+                        "SELECT e.model FROM memory_embeddings e
+                         JOIN memory_documents d ON d.document_id=e.document_id
+                         WHERE d.session_id=?1 AND d.granularity='message'
+                         ORDER BY d.end_sequence DESC LIMIT 1",
+                        [&session_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .map_err(|error| self.database_error(error))?;
+                let request_json = serde_json::json!({
+                    "kind":"raw_vector_publish",
+                    "session_id":session_id,
+                    "work_unit_ids":work_unit_ids,
+                })
+                .to_string();
+                let response_json = serde_json::json!({
+                    "published":active.len(),
+                    "through_event_id":last.id,
+                    "through_sequence":last.sequence,
+                })
+                .to_string();
+                transaction
+                    .execute(
+                        "INSERT INTO memory_stage_attempts
+                         (attempt_id,stage,request_kind,parent_attempt_id,work_unit_ids,retry_ordinal,
+                          batch_key,session_id,from_sequence,through_sequence,trigger,model,
+                          request_json,request_sha256,input_event_ids,input_event_hashes,
+                          response_json,response_sha256,status,input_tokens,output_tokens,latency_ms,
+                          started_at,completed_at,validation_json,error_json,done_reason,
+                          canonical_delta_json,canonical_delta_sha256,projection_schema_version)
+                         VALUES(?1,'raw_vectors','embedding',NULL,?2,0,?3,?4,?5,?6,
+                                'embedding_publish',?7,?8,?9,?10,?11,?12,?13,'applied',
+                                NULL,NULL,0,?14,?14,?15,NULL,'published',NULL,NULL,4)",
+                        params![
+                            attempt_id,
+                            serde_json::to_string(&work_unit_ids).map_err(|error| {
+                                RetrievalError::CorruptIndex(format!("无法序列化 raw work units: {error}"))
+                            })?,
+                            format!("raw_vectors:{}:{}", session_id, last.sequence),
+                            session_id,
+                            usize_to_i64(active.first().map(|event| event.sequence).unwrap_or(0))
+                                .map_err(|error| self.database_error(error))?,
+                            usize_to_i64(last.sequence).map_err(|error| self.database_error(error))?,
+                            model,
+                            request_json,
+                            content_sha256(&request_json),
+                            serde_json::to_string(&active.iter().map(|event| event.id.as_str()).collect::<Vec<_>>())
+                                .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?,
+                            serde_json::to_string(&active.iter().map(|event| event.content_sha256.as_str()).collect::<Vec<_>>())
+                                .map_err(|error| RetrievalError::CorruptIndex(error.to_string()))?,
+                            response_json,
+                            content_sha256(&response_json),
+                            updated_at,
+                            serde_json::json!({"valid":true,"published":active.len()}).to_string(),
+                        ],
+                    )
+                    .map_err(|error| self.database_error(error))?;
+                transaction
+                    .execute(
+                        "INSERT INTO memory_stage_watermarks
+                         (session_id,stage,through_sequence,through_event_id,through_event_sha256,updated_at)
+                         VALUES(?1,'raw_vectors',?2,?3,?4,?5)
+                         ON CONFLICT(session_id,stage) DO UPDATE SET
+                           through_sequence=excluded.through_sequence,
+                           through_event_id=excluded.through_event_id,
+                           through_event_sha256=excluded.through_event_sha256,
+                           updated_at=excluded.updated_at",
+                        params![
+                            session_id,
+                            usize_to_i64(last.sequence).map_err(|error| self.database_error(error))?,
+                            last.id,
+                            last.content_sha256,
+                            updated_at,
+                        ],
+                    )
+                    .map_err(|error| self.database_error(error))?;
+            }
+        }
+        self.require_unchanged_control_state(&control)?;
+        transaction
+            .commit()
+            .map_err(|error| self.database_error(error))?;
+        Ok(())
     }
 
     pub fn aggregate_embedding_snapshot(
@@ -10336,16 +10626,20 @@ impl RetrievalStore {
             "memory_embedding_cache",
             "memory_episode_boundaries",
             "memory_episode_materializations",
-            "consolidation_watermarks",
-            "consolidation_batches",
+            "memory_stage_watermarks",
+            "memory_stage_units",
+            "memory_stage_attempts",
             "memory_schema_meta",
             "memory_entities",
             "memory_entity_mentions",
             "memory_entity_aliases",
             "memory_claims",
             "memory_claim_evidence",
+            "memory_claim_context_links",
+            "memory_provenance_spans",
             "memory_claim_transitions",
             "memory_boundary_suggestions",
+            "memory_boundary_decisions",
             "memory_graph_nodes",
             "memory_graph_edges",
             "memory_graph_materializations",
@@ -10382,16 +10676,20 @@ impl RetrievalStore {
             "SELECT index_fingerprint,content_sha256,dimensions,vector_blob,cached_at FROM memory_embedding_cache LIMIT 0",
             "SELECT session_id,before_event_id,decision_json,input_sha256 FROM memory_episode_boundaries LIMIT 0",
             "SELECT session_id,source_session_sha256,ledger_snapshot_sha256,vector_index_fingerprint,plan_input_sha256,algorithm_version,gap_minutes,topic_similarity_threshold,episode_count,boundary_count,materialized_at FROM memory_episode_materializations LIMIT 0",
-            "SELECT session_id,through_sequence,through_event_id,through_event_sha256,updated_at FROM consolidation_watermarks LIMIT 0",
-            "SELECT attempt_id,batch_key,session_id,from_sequence,through_sequence,trigger,model,request_json,request_sha256,input_event_ids,input_event_hashes,response_json,response_sha256,status,input_tokens,output_tokens,latency_ms,started_at,completed_at,validation_json,error_json,projection_schema_version FROM consolidation_batches LIMIT 0",
+            "SELECT session_id,stage,through_sequence,through_event_id,through_event_sha256,updated_at FROM memory_stage_watermarks LIMIT 0",
+            "SELECT session_id,stage,unit_id,event_id,sequence,source_sha256,status,attempt_id,completed_at FROM memory_stage_units LIMIT 0",
+            "SELECT attempt_id,stage,request_kind,parent_attempt_id,work_unit_ids,retry_ordinal,batch_key,session_id,from_sequence,through_sequence,trigger,model,request_json,request_sha256,input_event_ids,input_event_hashes,response_json,response_sha256,status,input_tokens,output_tokens,latency_ms,started_at,completed_at,validation_json,error_json,done_reason,canonical_delta_json,canonical_delta_sha256,projection_schema_version FROM memory_stage_attempts LIMIT 0",
             "SELECT key,value FROM memory_schema_meta LIMIT 0",
             "SELECT entity_id,kind,canonical_name,normalized_name,disambiguation,created_session_id,created_batch_key,created_event_id,created_start,created_end,created_hash,created_at,updated_at FROM memory_entities LIMIT 0",
             "SELECT mention_id,session_id,batch_key,mention_kind,source_record_id,entity_id,entity_status,event_id,sequence,role,start_char,end_char,content_sha256,created_at FROM memory_entity_mentions LIMIT 0",
             "SELECT alias_id,entity_id,alias_text,normalized_alias,alias_kind,stable_identifier_kind,session_id,batch_key,event_id,start_char,end_char,content_sha256,proof_event_id,proof_start_char,proof_end_char,proof_sha256,identity_event_id,identity_start_char,identity_end_char,identity_sha256,created_at FROM memory_entity_aliases LIMIT 0",
             "SELECT claim_id,session_id,subject_entity_id,predicate_key,normalized_relation,object_kind,object_text,object_entity_id,normalized_object,polarity,cardinality,certainty,state,asserted_at,event_time,valid_from,valid_to,reference_time,created_batch_key,updated_batch_key,created_at,updated_at FROM memory_claims LIMIT 0",
             "SELECT evidence_id,claim_id,session_id,batch_key,event_id,sequence,role,kind,start_char,end_char,content_sha256,subject_start_char,subject_end_char,subject_sha256,relation_start_char,relation_end_char,relation_sha256,object_start_char,object_end_char,object_sha256,speech_act_event_id,speech_act_start_char,speech_act_end_char,speech_act_sha256,created_at FROM memory_claim_evidence LIMIT 0",
+            "SELECT context_link_id,claim_id,evidence_id,assistant_event_id,purpose,content_sha256,created_at FROM memory_claim_context_links LIMIT 0",
+            "SELECT span_id,event_id,role,start_char,end_char,content_sha256,created_at FROM memory_provenance_spans LIMIT 0",
             "SELECT transition_id,claim_id,ordinal,from_state,to_state,reason,related_claim_id,session_id,batch_key,created_at FROM memory_claim_transitions LIMIT 0",
             "SELECT boundary_id,session_id,batch_key,before_event_id,reason,evidence_json,created_at FROM memory_boundary_suggestions LIMIT 0",
+            "SELECT session_id,before_event_id,sequence,is_boundary,generator,signals_json,evidence_json,input_sha256,attempt_id,decided_at FROM memory_boundary_decisions LIMIT 0",
             "SELECT node_id,node_kind,source_id,session_id,granularity,source_sha256 FROM memory_graph_nodes LIMIT 0",
             "SELECT edge_id,edge_type,source_node_id,target_node_id,weight,directed,provenance_json,provenance_sha256 FROM memory_graph_edges LIMIT 0",
             "SELECT singleton,algorithm_version,vector_index_fingerprint,config_sha256,source_sha256,catalog_sha256,node_count,edge_count,materialized_at FROM memory_graph_materializations LIMIT 0",
@@ -10455,9 +10753,13 @@ impl RetrievalStore {
         connection
             .busy_timeout(SQLITE_BUSY_TIMEOUT)
             .map_err(|source| self.database_error(source))?;
-        let version = connection
+        let mut version = connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .map_err(|source| self.database_error(source))?;
+        if version == PREVIOUS_INDEX_SCHEMA_VERSION {
+            migrate_v9_to_v10(&mut connection).map_err(|source| self.database_error(source))?;
+            version = INDEX_SCHEMA_VERSION;
+        }
         if !matches!(version, 0 | INDEX_SCHEMA_VERSION) {
             return Err(RetrievalError::UnsupportedIndexVersion(version));
         }
@@ -12567,7 +12869,7 @@ fn load_validated_consolidation_watermark(
     let stored = connection
         .query_row(
             "SELECT through_sequence, through_event_id, through_event_sha256, updated_at
-             FROM consolidation_watermarks WHERE session_id=?1",
+             FROM memory_stage_watermarks WHERE session_id=?1 AND stage='boundaries'",
             [session_id],
             |row| {
                 Ok((
@@ -12642,29 +12944,6 @@ fn load_validated_consolidation_watermark(
             "会话 {session_id} 的巩固水位事件来源不匹配"
         )));
     }
-    let next_turn_id = connection
-        .query_row(
-            "SELECT turn_id FROM events WHERE session_id=?1 AND sequence>?2
-             ORDER BY sequence LIMIT 1",
-            params![
-                session_id,
-                i64::try_from(through_sequence).map_err(|_| {
-                    aggregate_corruption(format!(
-                        "会话 {session_id} 的巩固水位序号超出 SQLite INTEGER"
-                    ))
-                })?
-            ],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .optional()
-        .map_err(|error| aggregate_corruption(format!("读取巩固水位后继事件失败：{error}")))?
-        .flatten();
-    if next_turn_id.is_some() && next_turn_id == source.1 {
-        return Err(aggregate_corruption(format!(
-            "会话 {session_id} 的巩固水位落在轮次内部"
-        )));
-    }
-
     let through_sequence_sql = i64::try_from(through_sequence).map_err(|_| {
         aggregate_corruption(format!(
             "会话 {session_id} 的巩固水位序号超出 SQLite INTEGER"
@@ -12673,7 +12952,7 @@ fn load_validated_consolidation_watermark(
     let applied = connection
         .prepare(
             "SELECT through_sequence, input_event_ids, input_event_hashes, completed_at
-             FROM consolidation_batches WHERE session_id=?1 AND status='applied'
+             FROM memory_stage_attempts WHERE session_id=?1 AND stage='boundaries' AND status='applied'
                AND projection_schema_version=4 AND through_sequence<=?2
              ORDER BY through_sequence DESC, attempt_id",
         )
@@ -13856,6 +14135,65 @@ fn add_report(total: &mut SyncReport, report: SyncReport) {
     total.documents += report.documents;
 }
 
+/// V2 intentionally resets the incompatible consolidation ledger and every projection that
+/// depends on it. Raw events, lexical documents, control history, leaf documents, compatible
+/// leaf embeddings, and the embedding cache remain intact.
+fn migrate_v9_to_v10(connection: &mut Connection) -> rusqlite::Result<()> {
+    connection.execute_batch("PRAGMA foreign_keys=OFF;")?;
+    let result = (|| {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(
+            "DELETE FROM memory_embeddings
+               WHERE document_id IN (
+                   SELECT document_id FROM memory_documents
+                   WHERE granularity IN ('episode','session')
+               );
+             DELETE FROM memory_document_members
+               WHERE document_id IN (
+                   SELECT document_id FROM memory_documents
+                   WHERE granularity IN ('episode','session')
+               );
+             DELETE FROM memory_documents WHERE granularity IN ('episode','session');
+             DROP TABLE IF EXISTS memory_graph_edges;
+             DROP TABLE IF EXISTS memory_graph_nodes;
+             DROP TABLE IF EXISTS memory_graph_materializations;
+             DROP TABLE IF EXISTS memory_graph_watermarks;
+             DROP TABLE IF EXISTS memory_episode_materializations;
+             DROP TABLE IF EXISTS memory_episode_boundaries;
+             DROP TABLE IF EXISTS memory_boundary_suggestions;
+             DROP TABLE IF EXISTS memory_boundary_decisions;
+             DROP TABLE IF EXISTS memory_claim_context_links;
+             DROP TABLE IF EXISTS memory_provenance_spans;
+             DROP TABLE IF EXISTS memory_claim_transitions;
+             DROP TABLE IF EXISTS memory_claim_evidence;
+             DROP TABLE IF EXISTS memory_entity_mentions;
+             DROP TABLE IF EXISTS memory_claims;
+             DROP TABLE IF EXISTS memory_entity_aliases;
+             DROP TABLE IF EXISTS memory_entities;
+             DROP TABLE IF EXISTS consolidation_watermarks;
+             DROP TABLE IF EXISTS consolidation_batches;
+             DROP TABLE IF EXISTS memory_stage_units;
+             DROP TABLE IF EXISTS memory_stage_watermarks;
+             DROP TABLE IF EXISTS memory_stage_attempts;",
+        )?;
+        transaction.execute_batch(SCHEMA_SQL)?;
+        transaction.execute(
+            "INSERT INTO memory_schema_meta(key,value) VALUES('state_schema_version',?1)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [MEMORY_STATE_SCHEMA_VERSION],
+        )?;
+        transaction.execute(
+            "INSERT INTO memory_schema_meta(key,value) VALUES('graph_schema_version',?1)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [crate::graph::GRAPH_SCHEMA_VERSION],
+        )?;
+        transaction.pragma_update(None, "user_version", INDEX_SCHEMA_VERSION)?;
+        transaction.commit()
+    })();
+    let restore = connection.execute_batch("PRAGMA foreign_keys=ON;");
+    result.and(restore)
+}
+
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS indexed_sessions (
     session_id TEXT PRIMARY KEY,
@@ -14036,18 +14374,38 @@ CREATE INDEX IF NOT EXISTS events_session_sequence
 CREATE INDEX IF NOT EXISTS events_reply_to
     ON events(reply_to_event_id);
 
-CREATE TABLE IF NOT EXISTS consolidation_watermarks (
-    session_id TEXT PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS memory_stage_watermarks (
+    session_id TEXT NOT NULL,
+    stage TEXT NOT NULL DEFAULT 'facts' CHECK(stage IN ('facts','boundaries','raw_vectors')),
     through_sequence INTEGER NOT NULL CHECK(through_sequence >= 0),
     through_event_id TEXT,
     through_event_sha256 TEXT,
     updated_at TEXT,
     CHECK((through_event_id IS NULL AND through_event_sha256 IS NULL)
-       OR (through_event_id IS NOT NULL AND through_event_sha256 IS NOT NULL))
+       OR (through_event_id IS NOT NULL AND through_event_sha256 IS NOT NULL)),
+    PRIMARY KEY(session_id, stage)
 );
 
-CREATE TABLE IF NOT EXISTS consolidation_batches (
+CREATE TABLE IF NOT EXISTS memory_stage_units (
+    session_id TEXT NOT NULL,
+    stage TEXT NOT NULL CHECK(stage IN ('facts','boundaries','raw_vectors')),
+    unit_id TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    sequence INTEGER NOT NULL CHECK(sequence >= 0),
+    source_sha256 TEXT NOT NULL CHECK(length(source_sha256)=64),
+    status TEXT NOT NULL CHECK(status IN ('pending','applied','empty','failed')),
+    attempt_id TEXT,
+    completed_at TEXT,
+    PRIMARY KEY(session_id,stage,unit_id)
+);
+
+CREATE TABLE IF NOT EXISTS memory_stage_attempts (
     attempt_id TEXT PRIMARY KEY,
+    stage TEXT NOT NULL DEFAULT 'facts' CHECK(stage IN ('facts','boundaries','raw_vectors')),
+    request_kind TEXT NOT NULL DEFAULT 'initial' CHECK(request_kind IN ('initial','repair','split','deterministic','embedding')),
+    parent_attempt_id TEXT,
+    work_unit_ids TEXT NOT NULL DEFAULT '[]',
+    retry_ordinal INTEGER NOT NULL DEFAULT 0 CHECK(retry_ordinal >= 0),
     batch_key TEXT NOT NULL,
     session_id TEXT NOT NULL,
     from_sequence INTEGER NOT NULL CHECK(from_sequence >= 0),
@@ -14060,7 +14418,7 @@ CREATE TABLE IF NOT EXISTS consolidation_batches (
     input_event_hashes TEXT NOT NULL,
     response_json TEXT,
     response_sha256 TEXT,
-    status TEXT NOT NULL CHECK(status IN ('applied', 'rejected', 'model_error', 'cancelled')),
+    status TEXT NOT NULL CHECK(status IN ('applied','empty','split','rejected','model_error','cancelled','stale')),
     input_tokens INTEGER CHECK(input_tokens IS NULL OR input_tokens >= 0),
     output_tokens INTEGER CHECK(output_tokens IS NULL OR output_tokens >= 0),
     latency_ms INTEGER NOT NULL CHECK(latency_ms >= 0),
@@ -14068,21 +14426,26 @@ CREATE TABLE IF NOT EXISTS consolidation_batches (
     completed_at TEXT NOT NULL,
     validation_json TEXT,
     error_json TEXT,
+    done_reason TEXT,
+    canonical_delta_json TEXT,
+    canonical_delta_sha256 TEXT,
     projection_schema_version INTEGER CHECK(projection_schema_version IS NULL OR projection_schema_version = 4),
     CHECK(from_sequence <= through_sequence),
     CHECK((response_json IS NULL AND response_sha256 IS NULL)
-       OR (response_json IS NOT NULL AND response_sha256 IS NOT NULL))
+       OR (response_json IS NOT NULL AND response_sha256 IS NOT NULL)),
+    CHECK((canonical_delta_json IS NULL AND canonical_delta_sha256 IS NULL)
+       OR (canonical_delta_json IS NOT NULL AND canonical_delta_sha256 IS NOT NULL))
 );
-CREATE INDEX IF NOT EXISTS consolidation_batches_session_started
-    ON consolidation_batches(session_id, started_at, attempt_id);
-CREATE INDEX IF NOT EXISTS consolidation_batches_batch_key
-    ON consolidation_batches(batch_key);
-CREATE TRIGGER IF NOT EXISTS consolidation_batches_immutable_update
-BEFORE UPDATE ON consolidation_batches
-BEGIN SELECT RAISE(ABORT, 'consolidation_batches is immutable'); END;
-CREATE TRIGGER IF NOT EXISTS consolidation_batches_immutable_delete
-BEFORE DELETE ON consolidation_batches
-BEGIN SELECT RAISE(ABORT, 'consolidation_batches is immutable'); END;
+CREATE INDEX IF NOT EXISTS memory_stage_attempts_session_started
+    ON memory_stage_attempts(session_id, started_at, attempt_id);
+CREATE INDEX IF NOT EXISTS memory_stage_attempts_batch_key
+    ON memory_stage_attempts(batch_key);
+CREATE TRIGGER IF NOT EXISTS memory_stage_attempts_immutable_update
+BEFORE UPDATE ON memory_stage_attempts
+BEGIN SELECT RAISE(ABORT, 'memory_stage_attempts is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS memory_stage_attempts_immutable_delete
+BEFORE DELETE ON memory_stage_attempts
+BEGIN SELECT RAISE(ABORT, 'memory_stage_attempts is immutable'); END;
 
 CREATE TABLE IF NOT EXISTS memory_schema_meta (
     key TEXT PRIMARY KEY,
@@ -14118,7 +14481,7 @@ CREATE TABLE IF NOT EXISTS memory_entity_mentions (
     entity_status TEXT NOT NULL CHECK(entity_status IN ('resolved','pending')),
     event_id TEXT NOT NULL CHECK(length(event_id) > 0),
     sequence INTEGER NOT NULL CHECK(sequence >= 0),
-    role TEXT NOT NULL CHECK(role IN ('user','assistant')),
+    role TEXT NOT NULL CHECK(role = 'user'),
     start_char INTEGER NOT NULL CHECK(start_char >= 0),
     end_char INTEGER NOT NULL CHECK(end_char > start_char),
     content_sha256 TEXT NOT NULL CHECK(length(content_sha256) = 64
@@ -14206,26 +14569,32 @@ CREATE TABLE IF NOT EXISTS memory_claim_evidence (
     batch_key TEXT NOT NULL CHECK(length(batch_key) > 0),
     event_id TEXT NOT NULL CHECK(length(event_id) > 0),
     sequence INTEGER NOT NULL CHECK(sequence >= 0),
-    role TEXT NOT NULL CHECK(role IN ('user','assistant')),
+    role TEXT NOT NULL CHECK(role = 'user'),
     kind TEXT NOT NULL CHECK(kind IN ('assertion','user_confirmation','correction','temporal')),
     start_char INTEGER NOT NULL CHECK(start_char >= 0),
     end_char INTEGER NOT NULL CHECK(end_char > start_char),
     content_sha256 TEXT NOT NULL CHECK(length(content_sha256) = 64),
-    subject_start_char INTEGER NOT NULL CHECK(subject_start_char >= start_char),
-    subject_end_char INTEGER NOT NULL CHECK(subject_end_char > subject_start_char AND subject_end_char <= end_char),
-    subject_sha256 TEXT NOT NULL CHECK(length(subject_sha256) = 64),
-    relation_start_char INTEGER NOT NULL CHECK(relation_start_char >= start_char),
-    relation_end_char INTEGER NOT NULL CHECK(relation_end_char > relation_start_char AND relation_end_char <= end_char),
-    relation_sha256 TEXT NOT NULL CHECK(length(relation_sha256) = 64),
-    object_start_char INTEGER NOT NULL CHECK(object_start_char >= start_char),
-    object_end_char INTEGER NOT NULL CHECK(object_end_char > object_start_char AND object_end_char <= end_char),
-    object_sha256 TEXT NOT NULL CHECK(length(object_sha256) = 64),
+    subject_start_char INTEGER CHECK(subject_start_char IS NULL OR subject_start_char >= start_char),
+    subject_end_char INTEGER CHECK(subject_end_char IS NULL OR (subject_start_char IS NOT NULL AND subject_end_char > subject_start_char AND subject_end_char <= end_char)),
+    subject_sha256 TEXT CHECK(subject_sha256 IS NULL OR length(subject_sha256) = 64),
+    relation_start_char INTEGER CHECK(relation_start_char IS NULL OR relation_start_char >= start_char),
+    relation_end_char INTEGER CHECK(relation_end_char IS NULL OR (relation_start_char IS NOT NULL AND relation_end_char > relation_start_char AND relation_end_char <= end_char)),
+    relation_sha256 TEXT CHECK(relation_sha256 IS NULL OR length(relation_sha256) = 64),
+    object_start_char INTEGER CHECK(object_start_char IS NULL OR object_start_char >= start_char),
+    object_end_char INTEGER CHECK(object_end_char IS NULL OR (object_start_char IS NOT NULL AND object_end_char > object_start_char AND object_end_char <= end_char)),
+    object_sha256 TEXT CHECK(object_sha256 IS NULL OR length(object_sha256) = 64),
     speech_act_event_id TEXT,
     speech_act_start_char INTEGER,
     speech_act_end_char INTEGER,
     speech_act_sha256 TEXT,
     created_at TEXT NOT NULL,
     FOREIGN KEY(claim_id) REFERENCES memory_claims(claim_id),
+    CHECK((subject_start_char IS NULL AND subject_end_char IS NULL AND subject_sha256 IS NULL
+           AND relation_start_char IS NULL AND relation_end_char IS NULL AND relation_sha256 IS NULL
+           AND object_start_char IS NULL AND object_end_char IS NULL AND object_sha256 IS NULL)
+       OR (subject_start_char IS NOT NULL AND subject_end_char IS NOT NULL AND subject_sha256 IS NOT NULL
+           AND relation_start_char IS NOT NULL AND relation_end_char IS NOT NULL AND relation_sha256 IS NOT NULL
+           AND object_start_char IS NOT NULL AND object_end_char IS NOT NULL AND object_sha256 IS NOT NULL)),
     CHECK((speech_act_event_id IS NULL AND speech_act_start_char IS NULL
            AND speech_act_end_char IS NULL AND speech_act_sha256 IS NULL)
        OR (speech_act_event_id IS NOT NULL AND speech_act_start_char IS NOT NULL
@@ -14240,6 +14609,28 @@ CREATE INDEX IF NOT EXISTS memory_claim_evidence_claim
     ON memory_claim_evidence(claim_id, event_id, start_char, end_char, evidence_id);
 CREATE INDEX IF NOT EXISTS memory_claim_evidence_event
     ON memory_claim_evidence(event_id, claim_id);
+
+CREATE TABLE IF NOT EXISTS memory_claim_context_links (
+    context_link_id TEXT PRIMARY KEY,
+    claim_id TEXT NOT NULL REFERENCES memory_claims(claim_id),
+    evidence_id TEXT NOT NULL REFERENCES memory_claim_evidence(evidence_id),
+    assistant_event_id TEXT NOT NULL REFERENCES events(event_id),
+    purpose TEXT NOT NULL CHECK(purpose='interpretation_only'),
+    content_sha256 TEXT NOT NULL CHECK(length(content_sha256)=64),
+    created_at TEXT NOT NULL,
+    UNIQUE(claim_id,evidence_id,assistant_event_id)
+);
+
+CREATE TABLE IF NOT EXISTS memory_provenance_spans (
+    span_id TEXT PRIMARY KEY CHECK(span_id GLOB 'span_*' AND length(span_id)=69),
+    event_id TEXT NOT NULL REFERENCES events(event_id) ON DELETE CASCADE,
+    role TEXT NOT NULL CHECK(role='user'),
+    start_char INTEGER NOT NULL CHECK(start_char>=0),
+    end_char INTEGER NOT NULL CHECK(end_char>start_char),
+    content_sha256 TEXT NOT NULL CHECK(length(content_sha256)=64),
+    created_at TEXT NOT NULL,
+    UNIQUE(event_id,start_char,end_char,content_sha256)
+);
 
 CREATE TABLE IF NOT EXISTS memory_claim_transitions (
     transition_id TEXT PRIMARY KEY,
@@ -14270,6 +14661,20 @@ CREATE TABLE IF NOT EXISTS memory_boundary_suggestions (
 );
 CREATE INDEX IF NOT EXISTS memory_boundary_suggestions_session_event
     ON memory_boundary_suggestions(session_id, before_event_id, boundary_id);
+
+CREATE TABLE IF NOT EXISTS memory_boundary_decisions (
+    session_id TEXT NOT NULL,
+    before_event_id TEXT NOT NULL,
+    sequence INTEGER NOT NULL CHECK(sequence >= 0),
+    is_boundary INTEGER NOT NULL CHECK(is_boundary IN (0,1)),
+    generator TEXT NOT NULL CHECK(generator IN ('rust','qwen')),
+    signals_json TEXT NOT NULL,
+    evidence_json TEXT NOT NULL,
+    input_sha256 TEXT NOT NULL CHECK(length(input_sha256)=64),
+    attempt_id TEXT,
+    decided_at TEXT NOT NULL,
+    PRIMARY KEY(session_id,before_event_id)
+);
 
 CREATE TABLE IF NOT EXISTS memory_graph_nodes (
     node_id TEXT PRIMARY KEY,
@@ -14355,12 +14760,15 @@ CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_episode_boundaries_delete A
 CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_episode_materializations_insert AFTER INSERT ON memory_episode_materializations BEGIN DELETE FROM memory_graph_materializations; END;
 CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_episode_materializations_update AFTER UPDATE ON memory_episode_materializations BEGIN DELETE FROM memory_graph_materializations; END;
 CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_episode_materializations_delete AFTER DELETE ON memory_episode_materializations BEGIN DELETE FROM memory_graph_materializations; END;
-CREATE TRIGGER IF NOT EXISTS graph_invalidate_consolidation_watermarks_insert AFTER INSERT ON consolidation_watermarks BEGIN DELETE FROM memory_graph_materializations; END;
-CREATE TRIGGER IF NOT EXISTS graph_invalidate_consolidation_watermarks_update AFTER UPDATE ON consolidation_watermarks BEGIN DELETE FROM memory_graph_materializations; END;
-CREATE TRIGGER IF NOT EXISTS graph_invalidate_consolidation_watermarks_delete AFTER DELETE ON consolidation_watermarks BEGIN DELETE FROM memory_graph_materializations; END;
-CREATE TRIGGER IF NOT EXISTS graph_invalidate_consolidation_batches_insert AFTER INSERT ON consolidation_batches BEGIN DELETE FROM memory_graph_materializations; END;
-CREATE TRIGGER IF NOT EXISTS graph_invalidate_consolidation_batches_update AFTER UPDATE ON consolidation_batches BEGIN DELETE FROM memory_graph_materializations; END;
-CREATE TRIGGER IF NOT EXISTS graph_invalidate_consolidation_batches_delete AFTER DELETE ON consolidation_batches BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_stage_watermarks_insert AFTER INSERT ON memory_stage_watermarks BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_stage_watermarks_update AFTER UPDATE ON memory_stage_watermarks BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_stage_watermarks_delete AFTER DELETE ON memory_stage_watermarks BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_stage_units_insert AFTER INSERT ON memory_stage_units BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_stage_units_update AFTER UPDATE ON memory_stage_units BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_stage_units_delete AFTER DELETE ON memory_stage_units BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_stage_attempts_insert AFTER INSERT ON memory_stage_attempts BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_stage_attempts_update AFTER UPDATE ON memory_stage_attempts BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_stage_attempts_delete AFTER DELETE ON memory_stage_attempts BEGIN DELETE FROM memory_graph_materializations; END;
 CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_entities_insert AFTER INSERT ON memory_entities BEGIN DELETE FROM memory_graph_materializations; END;
 CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_entities_update AFTER UPDATE ON memory_entities BEGIN DELETE FROM memory_graph_materializations; END;
 CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_entities_delete AFTER DELETE ON memory_entities BEGIN DELETE FROM memory_graph_materializations; END;
@@ -14376,12 +14784,18 @@ CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_claims_delete AFTER DELETE 
 CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_claim_evidence_insert AFTER INSERT ON memory_claim_evidence BEGIN DELETE FROM memory_graph_materializations; END;
 CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_claim_evidence_update AFTER UPDATE ON memory_claim_evidence BEGIN DELETE FROM memory_graph_materializations; END;
 CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_claim_evidence_delete AFTER DELETE ON memory_claim_evidence BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_claim_context_links_insert AFTER INSERT ON memory_claim_context_links BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_claim_context_links_update AFTER UPDATE ON memory_claim_context_links BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_claim_context_links_delete AFTER DELETE ON memory_claim_context_links BEGIN DELETE FROM memory_graph_materializations; END;
 CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_claim_transitions_insert AFTER INSERT ON memory_claim_transitions BEGIN DELETE FROM memory_graph_materializations; END;
 CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_claim_transitions_update AFTER UPDATE ON memory_claim_transitions BEGIN DELETE FROM memory_graph_materializations; END;
 CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_claim_transitions_delete AFTER DELETE ON memory_claim_transitions BEGIN DELETE FROM memory_graph_materializations; END;
 CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_boundary_suggestions_insert AFTER INSERT ON memory_boundary_suggestions BEGIN DELETE FROM memory_graph_materializations; END;
 CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_boundary_suggestions_update AFTER UPDATE ON memory_boundary_suggestions BEGIN DELETE FROM memory_graph_materializations; END;
 CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_boundary_suggestions_delete AFTER DELETE ON memory_boundary_suggestions BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_boundary_decisions_insert AFTER INSERT ON memory_boundary_decisions BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_boundary_decisions_update AFTER UPDATE ON memory_boundary_decisions BEGIN DELETE FROM memory_graph_materializations; END;
+CREATE TRIGGER IF NOT EXISTS graph_invalidate_memory_boundary_decisions_delete AFTER DELETE ON memory_boundary_decisions BEGIN DELETE FROM memory_graph_materializations; END;
 "#;
 
 fn elapsed_ms(started: Instant) -> u64 {
@@ -17305,7 +17719,7 @@ mod tests {
             ProjectionAuditTamper::WatermarkEventId => {
                 connection
                     .execute(
-                        "UPDATE consolidation_watermarks
+                        "UPDATE memory_stage_watermarks
                          SET through_event_id=(SELECT event_id FROM events
                              WHERE session_id=?1 AND role='user' ORDER BY sequence LIMIT 1)
                          WHERE session_id=?1",
@@ -17316,7 +17730,7 @@ mod tests {
             ProjectionAuditTamper::WatermarkEventHash => {
                 connection
                     .execute(
-                        "UPDATE consolidation_watermarks SET through_event_sha256=?1
+                        "UPDATE memory_stage_watermarks SET through_event_sha256=?1
                          WHERE session_id=?2",
                         params![fake_hash, session_id],
                     )
@@ -17325,7 +17739,7 @@ mod tests {
             ProjectionAuditTamper::WatermarkUpdatedAt => {
                 connection
                     .execute(
-                        "UPDATE consolidation_watermarks
+                        "UPDATE memory_stage_watermarks
                          SET updated_at='2000-01-01T00:00:00Z' WHERE session_id=?1",
                         [session_id],
                     )
@@ -17931,10 +18345,11 @@ mod tests {
                 evidence: vec![ConsolidationClaimEvidence {
                     kind: ConsolidationEvidenceKind::Assertion,
                     quote: full_consolidation_quote(first_user),
-                    subject_span: subject,
-                    relation_span: relation,
-                    object_span: object,
+                    subject_span: Some(subject),
+                    relation_span: Some(relation),
+                    object_span: Some(object),
                     speech_act_span: None,
+                    context_id: None,
                 }],
             }],
             boundaries: vec![ConsolidationBoundaryOutput {
@@ -17992,6 +18407,14 @@ mod tests {
             completed_at,
             validation_json: Some("{\"valid\":true}".into()),
             error_json: None,
+            stage: "facts".into(),
+            request_kind: "initial".into(),
+            parent_attempt_id: None,
+            work_unit_ids: Vec::new(),
+            retry_ordinal: 0,
+            done_reason: Some("stop".into()),
+            canonical_delta_json: None,
+            canonical_delta_sha256: None,
         };
         store
             .retrieval()
@@ -18023,6 +18446,7 @@ mod tests {
                 version: "test".into(),
                 name: model.into(),
                 context_length: 32_768,
+                supports_thinking: true,
             })
         }
 
@@ -18913,7 +19337,7 @@ mod tests {
                      sentinel_value BLOB NOT NULL
                  );
                  INSERT INTO future_sentinel VALUES ('keep-me', X'00FF1020');
-                 CREATE TABLE consolidation_watermarks (
+                 CREATE TABLE memory_stage_watermarks (
                      session_id TEXT PRIMARY KEY,
                      through_sequence INTEGER NOT NULL,
                      through_event_id TEXT,
@@ -18921,15 +19345,15 @@ mod tests {
                      updated_at TEXT,
                      future_column TEXT NOT NULL
                  );
-                 INSERT INTO consolidation_watermarks VALUES
+                 INSERT INTO memory_stage_watermarks VALUES
                      ('future-session', 42, 'future-event', 'future-hash',
                       '2026-01-01T00:00:00Z', 'future-watermark');
-                 CREATE TABLE consolidation_batches (
+                 CREATE TABLE memory_stage_attempts (
                      attempt_id TEXT PRIMARY KEY,
                      status TEXT NOT NULL,
                      future_payload TEXT NOT NULL
                  );
-                 INSERT INTO consolidation_batches VALUES
+                 INSERT INTO memory_stage_attempts VALUES
                      ('future-attempt', 'future-applied', '{\"future\":true}');
                  PRAGMA user_version=10;",
             )
@@ -18967,7 +19391,7 @@ mod tests {
                 .query_row(
                     "SELECT session_id, through_sequence, through_event_id,
                             through_event_sha256, updated_at, future_column
-                     FROM consolidation_watermarks",
+                     FROM memory_stage_watermarks",
                     [],
                     |row| {
                         Ok((
@@ -18993,7 +19417,7 @@ mod tests {
         assert_eq!(
             connection
                 .query_row(
-                    "SELECT attempt_id, status, future_payload FROM consolidation_batches",
+                    "SELECT attempt_id, status, future_payload FROM memory_stage_attempts",
                     [],
                     |row| {
                         Ok((

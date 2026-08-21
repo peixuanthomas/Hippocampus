@@ -1236,6 +1236,7 @@ fn answer_request(
             ChatMessage { role: "user".into(), content: format!("Reference time: {}\nQuestion: {}\nEvidence JSON: {}", case.reference_time, case.question, serde_json::to_string(&evidence)?) },
         ],
         schema: json!({"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false}),
+        think: false,
         num_ctx: options.num_ctx,
         num_predict: options.num_predict,
     })

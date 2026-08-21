@@ -57,6 +57,19 @@ impl OllamaError {
             _ => None,
         }
     }
+
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Self::Connection { .. } | Self::Stream { .. } => true,
+            Self::Other(message) => ["408", "429", "500", "502", "503", "504"]
+                .iter()
+                .any(|status| message.starts_with(&format!("Ollama HTTP {status}"))),
+            Self::ModelNotFound(_)
+            | Self::Protocol(_)
+            | Self::ContextLength { .. }
+            | Self::Cancelled { .. } => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,6 +77,7 @@ pub struct ModelInfo {
     pub version: String,
     pub name: String,
     pub context_length: u64,
+    pub supports_thinking: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -97,6 +111,7 @@ pub struct StructuredChatRequest {
     pub model: String,
     pub messages: Vec<ChatMessage>,
     pub schema: Value,
+    pub think: bool,
     pub num_ctx: u64,
     pub num_predict: u64,
 }
@@ -106,6 +121,16 @@ pub struct StructuredChatResponse {
     pub content: String,
     pub usage: TokenUsage,
     pub done_reason: Option<String>,
+}
+
+impl StructuredChatResponse {
+    pub fn output_limit_reached(&self, configured_limit: u64) -> bool {
+        self.done_reason.as_deref() == Some("length")
+            || self
+                .usage
+                .output_tokens
+                .is_some_and(|tokens| tokens >= configured_limit)
+    }
 }
 
 #[async_trait]
@@ -199,8 +224,8 @@ impl OllamaClient {
     ) -> Result<StructuredChatResponse, OllamaError> {
         validate_structured_chat_request(&request)?;
         let payload = structured_chat_payload(&request);
-        let events = self.request_chat_events(&request.model, payload).await?;
-        parse_structured_chat_events(&events)
+        self.request_structured_chat_response(&request.model, payload)
+            .await
     }
 
     /// Unloads every model successfully used by this process from its Ollama host.
@@ -309,6 +334,46 @@ impl OllamaClient {
             events.push(event);
         }
         Ok(events)
+    }
+
+    /// Streams a structured response while deliberately discarding every thinking fragment.
+    /// Only final content and authoritative completion metadata survive this boundary.
+    async fn request_structured_chat_response(
+        &self,
+        model: &str,
+        payload: Value,
+    ) -> Result<StructuredChatResponse, OllamaError> {
+        let response = self
+            .client
+            .post(format!("{}/api/chat", self.host))
+            .header("Accept", "application/json")
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|error| self.connection(error))?;
+        let status = response.status();
+        if !status.is_success() {
+            let bytes = response
+                .bytes()
+                .await
+                .map_err(|error| self.connection(error))?;
+            let payload = serde_json::from_slice(&bytes)
+                .unwrap_or_else(|_| json!({"error": String::from_utf8_lossy(&bytes)}));
+            return Err(api_error(&payload, Some(status)));
+        }
+        self.record_model_use(model);
+        let mut stream = response.bytes_stream();
+        let mut buffer = Vec::new();
+        let mut accumulator = StructuredResponseAccumulator::default();
+        while let Some(chunk) = stream.next().await {
+            buffer.extend_from_slice(&chunk.map_err(|error| self.connection(error))?);
+            while let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
+                let line = buffer.drain(..=newline).collect::<Vec<_>>();
+                accumulator.push_line(&line[..line.len().saturating_sub(1)])?;
+            }
+        }
+        accumulator.push_line(&buffer)?;
+        accumulator.finish()
     }
 
     async fn unload_model(&self, model: &str) -> Result<(), OllamaError> {
@@ -488,7 +553,7 @@ fn structured_chat_payload(request: &StructuredChatRequest) -> Value {
         "model": request.model,
         "messages": messages,
         "stream": true,
-        "think": false,
+        "think": request.think,
         "format": request.schema,
         "truncate": false,
         "shift": false,
@@ -502,7 +567,7 @@ fn structured_chat_payload(request: &StructuredChatRequest) -> Value {
     })
 }
 
-fn structured_chat_messages(request: &StructuredChatRequest) -> Vec<ChatMessage> {
+pub(crate) fn structured_chat_messages(request: &StructuredChatRequest) -> Vec<ChatMessage> {
     let schema = serde_json::to_string(&request.schema)
         .expect("serde_json::Value serialization is infallible");
     let mut messages = Vec::with_capacity(request.messages.len() + 1);
@@ -521,8 +586,12 @@ fn parse_structured_chat_response(payload: &Value) -> Result<StructuredChatRespo
         .get("message")
         .and_then(|message| message.get("content"))
         .and_then(Value::as_str)
-        .filter(|content| !content.trim().is_empty())
-        .ok_or_else(|| OllamaError::Protocol("Ollama 结构化响应缺少非空内容".into()))?;
+        .unwrap_or_default();
+    if payload.get("done").and_then(Value::as_bool) != Some(true) {
+        return Err(OllamaError::Protocol(
+            "Ollama 结构化响应缺少最终完成事件".into(),
+        ));
+    }
     let input = payload.get("prompt_eval_count").and_then(Value::as_u64);
     let output = payload.get("eval_count").and_then(Value::as_u64);
     Ok(StructuredChatResponse {
@@ -533,6 +602,43 @@ fn parse_structured_chat_response(payload: &Value) -> Result<StructuredChatRespo
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
     })
+}
+
+#[derive(Default)]
+struct StructuredResponseAccumulator {
+    content: String,
+    final_event: Option<Value>,
+}
+
+impl StructuredResponseAccumulator {
+    fn push_line(&mut self, line: &[u8]) -> Result<(), OllamaError> {
+        let Some(event) = parse_chat_event_line(line)? else {
+            return Ok(());
+        };
+        // Thinking is intentionally not cloned, concatenated, logged, or returned.
+        if let Some(fragment) = event
+            .get("message")
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_str)
+        {
+            self.content.push_str(fragment);
+        }
+        if event.get("done").and_then(Value::as_bool) == Some(true) {
+            self.final_event = Some(event);
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<StructuredChatResponse, OllamaError> {
+        let mut final_event = self
+            .final_event
+            .ok_or_else(|| OllamaError::Protocol("Ollama 结构化流在最终事件前结束".into()))?;
+        final_event
+            .as_object_mut()
+            .expect("validated event object")
+            .insert("message".into(), json!({"content": self.content}));
+        parse_structured_chat_response(&final_event)
+    }
 }
 
 #[cfg(test)]
@@ -563,6 +669,7 @@ fn parse_chat_event_line(line: &[u8]) -> Result<Option<Value>, OllamaError> {
     Ok(Some(event))
 }
 
+#[cfg(test)]
 fn parse_structured_chat_events(events: &[Value]) -> Result<StructuredChatResponse, OllamaError> {
     let final_event = events
         .last()
@@ -652,6 +759,14 @@ impl ChatBackend for OllamaClient {
             version,
             name: model.to_owned(),
             context_length,
+            supports_thinking: details
+                .get("capabilities")
+                .and_then(Value::as_array)
+                .is_some_and(|values| {
+                    values
+                        .iter()
+                        .any(|value| value.as_str() == Some("thinking"))
+                }),
         })
     }
 
@@ -969,6 +1084,7 @@ mod tests {
                 "properties": {"name": {"type": "string"}},
                 "required": ["name"]
             }),
+            think: true,
             num_ctx: 4_096,
             num_predict: 256,
         }
@@ -1080,12 +1196,12 @@ mod tests {
     }
 
     #[test]
-    fn structured_chat_payload_disables_thinking_and_tools() {
+    fn structured_chat_payload_enables_requested_thinking_without_tools() {
         let request = structured_request();
         let payload = structured_chat_payload(&request);
         assert_eq!(payload["format"], request.schema);
         assert_eq!(payload["stream"], true);
-        assert_eq!(payload["think"], false);
+        assert_eq!(payload["think"], true);
         assert_eq!(payload["truncate"], false);
         assert_eq!(payload["shift"], false);
         assert_eq!(payload["keep_alive"], "5m");
@@ -1099,7 +1215,8 @@ mod tests {
             "message": {"content": "{\"name\":\"Ada\"}"},
             "prompt_eval_count": 12,
             "eval_count": 5,
-            "done_reason": "stop"
+            "done_reason": "stop",
+            "done": true
         }))
         .unwrap();
         assert_eq!(response.content, "{\"name\":\"Ada\"}");
@@ -1287,22 +1404,23 @@ mod tests {
     #[test]
     fn structured_chat_rejects_invalid_requests_and_responses() {
         let request = structured_request();
-        for payload in [
-            json!({"message":{"content":""},"prompt_eval_count":1,"eval_count":1}),
-            json!({"message":{"content":"   "},"prompt_eval_count":1,"eval_count":1}),
-            json!({"message":{"content":null},"prompt_eval_count":1,"eval_count":1}),
-        ] {
-            assert!(parse_structured_chat_response(&payload).is_err());
-        }
+        let empty = parse_structured_chat_response(&json!({
+            "message":{"content":""},"prompt_eval_count":1,"eval_count":256,
+            "done_reason":"length","done":true
+        }))
+        .unwrap();
+        assert!(empty.content.is_empty());
+        assert!(empty.output_limit_reached(256));
         let raw = parse_structured_chat_response(&json!({
             "message": {"content": "not json"},
-            "prompt_eval_count": 1
+            "prompt_eval_count": 1,
+            "done": true
         }))
         .unwrap();
         assert_eq!(raw.content, "not json");
         assert_eq!(raw.usage, TokenUsage::new(Some(1), None));
         assert_eq!(
-            parse_structured_chat_response(&json!({"message":{"content":"{}"}}))
+            parse_structured_chat_response(&json!({"message":{"content":"{}"},"done":true}))
                 .unwrap()
                 .usage,
             TokenUsage::new(None, None)

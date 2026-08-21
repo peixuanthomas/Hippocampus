@@ -10,7 +10,7 @@ max_selected = 4
 evidence_char_budget = 3200
 
 [memory]
-config_version = 1
+config_version = 2
 enabled = true
 embedding_model = "qwen3-embedding:8b"
 embedding_dimensions = 1024
@@ -20,7 +20,11 @@ vector_candidate_limit = 64
 graph_candidate_limit = 32
 max_graph_depth = 2
 rrf_k = 60
-consolidation_timeout_secs = 600
+consolidation_model = "qwen3.5:9b"
+consolidation_context_window = 16384
+consolidation_input_target_tokens = 4096
+consolidation_max_output_tokens = 4096
+consolidation_timeout_secs = 300
 embedding_timeout_secs = 600
 search_timeout_ms = 15000
 episode_gap_minutes = 30
