@@ -12,7 +12,6 @@ use uuid::Uuid;
 
 use crate::config::{KnowledgeConfig, KnowledgeSourceConfig, KnowledgeSourceKind};
 use crate::model::{content_sha256, utc_now};
-use crate::ollama::{ChatBackend, WebFetchResponse};
 use crate::retrieval::{lexical_field, ngram_field, query_terms};
 
 const KNOWLEDGE_DIR: &str = ".knowledge";
@@ -208,11 +207,7 @@ impl KnowledgeStore {
         &self.index_path
     }
 
-    pub async fn sync<B: ChatBackend>(
-        &self,
-        config: &KnowledgeConfig,
-        client: &B,
-    ) -> Result<KnowledgeSyncReport> {
+    pub async fn sync(&self, config: &KnowledgeConfig) -> Result<KnowledgeSyncReport> {
         config.validate()?;
         fs::create_dir_all(&self.snapshots)
             .with_context(|| format!("无法创建知识快照目录 {}", self.snapshots.display()))?;
@@ -230,10 +225,7 @@ impl KnowledgeStore {
             let compatible_previous = previous
                 .as_ref()
                 .filter(|value| value.kind == source.kind && value.location == source.location);
-            let result = match source.kind {
-                KnowledgeSourceKind::Path => self.read_path_source(source),
-                KnowledgeSourceKind::Url => self.fetch_url_source(source, client).await,
-            };
+            let result = self.read_path_source(source);
             match result {
                 Ok(documents) => {
                     let previous_by_document = self.latest_by_document(
@@ -578,32 +570,6 @@ impl KnowledgeStore {
             ));
         }
         Ok(output)
-    }
-
-    async fn fetch_url_source<B: ChatBackend>(
-        &self,
-        source: &KnowledgeSourceConfig,
-        client: &B,
-    ) -> Result<Vec<SourceDocument>> {
-        let WebFetchResponse {
-            title,
-            content,
-            links,
-        } = client.web_fetch(&source.location).await?;
-        if content.trim().is_empty() {
-            bail!("网页没有可索引正文");
-        }
-        Ok(vec![SourceDocument {
-            document_key: source.location.clone(),
-            title: if title.trim().is_empty() {
-                source.location.clone()
-            } else {
-                title
-            },
-            source_location: source.location.clone(),
-            content,
-            links,
-        }])
     }
 
     fn read_path_source(&self, source: &KnowledgeSourceConfig) -> Result<Vec<SourceDocument>> {
@@ -989,78 +955,6 @@ CREATE INDEX IF NOT EXISTS knowledge_documents_source ON knowledge_documents(sou
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::VecDeque;
-    use std::sync::{Arc, Mutex};
-
-    use async_trait::async_trait;
-    use tokio_util::sync::CancellationToken;
-
-    use crate::model::{ChatEvent, ChatMessage, TokenUsage};
-    use crate::ollama::{ChatRequest, ModelInfo, OllamaClient, OllamaError};
-
-    #[derive(Clone)]
-    struct FetchBackend {
-        responses: Arc<Mutex<VecDeque<std::result::Result<WebFetchResponse, OllamaError>>>>,
-    }
-
-    impl FetchBackend {
-        fn new(responses: Vec<std::result::Result<WebFetchResponse, OllamaError>>) -> Self {
-            Self {
-                responses: Arc::new(Mutex::new(responses.into())),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl ChatBackend for FetchBackend {
-        async fn check_model(
-            &self,
-            _model: &str,
-            _requested_context: u64,
-        ) -> std::result::Result<ModelInfo, OllamaError> {
-            unreachable!("knowledge sync only uses web_fetch")
-        }
-
-        async fn render_prompt(
-            &self,
-            _model: &str,
-            _messages: &[ChatMessage],
-            _think: bool,
-            _num_ctx: u64,
-        ) -> std::result::Result<Option<String>, OllamaError> {
-            unreachable!("knowledge sync only uses web_fetch")
-        }
-
-        async fn probe(
-            &self,
-            _model: &str,
-            _messages: &[ChatMessage],
-            _think: bool,
-            _num_ctx: u64,
-        ) -> std::result::Result<TokenUsage, OllamaError> {
-            unreachable!("knowledge sync only uses web_fetch")
-        }
-
-        async fn stream_chat(
-            &self,
-            _request: ChatRequest,
-            _cancellation: CancellationToken,
-            _emit: &mut (dyn FnMut(ChatEvent) + Send),
-        ) -> std::result::Result<(), OllamaError> {
-            unreachable!("knowledge sync only uses web_fetch")
-        }
-
-        async fn web_fetch(
-            &self,
-            _url: &str,
-        ) -> std::result::Result<WebFetchResponse, OllamaError> {
-            self.responses
-                .lock()
-                .unwrap()
-                .pop_front()
-                .expect("configured fetch response")
-        }
-    }
 
     fn local_config(path: &Path) -> KnowledgeConfig {
         KnowledgeConfig {
@@ -1072,20 +966,6 @@ mod tests {
                 id: "notes".into(),
                 kind: KnowledgeSourceKind::Path,
                 location: path.to_string_lossy().into_owned(),
-            }],
-        }
-    }
-
-    fn url_config() -> KnowledgeConfig {
-        KnowledgeConfig {
-            auto_sync: true,
-            candidate_limit: 64,
-            max_selected: 4,
-            evidence_char_budget: 3_200,
-            sources: vec![KnowledgeSourceConfig {
-                id: "remote-docs".into(),
-                kind: KnowledgeSourceKind::Url,
-                location: "https://example.com/docs".into(),
             }],
         }
     }
@@ -1102,11 +982,10 @@ mod tests {
         .unwrap();
         fs::write(docs.join("ignored.bin"), "ignored").unwrap();
         let store = KnowledgeStore::new(root.path().join("sessions")).unwrap();
-        let client = OllamaClient::new("http://127.0.0.1:11434").unwrap();
         let config = local_config(&docs);
-        let first = store.sync(&config, &client).await.unwrap();
+        let first = store.sync(&config).await.unwrap();
         assert_eq!(first.new_revisions, 1);
-        let unchanged = store.sync(&config, &client).await.unwrap();
+        let unchanged = store.sync(&config).await.unwrap();
         assert_eq!(unchanged.new_revisions, 0);
 
         let recall = store.recall("海棠计划暗号", &config).unwrap();
@@ -1122,7 +1001,7 @@ mod tests {
         );
 
         fs::write(docs.join("facts.md"), "海棠计划暗号更新为银杏晨光。").unwrap();
-        let updated = store.sync(&config, &client).await.unwrap();
+        let updated = store.sync(&config).await.unwrap();
         assert_eq!(updated.new_revisions, 1);
         let updated_recall = store.recall("银杏晨光", &config).unwrap();
         let updated_revision = &updated_recall.trace.selected_evidence[0].revision_id;
@@ -1145,9 +1024,8 @@ mod tests {
         let path = docs.join("gone.txt");
         fs::write(&path, "唯一旧词火山玻璃").unwrap();
         let store = KnowledgeStore::new(root.path().join("sessions")).unwrap();
-        let client = OllamaClient::new("http://127.0.0.1:11434").unwrap();
         let config = local_config(&docs);
-        store.sync(&config, &client).await.unwrap();
+        store.sync(&config).await.unwrap();
         assert!(
             store
                 .recall("火山玻璃", &config)
@@ -1157,7 +1035,7 @@ mod tests {
                 .is_some()
         );
         fs::remove_file(path).unwrap();
-        store.sync(&config, &client).await.unwrap();
+        store.sync(&config).await.unwrap();
         assert!(
             store
                 .recall("火山玻璃", &config)
@@ -1175,9 +1053,8 @@ mod tests {
         let document = root.path().join("facts.md");
         fs::write(&document, "配置移除前的唯一词是琥珀星环").unwrap();
         let store = KnowledgeStore::new(root.path().join("sessions")).unwrap();
-        let client = OllamaClient::new("http://127.0.0.1:11434").unwrap();
         let config = local_config(&document);
-        store.sync(&config, &client).await.unwrap();
+        store.sync(&config).await.unwrap();
 
         let empty = KnowledgeConfig {
             sources: Vec::new(),
@@ -1198,46 +1075,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn url_failure_preserves_latest_success_and_reports_staleness() {
-        let root = tempfile::tempdir().unwrap();
-        let store = KnowledgeStore::new(root.path().join("sessions")).unwrap();
-        let client = FetchBackend::new(vec![
-            Ok(WebFetchResponse {
-                title: "Remote docs".into(),
-                content: "远程资料的稳定事实是松石轨道".into(),
-                links: vec!["https://example.com/next".into()],
-            }),
-            Err(OllamaError::Other("simulated timeout".into())),
-        ]);
-        let config = url_config();
-        let first = store.sync(&config, &client).await.unwrap();
-        assert_eq!(first.new_revisions, 1);
-        let failed = store.sync(&config, &client).await.unwrap();
-        assert_eq!(failed.failed_sources, 1);
-        assert_eq!(failed.active_documents, 1);
-        assert!(failed.warnings[0].contains("simulated timeout"));
-
-        let recall = store.recall("松石轨道", &config).unwrap();
-        assert_eq!(recall.trace.selected_evidence.len(), 1);
-        assert!(
-            recall
-                .trace
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("simulated timeout"))
-        );
-        assert_eq!(fs::read_dir(&store.snapshots).unwrap().count(), 1);
-    }
-
-    #[tokio::test]
     async fn tampered_derived_row_is_rejected_and_rebuild_restores_it() {
         let root = tempfile::tempdir().unwrap();
         let document = root.path().join("facts.md");
         fs::write(&document, "索引校验词是紫藤罗盘").unwrap();
         let store = KnowledgeStore::new(root.path().join("sessions")).unwrap();
-        let client = OllamaClient::new("http://127.0.0.1:11434").unwrap();
         let config = local_config(&document);
-        store.sync(&config, &client).await.unwrap();
+        store.sync(&config).await.unwrap();
 
         let connection = Connection::open(store.index_path()).unwrap();
         connection

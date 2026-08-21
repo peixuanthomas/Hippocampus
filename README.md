@@ -2,7 +2,7 @@
 
 Hippocampus 是一个完全使用 Rust 实现的本地 Ollama 会话客户端。无参数启动时进入 Ratatui TUI；`serve` 提供本地 Web UI；`ask` 子命令适合脚本和其他程序进行单次调用。
 
-项目保存每轮原始输入、模型正文、thinking、权威 token usage、知识证据、联网工具步骤和上下文裁剪轨迹。thinking 只用于当前工具循环的展示与审计，绝不会重新注入未来对话轮次。当前会话格式为 `schema_version=5`，其他版本不会读取或迁移。
+项目保存每轮原始输入、模型正文、thinking、权威 token usage、知识证据、检索通道状态和上下文裁剪轨迹。thinking 只用于当前轮次的展示与审计，绝不会重新注入未来对话轮次。当前会话格式为 `schema_version=6`，其他版本不会读取或迁移。
 
 `<sessions-dir>/*.json` 中的 raw session JSON 是会话记忆的唯一事实来源；知识快照和原始文档则是知识库的事实来源。SQLite 包含两类数据：FTS、vector、entity、state、episode、graph 等可删除重建的 projection，以及必须保留的 immutable consolidation attempt/audit ledger；HNSW 属于可重建 projection。系统不会用生成摘要替代或覆盖原文。
 
@@ -21,20 +21,13 @@ cargo build --release
 
 ## 配置
 
-仓库根目录的 [`config.toml`](config.toml) 是默认配置，其中完整列出了 `[memory]` 的模型、候选数、超时、HNSW 和五种自适应预算键。未传 `--config` 时，程序可选读取当前工作目录下的 `config.toml`；当前目录没有配置时使用安全回退：名称为 `LLM`、联网和自动知识同步关闭、`memory.enabled=false`。此时长期回忆只使用 BM25，不调用 embedding 或聊天模型做巩固。显式传入的文件不存在或配置含未知字段、重复来源 ID、空名称或越界预算时会直接报错。
+仓库根目录的 [`config.toml`](config.toml) 是默认配置，其中完整列出了 `[memory]` 的模型、候选数、超时、HNSW 和五种自适应预算键。未传 `--config` 时，程序可选读取当前工作目录下的 `config.toml`；当前目录没有配置时使用安全回退：名称为 `LLM`、自动知识同步关闭、`memory.enabled=false`。此时长期回忆只使用 BM25，不调用 embedding 或聊天模型做巩固。显式传入的文件不存在或配置含未知字段、重复来源 ID、空名称或越界预算时会直接报错。
 
 ```toml
 ai_name = "hippocampus"
 system_prompt = """
 你是一个乐于助人的AI助手，你的任务是解决用户的问题或者与用户对话。
 """
-
-[web_search]
-enabled = true
-max_results = 5
-max_tool_rounds = 4
-max_tool_calls = 8
-max_injected_chars_per_fetch = 12000
 
 [knowledge]
 auto_sync = true
@@ -51,27 +44,17 @@ evidence_char_budget = 3200
 
 知识源中的相对文件路径以配置文件目录为基准。`--system-prompt` 和 `--system-prompt-file` 对新会话及无状态 `ask` 优先于配置。AI 名称和 system prompt 写入会话后冻结，恢复旧会话不会被新配置改名或改写提示词。
 
-## 联网搜索
+## 检索调试日志
 
-联网只对有会话的请求开放；模型可在有界循环中自主调用 `web_search` 和 `web_fetch`。无会话 `ask` 始终是纯模型调用，不提供搜索或知识检索。
-
-优先设置环境变量，由程序直连 Ollama Cloud：
+程序默认输出 `warn` 级别的回退原因。需要查看 BM25、Embedding、语义准备、融合、本地知识检索和上下文组装的逐阶段日志时，可写入独立文件：
 
 ```bash
-export OLLAMA_API_KEY="..."
+HIPPOCAMPUS_LOG='hippocampus::retrieval=debug,hippocampus::context=debug' \
+HIPPOCAMPUS_LOG_FILE=./hippocampus.log \
+./build/hippocampus resume SESSION_ID
 ```
 
-未设置密钥时，程序通过本地 Ollama 的登录状态访问代理接口：
-
-```bash
-ollama signin
-```
-
-API key 不会写入配置、日志或会话。每轮最多执行配置的工具轮次与调用数；搜索失败、认证失败、超时或达到上限后，程序只再执行一次禁用工具的尽力回答，并明确显示“未完成实时核验”。抓取限制为 HTTP(S)，会拒绝 localhost、私网 IP、私网 DNS 解析结果及带凭据 URL，单次完整响应最多 1 MiB。
-
-完整工具响应和截断后的模型注入内容都会进入对应轮次的 append-only trace。CLI、TUI 与 Web UI 的来源列表由程序从真实 trace 生成，而不是采信模型自行声称的来源；模型正文中的未返回 URL 会被移除。
-
-接口行为基于 Ollama 官方 [Web Search/Fetch API](https://docs.ollama.com/capabilities/web-search) 与 [Tool Calling](https://docs.ollama.com/capabilities/tool-calling)。
+日志文件以追加模式打开。日志只记录事件 ID、阶段、通道状态、候选数、耗时和错误原因，不记录用户问题或组装后的正文。每轮持久化的 `RetrievalTrace.fallback_reason` 与 `channels` 也可通过 `show --json`、`ask --json` 或 TUI 的 `/debug on` 查看。
 
 ## TUI
 
@@ -138,7 +121,7 @@ curl -N -H 'Content-Type: application/json' \
 
 ## `ask` 单次调用
 
-不传 `--session` 时是无状态调用：不会读取历史、不会创建会话文件、不会自动同步知识，也不会向模型提供联网工具，只发送 system prompt、独立身份指令和当前问题。
+不传 `--session` 时是无状态调用：不会读取历史、不会创建会话文件、不会自动同步或检索本地知识，只发送 system prompt、独立身份指令和当前问题。
 
 ```bash
 ./build/hippocampus ask "只回答一个词：天空是什么颜色？"
@@ -168,14 +151,9 @@ curl -N -H 'Content-Type: application/json' \
 id = "local-notes"
 kind = "path"
 location = "./knowledge"
-
-[[knowledge.sources]]
-id = "project-docs"
-kind = "url"
-location = "https://example.com/docs.txt"
 ```
 
-`path` 支持单个 UTF-8 `.txt`/`.md` 文件或递归目录，忽略符号链接和其他格式；`url` 通过 Ollama Web Fetch 获取标题、正文和链接。管理命令如下：
+`path` 支持单个 UTF-8 `.txt`/`.md` 文件或递归目录，忽略符号链接和其他格式。知识库不会访问网络。管理命令如下：
 
 ```bash
 ./build/hippocampus knowledge sync
@@ -184,7 +162,7 @@ location = "https://example.com/docs.txt"
 ./build/hippocampus knowledge rebuild
 ```
 
-当 `knowledge.auto_sync=true` 时，启动 TUI、Web、新建或恢复会话以及带 `--session` 的 `ask` 前都会同步；`list`、`show` 与无状态 `ask` 不触发同步。URL 更新失败时继续使用最近成功 revision，并在回答和界面中显示过期警告。
+当 `knowledge.auto_sync=true` 时，启动 TUI、Web、新建或恢复会话以及带 `--session` 的 `ask` 前都会同步；`list`、`show` 与无状态 `ask` 不触发同步。
 
 每次内容变化会在 `<sessions-dir>/.knowledge/snapshots/` 写入不可变 JSON revision；相同内容不重复写入，配置中移除的来源不再检索，但历史 revision 保留。当前来源的最新成功 revision 会派生到 `.knowledge/index.sqlite3`。索引使用 Jieba 字段、CJK 2/3-gram、完整文档以及 240 Unicode 字符、40 字符重叠的 passage，并在返回前核对精确 span 与 SHA-256。
 
@@ -254,7 +232,7 @@ summary 包含答案准确率与 token F1、时间/冲突准确率、拒答与�
 
 会话 JSON 始终是唯一事实来源。每次 JSON 原子保存成功后，`SessionStore` 会同步更新同目录下的 `.hippocampus-index.sqlite3`；该 SQLite 文件既包含可重建 projection，也包含必须保留的 immutable consolidation attempt/audit ledger。
 
-会话长期回忆同样使用完整消息及 240 字符重叠 passage，并以 Jieba 与 CJK n-gram 做确定性词法检索。`RetrievalTrace` 记录查询词、BM25 原始排名、排除原因、最终原文 span 和独立预算。`answer_context` 同时返回身份指令、知识证据与完整 `WebTrace`，因此可以重建最终模型请求和每个工具步骤。
+会话长期回忆同样使用完整消息及 240 字符重叠 passage，并以 Jieba 与 CJK n-gram 做确定性词法检索。`RetrievalTrace` 记录查询词、BM25 原始排名、各通道状态、回退原因、最终原文 span 和独立预算；`answer_context` 同时返回身份指令与本地知识证据，因此可以重建最终模型请求。
 
 Rust 调用方可以通过 `SessionStore::retrieval()` 获取 `RetrievalStore`：
 

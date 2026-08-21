@@ -17,7 +17,7 @@ pub mod web;
 
 pub use config::{
     AdaptiveBudgetConfig, AppConfig, KnowledgeConfig, KnowledgeSourceConfig, KnowledgeSourceKind,
-    MemoryBudgetConfig, MemoryConfig, WebSearchConfig,
+    MemoryBudgetConfig, MemoryConfig,
 };
 pub use consolidation::{
     BoundarySuggestionReason, CONSOLIDATION_MAX_CHARS, CONSOLIDATION_MAX_TURNS, ClaimCardinality,
@@ -61,18 +61,13 @@ pub use graph::{
 };
 pub use knowledge::{KnowledgeRecall, KnowledgeStore, KnowledgeSyncReport, KnowledgeTrace};
 pub use model::{
-    AgentChatRequest, AgentMessage, AgentRoundResult, BudgetAllocationTrace, BudgetBucket,
-    BudgetConfig, BudgetExclusionTrace, BudgetProbeTrace, BudgetReflowTrace,
-    BudgetStageLatencyTrace, BudgetTokenBreakdown, ChannelTrace, EntityMatchTrace, EventRole,
-    EvidenceKind, FusionCandidateTrace, GraphPathTrace, ProvenanceQuality, QueryKind,
-    RetrievalChannel, RetrievalConfig, RetrievalTrace, Session, SourceSpan, StateSelectionTrace,
-    TokenUsage, ToolCall, ToolDefinition, ToolResultTrace, ToolRoundTrace, Turn, WebSourceTrace,
-    WebTrace,
+    BudgetAllocationTrace, BudgetBucket, BudgetConfig, BudgetExclusionTrace, BudgetProbeTrace,
+    BudgetReflowTrace, BudgetStageLatencyTrace, BudgetTokenBreakdown, ChannelTrace,
+    EntityMatchTrace, EventRole, EvidenceKind, FusionCandidateTrace, GraphPathTrace,
+    ProvenanceQuality, QueryKind, RetrievalChannel, RetrievalConfig, RetrievalTrace, Session,
+    SourceSpan, StateSelectionTrace, TokenUsage, Turn,
 };
-pub use ollama::{
-    ModelInfo, OllamaClient, WebFetchResponse, WebSearchResponse, WebSearchResult,
-    validate_public_http_url, validate_public_http_url_resolved,
-};
+pub use ollama::{ModelInfo, OllamaClient};
 pub use retrieval::{
     AggregateEmbeddingDocument, AggregateEmbeddingSnapshot, AnswerContext, AnswerContextItem,
     DirectMessageEmbedding, EmbeddingPublishReport, HybridRecallOptions, IndexedSession,

@@ -154,9 +154,26 @@ impl ContextAssembler {
             .filter(|(index, _)| !selected_indices.contains(index))
             .map(|(_, turn)| turn.id.clone())
             .collect::<Vec<_>>();
-        let estimated_upper_tokens = Some(Self::estimate_upper_bound(&messages));
+        let estimated_upper_tokens = Self::estimate_upper_bound(&messages);
 
         let context_sha256 = context_sha256(&messages);
+        log::debug!(
+            target: "hippocampus::context",
+            "assembled context session_id={} turn_id={} messages={} history_included={} history_omitted={} recall_status={} fast_fallback={} fallback_reason={:?} recall_evidence={} knowledge_status={} knowledge_evidence={} estimated_upper_tokens={} context_sha256={}",
+            session.id,
+            current_turn_id,
+            messages.len(),
+            included_turn_ids.len(),
+            omitted_turn_ids.len(),
+            recall.map_or("not_run", |value| value.trace.status.as_str()),
+            recall.is_some_and(|value| value.trace.fast_fallback_used),
+            recall.and_then(|value| value.trace.fallback_reason.as_deref()),
+            recall.map_or(0, |value| value.evidence.len()),
+            knowledge.map_or("not_run", |value| value.trace.status.as_str()),
+            knowledge.map_or(0, |value| value.trace.selected_evidence.len()),
+            estimated_upper_tokens,
+            context_sha256,
+        );
         ContextPlan {
             messages,
             context_items,
@@ -164,7 +181,7 @@ impl ContextAssembler {
             included_turn_ids,
             omitted_turn_ids,
             selected_history_indices: selected_indices,
-            estimated_upper_tokens,
+            estimated_upper_tokens: Some(estimated_upper_tokens),
             exact_input_tokens: None,
             input_budget: session.budget.input_budget(),
             identity_instruction,

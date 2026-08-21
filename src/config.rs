@@ -15,7 +15,6 @@ pub const DEFAULT_AI_NAME: &str = "LLM";
 pub struct AppConfig {
     pub ai_name: Option<String>,
     pub system_prompt: String,
-    pub web_search: WebSearchConfig,
     pub knowledge: KnowledgeConfig,
     pub memory: MemoryConfig,
 }
@@ -25,7 +24,6 @@ impl Default for AppConfig {
         Self {
             ai_name: None,
             system_prompt: DEFAULT_SYSTEM_PROMPT.to_owned(),
-            web_search: WebSearchConfig::default(),
             knowledge: KnowledgeConfig::default(),
             memory: MemoryConfig::default(),
         }
@@ -75,7 +73,6 @@ impl AppConfig {
         {
             bail!("ai_name 不能为空");
         }
-        self.web_search.validate()?;
         self.knowledge.validate()?;
         self.memory.validate()
     }
@@ -273,46 +270,6 @@ pub struct LoadedConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
-pub struct WebSearchConfig {
-    pub enabled: bool,
-    pub max_results: usize,
-    pub max_tool_rounds: usize,
-    pub max_tool_calls: usize,
-    pub max_injected_chars_per_fetch: usize,
-}
-
-impl Default for WebSearchConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            max_results: 5,
-            max_tool_rounds: 4,
-            max_tool_calls: 8,
-            max_injected_chars_per_fetch: 12_000,
-        }
-    }
-}
-
-impl WebSearchConfig {
-    pub fn validate(&self) -> Result<()> {
-        if !(1..=10).contains(&self.max_results) {
-            bail!("web_search.max_results 必须在 1..=10 之间");
-        }
-        if !(1..=16).contains(&self.max_tool_rounds) {
-            bail!("web_search.max_tool_rounds 必须在 1..=16 之间");
-        }
-        if !(1..=64).contains(&self.max_tool_calls) {
-            bail!("web_search.max_tool_calls 必须在 1..=64 之间");
-        }
-        if !(1..=1_048_576).contains(&self.max_injected_chars_per_fetch) {
-            bail!("web_search.max_injected_chars_per_fetch 必须在 1..=1048576 之间");
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default, deny_unknown_fields)]
 pub struct KnowledgeConfig {
     pub auto_sync: bool,
     pub candidate_limit: usize,
@@ -359,7 +316,6 @@ impl KnowledgeConfig {
 #[serde(rename_all = "lowercase")]
 pub enum KnowledgeSourceKind {
     Path,
-    Url,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -383,13 +339,6 @@ impl KnowledgeSourceConfig {
         if self.location.trim().is_empty() {
             bail!("knowledge source {:?} 的 location 不能为空", self.id);
         }
-        if self.kind == KnowledgeSourceKind::Url {
-            let url = reqwest::Url::parse(&self.location)
-                .with_context(|| format!("knowledge source {:?} 的 URL 无效", self.id))?;
-            if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
-                bail!("knowledge source {:?} 只支持 HTTP(S) URL", self.id);
-            }
-        }
         Ok(())
     }
 }
@@ -410,7 +359,6 @@ mod tests {
     fn missing_implicit_config_uses_safe_defaults() {
         let config = AppConfig::default();
         assert_eq!(config.ai_name(), "LLM");
-        assert!(!config.web_search.enabled);
         assert!(config.knowledge.sources.is_empty());
         assert!(!config.memory.enabled);
     }
@@ -439,9 +387,6 @@ mod tests {
         fs::write(
             &path,
             r#"ai_name = "hippocampus"
-
-[web_search]
-enabled = true
 
 [knowledge]
 auto_sync = true
@@ -474,6 +419,19 @@ location = "notes"
     fn rejects_unknown_fields_and_duplicate_sources() {
         let unknown: Result<AppConfig, _> = toml::from_str("mystery = true");
         assert!(unknown.is_err());
+        let removed_web_config: Result<AppConfig, _> =
+            toml::from_str("[web_search]\nenabled = true");
+        assert!(removed_web_config.is_err());
+        let remote_knowledge_source: Result<AppConfig, _> = toml::from_str(
+            r#"[knowledge]
+
+[[knowledge.sources]]
+id = "remote"
+kind = "url"
+location = "https://example.com/docs"
+"#,
+        );
+        assert!(remote_knowledge_source.is_err());
 
         let mut config = AppConfig::default();
         config.knowledge.sources = vec![
@@ -489,10 +447,6 @@ location = "notes"
             },
         ];
         assert!(config.validate().is_err());
-
-        let mut invalid_budget = AppConfig::default();
-        invalid_budget.web_search.max_tool_calls = 0;
-        assert!(invalid_budget.validate().is_err());
 
         let empty_name: Result<AppConfig, _> = toml::from_str("ai_name = '   '");
         assert!(empty_name.unwrap().validate().is_err());

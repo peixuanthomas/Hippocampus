@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
@@ -307,6 +308,7 @@ impl AskArgs {
 
 #[tokio::main]
 async fn main() {
+    init_logging();
     let run_result = run().await;
     let unload_result = OllamaClient::unload_tracked_models().await;
     if let Err(error) = run_result {
@@ -325,6 +327,29 @@ async fn main() {
     if let Err(error) = unload_result {
         eprintln!("错误：{error}");
         std::process::exit(1);
+    }
+}
+
+fn init_logging() {
+    let env = env_logger::Env::new()
+        .filter_or("HIPPOCAMPUS_LOG", "hippocampus=warn")
+        .write_style_or("HIPPOCAMPUS_LOG_STYLE", "never");
+    let mut builder = env_logger::Builder::from_env(env);
+    builder.format_timestamp_millis();
+    if let Ok(path) = std::env::var("HIPPOCAMPUS_LOG_FILE")
+        && !path.trim().is_empty()
+    {
+        match OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(file) => {
+                builder.target(env_logger::Target::Pipe(Box::new(file)));
+            }
+            Err(error) => {
+                eprintln!("警告：无法打开日志文件 {path:?}：{error}");
+            }
+        }
+    }
+    if let Err(error) = builder.try_init() {
+        eprintln!("警告：无法初始化日志：{error}");
     }
 }
 
@@ -362,7 +387,7 @@ async fn run() -> Result<()> {
         Some(Command::Clear) => clear_history(&store),
         Some(Command::Ask(args)) => run_ask(store, &cli.host, &cli.model, args, &config).await,
         Some(Command::Serve(args)) => run_serve(store, &cli.host, &cli.model, args, &config).await,
-        Some(Command::Knowledge(args)) => run_knowledge(store, &cli.host, args, &config).await,
+        Some(Command::Knowledge(args)) => run_knowledge(store, args, &config).await,
         Some(Command::Memory(args)) => run_memory(store, &cli.host, args, &config).await,
         Some(Command::Eval(_)) => unreachable!("evaluation returned before opening session store"),
     }
@@ -683,13 +708,7 @@ async fn run_serve(
     args: ServeArgs,
     config: &AppConfig,
 ) -> Result<()> {
-    let sync_host = args
-        .session
-        .as_deref()
-        .map(|identifier| store.load(identifier).map(|session| session.ollama_host))
-        .transpose()?
-        .unwrap_or_else(|| host.to_owned());
-    auto_sync_knowledge(&store, &sync_host, config).await?;
+    auto_sync_knowledge(&store, config).await?;
     let mut session = if let Some(identifier) = &args.session {
         let mut session = store.load(identifier)?;
         store.reopen(&mut session)?;
@@ -724,7 +743,7 @@ async fn run_new_tui(
     args: NewArgs,
     config: &AppConfig,
 ) -> Result<()> {
-    auto_sync_knowledge(&store, host, config).await?;
+    auto_sync_knowledge(&store, config).await?;
     let prompt = args.read_prompt(config)?;
     let session = store.create_named(
         model,
@@ -758,7 +777,7 @@ async fn run_new_tui(
 
 async fn run_resume_tui(store: SessionStore, identifier: &str, config: &AppConfig) -> Result<()> {
     let mut session = store.load(identifier)?;
-    auto_sync_knowledge(&store, &session.ollama_host, config).await?;
+    auto_sync_knowledge(&store, config).await?;
     store.reopen(&mut session)?;
     let client = OllamaClient::new(&session.ollama_host)?;
     let info = client
@@ -802,7 +821,7 @@ async fn run_contextual_ask(
     config: &AppConfig,
 ) -> Result<()> {
     let mut session = store.load(identifier)?;
-    auto_sync_knowledge(&store, &session.ollama_host, config).await?;
+    auto_sync_knowledge(&store, config).await?;
     store.reopen(&mut session)?;
     let client = OllamaClient::new(&session.ollama_host)?;
     client
@@ -867,16 +886,10 @@ async fn run_contextual_ask(
     Ok(())
 }
 
-async fn run_knowledge(
-    store: SessionStore,
-    host: &str,
-    args: KnowledgeArgs,
-    config: &AppConfig,
-) -> Result<()> {
+async fn run_knowledge(store: SessionStore, args: KnowledgeArgs, config: &AppConfig) -> Result<()> {
     match args.command {
         KnowledgeCommand::Sync => {
-            let client = OllamaClient::new(host)?;
-            let report = store.knowledge().sync(&config.knowledge, &client).await?;
+            let report = store.knowledge().sync(&config.knowledge).await?;
             print_sync_report(&report);
         }
         KnowledgeCommand::List { json } => {
@@ -1672,12 +1685,11 @@ const fn consolidation_status_label(status: ConsolidationRunStatus) -> &'static 
     }
 }
 
-async fn auto_sync_knowledge(store: &SessionStore, host: &str, config: &AppConfig) -> Result<()> {
+async fn auto_sync_knowledge(store: &SessionStore, config: &AppConfig) -> Result<()> {
     if !config.knowledge.auto_sync {
         return Ok(());
     }
-    let client = OllamaClient::new(host)?;
-    let report = store.knowledge().sync(&config.knowledge, &client).await?;
+    let report = store.knowledge().sync(&config.knowledge).await?;
     for warning in &report.warnings {
         eprintln!("警告：{warning}；继续使用最近成功的知识版本（如有）。");
     }
@@ -1836,9 +1848,7 @@ fn contextual_done_json(session: &Session, turn: &Turn) -> Value {
         "usage": turn.usage,
         "retrieval": turn.context_trace.retrieval,
         "knowledge": turn.context_trace.knowledge,
-        "web": turn.context_trace.web,
         "knowledge_sources": turn.context_trace.knowledge.selected_evidence,
-        "web_sources": turn.context_trace.web.sources,
         "warnings": turn_warnings(turn),
     })
 }
@@ -1981,7 +1991,6 @@ fn print_usage(usage: Option<TokenUsage>) {
 
 fn turn_warnings(turn: &Turn) -> Vec<String> {
     let mut warnings = turn.context_trace.knowledge.warnings.clone();
-    warnings.extend(turn.context_trace.web.warnings.clone());
     warnings.sort();
     warnings.dedup();
     warnings
@@ -1999,12 +2008,6 @@ fn print_turn_sources(turn: &Turn) {
                 evidence.start_char,
                 evidence.end_char,
             );
-        }
-    }
-    if !turn.context_trace.web.sources.is_empty() {
-        eprintln!("实时来源：");
-        for source in &turn.context_trace.web.sources {
-            eprintln!("  - {}｜{}｜{}", source.kind, source.title, source.url);
         }
     }
     for warning in turn_warnings(turn) {

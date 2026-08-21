@@ -34,7 +34,7 @@ use crate::model::{
     EventRole, EvidenceKind, FusionCandidateTrace, ModelRequestTrace, ProvenanceQuality, QueryKind,
     RankedCandidate, RetrievalChannel, RetrievalConfig, RetrievalDocumentGranularity,
     RetrievalTrace, SelectedEvidence, Session, SourceSpan, StateSelectionTrace, Turn, TurnStatus,
-    WebTrace, content_sha256, context_sha256, event_id,
+    content_sha256, context_sha256, event_id,
 };
 use crate::ollama::{ChatBackend, EmbeddingRequest};
 use crate::vector::{
@@ -675,7 +675,6 @@ pub struct AnswerContext {
     pub items: Vec<AnswerContextItem>,
     pub retrieval_trace: RetrievalTrace,
     pub knowledge_trace: KnowledgeTrace,
-    pub web_trace: WebTrace,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -8226,10 +8225,6 @@ impl RetrievalStore {
             .map_err(|error| {
                 RetrievalError::CorruptIndex(format!("知识证据校验失败：{error:#}"))
             })?;
-        answer.web_trace = turn.context_trace.web.clone();
-        answer.web_trace.validate().map_err(|error| {
-            RetrievalError::CorruptIndex(format!("联网 trace 校验失败：{error:#}"))
-        })?;
         let mut statement = connection
             .prepare(
                 "SELECT i.ordinal, i.role, i.event_id, i.start_char, i.end_char,
@@ -13438,7 +13433,6 @@ fn map_answer_context(row: &rusqlite::Row<'_>) -> rusqlite::Result<AnswerContext
         items: Vec::new(),
         retrieval_trace: RetrievalTrace::default(),
         knowledge_trace: KnowledgeTrace::default(),
-        web_trace: WebTrace::default(),
     })
 }
 
@@ -14366,7 +14360,15 @@ fn apply_vector_fallback(
     error: String,
     channels: RecallChannels,
 ) {
+    log::warn!(
+        target: "hippocampus::retrieval",
+        "hybrid recall fallback stage=vector bm25_ms={} vector_ms={} error={}",
+        bm25_ms,
+        vector_ms,
+        error,
+    );
     result.trace.status = "bm25_fallback".into();
+    result.trace.fallback_reason = Some(format!("vector_failed: {error}"));
     result.trace.channels = vec![
         channel_trace(
             RetrievalChannel::Bm25,
@@ -14398,7 +14400,15 @@ fn apply_sidecar_fallback(
     error: String,
     channels: RecallChannels,
 ) {
+    log::warn!(
+        target: "hippocampus::retrieval",
+        "hybrid recall fallback stage=entity_state bm25_ms={} vector_ms={} error={}",
+        bm25_ms,
+        vector_ms,
+        error,
+    );
     result.trace.status = "bm25_fallback".into();
+    result.trace.fallback_reason = Some(format!("entity_state_failed: {error}"));
     result.trace.fusion_candidates.clear();
     result.trace.entity_matches.clear();
     result.trace.state_selections.clear();
@@ -14434,7 +14444,16 @@ fn apply_graph_fallback(
     error: String,
     channels: RecallChannels,
 ) {
+    log::warn!(
+        target: "hippocampus::retrieval",
+        "hybrid recall fallback stage=graph bm25_ms={} vector_ms={} graph_ms={} error={}",
+        bm25_ms,
+        vector_ms,
+        graph_ms,
+        error,
+    );
     result.trace.status = "bm25_fallback".into();
+    result.trace.fallback_reason = Some(format!("graph_failed: {error}"));
     result.trace.fusion_candidates.clear();
     result.trace.entity_matches.clear();
     result.trace.state_selections.clear();
@@ -17703,7 +17722,6 @@ mod tests {
             provenance_quality: ProvenanceQuality::Exact,
             retrieval: RetrievalTrace::default(),
             knowledge: KnowledgeTrace::default(),
-            web: Default::default(),
         };
         turn.request_started_at = Some(started_at);
         turn.assistant_content = assistant.to_owned();

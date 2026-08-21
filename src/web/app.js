@@ -206,7 +206,6 @@ function renderProvenance(container, options = {}) {
   container.replaceChildren();
   const warnings = [...(options.warnings ?? [])];
   if (options.error) warnings.unshift(`错误：${options.error}`);
-  if (options.unverifiedRealtime) warnings.push("实时信息未经验证（unverified realtime）");
   for (const warning of warnings) appendWarning(container, warning);
 
   const knowledge = options.knowledgeSources ?? [];
@@ -230,28 +229,6 @@ function renderProvenance(container, options = {}) {
     container.append(section.root);
   }
 
-  const web = options.webSources ?? [];
-  if (web.length) {
-    const section = provSection(`实时来源 · ${web.length}`);
-    for (const source of web) {
-      const item = document.createElement("div");
-      item.className = "prov-item";
-      const kind = document.createElement("span");
-      kind.className = "prov-kind mono";
-      kind.textContent = source.kind;
-      const link = document.createElement("a");
-      link.href = source.url;
-      link.target = "_blank";
-      link.rel = "noopener noreferrer";
-      link.textContent = source.title || source.url;
-      const round = document.createElement("span");
-      round.className = "prov-sub mono";
-      round.textContent = `第 ${source.round} 轮检索`;
-      item.append(kind, link, round);
-      section.body.append(item);
-    }
-    container.append(section.root);
-  }
   container.classList.toggle("hidden", !container.childElementCount);
 }
 
@@ -341,9 +318,7 @@ function renderSession(session) {
         status: turn.status,
         error: turn.error,
         knowledgeSources: turn.knowledge_sources,
-        webSources: turn.web_sources,
         warnings: turn.warnings,
-        unverifiedRealtime: turn.unverified_realtime,
         meta: fmtUsage(turn.usage),
       });
     } else if (turn.error) {
@@ -494,9 +469,7 @@ function handleStreamEvent(name, payload) {
       renderProvenance(live.provenance, {
         error: payload.error,
         warnings: payload.warnings,
-        unverifiedRealtime: payload.unverified_realtime,
         knowledgeSources: payload.knowledge_sources,
-        webSources: payload.web_sources,
       });
       const sessionStatus = SESSION_STATUS[payload.session_status];
       if (sessionStatus) {

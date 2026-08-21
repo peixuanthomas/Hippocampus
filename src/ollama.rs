@@ -10,11 +10,8 @@ use serde_json::{Map, Value, json};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-use crate::model::{
-    AgentChatRequest, AgentRoundResult, ChatEvent, ChatEventKind, ChatMessage, TokenUsage, ToolCall,
-};
+use crate::model::{ChatEvent, ChatEventKind, ChatMessage, TokenUsage};
 
-const MAX_WEB_RESPONSE_BYTES: usize = 1024 * 1024;
 const MODEL_UNLOAD_TIMEOUT: Duration = Duration::from_secs(10);
 
 type LoadedModels = BTreeMap<String, BTreeSet<String>>;
@@ -23,26 +20,6 @@ static LOADED_MODELS: OnceLock<Mutex<LoadedModels>> = OnceLock::new();
 
 fn loaded_models() -> &'static Mutex<LoadedModels> {
     LOADED_MODELS.get_or_init(|| Mutex::new(BTreeMap::new()))
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct WebSearchResult {
-    pub title: String,
-    pub url: String,
-    pub content: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct WebSearchResponse {
-    pub results: Vec<WebSearchResult>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct WebFetchResponse {
-    pub title: String,
-    pub content: String,
-    #[serde(default)]
-    pub links: Vec<String>,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -172,40 +149,6 @@ pub trait ChatBackend: Clone + Send + Sync + 'static {
     ) -> Result<StructuredChatResponse, OllamaError> {
         Err(OllamaError::Other("当前聊天后端不支持结构化输出".into()))
     }
-
-    async fn probe_agent(&self, request: &AgentChatRequest) -> Result<TokenUsage, OllamaError> {
-        let messages = request
-            .messages
-            .iter()
-            .map(|message| ChatMessage {
-                role: message.role.clone(),
-                content: message.content.clone(),
-            })
-            .collect::<Vec<_>>();
-        self.probe(&request.model, &messages, request.think, request.num_ctx)
-            .await
-    }
-
-    async fn stream_agent_round(
-        &self,
-        _request: AgentChatRequest,
-        _cancellation: CancellationToken,
-        _emit: &mut (dyn FnMut(ChatEvent) + Send),
-    ) -> Result<AgentRoundResult, OllamaError> {
-        Err(OllamaError::Other("当前聊天后端不支持流式工具调用".into()))
-    }
-
-    async fn web_search(
-        &self,
-        _query: &str,
-        _max_results: usize,
-    ) -> Result<WebSearchResponse, OllamaError> {
-        Err(OllamaError::Other("当前聊天后端不支持联网搜索".into()))
-    }
-
-    async fn web_fetch(&self, _url: &str) -> Result<WebFetchResponse, OllamaError> {
-        Err(OllamaError::Other("当前聊天后端不支持网页抓取".into()))
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -291,85 +234,6 @@ impl OllamaClient {
                 failures.join("；")
             )))
         }
-    }
-
-    pub async fn web_search(
-        &self,
-        query: &str,
-        max_results: usize,
-    ) -> Result<WebSearchResponse, OllamaError> {
-        if query.trim().is_empty() {
-            return Err(OllamaError::Other("联网搜索查询不能为空".into()));
-        }
-        if !(1..=10).contains(&max_results) {
-            return Err(OllamaError::Other(
-                "联网搜索结果数必须在 1..=10 之间".into(),
-            ));
-        }
-        self.web_request(
-            "web_search",
-            json!({"query": query, "max_results": max_results}),
-        )
-        .await
-    }
-
-    pub async fn web_fetch(&self, url: &str) -> Result<WebFetchResponse, OllamaError> {
-        validate_public_http_url_resolved(url).await?;
-        self.web_request("web_fetch", json!({"url": url})).await
-    }
-
-    async fn web_request<T>(&self, operation: &str, payload: Value) -> Result<T, OllamaError>
-    where
-        T: serde::de::DeserializeOwned,
-    {
-        let api_key = std::env::var("OLLAMA_API_KEY")
-            .ok()
-            .filter(|value| !value.trim().is_empty());
-        let url = if api_key.is_some() {
-            format!("https://ollama.com/api/{operation}")
-        } else {
-            format!("{}/api/experimental/{operation}", self.host)
-        };
-        let mut request = self
-            .client
-            .post(url)
-            .header("Accept", "application/json")
-            .timeout(Duration::from_secs(60))
-            .json(&payload);
-        if let Some(api_key) = api_key {
-            request = request.bearer_auth(api_key);
-        }
-        let response = request
-            .send()
-            .await
-            .map_err(|error| self.connection(error))?;
-        let status = response.status();
-        if response
-            .content_length()
-            .is_some_and(|length| length > MAX_WEB_RESPONSE_BYTES as u64)
-        {
-            return Err(OllamaError::Other(format!(
-                "Ollama {operation} 响应超过 1 MiB 上限"
-            )));
-        }
-        let mut stream = response.bytes_stream();
-        let mut bytes = Vec::new();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|error| self.connection(error))?;
-            if bytes.len().saturating_add(chunk.len()) > MAX_WEB_RESPONSE_BYTES {
-                return Err(OllamaError::Other(format!(
-                    "Ollama {operation} 响应超过 1 MiB 上限"
-                )));
-            }
-            bytes.extend_from_slice(&chunk);
-        }
-        let value: Value = serde_json::from_slice(&bytes)
-            .map_err(|error| OllamaError::Protocol(format!("Ollama 返回了无效 JSON: {error}")))?;
-        if !status.is_success() || value.get("error").is_some() {
-            return Err(api_error(&value, Some(status)));
-        }
-        serde_json::from_value(value)
-            .map_err(|error| OllamaError::Protocol(format!("Ollama Web 响应结构无效: {error}")))
     }
 
     async fn request_json(
@@ -492,23 +356,6 @@ impl OllamaClient {
             "options": {
                 "num_ctx": num_ctx,
                 "num_predict": num_predict,
-            }
-        })
-    }
-
-    fn agent_chat_payload(request: &AgentChatRequest) -> Value {
-        json!({
-            "model": request.model,
-            "messages": request.messages,
-            "tools": request.tools,
-            "stream": true,
-            "think": request.think,
-            "truncate": false,
-            "shift": false,
-            "keep_alive": "5m",
-            "options": {
-                "num_ctx": request.num_ctx,
-                "num_predict": request.num_predict,
             }
         })
     }
@@ -738,96 +585,6 @@ fn parse_structured_chat_events(events: &[Value]) -> Result<StructuredChatRespon
     parse_structured_chat_response(&aggregate)
 }
 
-pub fn validate_public_http_url(raw: &str) -> Result<Url, OllamaError> {
-    let url = Url::parse(raw).map_err(|_| OllamaError::Other(format!("无效 URL: {raw:?}")))?;
-    if !matches!(url.scheme(), "http" | "https") {
-        return Err(OllamaError::Other("仅允许 HTTP(S) URL".into()));
-    }
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err(OllamaError::Other("URL 不允许包含用户凭据".into()));
-    }
-    let host = url
-        .host_str()
-        .ok_or_else(|| OllamaError::Other("URL 缺少主机名".into()))?;
-    let lowered = host.trim_end_matches('.').to_ascii_lowercase();
-    if lowered == "localhost" || lowered.ends_with(".localhost") || lowered.ends_with(".local") {
-        return Err(OllamaError::Other("拒绝访问本机或局域网 URL".into()));
-    }
-    let ip_literal = lowered
-        .strip_prefix('[')
-        .and_then(|value| value.strip_suffix(']'))
-        .unwrap_or(&lowered);
-    if let Ok(ip) = ip_literal.parse::<std::net::IpAddr>()
-        && is_disallowed_web_ip(ip)
-    {
-        return Err(OllamaError::Other("拒绝访问本机或私有网络 URL".into()));
-    }
-    Ok(url)
-}
-
-pub async fn validate_public_http_url_resolved(raw: &str) -> Result<Url, OllamaError> {
-    let url = validate_public_http_url(raw)?;
-    let host = url
-        .host_str()
-        .expect("validated HTTP URL has a host")
-        .trim_start_matches('[')
-        .trim_end_matches(']');
-    if host.parse::<std::net::IpAddr>().is_ok() {
-        return Ok(url);
-    }
-    let port = url
-        .port_or_known_default()
-        .expect("HTTP(S) URL has a known default port");
-    let addresses = tokio::time::timeout(
-        Duration::from_secs(5),
-        tokio::net::lookup_host((host, port)),
-    )
-    .await
-    .map_err(|_| OllamaError::Other(format!("解析网页主机 {host:?} 超时")))?
-    .map_err(|error| OllamaError::Other(format!("无法解析网页主机 {host:?}: {error}")))?
-    .collect::<Vec<_>>();
-    if addresses.is_empty() {
-        return Err(OllamaError::Other(format!(
-            "网页主机 {host:?} 没有可用地址"
-        )));
-    }
-    if addresses
-        .iter()
-        .any(|address| is_disallowed_web_ip(address.ip()))
-    {
-        return Err(OllamaError::Other(
-            "拒绝访问解析到本机或私有网络的 URL".into(),
-        ));
-    }
-    Ok(url)
-}
-
-fn is_disallowed_web_ip(ip: std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(ip) => {
-            let [first, second, ..] = ip.octets();
-            ip.is_loopback()
-                || ip.is_unspecified()
-                || ip.is_private()
-                || ip.is_link_local()
-                || ip.is_multicast()
-                || first == 0
-                || first >= 240
-                || (first == 100 && (64..=127).contains(&second))
-                || (first == 198 && matches!(second, 18 | 19))
-        }
-        std::net::IpAddr::V6(ip) => {
-            ip.to_ipv4_mapped()
-                .is_some_and(|mapped| is_disallowed_web_ip(mapped.into()))
-                || ip.is_loopback()
-                || ip.is_unspecified()
-                || ip.is_multicast()
-                || ip.is_unique_local()
-                || ip.is_unicast_link_local()
-        }
-    }
-}
-
 #[async_trait]
 impl ChatBackend for OllamaClient {
     async fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingResponse, OllamaError> {
@@ -1041,209 +798,6 @@ impl ChatBackend for OllamaClient {
             })
         }
     }
-
-    async fn probe_agent(&self, request: &AgentChatRequest) -> Result<TokenUsage, OllamaError> {
-        let mut payload = Self::agent_chat_payload(request);
-        let options = payload
-            .get_mut("options")
-            .and_then(Value::as_object_mut)
-            .expect("agent chat options are an object");
-        options.insert("num_predict".into(), Value::from(1));
-        options.insert("temperature".into(), Value::from(0));
-        options.insert("seed".into(), Value::from(0));
-        let events = self.request_chat_events(&request.model, payload).await?;
-        let response = events
-            .last()
-            .ok_or_else(|| OllamaError::Protocol("工具请求精确探测响应为空".into()))?;
-        let input = response.get("prompt_eval_count").and_then(Value::as_u64);
-        let output = response.get("eval_count").and_then(Value::as_u64);
-        match (input, output) {
-            (Some(input), Some(output)) => Ok(TokenUsage::new(Some(input), Some(output))),
-            _ => Err(OllamaError::Protocol(
-                "工具请求精确探测响应缺少 token 计数".into(),
-            )),
-        }
-    }
-
-    async fn stream_agent_round(
-        &self,
-        request: AgentChatRequest,
-        cancellation: CancellationToken,
-        emit: &mut (dyn FnMut(ChatEvent) + Send),
-    ) -> Result<AgentRoundResult, OllamaError> {
-        let mut payload = Self::agent_chat_payload(&request);
-        let object = payload.as_object_mut().expect("agent payload is an object");
-        object.insert("logprobs".into(), Value::Bool(true));
-        object.insert("top_logprobs".into(), Value::from(0));
-        let response = self
-            .client
-            .post(format!("{}/api/chat", self.host))
-            .header("Accept", "application/json")
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|error| self.connection(error))?;
-        let status = response.status();
-        if !status.is_success() {
-            let bytes = response
-                .bytes()
-                .await
-                .map_err(|error| self.connection(error))?;
-            let payload = serde_json::from_slice(&bytes)
-                .unwrap_or_else(|_| json!({"error": String::from_utf8_lossy(&bytes)}));
-            return Err(api_error(&payload, Some(status)));
-        }
-        self.record_model_use(&request.model);
-        let mut stream = response.bytes_stream();
-        let mut buffer = Vec::<u8>::new();
-        let mut accumulator = AgentAccumulator::default();
-        loop {
-            let next = tokio::select! {
-                _ = cancellation.cancelled() => {
-                    return Err(OllamaError::Cancelled { live_output_tokens: accumulator.live_output_tokens });
-                }
-                value = stream.next() => value,
-            };
-            let Some(chunk) = next else { break };
-            let chunk = chunk.map_err(|error| OllamaError::Stream {
-                message: format!("Ollama 工具流读取失败: {error}"),
-                live_output_tokens: accumulator.live_output_tokens,
-            })?;
-            buffer.extend_from_slice(&chunk);
-            while let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
-                let line = buffer.drain(..=newline).collect::<Vec<_>>();
-                let line = &line[..line.len().saturating_sub(1)];
-                if line.iter().all(u8::is_ascii_whitespace) {
-                    continue;
-                }
-                if parse_agent_stream_line(line, &mut accumulator, emit)? {
-                    return accumulator.finish();
-                }
-            }
-        }
-        if !buffer.iter().all(u8::is_ascii_whitespace)
-            && parse_agent_stream_line(&buffer, &mut accumulator, emit)?
-        {
-            return accumulator.finish();
-        }
-        Err(OllamaError::Stream {
-            message: "Ollama 工具流在最终计数事件之前结束".into(),
-            live_output_tokens: accumulator.live_output_tokens,
-        })
-    }
-
-    async fn web_search(
-        &self,
-        query: &str,
-        max_results: usize,
-    ) -> Result<WebSearchResponse, OllamaError> {
-        OllamaClient::web_search(self, query, max_results).await
-    }
-
-    async fn web_fetch(&self, url: &str) -> Result<WebFetchResponse, OllamaError> {
-        OllamaClient::web_fetch(self, url).await
-    }
-}
-
-#[derive(Default)]
-struct AgentAccumulator {
-    thinking: String,
-    content: String,
-    tool_calls: Vec<ToolCall>,
-    usage: Option<TokenUsage>,
-    done_reason: Option<String>,
-    live_output_tokens: u64,
-}
-
-impl AgentAccumulator {
-    fn finish(self) -> Result<AgentRoundResult, OllamaError> {
-        let usage = self.usage.ok_or_else(|| OllamaError::Stream {
-            message: "Ollama 工具流缺少最终 token 计数".into(),
-            live_output_tokens: self.live_output_tokens,
-        })?;
-        Ok(AgentRoundResult {
-            thinking: self.thinking,
-            content: self.content,
-            tool_calls: self.tool_calls,
-            usage,
-            done_reason: self.done_reason,
-            live_output_tokens: self.live_output_tokens,
-        })
-    }
-}
-
-fn parse_agent_stream_line(
-    line: &[u8],
-    accumulator: &mut AgentAccumulator,
-    emit: &mut (dyn FnMut(ChatEvent) + Send),
-) -> Result<bool, OllamaError> {
-    let chunk: Value = serde_json::from_slice(line).map_err(|error| OllamaError::Stream {
-        message: format!("Ollama 工具流返回了无效 JSON: {error}"),
-        live_output_tokens: accumulator.live_output_tokens,
-    })?;
-    let object = chunk.as_object().ok_or_else(|| OllamaError::Stream {
-        message: "Ollama 工具流事件不是 JSON 对象".into(),
-        live_output_tokens: accumulator.live_output_tokens,
-    })?;
-    if object.contains_key("error") {
-        return Err(api_error(&chunk, None));
-    }
-    let increment = object
-        .get("logprobs")
-        .and_then(Value::as_array)
-        .map_or(0, |items| items.len() as u64);
-    accumulator.live_output_tokens += increment;
-    if let Some(message) = object.get("message").and_then(Value::as_object) {
-        if let Some(thinking) = nonempty_string(message, "thinking") {
-            accumulator.thinking.push_str(thinking);
-            emit(ChatEvent::text(
-                ChatEventKind::Thinking,
-                thinking.to_owned(),
-                accumulator.live_output_tokens,
-            ));
-        }
-        if let Some(content) = nonempty_string(message, "content") {
-            accumulator.content.push_str(content);
-        }
-        if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
-            for call in tool_calls {
-                accumulator
-                    .tool_calls
-                    .push(serde_json::from_value(call.clone()).map_err(|error| {
-                        OllamaError::Stream {
-                            message: format!("Ollama tool_call 结构无效: {error}"),
-                            live_output_tokens: accumulator.live_output_tokens,
-                        }
-                    })?);
-            }
-        }
-    }
-    if increment > 0 {
-        emit(ChatEvent {
-            kind: ChatEventKind::Usage,
-            text: String::new(),
-            live_output_tokens: Some(accumulator.live_output_tokens),
-            usage: None,
-            done_reason: None,
-        });
-    }
-    let done = object.get("done").and_then(Value::as_bool) == Some(true);
-    if done {
-        let input = object.get("prompt_eval_count").and_then(Value::as_u64);
-        let output = object.get("eval_count").and_then(Value::as_u64);
-        let (Some(input), Some(output)) = (input, output) else {
-            return Err(OllamaError::Stream {
-                message: "Ollama 工具流最终事件缺少 token 计数".into(),
-                live_output_tokens: accumulator.live_output_tokens,
-            });
-        };
-        accumulator.usage = Some(TokenUsage::new(Some(input), Some(output)));
-        accumulator.done_reason = object
-            .get("done_reason")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned);
-    }
-    Ok(done)
 }
 
 fn parse_stream_line(
@@ -1434,35 +988,6 @@ mod tests {
     }
 
     #[test]
-    fn streaming_tool_calls_accumulate_with_thinking_and_usage() {
-        let mut accumulator = AgentAccumulator::default();
-        let mut events = Vec::new();
-        assert!(!parse_agent_stream_line(
-            br#"{"message":{"thinking":"plan","tool_calls":[{"type":"function","function":{"index":0,"name":"web_search","arguments":{"query":"one"}}},{"type":"function","function":{"index":1,"name":"web_search","arguments":{"query":"two"}}}]},"done":false,"logprobs":[{}]}"#,
-            &mut accumulator,
-            &mut |event| events.push(event),
-        )
-        .unwrap());
-        assert!(parse_agent_stream_line(
-            br#"{"message":{"content":"final"},"done":true,"done_reason":"stop","prompt_eval_count":33,"eval_count":7}"#,
-            &mut accumulator,
-            &mut |event| events.push(event),
-        )
-        .unwrap());
-        let result = accumulator.finish().unwrap();
-        assert_eq!(result.thinking, "plan");
-        assert_eq!(result.content, "final");
-        assert_eq!(result.tool_calls.len(), 2);
-        assert_eq!(result.tool_calls[1].function.arguments["query"], "two");
-        assert_eq!(result.usage, TokenUsage::new(Some(33), Some(7)));
-        assert!(
-            events
-                .iter()
-                .any(|event| event.kind == ChatEventKind::Thinking)
-        );
-    }
-
-    #[test]
     fn nested_context_error_exposes_counts() {
         let nested = json!({
             "error": serde_json::to_string(&json!({"error": {
@@ -1479,25 +1004,6 @@ mod tests {
                 ..
             }
         ));
-    }
-
-    #[test]
-    fn web_fetch_url_policy_rejects_local_and_non_http_targets() {
-        for url in [
-            "file:///etc/passwd",
-            "http://localhost:8080/",
-            "http://service.local/path",
-            "http://127.0.0.1/",
-            "http://10.1.2.3/",
-            "http://169.254.169.254/latest/meta-data/",
-            "http://[::1]/",
-            "http://[::ffff:127.0.0.1]/",
-            "http://100.64.0.1/",
-            "https://user:secret@example.com/",
-        ] {
-            assert!(validate_public_http_url(url).is_err(), "accepted {url}");
-        }
-        assert!(validate_public_http_url("https://example.com/docs").is_ok());
     }
 
     #[test]
@@ -1602,7 +1108,7 @@ mod tests {
     }
 
     #[test]
-    fn all_chat_payload_builders_force_streaming() {
+    fn all_chat_payloads_force_streaming() {
         let messages = vec![ChatMessage {
             role: "user".into(),
             content: "hi".into(),
@@ -1610,15 +1116,6 @@ mod tests {
         let payload = OllamaClient::chat_payload("model", &messages, false, 4096, 32);
         assert_eq!(payload["stream"], true);
 
-        let agent = AgentChatRequest {
-            model: "model".into(),
-            messages: Vec::new(),
-            tools: Vec::new(),
-            think: false,
-            num_ctx: 4096,
-            num_predict: 32,
-        };
-        assert_eq!(OllamaClient::agent_chat_payload(&agent)["stream"], true);
         assert_eq!(
             structured_chat_payload(&structured_request())["stream"],
             true
@@ -1706,23 +1203,6 @@ mod tests {
             .await
             .unwrap();
 
-        let agent_request = AgentChatRequest {
-            model: "agent-model".into(),
-            messages: Vec::new(),
-            tools: Vec::new(),
-            think: false,
-            num_ctx: 4_096,
-            num_predict: 32,
-        };
-        ChatBackend::stream_agent_round(
-            &first,
-            agent_request,
-            CancellationToken::new(),
-            &mut |_| {},
-        )
-        .await
-        .unwrap();
-
         let mut failed = structured_request();
         failed.model = "failed-model".into();
         assert!(first.structured_chat(failed).await.is_err());
@@ -1731,7 +1211,7 @@ mod tests {
         OllamaClient::unload_tracked_models().await.unwrap();
 
         let first_chats = first_state.chats.lock().unwrap().clone();
-        assert_eq!(first_chats.len(), 4);
+        assert_eq!(first_chats.len(), 3);
         assert_eq!(
             first_chats
                 .iter()
@@ -1742,21 +1222,13 @@ mod tests {
         assert!(
             first_chats
                 .iter()
-                .any(|payload| payload["model"] == "agent-model")
-        );
-        assert!(
-            first_chats
-                .iter()
                 .any(|payload| payload["model"] == "failed-model")
         );
         assert_eq!(second_state.embeds.lock().unwrap().len(), 1);
 
         assert_eq!(
             *first_state.unloads.lock().unwrap(),
-            vec![
-                json!({"model": "agent-model", "keep_alive": 0}),
-                json!({"model": "shared-model", "keep_alive": 0}),
-            ]
+            vec![json!({"model": "shared-model", "keep_alive": 0})]
         );
         assert_eq!(
             *second_state.unloads.lock().unwrap(),

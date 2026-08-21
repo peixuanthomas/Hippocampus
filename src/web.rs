@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::engine::{ChatEngine, LimitAction, PreparationProgress, PreparationStatus};
 use crate::knowledge::KnowledgeEvidence;
-use crate::model::{ChatEvent, ChatEventKind, Session, TokenUsage, Turn, WebSourceTrace};
+use crate::model::{ChatEvent, ChatEventKind, Session, TokenUsage, Turn};
 use crate::ollama::{ChatBackend, ModelInfo, OllamaClient};
 
 const INDEX_HTML: &str = include_str!("web/index.html");
@@ -88,9 +88,7 @@ struct TurnView {
     probe_usage: TokenUsage,
     error: Option<String>,
     knowledge_sources: Vec<KnowledgeEvidence>,
-    web_sources: Vec<WebSourceTrace>,
     warnings: Vec<String>,
-    unverified_realtime: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -401,6 +399,8 @@ async fn generate<B: ChatBackend>(
             "search_deadline_ms": prepared.plan.retrieval_trace.deadline_ms,
             "search_timed_out": prepared.plan.retrieval_trace.deadline_exceeded,
             "fast_fallback_used": prepared.plan.retrieval_trace.fast_fallback_used,
+            "fallback_reason": prepared.plan.retrieval_trace.fallback_reason,
+            "search_channels": prepared.plan.retrieval_trace.channels,
             "search_debug": prepared.plan.retrieval_trace.warnings,
         }),
     );
@@ -427,9 +427,7 @@ async fn generate<B: ChatBackend>(
             "usage": turn.usage,
             "error": turn.error,
             "knowledge_sources": turn.context_trace.knowledge.selected_evidence,
-            "web_sources": turn.context_trace.web.sources,
             "warnings": turn_warnings(turn),
-            "unverified_realtime": turn.context_trace.web.unverified_realtime,
             "session_status": session.status.as_str(),
             "title": session.title,
         }),
@@ -610,9 +608,7 @@ fn session_view(session: &Session, model_info: &ModelInfo, busy: bool) -> Sessio
                 probe_usage: turn.probe_usage,
                 error: turn.error.clone(),
                 knowledge_sources: turn.context_trace.knowledge.selected_evidence.clone(),
-                web_sources: turn.context_trace.web.sources.clone(),
                 warnings: turn_warnings(turn),
-                unverified_realtime: turn.context_trace.web.unverified_realtime,
             })
             .collect(),
     }
@@ -620,7 +616,6 @@ fn session_view(session: &Session, model_info: &ModelInfo, busy: bool) -> Sessio
 
 fn turn_warnings(turn: &Turn) -> Vec<String> {
     let mut warnings = turn.context_trace.knowledge.warnings.clone();
-    warnings.extend(turn.context_trace.web.warnings.clone());
     warnings.sort();
     warnings.dedup();
     warnings

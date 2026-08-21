@@ -13,8 +13,10 @@ axum = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
 crossterm = "0.28"
+env_logger = "0.11"
 futures-util = "0.3"
 hnsw_rs = { version = "=0.3.4", default-features = false }
+log = "0.4"
 pulldown-cmark = "0.13"
 ratatui = "0.29"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }

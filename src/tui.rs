@@ -708,11 +708,30 @@ fn format_prepared_turn(session: &Session, prepared: &crate::engine::PreparedTur
             prepared.plan.knowledge_trace.selected_evidence.len()
         ),
         format!(
-            "search_elapsed_ms={} deadline_ms={} deadline_exceeded={} fast_fallback_used={}",
+            "search_elapsed_ms={} deadline_ms={} deadline_exceeded={} fast_fallback_used={} fallback_reason={:?}",
             prepared.plan.retrieval_trace.elapsed_ms,
             prepared.plan.retrieval_trace.deadline_ms,
             prepared.plan.retrieval_trace.deadline_exceeded,
             prepared.plan.retrieval_trace.fast_fallback_used,
+            prepared.plan.retrieval_trace.fallback_reason,
+        ),
+        format!(
+            "search_channels=[{}]",
+            prepared
+                .plan
+                .retrieval_trace
+                .channels
+                .iter()
+                .map(|channel| format!(
+                    "{:?}:status={},candidates={},elapsed_ms={},error={:?}",
+                    channel.channel,
+                    channel.status,
+                    channel.candidate_count,
+                    channel.elapsed_ms,
+                    channel.error,
+                ))
+                .collect::<Vec<_>>()
+                .join(" | ")
         ),
         format!(
             "search_warnings=[{}]",
@@ -743,17 +762,7 @@ fn provenance_summary(turn: &Turn) -> Option<String> {
             ));
         }
     }
-    if !turn.context_trace.web.sources.is_empty() {
-        lines.push("实时来源（由程序 trace 生成）".to_owned());
-        for source in &turn.context_trace.web.sources {
-            lines.push(format!(
-                "[W] {} · {} · {}",
-                source.kind, source.title, source.url
-            ));
-        }
-    }
     let mut warnings = turn.context_trace.knowledge.warnings.clone();
-    warnings.extend(turn.context_trace.web.warnings.clone());
     warnings.sort();
     warnings.dedup();
     lines.extend(
