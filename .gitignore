@@ -6,3 +6,4 @@ AGENTS.md
 /target/
 .DS_Store
 /eval-results/
+package.bat
