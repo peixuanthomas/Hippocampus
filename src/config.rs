@@ -15,6 +15,8 @@ pub const CONSOLIDATION_MODEL: &str = "qwen3.5:9b";
 #[serde(default, deny_unknown_fields)]
 pub struct AppConfig {
     pub ai_name: Option<String>,
+    /// 新会话与无状态调用使用的对话模型；启动参数可以覆盖此值。
+    pub model: Option<String>,
     pub system_prompt: String,
     pub knowledge: KnowledgeConfig,
     pub memory: MemoryConfig,
@@ -24,6 +26,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             ai_name: None,
+            model: None,
             system_prompt: DEFAULT_SYSTEM_PROMPT.to_owned(),
             knowledge: KnowledgeConfig::default(),
             memory: MemoryConfig::default(),
@@ -52,10 +55,20 @@ impl AppConfig {
         let Some(path) = path else {
             let config = Self::default();
             config.validate()?;
-            return Ok(LoadedConfig { config, path: None });
+            return Ok(LoadedConfig {
+                config,
+                path: None,
+                consolidation_model_configured: false,
+            });
         };
         let text = fs::read_to_string(&path)
             .with_context(|| format!("无法读取配置文件 {}", path.display()))?;
+        let document: toml::Value =
+            toml::from_str(&text).with_context(|| format!("配置文件 {} 无效", path.display()))?;
+        let consolidation_model_configured = document
+            .get("memory")
+            .and_then(toml::Value::as_table)
+            .is_some_and(|memory| memory.contains_key("consolidation_model"));
         let mut config: Self =
             toml::from_str(&text).with_context(|| format!("配置文件 {} 无效", path.display()))?;
         config.resolve_relative_sources(path.parent().unwrap_or_else(|| Path::new(".")));
@@ -63,6 +76,7 @@ impl AppConfig {
         Ok(LoadedConfig {
             config,
             path: Some(path),
+            consolidation_model_configured,
         })
     }
 
@@ -73,6 +87,13 @@ impl AppConfig {
             .is_some_and(|name| name.trim().is_empty())
         {
             bail!("ai_name 不能为空");
+        }
+        if self
+            .model
+            .as_ref()
+            .is_some_and(|model| model.trim().is_empty())
+        {
+            bail!("model 不能为空");
         }
         self.knowledge.validate()?;
         self.memory.validate()
@@ -178,8 +199,8 @@ impl MemoryConfig {
         if !(1..=1_000).contains(&self.rrf_k) {
             bail!("memory.rrf_k 必须在 1..=1000 之间");
         }
-        if self.consolidation_model != CONSOLIDATION_MODEL {
-            bail!("memory.consolidation_model 是固定巩固契约，必须精确为 {CONSOLIDATION_MODEL}");
+        if self.consolidation_model.trim().is_empty() {
+            bail!("memory.consolidation_model 不能为空");
         }
         if !(4_096..=262_144).contains(&self.consolidation_context_window) {
             bail!("memory.consolidation_context_window 必须在 4096..=262144 之间");
@@ -294,6 +315,8 @@ impl MemoryBudgetConfig {
 pub struct LoadedConfig {
     pub config: AppConfig,
     pub path: Option<PathBuf>,
+    /// 配置文件是否显式包含 `[memory].consolidation_model`。
+    pub consolidation_model_configured: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -387,6 +410,7 @@ mod tests {
     fn missing_implicit_config_uses_safe_defaults() {
         let config = AppConfig::default();
         assert_eq!(config.ai_name(), "LLM");
+        assert!(config.model.is_none());
         assert!(config.knowledge.sources.is_empty());
         assert!(!config.memory.enabled);
     }
@@ -402,10 +426,15 @@ mod tests {
     fn checked_in_config_enables_memory_with_defaulted_fields() {
         let config: AppConfig = toml::from_str(include_str!("../config.toml")).unwrap();
         config.validate().unwrap();
+        assert_eq!(config.model.as_deref(), Some("qwen3.8:27b-mlx"));
         assert!(config.memory.enabled);
         assert_eq!(config.memory.embedding_model, "qwen3-embedding:8b");
         assert_eq!(config.memory.embedding_dimensions, 1_024);
         assert_eq!(config.memory.budgets, AdaptiveBudgetConfig::default());
+
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.toml");
+        let loaded = AppConfig::load(Some(&path)).unwrap();
+        assert!(loaded.consolidation_model_configured);
     }
 
     #[test]
@@ -432,6 +461,7 @@ location = "notes"
         )
         .unwrap();
         let loaded = AppConfig::load(Some(&path)).unwrap();
+        assert!(!loaded.consolidation_model_configured);
         assert_eq!(loaded.config.ai_name(), "hippocampus");
         assert!(loaded.config.memory.enabled);
         assert_eq!(loaded.config.memory.embedding_model, "test-embedding");
@@ -546,12 +576,17 @@ location = "https://example.com/docs"
         };
         assert!(blank_model.validate().is_err());
 
-        let wrong_consolidation_model = MemoryConfig {
+        let custom_consolidation_model = MemoryConfig {
             consolidation_model: "qwen3.5:27b".into(),
             ..MemoryConfig::default()
         };
-        let error = wrong_consolidation_model.validate().unwrap_err();
-        assert!(error.to_string().contains(CONSOLIDATION_MODEL));
+        custom_consolidation_model.validate().unwrap();
+
+        let blank_consolidation_model = MemoryConfig {
+            consolidation_model: "   ".into(),
+            ..MemoryConfig::default()
+        };
+        assert!(blank_consolidation_model.validate().is_err());
 
         let construction_too_small = MemoryConfig {
             hnsw_ef_construction: 15,

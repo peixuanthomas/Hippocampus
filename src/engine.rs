@@ -9,7 +9,9 @@ use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::config::{AppConfig, CONSOLIDATION_MODEL};
+use crate::config::AppConfig;
+#[cfg(test)]
+use crate::config::CONSOLIDATION_MODEL;
 use crate::consolidation::{
     ConsolidationApplyError, ConsolidationAttemptRecord, ConsolidationAttemptStatus,
     ConsolidationInputBatch, ConsolidationRunReport, ConsolidationRunStatus,
@@ -1068,7 +1070,7 @@ impl<B: ChatBackend> ChatEngine<B> {
             }
             ConsolidationStageSelection::Boundaries => {
                 let mut report = consolidation_report(session, trigger);
-                report.model = CONSOLIDATION_MODEL.into();
+                report.model = self.config.memory.consolidation_model.clone();
                 report.boundaries = self
                     .consolidate_boundaries(session, trigger, cancellation)
                     .await;
@@ -1273,7 +1275,7 @@ impl<B: ChatBackend> ChatEngine<B> {
                 return report;
             }
         };
-        report.model = CONSOLIDATION_MODEL.into();
+        report.model = self.config.memory.consolidation_model.clone();
         if cancellation.is_cancelled() {
             report.status = ConsolidationRunStatus::Cancelled;
             return report;
@@ -1361,7 +1363,7 @@ impl<B: ChatBackend> ChatEngine<B> {
                 }
             };
             let prepared_request = match prepare_fact_request(
-                CONSOLIDATION_MODEL.into(),
+                self.config.memory.consolidation_model.clone(),
                 &batch,
                 &candidates,
                 &preceding_contexts,
@@ -1466,7 +1468,7 @@ impl<B: ChatBackend> ChatEngine<B> {
                 match self
                     .client
                     .check_model(
-                        CONSOLIDATION_MODEL,
+                        &self.config.memory.consolidation_model,
                         self.config.memory.consolidation_context_window,
                     )
                     .await
@@ -1545,7 +1547,7 @@ impl<B: ChatBackend> ChatEngine<B> {
                         from_sequence: batch.from_sequence,
                         through_sequence: batch.through_sequence,
                         trigger: trigger.as_str().into(),
-                        model: CONSOLIDATION_MODEL.into(),
+                        model: self.config.memory.consolidation_model.clone(),
                         request_json: initial_request_json.clone(),
                         request_sha256: content_sha256(&initial_request_json),
                         input_event_ids: batch.events.iter().map(|event| event.event_id.clone()).collect(),
@@ -1701,7 +1703,7 @@ impl<B: ChatBackend> ChatEngine<B> {
                         from_sequence: batch.from_sequence,
                         through_sequence: batch.through_sequence,
                         trigger: trigger.as_str().into(),
-                        model: CONSOLIDATION_MODEL.into(),
+                        model: self.config.memory.consolidation_model.clone(),
                         request_json: request_json.clone(),
                         request_sha256: content_sha256(&request_json),
                         input_event_ids: batch
@@ -2307,7 +2309,7 @@ impl<B: ChatBackend> ChatEngine<B> {
                         match self
                             .client
                             .check_model(
-                                CONSOLIDATION_MODEL,
+                                &self.config.memory.consolidation_model,
                                 self.config.memory.consolidation_context_window,
                             )
                             .await
@@ -2316,7 +2318,7 @@ impl<B: ChatBackend> ChatEngine<B> {
                             Ok(_) => {
                                 report.warnings.push(format!(
                                     "专用巩固模型 {} 未声明 thinking 能力",
-                                    CONSOLIDATION_MODEL
+                                    self.config.memory.consolidation_model
                                 ));
                                 report.status = if report.batches_applied == 0 {
                                     ConsolidationRunStatus::Failed
@@ -2339,7 +2341,7 @@ impl<B: ChatBackend> ChatEngine<B> {
                         }
                     }
                     let initial = prepare_boundary_request(
-                        CONSOLIDATION_MODEL.into(),
+                        self.config.memory.consolidation_model.clone(),
                         &input,
                         self.config.memory.consolidation_context_window,
                         self.config.memory.consolidation_max_output_tokens,
@@ -2355,7 +2357,7 @@ impl<B: ChatBackend> ChatEngine<B> {
                             from_sequence: input.sequence,
                             through_sequence: input.sequence,
                             trigger: trigger.as_str().into(),
-                            model: CONSOLIDATION_MODEL.into(),
+                            model: self.config.memory.consolidation_model.clone(),
                             request_sha256: content_sha256(&request_json),
                             request_json,
                             input_event_ids: vec![input.event_id.clone()],
@@ -5668,6 +5670,7 @@ mod tests {
 
     #[tokio::test]
     async fn consolidation_uses_persisted_session_contract_and_applies_batches() {
+        const CUSTOM_CONSOLIDATION_MODEL: &str = "custom-consolidation-model";
         let root = tempfile::tempdir().unwrap();
         let store = SessionStore::new(root.path()).unwrap();
         let mut session = store
@@ -5702,6 +5705,7 @@ mod tests {
         stale.budget.max_output_tokens = 777;
         let mut config = AppConfig::default();
         config.memory.enabled = true;
+        config.memory.consolidation_model = CUSTOM_CONSOLIDATION_MODEL.into();
         let engine = ChatEngine::with_config(store.clone(), client.clone(), config);
         let report = engine
             .consolidate_session_stage(
@@ -5719,15 +5723,16 @@ mod tests {
         );
         assert_eq!(report.batches_applied, 2);
         assert_eq!(report.watermark_after, 33);
+        assert_eq!(report.model, CUSTOM_CONSOLIDATION_MODEL);
         assert_eq!(serde_json::to_vec(&session).unwrap(), before);
         let requests = client.structured_requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
         assert_eq!(
             client.checked_models.lock().unwrap().as_slice(),
-            [CONSOLIDATION_MODEL]
+            [CUSTOM_CONSOLIDATION_MODEL]
         );
         for request in requests.iter() {
-            assert_eq!(request.model, CONSOLIDATION_MODEL);
+            assert_eq!(request.model, CUSTOM_CONSOLIDATION_MODEL);
             assert!(request.think);
             assert_eq!(
                 request.num_ctx,
@@ -5751,6 +5756,7 @@ mod tests {
         for (attempt, captured) in attempts.into_iter().zip(requests.iter()) {
             let request: StructuredChatRequest =
                 serde_json::from_str(&attempt.request_json).unwrap();
+            assert_eq!(attempt.model, CUSTOM_CONSOLIDATION_MODEL);
             assert_eq!(request, *captured);
             assert_eq!(
                 attempt.request_sha256,

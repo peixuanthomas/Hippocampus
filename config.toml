@@ -1,4 +1,5 @@
 ai_name = "Edith"
+model = "qwen3.8:27b-mlx"
 system_prompt = """
 你是AI助手，你的任务是简练直白且直入主题的解决用户的问题或者与用户对话。
 """

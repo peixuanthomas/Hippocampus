@@ -21,10 +21,11 @@ cargo build --release
 
 ## 配置
 
-仓库根目录的 [`config.toml`](config.toml) 是默认配置，其中完整列出了 `[memory]` 的模型、候选数、超时、HNSW 和五种自适应预算键。未传 `--config` 时，程序可选读取当前工作目录下的 `config.toml`；当前目录没有配置时使用安全回退：名称为 `LLM`、自动知识同步关闭、`memory.enabled=false`。此时长期回忆只使用 BM25，不调用 embedding 或聊天模型做巩固。显式传入的文件不存在或配置含未知字段、重复来源 ID、空名称或越界预算时会直接报错。
+仓库根目录的 [`config.toml`](config.toml) 是默认配置，其中完整列出了对话模型和 `[memory]` 的模型、候选数、超时、HNSW 与五种自适应预算键。未传 `--config` 时，程序可选读取当前工作目录下的 `config.toml`。配置中必须包含非空的顶层 `model`；缺少时程序会报错，要求写入配置或在启动时显式传入 `--model <MODEL>`。当前目录没有配置但显式传入了 `--model` 时，其余设置使用安全回退：名称为 `LLM`、自动知识同步关闭、`memory.enabled=false`。此时长期回忆只使用 BM25。显式传入的文件不存在或配置含未知字段、重复来源 ID、空名称或越界预算时会直接报错。
 
 ```toml
 ai_name = "hippocampus"
+model = "qwen3.8:27b-mlx"
 system_prompt = """
 你是一个乐于助人的AI助手，你的任务是解决用户的问题或者与用户对话。
 """
@@ -68,7 +69,7 @@ HIPPOCAMPUS_LOG_FILE=./hippocampus.log \
 ./build/hippocampus --sessions-dir ./sessions resume 20260811-abcdef12
 ```
 
-`--model` 是全局启动参数，可放在子命令前后；无参数 TUI、`new`、新建 Web 会话和无状态 `ask` 都使用它。默认模型为 `qwen3.8:27b-mlx`，thinking 默认关闭；显式传入 `--think` 才会开启，`--no-think` 作为兼容参数保留。恢复旧会话始终沿用其中已保存的模型和 thinking 设置，不会迁移到新默认值。TUI 会在模型生成期间持续追加并重绘正文，不等待完整回答结束。
+顶层配置项 `model` 供无参数 TUI、`new`、新建 Web 会话、无状态 `ask` 和评测使用。全局启动参数 `--model` 可放在子命令前后并覆盖配置值；两者都没有时启动会报错。thinking 默认关闭；显式传入 `--think` 才会开启，`--no-think` 作为兼容参数保留。恢复旧会话始终沿用其中已保存的模型和 thinking 设置，不会迁移到新配置值。TUI 会在模型生成期间持续追加并重绘正文，不等待完整回答结束。
 
 界面顶部显示模型、thinking、上下文与会话状态；中间是对话；底部是可编辑的多行输入框。
 
@@ -131,7 +132,7 @@ curl -N -H 'Content-Type: application/json' \
 
 `ask --json` 输出逐行刷新的 JSONL 事件，而不是单个缓冲 JSON 对象。`thinking` 和 `content` 事件携带本次增量，随后可能有 `usage`/`completed`，最后一行固定为 `event:"done"` 并包含完整内容、thinking、最终 usage、会话 ID 和上下文来源元数据。JSON 模式总是输出 thinking 事件，不受 `--show-thinking` 影响。
 
-无状态 `ask` 默认使用 `qwen3.8:27b-mlx` 且 thinking 关闭；显式传入 `--think` 才会开启，兼容参数 `--no-think` 仍可使用。带 `--session` 时则沿用会话已保存的模型和 thinking 设置。
+无状态 `ask` 使用配置中的 `model`（或 `--model` 覆盖值）且 thinking 默认关闭；显式传入 `--think` 才会开启，兼容参数 `--no-think` 仍可使用。带 `--session` 时则沿用会话已保存的模型和 thinking 设置。
 
 传入 `--session` 时才会加载该会话上下文，并把新一轮原子保存回同一个会话：
 
@@ -179,10 +180,11 @@ location = "./knowledge"
 
 ## 派生记忆运维
 
-启用仓库配置后，巩固始终使用独立的 `qwen3.5:9b`，不受会话聊天模型影响。巩固请求固定 `think=true`，但 thinking 会直接丢弃且不写入审计；只有结构化响应、校验结果、canonical delta 和错误进入 attempt ledger。向量使用 `[memory].embedding_model`（当前为 `qwen3-embedding:8b`）生成。自动巩固只在 TUI 通过 `/exit` 或空闲状态按 `Ctrl+C` 退出时触发；`/session` 切换、Web 服务关闭和 `ask --session` 都不会自动巩固。手动命令如下：
+启用仓库配置后，巩固使用 `[memory].consolidation_model` 指定的独立模型，不受会话聊天模型影响。全局 `--consolidation-model <MODEL>` 可显式覆盖它；两者都未指定时程序会警告并使用内置回退模型 `qwen3.5:9b`，提示补充配置或启动参数，但不会阻止主要功能启动。巩固请求固定 `think=true`，但 thinking 会直接丢弃且不写入审计；只有结构化响应、校验结果、canonical delta 和错误进入 attempt ledger。向量使用 `[memory].embedding_model`（当前为 `qwen3-embedding:8b`）生成。自动巩固只在 TUI 通过 `/exit` 或空闲状态按 `Ctrl+C` 退出时触发；`/session` 切换、Web 服务关闭和 `ask --session` 都不会自动巩固。手动命令如下：
 
 ```bash
 ./build/hippocampus memory consolidate 20260811-abcdef12 --stage facts
+./build/hippocampus memory consolidate 20260811-abcdef12 --consolidation-model qwen3.5:27b
 ./build/hippocampus memory consolidate --all --stage all
 ./build/hippocampus memory consolidate 20260811-abcdef12 --stage boundaries
 ./build/hippocampus memory consolidate 20260811-abcdef12 --stage raw-vectors
@@ -216,11 +218,11 @@ v2 采用破坏性 `v9→v10` 迁移：删除旧 consolidation、graph、episode
 
 存储布局为：`<sessions-dir>/*.json` 是权威原文；`<sessions-dir>/.hippocampus-index.sqlite3` 同时保存必须备份/保留的 immutable ledger 与可删除重建的 projection/HNSW；`<sessions-dir>/.hippocampus-control/*.json` 是 append-only 控制记录。模型输入分别使用 `system`、`user`、`memory` 和 `knowledge` 角色；长期记忆证据使用 `memory`，本地知识库证据使用 `knowledge`，两者都属于不可信数据，不得作为指令执行，recent history 则保留原始 user/assistant 角色。embedding、巩固或 graph 失败会记录在 trace/状态中，并回退到 BM25 可用路径。如果 source 已写入而索引同步失败，原始会话仍安全，可重试保存或运行 `memory rebuild`。
 
-如果删除整个 `.hippocampus-index.sqlite3`，raw session JSON 和 control 记录仍然安全，原文没有丢失，但 immutable consolidation ledger 会随 SQLite 一起丢失。之后需要运行 `memory consolidate SESSION` 或 `memory consolidate --all`，由独立的 `qwen3.5:9b` 重新生成审计 attempt、canonical delta 和 structured memory，再执行所需的 embedding/graph 维护。
+如果删除整个 `.hippocampus-index.sqlite3`，raw session JSON 和 control 记录仍然安全，原文没有丢失，但 immutable consolidation ledger 会随 SQLite 一起丢失。之后需要运行 `memory consolidate SESSION` 或 `memory consolidate --all`，由当前配置或命令行指定的独立巩固模型重新生成审计 attempt、canonical delta 和 structured memory，再执行所需的 embedding/graph 维护。
 
 ## 记忆评测
 
-评测命令固定使用真实回答模型 `qwen3.8:27b-mlx`，embedding 模型和参数来自当前配置；结构化调用仍关闭 thinking。它不会报告仓库预先跑出的分数。三个入口为：
+评测命令使用顶层 `model` 或 `--model` 指定的真实回答模型，embedding 模型和参数来自当前配置；结构化调用仍关闭 thinking。它不会报告仓库预先跑出的分数。三个入口为：
 
 ```bash
 ./build/hippocampus eval synthetic

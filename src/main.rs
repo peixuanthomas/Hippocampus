@@ -27,8 +27,6 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
-const DEFAULT_OLLAMA_MODEL: &str = "qwen3.8:27b-mlx";
-
 #[derive(Debug, Parser)]
 #[command(
     name = "hippocampus",
@@ -43,9 +41,12 @@ struct Cli {
     sessions_dir: PathBuf,
     #[arg(long, global = true, default_value = "http://127.0.0.1:11434")]
     host: String,
-    /// 新会话和无状态 ask 使用的 Ollama 模型；恢复会话时忽略
-    #[arg(long, global = true, default_value = DEFAULT_OLLAMA_MODEL)]
-    model: String,
+    /// 显式指定新会话、无状态 ask 和评测使用的对话模型；覆盖配置文件的 model
+    #[arg(long, global = true)]
+    model: Option<String>,
+    /// 显式指定巩固模型；覆盖配置文件的 memory.consolidation_model
+    #[arg(long, global = true)]
+    consolidation_model: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -378,17 +379,29 @@ fn init_logging() {
 async fn run() -> Result<()> {
     let cli = Cli::parse();
     let loaded = AppConfig::load(cli.config.as_deref())?;
+    let warn_missing_consolidation_model =
+        !loaded.consolidation_model_configured && cli.consolidation_model.is_none();
+    let mut config = loaded.config;
+    let model = configure_runtime_models(
+        &mut config,
+        cli.model.as_deref(),
+        cli.consolidation_model.as_deref(),
+    )?;
+    if warn_missing_consolidation_model {
+        eprintln!(
+            "警告：未配置巩固模型，将使用内置回退模型 {CONSOLIDATION_MODEL:?}；请在配置文件的 [memory] 中添加 consolidation_model = \"...\"，或启动时显式指定 --consolidation-model <MODEL>"
+        );
+    }
     if let Some(Command::Eval(args)) = cli.command {
         return run_eval(
             args,
             &cli.host,
             &cli.sessions_dir,
             loaded.path.as_deref(),
-            loaded.config,
+            config,
         )
         .await;
     }
-    let config = loaded.config;
     if !config.memory.enabled
         && matches!(
             &cli.command,
@@ -401,18 +414,38 @@ async fn run() -> Result<()> {
     }
     let store = SessionStore::new(&cli.sessions_dir)?;
     match cli.command {
-        None => run_new_tui(store, &cli.host, &cli.model, NewArgs::default(), &config).await,
-        Some(Command::New(args)) => run_new_tui(store, &cli.host, &cli.model, args, &config).await,
+        None => run_new_tui(store, &cli.host, &model, NewArgs::default(), &config).await,
+        Some(Command::New(args)) => run_new_tui(store, &cli.host, &model, args, &config).await,
         Some(Command::Resume { identifier }) => run_resume_tui(store, &identifier, &config).await,
         Some(Command::List) => list_sessions(&store),
         Some(Command::Show { identifier, json }) => show_session(&store, &identifier, json),
         Some(Command::Clear) => clear_history(&store),
-        Some(Command::Ask(args)) => run_ask(store, &cli.host, &cli.model, args, &config).await,
-        Some(Command::Serve(args)) => run_serve(store, &cli.host, &cli.model, args, &config).await,
+        Some(Command::Ask(args)) => run_ask(store, &cli.host, &model, args, &config).await,
+        Some(Command::Serve(args)) => run_serve(store, &cli.host, &model, args, &config).await,
         Some(Command::Knowledge(args)) => run_knowledge(store, args, &config).await,
         Some(Command::Memory(args)) => run_memory(store, &cli.host, args, &config).await,
         Some(Command::Eval(_)) => unreachable!("evaluation returned before opening session store"),
     }
+}
+
+fn configure_runtime_models(
+    config: &mut AppConfig,
+    model_override: Option<&str>,
+    consolidation_model_override: Option<&str>,
+) -> Result<String> {
+    if let Some(model) = model_override {
+        config.model = Some(model.to_owned());
+    }
+    let model = config.model.clone().ok_or_else(|| {
+        anyhow::anyhow!(
+            "未配置对话模型；请在配置文件中添加 model = \"...\"，或启动时显式指定 --model <MODEL>"
+        )
+    })?;
+    if let Some(model) = consolidation_model_override {
+        config.memory.consolidation_model = model.to_owned();
+    }
+    config.validate()?;
+    Ok(model)
 }
 
 async fn run_eval(
@@ -602,11 +635,15 @@ async fn run_single_evaluation_inner(
     let workspace = output.with_file_name(workspace_name);
     validate_eval_paths(dataset.as_deref(), &output, &workspace)?;
     validate_eval_store_isolation(&output, &workspace, sessions_dir, config_path)?;
+    let answer_model = config
+        .model
+        .clone()
+        .context("evaluation conversation model missing after startup validation")?;
     let options = EvalRunOptions {
         dataset_path: dataset,
         output: output.clone(),
         workspace,
-        answer_model: "qwen3.8:27b-mlx".into(),
+        answer_model,
         ollama_host: ollama_host.to_owned(),
         channels,
         num_ctx: 32_768,
@@ -1470,7 +1507,7 @@ async fn run_memory_consolidate(
         if !json_output && config.memory.enabled {
             eprintln!(
                 "巩固中：会话 {}（专用巩固模型 {}）…",
-                session.id, CONSOLIDATION_MODEL
+                session.id, config.memory.consolidation_model
             );
         }
         let client = match OllamaClient::new(&session.ollama_host) {
@@ -1481,6 +1518,7 @@ async fn run_memory_consolidate(
                     ConsolidationTrigger::Manual,
                     ConsolidationRunStatus::Failed,
                     vec![format!("无法创建 Ollama 客户端: {error}")],
+                    &config.memory.consolidation_model,
                 ));
                 continue;
             }
@@ -1541,7 +1579,7 @@ async fn run_tui_exit_maintenance(
     if config.memory.enabled {
         eprintln!(
             "分阶段整理中：会话 {}（专用巩固模型 {}；raw_vectors/facts/boundaries 独立提交）…",
-            session.id, CONSOLIDATION_MODEL
+            session.id, config.memory.consolidation_model
         );
     }
     let report = consolidate_for_session(
@@ -1620,6 +1658,7 @@ async fn consolidate_for_session(
             trigger,
             ConsolidationRunStatus::Disabled,
             Vec::new(),
+            &config.memory.consolidation_model,
         );
     }
     if cancellation.is_cancelled() {
@@ -1628,6 +1667,7 @@ async fn consolidate_for_session(
             trigger,
             ConsolidationRunStatus::Cancelled,
             Vec::new(),
+            &config.memory.consolidation_model,
         );
     }
     let client = match OllamaClient::new(&session.ollama_host) {
@@ -1638,6 +1678,7 @@ async fn consolidate_for_session(
                 trigger,
                 ConsolidationRunStatus::Failed,
                 vec![format!("无法创建 Ollama 客户端：{error}")],
+                &config.memory.consolidation_model,
             );
         }
     };
@@ -1688,11 +1729,12 @@ fn synthetic_consolidation_report(
     trigger: ConsolidationTrigger,
     status: ConsolidationRunStatus,
     warnings: Vec<String>,
+    model: &str,
 ) -> ConsolidationRunReport {
     ConsolidationRunReport {
         session_id: session.id.clone(),
         trigger,
-        model: CONSOLIDATION_MODEL.to_owned(),
+        model: model.to_owned(),
         status,
         batches_attempted: 0,
         batches_applied: 0,
@@ -1722,7 +1764,7 @@ fn format_consolidation_report(report: &ConsolidationRunReport) -> String {
     format!(
         "会话 {}｜巩固模型 {}｜{}｜批次 {}/{} 事件 {}/{} 水位 {}→{}｜facts {} 水位 {}→{} 批次 {}/{} 单元 {}/{} token {}/{} 延迟 {}ms 实体 {}/{} 声明 {}/{}｜boundaries {} 水位 {}→{} 批次 {}/{} 单元 {}/{} token {}/{} 延迟 {}ms｜raw_vectors {} 水位 {}→{} 批次 {}/{} 单元 {}/{} 延迟 {}ms",
         report.session_id,
-        CONSOLIDATION_MODEL,
+        report.model,
         consolidation_status_label(report.status),
         report.batches_applied,
         report.batches_attempted,
@@ -2154,7 +2196,7 @@ mod tests {
     #[test]
     fn ask_session_is_optional_and_thinking_defaults_off() {
         let stateless = Cli::try_parse_from(["hippocampus", "ask", "hello"]).unwrap();
-        assert_eq!(stateless.model, DEFAULT_OLLAMA_MODEL);
+        assert!(stateless.model.is_none());
         let Some(Command::Ask(args)) = stateless.command else {
             panic!("expected ask command");
         };
@@ -2198,7 +2240,7 @@ mod tests {
         let Some(Command::New(args)) = cli.command else {
             panic!("expected new command");
         };
-        assert_eq!(cli.model, "qwen");
+        assert_eq!(cli.model.as_deref(), Some("qwen"));
         assert_eq!(args.context_window, 2048);
         assert!(!args.thinking_enabled());
         assert_eq!(args.system_prompt.as_deref(), Some("system"));
@@ -2208,7 +2250,38 @@ mod tests {
     fn model_is_a_global_startup_option_for_default_tui() {
         let cli = Cli::try_parse_from(["hippocampus", "--model", "llama3.3:70b"]).unwrap();
         assert!(cli.command.is_none());
-        assert_eq!(cli.model, "llama3.3:70b");
+        assert_eq!(cli.model.as_deref(), Some("llama3.3:70b"));
+    }
+
+    #[test]
+    fn consolidation_model_is_a_global_startup_option() {
+        let cli = Cli::try_parse_from([
+            "hippocampus",
+            "memory",
+            "status",
+            "--consolidation-model",
+            "qwen3.5:27b",
+        ])
+        .unwrap();
+        assert_eq!(cli.consolidation_model.as_deref(), Some("qwen3.5:27b"));
+    }
+
+    #[test]
+    fn startup_models_use_config_and_allow_explicit_overrides() {
+        let mut missing = AppConfig::default();
+        let error = configure_runtime_models(&mut missing, None, None).unwrap_err();
+        assert!(error.to_string().contains("--model <MODEL>"));
+
+        let mut configured = AppConfig {
+            model: Some("config-chat".into()),
+            ..AppConfig::default()
+        };
+        let model =
+            configure_runtime_models(&mut configured, Some("cli-chat"), Some("cli-consolidation"))
+                .unwrap();
+        assert_eq!(model, "cli-chat");
+        assert_eq!(configured.model.as_deref(), Some("cli-chat"));
+        assert_eq!(configured.memory.consolidation_model, "cli-consolidation");
     }
 
     #[test]
