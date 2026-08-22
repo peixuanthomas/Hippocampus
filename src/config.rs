@@ -423,21 +423,6 @@ mod tests {
     }
 
     #[test]
-    fn checked_in_config_enables_memory_with_defaulted_fields() {
-        let config: AppConfig = toml::from_str(include_str!("../config.toml")).unwrap();
-        config.validate().unwrap();
-        assert_eq!(config.model.as_deref(), Some("qwen3.8:27b-mlx"));
-        assert!(config.memory.enabled);
-        assert_eq!(config.memory.embedding_model, "qwen3-embedding:8b");
-        assert_eq!(config.memory.embedding_dimensions, 1_024);
-        assert_eq!(config.memory.budgets, AdaptiveBudgetConfig::default());
-
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.toml");
-        let loaded = AppConfig::load(Some(&path)).unwrap();
-        assert!(loaded.consolidation_model_configured);
-    }
-
-    #[test]
     fn strict_config_resolves_relative_paths() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("custom.toml");

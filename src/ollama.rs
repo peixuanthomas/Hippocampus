@@ -1263,32 +1263,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn chat_payload_preserves_memory_and_knowledge_roles() {
-        let messages = vec![
-            ChatMessage {
-                role: "system".into(),
-                content: "instructions".into(),
-            },
-            ChatMessage {
-                role: "knowledge".into(),
-                content: "reference".into(),
-            },
-            ChatMessage {
-                role: "memory".into(),
-                content: "recollection".into(),
-            },
-            ChatMessage {
-                role: "user".into(),
-                content: "question".into(),
-            },
-        ];
-
-        let payload = OllamaClient::chat_payload("model", &messages, false, 4096, 32);
-
-        assert_eq!(payload["messages"], serde_json::to_value(messages).unwrap());
-    }
-
     #[tokio::test]
     async fn unload_tracked_models_covers_successful_request_paths_and_hosts() {
         use axum::extract::State;

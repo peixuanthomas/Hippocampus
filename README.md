@@ -216,7 +216,7 @@ v2 采用破坏性 `v9→v10` 迁移：删除旧 consolidation、graph、episode
 
 巩固调用强制使用 JSON Schema 结构化输出并执行确定性校验。超长输入按 work unit 拆成更小批次，不会把同一个超长原请求原样重试；网络瞬态错误最多重试三次并使用指数退避；语义校验失败最多发起一次 repair。没有可发布内容时记录确定性空结果，不伪造事实，也不重复推进水位。非 JSON 模式会逐批输出 stage、尝试、修复和水位进度。SQLite 连接使用 30 秒 busy timeout，连接初始化遇到瞬态 writer lock 时执行有限指数退避。exclude/restore 只追加 control 记录，不删除或改写原文。
 
-存储布局为：`<sessions-dir>/*.json` 是权威原文；`<sessions-dir>/.hippocampus-index.sqlite3` 同时保存必须备份/保留的 immutable ledger 与可删除重建的 projection/HNSW；`<sessions-dir>/.hippocampus-control/*.json` 是 append-only 控制记录。模型输入分别使用 `system`、`user`、`memory` 和 `knowledge` 角色；长期记忆证据使用 `memory`，本地知识库证据使用 `knowledge`，两者都属于不可信数据，不得作为指令执行，recent history 则保留原始 user/assistant 角色。embedding、巩固或 graph 失败会记录在 trace/状态中，并回退到 BM25 可用路径。如果 source 已写入而索引同步失败，原始会话仍安全，可重试保存或运行 `memory rebuild`。
+存储布局为：`<sessions-dir>/*.json` 是权威原文；`<sessions-dir>/.hippocampus-index.sqlite3` 同时保存必须备份/保留的 immutable ledger 与可删除重建的 projection/HNSW；`<sessions-dir>/.hippocampus-control/*.json` 是 append-only 控制记录。模型输入只使用 Ollama 支持的标准消息角色：系统提示、身份指令、长期记忆证据和本地知识库证据使用 `system`，当前问题使用 `user`，recent history 保留原始 `user`/`assistant` 角色。长期记忆与知识证据都属于不可信数据，不得作为指令执行。embedding、巩固或 graph 失败会记录在 trace/状态中，并回退到 BM25 可用路径。如果 source 已写入而索引同步失败，原始会话仍安全，可重试保存或运行 `memory rebuild`。
 
 如果删除整个 `.hippocampus-index.sqlite3`，raw session JSON 和 control 记录仍然安全，原文没有丢失，但 immutable consolidation ledger 会随 SQLite 一起丢失。之后需要运行 `memory consolidate SESSION` 或 `memory consolidate --all`，由当前配置或命令行指定的独立巩固模型重新生成审计 attempt、canonical delta 和 structured memory，再执行所需的 embedding/graph 维护。
 

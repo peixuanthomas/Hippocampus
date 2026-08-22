@@ -1029,9 +1029,6 @@ pub struct ChatMessage {
     pub content: String,
 }
 
-pub const MEMORY_MESSAGE_ROLE: &str = "memory";
-pub const KNOWLEDGE_MESSAGE_ROLE: &str = "knowledge";
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContextPlan {
     pub messages: Vec<ChatMessage>,

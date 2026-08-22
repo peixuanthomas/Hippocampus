@@ -31,10 +31,10 @@ use crate::graph::GraphRecallSeed;
 use crate::knowledge::{KnowledgeStore, KnowledgeTrace};
 use crate::model::{
     BudgetAllocationTrace, ChannelTrace, ChatMessage, ContextItemTrace, EntityMatchTrace,
-    EventRole, EvidenceKind, FusionCandidateTrace, KNOWLEDGE_MESSAGE_ROLE, MEMORY_MESSAGE_ROLE,
-    ModelRequestTrace, ProvenanceQuality, QueryKind, RankedCandidate, RetrievalChannel,
-    RetrievalConfig, RetrievalDocumentGranularity, RetrievalTrace, SelectedEvidence, Session,
-    SourceSpan, StateSelectionTrace, Turn, TurnStatus, content_sha256, context_sha256, event_id,
+    EventRole, EvidenceKind, FusionCandidateTrace, ModelRequestTrace, ProvenanceQuality, QueryKind,
+    RankedCandidate, RetrievalChannel, RetrievalConfig, RetrievalDocumentGranularity,
+    RetrievalTrace, SelectedEvidence, Session, SourceSpan, StateSelectionTrace, Turn, TurnStatus,
+    content_sha256, context_sha256, event_id,
 };
 use crate::ollama::{ChatBackend, EmbeddingRequest};
 use crate::vector::{
@@ -8809,7 +8809,7 @@ impl RetrievalStore {
             }
             messages.push(ChatMessage {
                 role: wrapped_source_role
-                    .map_or(role.as_str(), |_| MEMORY_MESSAGE_ROLE)
+                    .map_or(role.as_str(), |_| EventRole::System.as_str())
                     .to_owned(),
                 content: content.clone(),
             });
@@ -10463,7 +10463,7 @@ impl RetrievalStore {
                 }
                 context_messages.push(ChatMessage {
                     role: wrapped_source_role
-                        .map_or(item.role.as_str(), |_| MEMORY_MESSAGE_ROLE)
+                        .map_or(item.role.as_str(), |_| EventRole::System.as_str())
                         .to_owned(),
                     content: selected.clone(),
                 });
@@ -14037,7 +14037,7 @@ fn push_generated_messages(
     }
     if let Some(content) = knowledge_message {
         messages.push(ChatMessage {
-            role: KNOWLEDGE_MESSAGE_ROLE.to_owned(),
+            role: EventRole::System.as_str().to_owned(),
             content: content.to_owned(),
         });
     }

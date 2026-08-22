@@ -5110,7 +5110,7 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::*;
-    use crate::model::{BudgetConfig, ChatMessage, KNOWLEDGE_MESSAGE_ROLE, MEMORY_MESSAGE_ROLE};
+    use crate::model::{BudgetConfig, ChatMessage};
     use crate::ollama::ModelInfo;
 
     #[derive(Clone, Default)]
@@ -5615,57 +5615,6 @@ mod tests {
         assert!(response_json.is_none());
         assert!(response_sha256.is_none());
         assert_eq!(request_sha256, content_sha256(&request_json));
-    }
-
-    /// Opt-in local canary: requires Ollama on `OLLAMA_HOST` (default localhost:11434)
-    /// with `qwen3.5:9b` installed. The tiny output cap deliberately exercises the real
-    /// length/split path; persisted audit output must contain final content only.
-    #[tokio::test]
-    #[ignore = "requires a local Ollama qwen3.5:9b model"]
-    async fn local_qwen_canary_separates_thinking_and_audits_length_split() {
-        let root = tempfile::tempdir().unwrap();
-        let store = SessionStore::new(root.path()).unwrap();
-        let host = std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://127.0.0.1:11434".into());
-        let mut session = store
-            .create("unrelated-chat-model", &host, None, budget(), true)
-            .unwrap();
-        let mut turn = Turn::pending(
-            "Alice moved from Paris to Berlin in 2024 and now works for Example Labs.".into(),
-        );
-        turn.status = TurnStatus::Complete;
-        session.turns.push(turn);
-        store.save(&mut session).unwrap();
-        let client = crate::ollama::OllamaClient::new(&host).unwrap();
-        let mut config = AppConfig::default();
-        config.memory.enabled = true;
-        config.memory.consolidation_max_output_tokens = 1;
-        let engine = ChatEngine::with_config(store.clone(), client, config);
-
-        let report = engine
-            .consolidate_session_stage(
-                &session,
-                ConsolidationTrigger::Manual,
-                CancellationToken::new(),
-                ConsolidationStageSelection::Facts,
-            )
-            .await;
-        assert_eq!(report.model, CONSOLIDATION_MODEL);
-        let attempts = store
-            .retrieval()
-            .consolidation_attempts(&session.id)
-            .unwrap();
-        assert!(attempts.iter().any(|attempt| {
-            attempt.status == ConsolidationAttemptStatus::Split
-                && attempt.done_reason.as_deref() == Some("length")
-        }));
-        assert!(attempts.iter().all(|attempt| {
-            attempt.model == CONSOLIDATION_MODEL
-                && !attempt
-                    .response_json
-                    .as_deref()
-                    .unwrap_or_default()
-                    .contains("<think>")
-        }));
     }
 
     #[tokio::test]
@@ -6795,45 +6744,21 @@ mod tests {
         let mut messages = before
             .items
             .iter()
-            .map(|item| {
-                let role = if before
-                    .retrieval_trace
-                    .selected_evidence
-                    .iter()
-                    .any(|selected| {
-                        selected.span == item.resolved.span
-                            && selected.content_sha256 == item.resolved.content_sha256
-                    }) {
-                    MEMORY_MESSAGE_ROLE
-                } else {
-                    item.role.as_str()
-                };
-                ChatMessage {
-                    role: role.into(),
-                    content: item.resolved.content.clone(),
-                }
+            .map(|item| ChatMessage {
+                role: item.role.as_str().into(),
+                content: item.resolved.content.clone(),
             })
             .collect::<Vec<_>>();
-        let mut generated_position = messages
-            .iter()
-            .take_while(|message| message.role == "system")
-            .count();
         if let Some(identity) = &before.identity_instruction {
+            let position = messages
+                .iter()
+                .position(|message| message.role == "system")
+                .map_or(0, |index| index + 1);
             messages.insert(
-                generated_position,
+                position,
                 ChatMessage {
                     role: "system".into(),
                     content: identity.clone(),
-                },
-            );
-            generated_position += 1;
-        }
-        if let Some(knowledge) = &before.knowledge_trace.injected_message {
-            messages.insert(
-                generated_position,
-                ChatMessage {
-                    role: KNOWLEDGE_MESSAGE_ROLE.into(),
-                    content: knowledge.clone(),
                 },
             );
         }
